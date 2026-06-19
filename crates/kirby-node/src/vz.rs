@@ -37,6 +37,10 @@ impl SandboxBackend for VzBackend {
             isolation: IsolationTier::HardwareVm,
             metering: MeterFidelity::HostCoarse,
             snapshot: None,
+            // This is a declared resume capability, not working machinery yet:
+            // Track A must land CheckpointRef/CheckpointStore, SubmitCheckpoint,
+            // restore_from boot state, and a checkpoint-aware genome before a
+            // scheduler can rely on this flag for VZ-6.
             app_checkpoint: true,
         }
     }

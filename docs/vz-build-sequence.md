@@ -88,24 +88,40 @@ M4 Max manually until a self-hosted Mac runner exists (section 6).
   Mac and hashes identically to the Linux-built path. (Resolved + documented in
   README "Getting the arm64 genome image on macOS"; this is no longer a blocker.)
 
-- **VZ-1 (FFI shim, the long pole):** decide objc2-in-process vs a sidecar Swift
-  helper the daemon drives, then stand up the minimal surface to construct + run a
-  `VZVirtualMachine`. Budget the most time here. Gate: a trivial VZ guest starts +
-  stops under the shim.
+- **VZ-1 (Swift sidecar helper, the long pole):** resolved: use a sidecar Swift
+  helper the daemon drives, NOT objc2-in-process. Rationale: Swift is the
+  first-class API surface for VZ's entitlement, run-loop, and delegate model; the
+  Rust daemon stays pure Rust and reuses the proven Unix-socket gateway serve path.
+  Stand up the minimal helper surface to construct + run a `VZVirtualMachine`.
+  Budget the most time here. Gate: a trivial VZ guest starts + stops under the
+  helper.
+
+  Consequences to carry into later chunks:
+  - G2 budget-halt crosses a process boundary on macOS. The daemon remains the
+    authority that decides to halt; the helper is not an independent authority.
+    Design lifecycle so the daemon is the helper's parent and helper death tears
+    down the `VZVirtualMachine`, so a wedged or killed helper cannot leave the VM
+    alive after the daemon's budget-death decision.
+  - FIX-3 dead-fd liveness lives inside the helper. The daemon side sees a Unix
+    socket, which is the well-understood Firecracker-like case. The helper must
+    still verify and guard the framework side: reap dead `VZVirtioSocketConnection`
+    objects, keep accepting fresh connections, and apply a read-deadline or
+    peer-close guard so a dead guest cannot wedge the bridge.
 
 - **VZ-2 (boot, macOS G1):** `VZLinuxBootLoader` + the uncompressed `vmlinux` ELF +
   the same squashfs genome image. Gate G1: the Linux genome microVM boots headless on
   the Mac and the genome process starts.
 
-- **VZ-3 (vsock host shim):** the guest side is identical (genome dials AF_VSOCK);
-  the host side is `VZVirtioSocketDevice` / `VZVirtioSocketConnection`, not a Unix
-  socket. Add a `GatewayTransport::VzVsock` variant; the `NodeGateway` tonic service
-  is unchanged. CARRY FIX-3's host-side liveness from the start (see
-  docs/vz-app-checkpoint-resume.md section "Resume liveness"): `serve_vz_vsock` reaps
-  dead connections + keeps accepting, and guards per-connection reads against a
-  half-dead `VZVirtioSocketConnection`. Gate: the genome completes a gateway
-  round-trip (GetSessionContext) over VZ vsock, AND a killed-guest connection does not
-  wedge the serve loop (the FIX-3 host-side probe, section 5).
+- **VZ-3 (vsock helper bridge):** the guest side is identical (genome dials
+  AF_VSOCK); the helper owns `VZVirtioSocketDevice` / `VZVirtioSocketConnection`
+  and bridges the framework stream to a Unix socket. The daemon serves the unchanged
+  `NodeGateway` tonic service over `GatewayTransport::VzVsockProxyUds`. CARRY FIX-3's
+  host-side liveness from the start (see docs/vz-app-checkpoint-resume.md section
+  "Resume liveness"): the helper reaps dead connections + keeps accepting, and
+  guards per-connection reads against a half-dead `VZVirtioSocketConnection`. Gate:
+  the genome completes a gateway round-trip (GetSessionContext) over VZ vsock, AND a
+  killed-guest connection does not wedge the helper bridge or daemon serve loop (the
+  FIX-3 host-side probe, section 5).
 
 - **VZ-4 (egress lockdown + meter, macOS G4):** pf default-deny + counters on the
   vmnet interface in place of nftables + eBPF. Resolve the entitlement fork first
@@ -160,6 +176,9 @@ Both are boot-confirm items the design flags as MUST-verify on real VZ, not assu
   landed). Track B (VZ backend) is built on the Mac off this repo; the design owner
   owns the design + reviews each chunk; the Mac implementer builds. The design owner
   cannot test VZ on Linux, so VZ gates are verified on the Mac.
+- **VZ-1 helper shape:** sidecar Swift helper, not objc2-in-process. The daemon
+  drives helper lifecycle and remains authoritative for halt decisions; the helper
+  owns VZ framework calls and the framework-stream to Unix-socket gateway bridge.
 
 ## 7. Isolation caveat to carry (documented risk, not a build step)
 
