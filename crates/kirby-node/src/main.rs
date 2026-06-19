@@ -8,17 +8,16 @@
 
 use std::time::Duration;
 
-use kirby_node::{
-    boot, brokered_run, egress_run, gateway, metered_run, mint_rig, nerve, prereqs, rail,
-    snapshot_run, treasury,
-};
+use kirby_node::{boot, gateway, nerve, prereqs, rail, treasury};
+#[cfg(target_os = "linux")]
+use kirby_node::{brokered_run, egress_run, metered_run, mint_rig, snapshot_run};
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
     name = "kirby-node",
-    about = "Kirby DKG-less Firecracker compute spike: node daemon",
+    about = "Kirby DKG-less compute spike: node daemon",
     version
 )]
 struct Cli {
@@ -28,9 +27,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Check the host satisfies every spike prerequisite (KVM, cgroup v2,
-    /// nftables, vsock, jailer privilege). This is the C-1 definition-of-done
-    /// gate: it must pass on the target host with output captured.
+    /// Check the host satisfies every spike prerequisite for this platform
+    /// (Linux/Firecracker or macOS/VZ). This gate must pass on the target host
+    /// with output captured.
     Prereqs {
         /// Emit machine-readable JSON instead of the human report.
         #[arg(long)]
@@ -575,15 +574,20 @@ fn main() -> anyhow::Result<()> {
                 post_resume_secs,
             })
         }
-        Command::EbpfEgress { iface, tick_ms } => {
-            // The privileged child (run via sudo). No tracing init: it logs to
-            // stderr in plain lines the parent forwards. This blocks until killed.
-            kirby_node::meter_egress::run_privileged_egress_meter(
-                &iface,
-                Duration::from_millis(tick_ms),
-            )
-        }
+        Command::EbpfEgress { iface, tick_ms } => run_ebpf_egress(iface, tick_ms),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run_ebpf_egress(iface: String, tick_ms: u64) -> anyhow::Result<()> {
+    // The privileged child (run via sudo). No tracing init: it logs to stderr in
+    // plain lines the parent forwards. This blocks until killed.
+    kirby_node::meter_egress::run_privileged_egress_meter(&iface, Duration::from_millis(tick_ms))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_ebpf_egress(_iface: String, _tick_ms: u64) -> anyhow::Result<()> {
+    anyhow::bail!("the eBPF egress meter is only available on Linux")
 }
 
 /// Parsed `run` arguments, grouped so the daemon entry point takes one value.
@@ -627,9 +631,10 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
     // The node state directory (the treasury dir): also the default home for the
     // node's Nostr identity key. Default to a per-node directory under the OS temp
     // dir so two node processes on one host stay distinct (D-13 same-host harness).
-    let treasury_path = args.treasury_path.clone().unwrap_or_else(|| {
-        std::env::temp_dir().join(format!("kirby-treasury-{}", args.node_id))
-    });
+    let treasury_path = args
+        .treasury_path
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("kirby-treasury-{}", args.node_id)));
 
     // --presence-only: just join the fleet over the relay and serve until killed.
     // This is the VM-INDEPENDENT path (no prereqs gate, no KVM/Firecracker, no
@@ -689,7 +694,10 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
     // configured. It is host-side and unprivileged; it publishes this node's beacon
     // and tracks the fleet. When no relay is given, presence is OFF (no behavior
     // change). The shutdown sender is held for the lifetime of the serve path.
-    let mut presence_handle: Option<(tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<anyhow::Result<()>>)> = None;
+    let mut presence_handle: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    )> = None;
     if let Some(relay_url) = args.relay_url.clone() {
         let key_path =
             nerve::NodeIdentity::resolve_key_path(args.nostr_key_path.as_deref(), &treasury_path);
@@ -727,7 +735,9 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
     } else if presence_handle.is_some() {
         // No vsock serve, but presence is running: keep the process alive (serving
         // the fleet) until a signal, then stop presence cleanly.
-        tracing::info!("gateway constructed; presence task running. Serving the fleet until killed (Ctrl-C).");
+        tracing::info!(
+            "gateway constructed; presence task running. Serving the fleet until killed (Ctrl-C)."
+        );
         wait_for_signal().await;
     } else {
         // The gateway is constructed and ready, no presence, no vsock serve. The
@@ -839,7 +849,9 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
         .image_dir
         .or_else(|| std::env::var_os("KIRBY_GENOME_IMAGE").map(std::path::PathBuf::from))
         .ok_or_else(|| {
-            anyhow::anyhow!("no image: pass --image-dir or set KIRBY_GENOME_IMAGE to the genome-image output")
+            anyhow::anyhow!(
+                "no image: pass --image-dir or set KIRBY_GENOME_IMAGE to the genome-image output"
+            )
         })?;
     let image = boot::ImagePaths::from_dir(&image_dir)?;
 
@@ -884,7 +896,9 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
     }
 
     if args.keep_running {
-        tracing::info!("keep-running set: leaving the VM up (Ctrl-C to exit; jail is left for inspection)");
+        tracing::info!(
+            "keep-running set: leaving the VM up (Ctrl-C to exit; jail is left for inspection)"
+        );
         // Park so the spawned gateway server keeps serving. The VM stays up.
         futures::future::pending::<()>().await;
         Ok(())
@@ -900,6 +914,7 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
 }
 
 /// Parsed `meter` arguments.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct MeterArgs {
     image_dir: Option<std::path::PathBuf>,
     node_id: String,
@@ -914,6 +929,7 @@ struct MeterArgs {
     max_run_secs: u64,
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
     // The daemon refuses to run on a host that fails the prereqs gate.
@@ -927,7 +943,9 @@ async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
         .image_dir
         .or_else(|| std::env::var_os("KIRBY_GENOME_IMAGE").map(std::path::PathBuf::from))
         .ok_or_else(|| {
-            anyhow::anyhow!("no image: pass --image-dir or set KIRBY_GENOME_IMAGE to the genome-image output")
+            anyhow::anyhow!(
+                "no image: pass --image-dir or set KIRBY_GENOME_IMAGE to the genome-image output"
+            )
         })?;
     let image = boot::ImagePaths::from_dir(&image_dir)?;
 
@@ -983,7 +1001,13 @@ async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn run_meter(_args: MeterArgs) -> anyhow::Result<()> {
+    anyhow::bail!("`kirby-node meter` is Linux-only until the VZ HostRusage meter lands")
+}
+
 /// Parsed `egress` arguments.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct EgressArgs {
     image_dir: Option<std::path::PathBuf>,
     node_id: String,
@@ -996,6 +1020,7 @@ struct EgressArgs {
     probe_secs: u64,
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn run_egress(args: EgressArgs) -> anyhow::Result<()> {
     // The daemon refuses to run on a host that fails the prereqs gate.
@@ -1009,7 +1034,9 @@ async fn run_egress(args: EgressArgs) -> anyhow::Result<()> {
         .image_dir
         .or_else(|| std::env::var_os("KIRBY_GENOME_IMAGE").map(std::path::PathBuf::from))
         .ok_or_else(|| {
-            anyhow::anyhow!("no image: pass --image-dir or set KIRBY_GENOME_IMAGE to the genome-image output")
+            anyhow::anyhow!(
+                "no image: pass --image-dir or set KIRBY_GENOME_IMAGE to the genome-image output"
+            )
         })?;
     let image = boot::ImagePaths::from_dir(&image_dir)?;
 
@@ -1034,10 +1061,8 @@ async fn run_egress(args: EgressArgs) -> anyhow::Result<()> {
         snapshot_capable: false,
     };
 
-    let config = egress_run::EgressRunConfig::new(
-        boot_config,
-        Duration::from_secs(args.probe_secs),
-    );
+    let config =
+        egress_run::EgressRunConfig::new(boot_config, Duration::from_secs(args.probe_secs));
 
     let outcome = egress_run::run(config).await?;
 
@@ -1067,7 +1092,13 @@ async fn run_egress(args: EgressArgs) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn run_egress(_args: EgressArgs) -> anyhow::Result<()> {
+    anyhow::bail!("`kirby-node egress` is Linux-only until the VZ pf/vmnet egress path lands")
+}
+
 /// Parsed `brokered` arguments.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct BrokeredArgs {
     image_dir: Option<std::path::PathBuf>,
     mint_url: String,
@@ -1082,6 +1113,7 @@ struct BrokeredArgs {
     act_secs: u64,
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
     use std::sync::Arc;
@@ -1097,7 +1129,9 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
         .image_dir
         .or_else(|| std::env::var_os("KIRBY_GENOME_IMAGE").map(std::path::PathBuf::from))
         .ok_or_else(|| {
-            anyhow::anyhow!("no image: pass --image-dir or set KIRBY_GENOME_IMAGE to the genome-image output")
+            anyhow::anyhow!(
+                "no image: pass --image-dir or set KIRBY_GENOME_IMAGE to the genome-image output"
+            )
         })?;
     let image = boot::ImagePaths::from_dir(&image_dir)?;
 
@@ -1108,7 +1142,10 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
     mint_rig::fund_wallet(wallet.clone(), args.fund_sats).await?;
     let funded = wallet.total_balance().await.map(u64::from).unwrap_or(0);
     tracing::info!(balance = funded, "daemon wallet funded");
-    let cdk_rail = Arc::new(rail::CdkEcashRail::new(wallet.clone(), args.mint_url.clone()));
+    let cdk_rail = Arc::new(rail::CdkEcashRail::new(
+        wallet.clone(),
+        args.mint_url.clone(),
+    ));
 
     // The allowlist contains the mint URL so the brokered act authorizes (step 2).
     // The TAP + the `brokered` workload are forced on by BrokeredRunConfig.
@@ -1129,7 +1166,8 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
         snapshot_capable: false,
     };
 
-    let config = brokered_run::BrokeredRunConfig::new(boot_config, Duration::from_secs(args.act_secs));
+    let config =
+        brokered_run::BrokeredRunConfig::new(boot_config, Duration::from_secs(args.act_secs));
     let rail_dyn: Arc<dyn rail::Rail> = cdk_rail.clone();
     let outcome = brokered_run::run(config, rail_dyn).await?;
 
@@ -1153,7 +1191,10 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
 
     // (ii) the REAL settle: the mint shows the wallet's input proofs spent.
     if let Ok(proofs) = cdk_rail.wallet().get_unspent_proofs().await {
-        println!("  wallet balance after settle: {} sat (was {funded})", cdk_rail.wallet_balance_sats().await);
+        println!(
+            "  wallet balance after settle: {} sat (was {funded})",
+            cdk_rail.wallet_balance_sats().await
+        );
         let _ = proofs; // unspent remaining; the spent ones are gone from the wallet
     }
 
@@ -1164,7 +1205,15 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn run_brokered(_args: BrokeredArgs) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "`kirby-node brokered` is Linux-only until the VZ cold-boot and egress paths land"
+    )
+}
+
 /// Parsed `snapshot` arguments.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct SnapshotArgs {
     image_dir: Option<std::path::PathBuf>,
     node_id: String,
@@ -1177,6 +1226,7 @@ struct SnapshotArgs {
     post_resume_secs: u64,
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn run_snapshot(args: SnapshotArgs) -> anyhow::Result<()> {
     // The daemon refuses to run on a host that fails the prereqs gate.
@@ -1190,7 +1240,9 @@ async fn run_snapshot(args: SnapshotArgs) -> anyhow::Result<()> {
         .image_dir
         .or_else(|| std::env::var_os("KIRBY_GENOME_IMAGE").map(std::path::PathBuf::from))
         .ok_or_else(|| {
-            anyhow::anyhow!("no image: pass --image-dir or set KIRBY_GENOME_IMAGE to the genome-image output")
+            anyhow::anyhow!(
+                "no image: pass --image-dir or set KIRBY_GENOME_IMAGE to the genome-image output"
+            )
         })?;
     let image = boot::ImagePaths::from_dir(&image_dir)?;
 
@@ -1247,4 +1299,11 @@ async fn run_snapshot(args: SnapshotArgs) -> anyhow::Result<()> {
     } else {
         std::process::exit(1);
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_snapshot(_args: SnapshotArgs) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "`kirby-node snapshot` is Linux/Firecracker-only; macOS resume uses app checkpoints"
+    )
 }

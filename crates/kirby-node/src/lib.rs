@@ -168,22 +168,35 @@
 //!   fingerprint, re-issue K on resume).
 
 pub mod boot;
+#[cfg(target_os = "linux")]
 pub mod brokered_run;
+#[cfg(target_os = "linux")]
 pub mod egress_run;
+#[cfg(target_os = "linux")]
 pub mod firecracker;
+#[cfg(target_os = "linux")]
 pub mod full_loop_run;
 pub mod gateway;
+#[cfg(target_os = "linux")]
 pub mod idempotent_run;
+#[cfg(target_os = "linux")]
 pub mod meter;
+#[cfg(target_os = "linux")]
 pub mod meter_egress;
+#[cfg(target_os = "linux")]
 pub mod metered_run;
 pub mod mint_rig;
 pub mod nerve;
+#[cfg(target_os = "linux")]
 pub mod network;
+#[cfg(target_os = "linux")]
 pub mod nosplitbrain_run;
 pub mod prereqs;
-pub mod rail;
 pub mod raft_lease;
+pub mod rail;
 pub mod sandbox;
+#[cfg(target_os = "linux")]
 pub mod snapshot_run;
 pub mod treasury;
+#[cfg(target_os = "macos")]
+pub mod vz;

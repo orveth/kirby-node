@@ -25,11 +25,14 @@ use std::time::Duration;
 
 use kirby_proto::Event;
 
+#[cfg(target_os = "linux")]
 use crate::firecracker::FirecrackerBackend;
 use crate::gateway::{GatewayService, Session};
 use crate::rail::{MockRail, Rail};
 use crate::sandbox::{GatewayTransport, GuestImage, GuestSpec, SandboxBackend, SandboxInstance};
 use crate::treasury::Treasury;
+#[cfg(target_os = "macos")]
+use crate::vz::VzBackend;
 
 /// Where the genome image artifacts live (built by `nix build .#genome-image`).
 /// Resolved from `--image-dir` or the `KIRBY_GENOME_IMAGE` env var, both of
@@ -126,10 +129,9 @@ pub async fn boot_and_observe(
 /// on the local mint; the other chunks use the mock rail. Everything else (the
 /// gateway service, the treasury, the authorize order, the metering) is identical.
 ///
-/// The backend is the Firecracker backend (the only one built); the daemon
-/// constructs it and boots through the [`SandboxBackend`] trait, never a concrete
-/// Firecracker type. A future macOS backend swaps in here with no change to the
-/// gateway/treasury/rail this function wires.
+/// The backend is selected by platform: Firecracker on Linux, VZ on macOS. The
+/// daemon boots through the [`SandboxBackend`] trait, never through a concrete VM
+/// type, so the gateway/treasury/rail wiring stays shared.
 pub async fn boot_and_observe_with_rail(
     config: BootConfig,
     rail: Arc<dyn Rail>,
@@ -174,12 +176,11 @@ pub async fn boot_and_observe_with_rail(
         node_id = %config.node_id,
         cid = config.guest_cid,
         port = config.gateway_port,
-        "booting genome guest through the sandbox backend (Firecracker)"
+        backend = backend_label(),
+        "booting genome guest through the sandbox backend"
     );
 
-    // The Firecracker backend (the first SandboxBackend impl). Constructed here;
-    // a future macOS backend is selected the same way.
-    let backend = FirecrackerBackend::new();
+    let backend = default_backend();
     let mut instance = backend.boot(spec).await?;
 
     // The boot evidence: the guest reached Running.
@@ -210,11 +211,17 @@ pub async fn boot_and_observe_with_rail(
     // context, and reported hello.
     let hello = wait_for_hello(&mut events, &config.task, config.hello_timeout).await;
     match &hello {
-        Some(ev) => tracing::info!(detail = %ev.detail, "genome boot hello received (G1 round-trip proven)"),
+        Some(ev) => {
+            tracing::info!(detail = %ev.detail, "genome boot hello received (G1 round-trip proven)")
+        }
         None => tracing::warn!("genome boot hello did NOT arrive before the timeout"),
     }
 
-    let outcome = BootOutcome { reached_running, hello, budget_sats: config.budget_sats };
+    let outcome = BootOutcome {
+        reached_running,
+        hello,
+        budget_sats: config.budget_sats,
+    };
     Ok((instance, outcome, meter_treasury, events))
 }
 
@@ -241,7 +248,32 @@ pub async fn serve_gateway_over_pub(
         GatewayTransport::FirecrackerVsockUds { uds_base, port } => {
             service.serve_firecracker_vsock(&uds_base, port).await
         }
+        #[cfg(target_os = "macos")]
+        GatewayTransport::VzVsockProxyUds { uds_path, port } => {
+            tracing::info!(path = %uds_path.display(), port, "NodeGateway serving over VZ helper proxy");
+            service.serve_unix_socket(&uds_path).await
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn default_backend() -> impl SandboxBackend {
+    FirecrackerBackend::new()
+}
+
+#[cfg(target_os = "macos")]
+fn default_backend() -> impl SandboxBackend {
+    VzBackend::new()
+}
+
+#[cfg(target_os = "linux")]
+fn backend_label() -> &'static str {
+    "firecracker"
+}
+
+#[cfg(target_os = "macos")]
+fn backend_label() -> &'static str {
+    "vz"
 }
 
 /// Wait for the genome's boot hello event with the expected `session=<task>`
@@ -262,9 +294,8 @@ async fn wait_for_hello(
         match tokio::time::timeout(remaining, events.recv()).await {
             Ok(Some(ev)) if ev.kind == "hello" && ev.detail == expected_detail => return Some(ev),
             Ok(Some(_)) => continue, // some other event; keep waiting for hello
-            Ok(None) => return None,  // observer dropped
-            Err(_) => return None,    // timed out
+            Ok(None) => return None, // observer dropped
+            Err(_) => return None,   // timed out
         }
     }
 }
-

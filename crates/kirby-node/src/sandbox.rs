@@ -60,6 +60,9 @@ use std::path::PathBuf;
 pub enum BackendKind {
     /// Linux/KVM Firecracker under the jailer (the reference backend, built).
     Firecracker,
+    /// macOS Apple Virtualization.framework. Built on Darwin only.
+    #[cfg(target_os = "macos")]
+    VirtualizationFramework,
 }
 
 /// Post-escape isolation strength of a backend (the cross-platform plan's
@@ -73,6 +76,10 @@ pub enum IsolationTier {
     /// Hardware VM boundary PLUS an OS-level cage on escape (Firecracker: the
     /// jailer's chroot/seccomp/namespaces/uid-drop).
     HardwareVmJailed,
+    /// Hardware VM boundary only. VZ has no jailer-equivalent post-escape cage,
+    /// so policy can distinguish it from Firecracker.
+    #[cfg(target_os = "macos")]
+    HardwareVm,
 }
 
 /// How much the daemon should trust this backend's metering, and therefore how
@@ -85,6 +92,10 @@ pub enum MeterFidelity {
     /// Authoritative, tick-accurate, hard running memory bound (Linux cgroups v2
     /// `cpu.stat`/`memory.current` + the eBPF egress byte counter).
     CgroupExact,
+    /// Coarser host-side accounting. macOS has no cgroup v2 equivalent; VZ uses
+    /// boot-time memory caps and later Mach/rusage sampling.
+    #[cfg(target_os = "macos")]
+    HostCoarse,
 }
 
 /// What a backend can do, surfaced so the daemon can reason about it without
@@ -122,6 +133,9 @@ pub struct BackendCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestArch {
     X86_64,
+    /// AArch64 Linux guest, the Apple Silicon VZ image.
+    #[cfg(target_os = "macos")]
+    Aarch64,
 }
 
 /// The CPU-normalization class a VM snapshot is created under, so it restores on a
@@ -238,7 +252,10 @@ pub struct LocalDirTransfer {
 impl SnapshotTransfer for LocalDirTransfer {
     async fn transfer(&self, artifact: SnapshotArtifact) -> anyhow::Result<SnapshotArtifact> {
         std::fs::create_dir_all(&self.target_dir).map_err(|e| {
-            anyhow::anyhow!("create snapshot transfer target dir {}: {e}", self.target_dir.display())
+            anyhow::anyhow!(
+                "create snapshot transfer target dir {}: {e}",
+                self.target_dir.display()
+            )
         })?;
         let copy_into = |src: &std::path::Path| -> anyhow::Result<PathBuf> {
             let name = src
@@ -358,6 +375,11 @@ pub enum GatewayTransport {
     /// A macOS VZ backend would add a variant here (a `VZVirtioSocketConnection`
     /// host endpoint); the gateway service it serves is identical.
     FirecrackerVsockUds { uds_base: PathBuf, port: u32 },
+    /// macOS VZ helper proxy socket. Virtualization.framework owns the virtio-vsock
+    /// object; the helper bridges that stream to this Unix socket, where the daemon
+    /// serves the same `NodeGateway` tonic service.
+    #[cfg(target_os = "macos")]
+    VzVsockProxyUds { uds_path: PathBuf, port: u32 },
 }
 
 /// Where the daemon reads host-authoritative CPU+memory consumption for THIS
@@ -373,6 +395,11 @@ pub enum MeterSource {
     /// slice, so the daemon reads `cpu.stat usage_usec` + `memory.current` there
     /// rootlessly (C-4).
     CgroupV2 { rel_path: PathBuf },
+    /// A macOS VZ process/thread accounting source. The first Mac milestone only
+    /// needs cold boot plus gateway transport; real HostRusage sampling lands with
+    /// macOS G2.
+    #[cfg(target_os = "macos")]
+    HostProcess { pid: u32 },
 }
 
 /// A booted genome guest: the per-instance handle the daemon drives. The backend
