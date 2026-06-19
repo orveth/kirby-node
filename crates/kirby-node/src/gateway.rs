@@ -140,6 +140,7 @@ impl GatewayService {
     /// uses `serve_firecracker_vsock`. Kept for a non-Firecracker peer and for
     /// symmetry with spec 3.1. Runs until the listener errors or the task is
     /// cancelled.
+    #[cfg(target_os = "linux")]
     pub async fn serve_vsock(self, cid: u32, port: u32) -> anyhow::Result<()> {
         use tokio_vsock::{VsockAddr, VsockListener};
         let listener = VsockListener::bind(VsockAddr::new(cid, port))?;
@@ -147,6 +148,35 @@ impl GatewayService {
         tonic::transport::Server::builder()
             .add_service(self.into_server())
             .serve_with_incoming(listener.incoming())
+            .await?;
+        Ok(())
+    }
+
+    /// Raw AF_VSOCK is a Linux host API in this daemon. macOS VZ exposes the host
+    /// side through Virtualization.framework, so the VZ backend uses a helper
+    /// process and a Unix-socket proxy instead.
+    #[cfg(not(target_os = "linux"))]
+    pub async fn serve_vsock(self, _cid: u32, _port: u32) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "raw AF_VSOCK serving is only available on Linux; use the VZ backend on macOS"
+        )
+    }
+
+    /// Serve this gateway over an already-chosen Unix socket path. Firecracker
+    /// derives its path from a vsock base plus port; the macOS VZ helper uses an
+    /// explicit proxy socket path. The tonic service is identical.
+    pub async fn serve_unix_socket(self, listen_path: &std::path::Path) -> anyhow::Result<()> {
+        use tokio::net::UnixListener;
+        use tokio_stream::wrappers::UnixListenerStream;
+
+        let _ = std::fs::remove_file(listen_path);
+        let listener = UnixListener::bind(listen_path).map_err(|e| {
+            anyhow::anyhow!("bind gateway unix socket {}: {e}", listen_path.display())
+        })?;
+        tracing::info!(path = %listen_path.display(), "NodeGateway serving over unix socket");
+        tonic::transport::Server::builder()
+            .add_service(self.into_server())
+            .serve_with_incoming(UnixListenerStream::new(listener))
             .await?;
         Ok(())
     }
@@ -164,26 +194,13 @@ impl GatewayService {
         uds_base: &std::path::Path,
         port: u32,
     ) -> anyhow::Result<()> {
-        use tokio::net::UnixListener;
-        use tokio_stream::wrappers::UnixListenerStream;
-
         let listen_path = firecracker_vsock_listen_path(uds_base, port);
-        // A stale socket file from a prior run would make bind fail with
-        // EADDRINUSE; remove it first (the daemon owns this path for this VM).
-        let _ = std::fs::remove_file(&listen_path);
-        let listener = UnixListener::bind(&listen_path).map_err(|e| {
-            anyhow::anyhow!("bind gateway vsock unix socket {}: {e}", listen_path.display())
-        })?;
         tracing::info!(
             path = %listen_path.display(),
             port,
             "NodeGateway serving over Firecracker vsock (host unix socket)"
         );
-        tonic::transport::Server::builder()
-            .add_service(self.into_server())
-            .serve_with_incoming(UnixListenerStream::new(listener))
-            .await?;
-        Ok(())
+        self.serve_unix_socket(&listen_path).await
     }
 
     /// The current VMGenID generation the daemon believes the VM is at. Bumped
@@ -231,7 +248,11 @@ impl GatewayService {
         if let Some(fence) = &self.lease_fence {
             match fence.handle.fence(fence.vm_term).await {
                 FenceVerdict::Active { .. } => {}
-                FenceVerdict::Fenced { committed_term, committed_holder, believed_term } => {
+                FenceVerdict::Fenced {
+                    committed_term,
+                    committed_holder,
+                    believed_term,
+                } => {
                     tracing::warn!(
                         committed_term,
                         committed_holder,
@@ -305,7 +326,10 @@ impl GatewayService {
             .treasury
             .debit_and_record(&req.idempotency_key, actual_cost, proof.clone())?
         {
-            DebitOutcome::Debited { cost_sats, remaining } => Ok(receipt(
+            DebitOutcome::Debited {
+                cost_sats,
+                remaining,
+            } => Ok(receipt(
                 Outcome::AuthorizedAndPerformed,
                 cost_sats,
                 remaining,
@@ -379,7 +403,10 @@ impl NodeGateway for GatewayService {
         // The ordering signal: a genome called GetEntropyNonce at this generation.
         // Feed the observer (the same stream the heartbeat ReportEvent uses) so the
         // test sees the entropy call land before the post-resume heartbeat act (G7).
-        tracing::info!(generation, "genome called GetEntropyNonce (entropy re-derive, G7 ordering)");
+        tracing::info!(
+            generation,
+            "genome called GetEntropyNonce (entropy re-derive, G7 ordering)"
+        );
         if let Some(observer) = &self.event_observer {
             let _ = observer.send(Event {
                 schema_version: kirby_proto::SCHEMA_VERSION,
@@ -411,7 +438,9 @@ impl NodeGateway for GatewayService {
         if let Some(observer) = &self.event_observer {
             let _ = observer.send(event);
         }
-        Ok(Response::new(Ack { schema_version: kirby_proto::SCHEMA_VERSION }))
+        Ok(Response::new(Ack {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+        }))
     }
 
     /// The brokered-act path (spec 3.2). Delegates to `authorize_capability`,

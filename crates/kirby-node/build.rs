@@ -19,6 +19,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        println!("cargo:rerun-if-env-changed=KIRBY_EBPF_CARGO");
+        return;
+    }
+
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     // crates/kirby-node -> crates/kirby-ebpf
@@ -28,9 +33,18 @@ fn main() {
         .join("kirby-ebpf");
 
     // Rebuild the embedded object if the eBPF source or its manifest changes.
-    println!("cargo:rerun-if-changed={}", ebpf_dir.join("src/main.rs").display());
-    println!("cargo:rerun-if-changed={}", ebpf_dir.join("Cargo.toml").display());
-    println!("cargo:rerun-if-changed={}", ebpf_dir.join(".cargo/config.toml").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        ebpf_dir.join("src/main.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        ebpf_dir.join("Cargo.toml").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        ebpf_dir.join(".cargo/config.toml").display()
+    );
     println!("cargo:rerun-if-env-changed=KIRBY_EBPF_CARGO");
 
     // A per-crate target dir under OUT_DIR (cargo flocks its own target dir;
@@ -91,8 +105,7 @@ fn main() {
          egress meter. Check bpf-linker is on PATH and the nightly toolchain has rust-src."
     );
 
-    let object = ebpf_target
-        .join("bpfel-unknown-none/release/kirby-egress");
+    let object = ebpf_target.join("bpfel-unknown-none/release/kirby-egress");
     assert!(
         object.is_file(),
         "the eBPF build reported success but produced no object at {} (C-5)",
@@ -100,5 +113,8 @@ fn main() {
     );
 
     // Hand the daemon the object path for include_bytes!.
-    println!("cargo:rustc-env=KIRBY_EGRESS_BPF_OBJECT={}", object.display());
+    println!(
+        "cargo:rustc-env=KIRBY_EGRESS_BPF_OBJECT={}",
+        object.display()
+    );
 }

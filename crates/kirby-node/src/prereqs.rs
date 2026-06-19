@@ -49,13 +49,28 @@ pub struct Check {
 
 impl Check {
     fn pass(name: &'static str, found: impl Into<String>, detail: impl Into<String>) -> Self {
-        Check { name, status: Status::Pass, found: found.into(), detail: detail.into() }
+        Check {
+            name,
+            status: Status::Pass,
+            found: found.into(),
+            detail: detail.into(),
+        }
     }
     fn warn(name: &'static str, found: impl Into<String>, detail: impl Into<String>) -> Self {
-        Check { name, status: Status::Warn, found: found.into(), detail: detail.into() }
+        Check {
+            name,
+            status: Status::Warn,
+            found: found.into(),
+            detail: detail.into(),
+        }
     }
     fn fail(name: &'static str, found: impl Into<String>, detail: impl Into<String>) -> Self {
-        Check { name, status: Status::Fail, found: found.into(), detail: detail.into() }
+        Check {
+            name,
+            status: Status::Fail,
+            found: found.into(),
+            detail: detail.into(),
+        }
     }
 }
 
@@ -83,10 +98,22 @@ impl Report {
             }
         }
         println!("{}", "=".repeat(60));
-        let fails = self.checks.iter().filter(|c| c.status == Status::Fail).count();
-        let warns = self.checks.iter().filter(|c| c.status == Status::Warn).count();
+        let fails = self
+            .checks
+            .iter()
+            .filter(|c| c.status == Status::Fail)
+            .count();
+        let warns = self
+            .checks
+            .iter()
+            .filter(|c| c.status == Status::Warn)
+            .count();
         if self.all_satisfied() {
-            println!("RESULT: PASS ({} checks, {} warn) host is spike-ready", self.checks.len(), warns);
+            println!(
+                "RESULT: PASS ({} checks, {} warn) host is spike-ready",
+                self.checks.len(),
+                warns
+            );
         } else {
             println!("RESULT: FAIL ({} hard requirement(s) unmet)", fails);
         }
@@ -140,6 +167,10 @@ fn json_str(s: &str) -> String {
 
 /// Run every probe and assemble the report.
 pub fn check() -> Report {
+    if cfg!(target_os = "macos") {
+        return check_macos_vz();
+    }
+
     Report {
         checks: vec![
             check_os(),
@@ -155,13 +186,118 @@ pub fn check() -> Report {
     }
 }
 
+fn check_macos_vz() -> Report {
+    Report {
+        checks: vec![
+            check_macos_os(),
+            check_macos_arch(),
+            check_virtualization_framework(),
+            check_swiftc(),
+            check_codesign(),
+            check_login_keychain_note(),
+        ],
+    }
+}
+
+fn check_macos_os() -> Check {
+    if cfg!(target_os = "macos") {
+        let version = run_version("/usr/bin/sw_vers", &["-productVersion"]);
+        Check::pass(
+            "os: macos",
+            version,
+            "Apple Virtualization.framework backend target",
+        )
+    } else {
+        Check::fail(
+            "os: macos",
+            std::env::consts::OS,
+            "the VZ backend requires macOS",
+        )
+    }
+}
+
+fn check_macos_arch() -> Check {
+    if cfg!(target_arch = "aarch64") {
+        Check::pass(
+            "arch: aarch64",
+            std::env::consts::ARCH,
+            "matches the staged aarch64 Linux genome image",
+        )
+    } else {
+        Check::fail(
+            "arch: aarch64",
+            std::env::consts::ARCH,
+            "the current Mac MVP targets Apple Silicon and the aarch64 genome image",
+        )
+    }
+}
+
+fn check_virtualization_framework() -> Check {
+    let path = "/System/Library/Frameworks/Virtualization.framework";
+    if Path::new(path).is_dir() {
+        Check::pass(
+            "Virtualization.framework",
+            path,
+            "runtime framework present for the VZ backend",
+        )
+    } else {
+        Check::fail(
+            "Virtualization.framework",
+            "not found",
+            "macOS Virtualization.framework is required to boot the Linux guest",
+        )
+    }
+}
+
+fn check_swiftc() -> Check {
+    match which("swiftc") {
+        Some(path) => Check::pass(
+            "swiftc",
+            format!("{path} ({})", run_version(&path, &["--version"])),
+            "the planned VZ helper is a small Swift sidecar",
+        ),
+        None => Check::fail(
+            "swiftc",
+            "swiftc not on PATH",
+            "install Xcode or command line tools so the VZ helper can be built",
+        ),
+    }
+}
+
+fn check_codesign() -> Check {
+    match which("codesign") {
+        Some(path) => Check::pass(
+            "codesign",
+            path,
+            "the VZ helper will be ad-hoc signed with the virtualization entitlement",
+        ),
+        None => Check::fail(
+            "codesign",
+            "codesign not on PATH",
+            "macOS requires signing for the virtualization entitlement",
+        ),
+    }
+}
+
+fn check_login_keychain_note() -> Check {
+    Check::warn(
+        "login keychain",
+        "not probed",
+        "unlock login.keychain before running the VZ helper if Security Server interaction is denied",
+    )
+}
+
 /// Linux is required (KVM, cgroup v2, vsock are Linux-only).
 fn check_os() -> Check {
     if cfg!(target_os = "linux") {
         let release = read_trim("/proc/sys/kernel/osrelease").unwrap_or_else(|| "unknown".into());
         Check::pass("os: linux", format!("kernel {release}"), "")
     } else {
-        Check::fail("os: linux", std::env::consts::OS, "the spike requires a Linux host")
+        Check::fail(
+            "os: linux",
+            std::env::consts::OS,
+            "the spike requires a Linux host",
+        )
     }
 }
 
@@ -170,11 +306,19 @@ fn check_os() -> Check {
 fn check_kvm() -> Check {
     let path = "/dev/kvm";
     if !Path::new(path).exists() {
-        return Check::fail("kvm", "/dev/kvm absent", "no hardware virtualization; Firecracker cannot run");
+        return Check::fail(
+            "kvm",
+            "/dev/kvm absent",
+            "no hardware virtualization; Firecracker cannot run",
+        );
     }
     match fs::OpenOptions::new().read(true).write(true).open(path) {
         Ok(_) => Check::pass("kvm", "/dev/kvm rw", "hardware virtualization available"),
-        Err(e) => Check::fail("kvm", format!("/dev/kvm present but not openable: {e}"), "the daemon user needs rw on /dev/kvm (group kvm)"),
+        Err(e) => Check::fail(
+            "kvm",
+            format!("/dev/kvm present but not openable: {e}"),
+            "the daemon user needs rw on /dev/kvm (group kvm)",
+        ),
     }
 }
 
@@ -183,11 +327,23 @@ fn check_kvm() -> Check {
 fn check_vsock() -> Check {
     let path = "/dev/vhost-vsock";
     if !Path::new(path).exists() {
-        return Check::fail("vsock", "/dev/vhost-vsock absent", "load the vhost_vsock kernel module; the gateway transport needs it");
+        return Check::fail(
+            "vsock",
+            "/dev/vhost-vsock absent",
+            "load the vhost_vsock kernel module; the gateway transport needs it",
+        );
     }
     match fs::OpenOptions::new().read(true).write(true).open(path) {
-        Ok(_) => Check::pass("vsock", "/dev/vhost-vsock rw", "vsock gateway transport available"),
-        Err(e) => Check::fail("vsock", format!("/dev/vhost-vsock present but not openable: {e}"), "the daemon user needs rw on /dev/vhost-vsock"),
+        Ok(_) => Check::pass(
+            "vsock",
+            "/dev/vhost-vsock rw",
+            "vsock gateway transport available",
+        ),
+        Err(e) => Check::fail(
+            "vsock",
+            format!("/dev/vhost-vsock present but not openable: {e}"),
+            "the daemon user needs rw on /dev/vhost-vsock",
+        ),
     }
 }
 
@@ -201,12 +357,24 @@ fn check_cgroup_v2() -> Check {
             let has_cpu = controllers.split_whitespace().any(|c| c == "cpu");
             let has_mem = controllers.split_whitespace().any(|c| c == "memory");
             if has_cpu && has_mem {
-                Check::pass("cgroup v2", format!("controllers: {controllers}"), "unified hierarchy with cpu and memory")
+                Check::pass(
+                    "cgroup v2",
+                    format!("controllers: {controllers}"),
+                    "unified hierarchy with cpu and memory",
+                )
             } else {
-                Check::fail("cgroup v2", format!("controllers: {controllers}"), "cpu and memory controllers are required for metering (spec 3.3)")
+                Check::fail(
+                    "cgroup v2",
+                    format!("controllers: {controllers}"),
+                    "cpu and memory controllers are required for metering (spec 3.3)",
+                )
             }
         }
-        None => Check::fail("cgroup v2", "no /sys/fs/cgroup/cgroup.controllers", "host is not on the cgroup v2 unified hierarchy"),
+        None => Check::fail(
+            "cgroup v2",
+            "no /sys/fs/cgroup/cgroup.controllers",
+            "host is not on the cgroup v2 unified hierarchy",
+        ),
     }
 }
 
@@ -277,7 +445,11 @@ fn check_firecracker() -> Check {
     match which("firecracker") {
         Some(path) => {
             let version = run_version(&path, &["--version"]);
-            Check::pass("firecracker", format!("{path} ({version})"), "microVM monitor on PATH")
+            Check::pass(
+                "firecracker",
+                format!("{path} ({version})"),
+                "microVM monitor on PATH",
+            )
         }
         None => Check::fail(
             "firecracker",
@@ -294,7 +466,11 @@ fn check_jailer_binary() -> Check {
     match which("jailer") {
         Some(path) => {
             let version = run_version(&path, &["--version"]);
-            Check::pass("jailer binary", format!("{path} ({version})"), "the untrusted-genome boundary is present")
+            Check::pass(
+                "jailer binary",
+                format!("{path} ({version})"),
+                "the untrusted-genome boundary is present",
+            )
         }
         None => Check::fail(
             "jailer binary",
@@ -447,9 +623,12 @@ pub fn resolve_sudo() -> anyhow::Result<PathBuf> {
 /// `(path, detail)` shape. A thin wrapper over [`resolve_sudo`] so the gate and
 /// the jailer-launch call sites use the one discovery, never a divergent copy.
 fn sudo_nopasswd_available() -> Option<(String, String)> {
-    resolve_sudo()
-        .ok()
-        .map(|sudo| (sudo.to_string_lossy().into_owned(), "verified with `sudo -n true`".to_string()))
+    resolve_sudo().ok().map(|sudo| {
+        (
+            sudo.to_string_lossy().into_owned(),
+            "verified with `sudo -n true`".to_string(),
+        )
+    })
 }
 
 /// Check whether the running process holds CAP_SYS_ADMIN in its effective set.

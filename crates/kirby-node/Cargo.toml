@@ -31,7 +31,6 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 tonic.workspace = true
 prost.workspace = true
-tokio-vsock = { version = "0.7.2", features = ["tonic012"] }
 sled = "0.34"
 rand = "0.9"
 # async-trait: the SandboxBackend / SandboxInstance seam is dyn-dispatched (the
@@ -39,38 +38,13 @@ rand = "0.9"
 # backend can slot in), and dyn-compatible async trait methods need boxed futures.
 # Already in the dependency graph via tonic; declared here as a direct dep.
 async-trait = "0.1"
-# fctools drives Firecracker plus the jailer (spec D-7). Pinned exactly: it is a
-# pre-1.0 alpha that churns (spec section 11). Features: the VM layer plus the
-# jailed executor (the jailer is the security boundary), the elevation spawners
-# (the daemon launches the jailer via sudo, the locked decision), the tokio
-# runtime, and the nix syscall backend (a binary must choose one).
-fctools = { version = "=0.7.0-alpha.2", default-features = false, features = [
-    "tokio-runtime",
-    "vm",
-    "jailed-vmm-executor",
-    "elevation-process-spawners",
-    "nix-syscall-backend",
-] }
 # tokio-stream wraps the Unix listener as a Stream for tonic's
-# serve_with_incoming (the Firecracker vsock host socket, spec 3.1).
+# serve_with_incoming (Firecracker's host socket on Linux, and the VZ helper
+# proxy socket on macOS).
 tokio-stream = { version = "0.1", features = ["net"] }
-# futures: read the guest serial console (an AsyncRead pipe from fctools) line by
-# line for the boot log.
+# futures: used by the CLI to park long-running commands and by the Linux
+# Firecracker backend to stream the guest serial console.
 futures = "0.3"
-# cgroups-rs reads the VM's cgroup v2 cpu.stat (usage_usec) and memory.current to
-# bill the treasury on a tick (spec 3.3, D-7, the C-4 meter). libc is the raw
-# kill(2) for the daemon-initiated VMM kill via the VM's cgroup.procs (fctools'
-# sudo-tracked process handle reaches only the sudo process, not the firecracker
-# it launches, so the budget-death halt kills the firecracker directly).
-cgroups-rs = "0.5"
-libc = "0.2"
-# aya is the userspace side of the eBPF egress-byte meter (spec 3.3, D-7, the
-# C-5 meter, gate G4). It loads the kernel program built by build.rs from the
-# kirby-ebpf crate, attaches it to the VM TAP's clsact ingress hook (the VM-egress direction), and reads the
-# per-byte counter map on a tick. Pinned: the 0.13 line is pre-1.0 and churns
-# (spec section 11). The kernel program object is embedded by build.rs and loaded
-# from memory, so aya needs no extra features.
-aya = "=0.13.1"
 # The CDK ecash stack for the C-6 brokered act (gate G5, D-16). The real rail
 # (CdkEcashRail) holds a funded cdk Wallet (the host-only credential the genome
 # never sees) and settles ecash by melting against the LOCAL fakewallet mint over
@@ -102,6 +76,30 @@ openraft = { workspace = true }
 # brings its own consistent secp256k1/tokio-tungstenite/reqwest, so it is NOT
 # coupled to cdk's transitive versions.
 nostr-sdk = { version = "0.44", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = { version = "0.7.2", features = ["tonic012"] }
+# fctools drives Firecracker plus the jailer (spec D-7). Pinned exactly: it is a
+# pre-1.0 alpha that churns (spec section 11). Features: the VM layer plus the
+# jailed executor (the jailer is the security boundary), the elevation spawners
+# (the daemon launches the jailer via sudo, the locked decision), the tokio
+# runtime, and the nix syscall backend (a binary must choose one).
+fctools = { version = "=0.7.0-alpha.2", default-features = false, features = [
+    "tokio-runtime",
+    "vm",
+    "jailed-vmm-executor",
+    "elevation-process-spawners",
+    "nix-syscall-backend",
+] }
+# cgroups-rs reads the VM's cgroup v2 cpu.stat (usage_usec) and memory.current to
+# bill the treasury on a tick (spec 3.3, D-7, the C-4 meter). libc is the raw
+# kill(2) for the daemon-initiated VMM kill via the VM's cgroup.procs.
+cgroups-rs = "0.5"
+libc = "0.2"
+# aya is the userspace side of the eBPF egress-byte meter (spec 3.3, D-7, the
+# C-5 meter, gate G4). It loads the kernel program built by build.rs from the
+# kirby-ebpf crate and attaches it to the VM TAP.
+aya = "=0.13.1"
 
 [[bin]]
 name = "kirby-node"

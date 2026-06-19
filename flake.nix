@@ -93,7 +93,7 @@
           name = "firecracker-static-tools";
           paths = [ pkgs.pkgsStatic.firecracker ];
         };
-        hostTools = [
+        linuxHostTools = [
           firecrackerStatic
           pkgs.nftables
           pkgs.iproute2      # ip tuntap, for per-VM TAP devices (C-5)
@@ -106,10 +106,22 @@
           pkgs.jq            # the presence test parses the `presence --json` output
         ];
 
-        buildTools = [
+        darwinHostTools = [
+          pkgs.jq
+        ];
+
+        hostTools =
+          if pkgs.stdenv.isLinux then linuxHostTools
+          else if pkgs.stdenv.isDarwin then darwinHostTools
+          else [];
+
+        baseBuildTools = [
           rustToolchain
           pkgs.protobuf      # protoc, for tonic-build (the vsock gateway proto)
           pkgs.pkg-config
+        ];
+
+        linuxBuildTools = [
           # bpf-linker links the eBPF object the daemon's build.rs builds with the
           # nightly cargo (C-5, spec 3.3 / D-7). On PATH so the nightly cargo
           # invocation finds it. The nightly toolchain itself is NOT added to
@@ -117,6 +129,8 @@
           # build.rs invokes it by absolute path via KIRBY_EBPF_CARGO.
           pkgs.bpf-linker
         ];
+
+        buildTools = baseBuildTools ++ pkgs.lib.optionals pkgs.stdenv.isLinux linuxBuildTools;
 
         # The genome image (spec 3.6): the musl-Rust genome in a read-only
         # squashfs plus the stripped 6.1 LTS guest kernel (VMGenID built-in),
@@ -164,32 +178,28 @@
           program = "${nerveRelay.runner}/bin/kirby-relay";
         };
 
-        devShells.default = pkgs.mkShell {
+        devShells.default = pkgs.mkShell ({
           packages = buildTools ++ hostTools;
 
           # tonic-build needs protoc on PATH; make the location explicit so the
           # build does not depend on shell ordering.
           PROTOC = "${pkgs.protobuf}/bin/protoc";
 
-          # The eBPF kernel program (C-5) is built by the daemon's build.rs with
-          # the NIGHTLY cargo, invoked by ABSOLUTE PATH (no rustup in nix). The
-          # flake hands build.rs that cargo plus bpf-linker so the bpfel object
-          # builds reproducibly without the daemon itself leaving stable. The
-          # daemon's build.rs reads KIRBY_EBPF_CARGO; if unset (a non-nix build)
-          # it falls back to `cargo +nightly-...` via rustup.
-          KIRBY_EBPF_CARGO = "${rustNightlyEbpf}/bin/cargo";
-          # bpf-linker links the BPF object; it must be on PATH for the nightly
-          # cargo invocation.
-          KIRBY_EBPF_BPF_LINKER_BIN = "${pkgs.bpf-linker}/bin/bpf-linker";
-
           shellHook = ''
             echo "kirby-node dev shell"
             echo "  rust:        $(rustc --version)"
-            echo "  firecracker: $(firecracker --version 2>&1 | head -1)"
-            echo "  jailer:      $(jailer --version 2>&1 | head -1)"
-            echo "  nft:         $(nft --version 2>&1 | head -1)"
+            if command -v firecracker >/dev/null 2>&1; then
+              echo "  firecracker: $(firecracker --version 2>&1 | head -1)"
+              echo "  jailer:      $(jailer --version 2>&1 | head -1)"
+              echo "  nft:         $(nft --version 2>&1 | head -1)"
+            fi
             echo "Run the host-prereqs gate:  cargo run -p kirby-node -- prereqs"
           '';
-        };
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          # The eBPF kernel program (C-5) is built by the daemon's build.rs with
+          # the nightly cargo on Linux only.
+          KIRBY_EBPF_CARGO = "${rustNightlyEbpf}/bin/cargo";
+          KIRBY_EBPF_BPF_LINKER_BIN = "${pkgs.bpf-linker}/bin/bpf-linker";
+        });
       });
 }
