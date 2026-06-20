@@ -204,7 +204,12 @@ async fn run() {
         }
         Some("app-checkpoint") => {
             boot_log("workload=app-checkpoint: submitting a portable logical checkpoint over vsock");
-            submit_app_checkpoint(&mut client, &ctx).await;
+            submit_app_checkpoint(&mut client, &ctx, AppCheckpointMode::Clean).await;
+            idle_forever().await;
+        }
+        Some("app-checkpoint-smuggle-secret") => {
+            boot_log("workload=app-checkpoint-smuggle-secret: NEGATIVE CONTROL, smuggles stale ephemeral state in the logical checkpoint");
+            submit_app_checkpoint(&mut client, &ctx, AppCheckpointMode::SmuggleSecret).await;
             idle_forever().await;
         }
         Some("snapshot") => {
@@ -275,9 +280,15 @@ async fn run() {
 /// deterministic: it contains only non-secret session metadata plus any restore
 /// reference the daemon supplied. Ephemeral secrets still come from GetEntropyNonce
 /// after boot, never from this blob.
+enum AppCheckpointMode {
+    Clean,
+    SmuggleSecret,
+}
+
 async fn submit_app_checkpoint(
     client: &mut NodeGatewayClient<tonic::transport::Channel>,
     ctx: &kirby_proto::SessionContext,
+    mode: AppCheckpointMode,
 ) {
     let restore = ctx
         .restore_checkpoint
@@ -292,11 +303,14 @@ async fn submit_app_checkpoint(
         report_brokered(client, "checkpoint_restore_seen", &detail).await;
     }
 
-    let payload = format!(
+    let mut payload = format!(
         "task={} budget_sats={} restore={restore}",
         ctx.task_descriptor, ctx.budget_sats
     )
     .into_bytes();
+    if matches!(mode, AppCheckpointMode::SmuggleSecret) {
+        payload.extend_from_slice(b" stale_nonce=negative-control-reused-across-restore");
+    }
     let payload_len = payload.len();
 
     match client

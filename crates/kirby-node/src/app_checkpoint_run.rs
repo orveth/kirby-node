@@ -30,6 +30,10 @@ pub struct AppCheckpointRunConfig {
     pub node2_gateway_port: u32,
     /// Durable local checkpoint store used for the same-host proof.
     pub store_dir: PathBuf,
+    /// Node 1 workload. The normal proof uses `app-checkpoint`; the negative
+    /// control uses a deliberately-broken genome workload that smuggles stale
+    /// ephemeral state into the checkpoint and must be rejected before storage.
+    pub node1_workload: String,
     /// How long to wait for node 1 to submit a checkpoint.
     pub checkpoint_timeout: Duration,
     /// How long to wait for node 2 to report that it saw the restore checkpoint.
@@ -52,9 +56,17 @@ impl AppCheckpointRunConfig {
             node2_guest_cid,
             node2_gateway_port,
             store_dir,
+            node1_workload: "app-checkpoint".to_string(),
             checkpoint_timeout: Duration::from_secs(40),
             restore_timeout: Duration::from_secs(40),
         }
+    }
+
+    pub fn new_negative_control(mut boot: BootConfig) -> Self {
+        boot.workload = Some("app-checkpoint-smuggle-secret".to_string());
+        let mut config = Self::new(boot);
+        config.node1_workload = "app-checkpoint-smuggle-secret".to_string();
+        config
     }
 }
 
@@ -117,7 +129,7 @@ pub async fn run(config: AppCheckpointRunConfig) -> anyhow::Result<AppCheckpoint
     let store = LocalDirCheckpointStore::new(config.store_dir.clone());
 
     let mut node1_boot = config.boot.clone();
-    node1_boot.workload = Some("app-checkpoint".to_string());
+    node1_boot.workload = Some(config.node1_workload.clone());
     node1_boot.lockdown_egress = false;
     node1_boot.snapshot_capable = false;
     node1_boot.restore_checkpoint = None;
@@ -136,6 +148,10 @@ pub async fn run(config: AppCheckpointRunConfig) -> anyhow::Result<AppCheckpoint
     )
     .await;
     let checkpoint = latest_checkpoint(&node1_outcome.checkpoints)?;
+    if let Err(e) = validate_checkpoint_membrane(&checkpoint) {
+        node1.halt().await;
+        return Err(e);
+    }
     let stored_ref = match store.put(&checkpoint) {
         Ok(reference) => reference,
         Err(e) => {
@@ -188,11 +204,15 @@ pub async fn run(config: AppCheckpointRunConfig) -> anyhow::Result<AppCheckpoint
         config.restore_timeout,
     )
     .await;
-    let second_checkpoint_ref = node2_outcome
+    let second_checkpoint = node2_outcome
         .checkpoints
         .latest()
         .map_err(|e| anyhow::anyhow!("read node 2 checkpoint handle: {e}"))?
-        .map(|artifact| artifact.reference);
+        .map(|artifact| {
+            validate_checkpoint_membrane(&artifact)?;
+            Ok::<CheckpointRef, anyhow::Error>(artifact.reference)
+        })
+        .transpose()?;
 
     node2.halt().await;
 
@@ -207,7 +227,7 @@ pub async fn run(config: AppCheckpointRunConfig) -> anyhow::Result<AppCheckpoint
         restore_seen,
         restore_detail,
         second_checkpoint_submitted: second_submit.is_some(),
-        second_checkpoint_ref,
+        second_checkpoint_ref: second_checkpoint,
     })
 }
 
@@ -232,6 +252,26 @@ fn restore_detail_matches(event: &Event, artifact: &CheckpointArtifact) -> bool 
             .contains(&format!("blob_len={}", artifact.payload.len()))
 }
 
+fn validate_checkpoint_membrane(artifact: &CheckpointArtifact) -> anyhow::Result<()> {
+    let payload = String::from_utf8_lossy(&artifact.payload);
+    let forbidden_markers = [
+        "stale_nonce=",
+        "ephemeral_secret=",
+        "credential=",
+        "private_key=",
+        "secret_key=",
+    ];
+    if let Some(marker) = forbidden_markers
+        .iter()
+        .find(|marker| payload.contains(**marker))
+    {
+        anyhow::bail!(
+            "checkpoint membrane violation: payload contains forbidden marker {marker:?}"
+        );
+    }
+    Ok(())
+}
+
 async fn wait_for_event(events: &mut EventStream, kind: &str, timeout: Duration) -> Option<Event> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -254,7 +294,7 @@ mod tests {
 
     use crate::checkpoint::CheckpointArtifact;
 
-    use super::restore_detail_matches;
+    use super::{restore_detail_matches, validate_checkpoint_membrane};
 
     #[test]
     fn restore_detail_match_requires_hash_len_and_blob_len() {
@@ -278,5 +318,25 @@ mod tests {
             },
             &artifact
         ));
+    }
+
+    #[test]
+    fn checkpoint_membrane_accepts_clean_logical_state() {
+        let artifact = CheckpointArtifact::new(b"task=demo budget_sats=7 restore=none".to_vec());
+
+        validate_checkpoint_membrane(&artifact).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_membrane_rejects_smuggled_ephemeral_secret() {
+        let artifact = CheckpointArtifact::new(
+            b"task=demo budget_sats=7 stale_nonce=negative-control-reused-across-restore".to_vec(),
+        );
+
+        let err = validate_checkpoint_membrane(&artifact).unwrap_err();
+        assert!(
+            err.to_string().contains("checkpoint membrane violation"),
+            "negative-control checkpoint must fail closed, got: {err}"
+        );
     }
 }
