@@ -530,9 +530,9 @@ pub trait SandboxBackend: Send + Sync {
     /// via [`SandboxBackend::boot`] (NOT this method) and hands the genome a
     /// `restore_from: CheckpointRef` so it rehydrates its logical state and
     /// re-derives ephemeral secrets (the SAME no-secret-survives-a-move invariant as
-    /// G7, enforced on the checkpoint blob). That path adds two gateway RPCs
-    /// (`Checkpoint(reason) -> CheckpointBlob` and a boot-time checkpoint ref) and a
-    /// checkpoint-aware genome workload; it does NOT change this `restore` (the
+    /// G7, enforced on the checkpoint blob). That path uses the agnostic gateway's
+    /// genome-pushed `SubmitCheckpoint(CheckpointBlob)` RPC and boot-time checkpoint
+    /// metadata in `GetSessionContext`; it does NOT change this `restore` (the
     /// VM-snapshot path) or the five boot/transport/meter/egress/halt methods. The
     /// scheduler chooses between them by [`SnapshotClass::restorable_on`] over the
     /// source class and the target backend's `snapshot`/`app_checkpoint` caps, so

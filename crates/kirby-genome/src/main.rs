@@ -56,7 +56,7 @@ use std::time::Duration;
 use kirby_proto::capability_request::Act;
 use kirby_proto::node_gateway_client::NodeGatewayClient;
 use kirby_proto::{
-    CapabilityRequest, EntropyRequest, Event, Outcome, SessionRequest, SettleEcash,
+    CapabilityRequest, CheckpointBlob, EntropyRequest, Event, Outcome, SessionRequest, SettleEcash,
 };
 use tokio_vsock::{VsockAddr, VsockStream};
 use tonic::transport::{Endpoint, Uri};
@@ -90,6 +90,7 @@ fn main() {
 /// Mount the kernel pseudo-filesystems the genome needs as PID 1. Raw `mount`
 /// syscalls (no init system in the image). Errors are non-fatal: /proc feeds the
 /// gateway-port lookup, which has a default fallback.
+#[cfg(target_os = "linux")]
 fn mount_pseudo_filesystems() {
     // (source, target, fstype). The mount points exist in the read-only squashfs.
     let mounts = [("proc", "/proc", "proc"), ("sysfs", "/sys", "sysfs")];
@@ -114,6 +115,11 @@ fn mount_pseudo_filesystems() {
             boot_log(&format!("WARN: mount {target} failed: {err}"));
         }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_pseudo_filesystems() {
+    boot_log("WARN: pseudo-filesystem mounts skipped outside the Linux guest target");
 }
 
 async fn run() {
@@ -149,8 +155,12 @@ async fn run() {
         }
     };
     boot_log(&format!(
-        "GetSessionContext ok: task={:?} budget_sats={} allowlist={:?}",
-        ctx.task_descriptor, ctx.budget_sats, ctx.allowlisted_destinations
+        "GetSessionContext ok: task={:?} budget_sats={} allowlist={:?} restore_checkpoint={:?} restore_blob_len={}",
+        ctx.task_descriptor,
+        ctx.budget_sats,
+        ctx.allowlisted_destinations,
+        ctx.restore_checkpoint,
+        ctx.restore_checkpoint_blob.len()
     ));
 
     // Report the boot "hello" event tagged with the session task. This is the
@@ -190,6 +200,11 @@ async fn run() {
             // The request is done and reported; park (PID 1 must not exit) so the
             // daemon can read the receipt and the egress counters, then tear the
             // VM down (G5).
+            idle_forever().await;
+        }
+        Some("app-checkpoint") => {
+            boot_log("workload=app-checkpoint: submitting a portable logical checkpoint over vsock");
+            submit_app_checkpoint(&mut client, &ctx).await;
             idle_forever().await;
         }
         Some("snapshot") => {
@@ -252,6 +267,58 @@ async fn run() {
         _ => {
             boot_log("no burn workload: idling (the daemon meters/halts or tears down)");
             idle_forever().await;
+        }
+    }
+}
+
+/// Submit one portable logical checkpoint. The payload is intentionally small and
+/// deterministic: it contains only non-secret session metadata plus any restore
+/// reference the daemon supplied. Ephemeral secrets still come from GetEntropyNonce
+/// after boot, never from this blob.
+async fn submit_app_checkpoint(
+    client: &mut NodeGatewayClient<tonic::transport::Channel>,
+    ctx: &kirby_proto::SessionContext,
+) {
+    let restore = ctx
+        .restore_checkpoint
+        .as_ref()
+        .map(|r| format!("sha256={} len={}", r.sha256, r.len))
+        .unwrap_or_else(|| "none".to_string());
+    if ctx.restore_checkpoint.is_some() {
+        let detail = format!(
+            "restore_seen {restore} blob_len={}",
+            ctx.restore_checkpoint_blob.len()
+        );
+        report_brokered(client, "checkpoint_restore_seen", &detail).await;
+    }
+
+    let payload = format!(
+        "task={} budget_sats={} restore={restore}",
+        ctx.task_descriptor, ctx.budget_sats
+    )
+    .into_bytes();
+    let payload_len = payload.len();
+
+    match client
+        .submit_checkpoint(CheckpointBlob {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            payload,
+        })
+        .await
+    {
+        Ok(resp) => {
+            let ack = resp.into_inner();
+            let detail = format!(
+                "checkpoint_submitted payload_len={payload_len} ack_schema={}",
+                ack.schema_version
+            );
+            report_brokered(client, "checkpoint_submitted", &detail).await;
+            boot_log(&detail);
+        }
+        Err(status) => {
+            let detail = format!("checkpoint_submit_failed status={status}");
+            report_brokered(client, "checkpoint_submit_failed", &detail).await;
+            boot_log(&detail);
         }
     }
 }

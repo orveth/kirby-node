@@ -20,12 +20,13 @@ use std::sync::Arc;
 
 use kirby_proto::node_gateway_server::{NodeGateway, NodeGatewayServer};
 use kirby_proto::{
-    Ack, CapabilityReceipt, CapabilityRequest, EntropyNonce, EntropyRequest, Event, Outcome,
-    SessionContext, SessionRequest,
+    Ack, CapabilityReceipt, CapabilityRequest, CheckpointBlob, EntropyNonce, EntropyRequest, Event,
+    Outcome, SessionContext, SessionRequest,
 };
 use rand::TryRngCore;
 use tonic::{Request, Response, Status};
 
+use crate::checkpoint::{CheckpointArtifact, LatestCheckpoint};
 use crate::raft_lease::{FenceVerdict, LeaseHandle};
 use crate::rail::{self, Rail, RailOutcome};
 use crate::treasury::{DebitOutcome, Treasury, TreasuryError};
@@ -53,6 +54,8 @@ pub struct GatewayService {
     allowlist: Arc<HashSet<String>>,
     session: Session,
     vm_generation: Arc<AtomicU64>,
+    restore_checkpoint: Option<CheckpointArtifact>,
+    checkpoints: LatestCheckpoint,
     /// An optional observer of genome `ReportEvent`s. The daemon (and the C-2
     /// boot test) attaches one to await the genome's boot "hello" event (gate
     /// G1). It is diagnostic only and NEVER touches the treasury (G3c); a
@@ -99,9 +102,32 @@ impl GatewayService {
             allowlist: Arc::new(allowlist),
             session,
             vm_generation: Arc::new(AtomicU64::new(0)),
+            restore_checkpoint: None,
+            checkpoints: LatestCheckpoint::default(),
             event_observer: None,
             lease_fence: None,
         }
+    }
+
+    /// Boot this gateway with an app-level checkpoint for the genome to
+    /// rehydrate from. This is the portable resume path: the backend boots a
+    /// fresh guest, and `GetSessionContext` carries the logical-state blob.
+    pub fn with_restore_checkpoint(mut self, checkpoint: CheckpointArtifact) -> Self {
+        self.restore_checkpoint = Some(checkpoint);
+        self
+    }
+
+    /// Return the latest checkpoint this gateway has accepted, if any.
+    pub fn latest_checkpoint(
+        &self,
+    ) -> Result<Option<CheckpointArtifact>, crate::checkpoint::CheckpointError> {
+        self.checkpoints.latest()
+    }
+
+    /// Clone the shared latest-checkpoint handle so orchestration can observe
+    /// checkpoint submissions while the gateway service is being served.
+    pub fn checkpoint_handle(&self) -> LatestCheckpoint {
+        self.checkpoints.clone()
     }
 
     /// Attach the lease fence to the treasury-debit path (spec 3.5, 4.3, D-4, gate
@@ -372,6 +398,15 @@ impl NodeGateway for GatewayService {
             task_descriptor: self.session.task_descriptor.clone(),
             budget_sats: self.session.budget_sats,
             allowlisted_destinations: self.session.allowlisted_destinations.clone(),
+            restore_checkpoint: self
+                .restore_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.reference.clone()),
+            restore_checkpoint_blob: self
+                .restore_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.payload.clone())
+                .unwrap_or_default(),
         }))
     }
 
@@ -437,6 +472,37 @@ impl NodeGateway for GatewayService {
         // so a genome's self-reported numbers still cannot move the counter (G3c).
         if let Some(observer) = &self.event_observer {
             let _ = observer.send(event);
+        }
+        Ok(Response::new(Ack {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+        }))
+    }
+
+    /// Accept a genome-pushed app checkpoint. This is diagnostic/storage only:
+    /// it does not debit or credit the treasury, and the daemon treats the
+    /// payload as opaque logical state.
+    async fn submit_checkpoint(
+        &self,
+        request: Request<CheckpointBlob>,
+    ) -> Result<Response<Ack>, Status> {
+        let artifact = self
+            .checkpoints
+            .submit(request.into_inner())
+            .map_err(|e| Status::internal(format!("checkpoint store fault: {e}")))?;
+        tracing::info!(
+            sha256 = %artifact.reference.sha256,
+            len = artifact.reference.len,
+            "genome submitted app checkpoint"
+        );
+        if let Some(observer) = &self.event_observer {
+            let _ = observer.send(Event {
+                schema_version: kirby_proto::SCHEMA_VERSION,
+                kind: "checkpoint_submit".into(),
+                detail: format!(
+                    "sha256={} len={}",
+                    artifact.reference.sha256, artifact.reference.len
+                ),
+            });
         }
         Ok(Response::new(Ack {
             schema_version: kirby_proto::SCHEMA_VERSION,

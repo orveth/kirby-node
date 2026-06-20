@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use kirby_node::checkpoint::{checkpoint_ref, CheckpointArtifact};
 use kirby_node::gateway::{GatewayService, Session};
 use kirby_node::rail::MockRail;
 use kirby_node::treasury::Treasury;
@@ -19,7 +20,8 @@ use kirby_node::treasury::Treasury;
 use kirby_proto::capability_request::Act;
 use kirby_proto::node_gateway_server::NodeGateway;
 use kirby_proto::{
-    CapabilityRequest, Event, Outcome, PaidHttp, PayInvoice, SettleEcash, SessionRequest,
+    CapabilityRequest, CheckpointBlob, Event, Outcome, PaidHttp, PayInvoice, SettleEcash,
+    SessionRequest,
 };
 
 const MINT: &str = "mint.test.local";
@@ -121,6 +123,13 @@ async fn g3b_no_gateway_method_increases_treasury() {
             .get_session_context(tonic::Request::new(SessionRequest { schema_version: 1 }))
             .await
             .unwrap();
+        let _ = svc
+            .submit_checkpoint(tonic::Request::new(CheckpointBlob {
+                schema_version: 1,
+                payload: format!("checkpoint-{i}").into_bytes(),
+            }))
+            .await
+            .unwrap();
 
         // A randomized capability request. Vary the act type, the amount, the
         // budget, the destination (some off-allowlist), and the key (some
@@ -179,6 +188,57 @@ async fn g3b_no_gateway_method_increases_treasury() {
         prev = now;
     }
     assert!(svc.treasury_remaining().unwrap() <= initial);
+}
+
+#[tokio::test]
+async fn app_checkpoint_submit_is_content_addressed_and_unbilled() {
+    let (mut svc, _rail) = gateway_with(1000, MockRail::new());
+    let mut events = svc.observe_events();
+    let before = svc.treasury_remaining().unwrap();
+    let payload = b"state-1".to_vec();
+
+    let ack = svc
+        .submit_checkpoint(tonic::Request::new(CheckpointBlob {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            payload: payload.clone(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(ack.schema_version, kirby_proto::SCHEMA_VERSION);
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        before,
+        "SubmitCheckpoint stores state but must not bill or credit"
+    );
+
+    let latest = svc.latest_checkpoint().unwrap().unwrap();
+    assert_eq!(latest.payload, payload);
+    assert_eq!(latest.reference, checkpoint_ref(&payload));
+
+    let event = events.recv().await.expect("checkpoint observer event");
+    assert_eq!(event.kind, "checkpoint_submit");
+    assert!(event.detail.contains(&latest.reference.sha256));
+    assert!(event.detail.contains("len=7"));
+}
+
+#[tokio::test]
+async fn get_session_context_carries_restore_checkpoint() {
+    let checkpoint = CheckpointArtifact::new(b"mission-state".to_vec());
+    let (svc, _rail) = gateway_with(1000, MockRail::new());
+    let svc = svc.with_restore_checkpoint(checkpoint.clone());
+
+    let ctx = svc
+        .get_session_context(tonic::Request::new(SessionRequest {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(ctx.restore_checkpoint, Some(checkpoint.reference));
+    assert_eq!(ctx.restore_checkpoint_blob, checkpoint.payload);
 }
 
 /// G3b (inspection, encoded as a property): the treasury type exposes exactly
