@@ -161,10 +161,18 @@ impl SandboxBackend for VzBackend {
         }
         let mut service_pids = list_vz_virtual_machine_service_pids();
         service_pids.retain(|pid| !vz_service_pids_before.contains(pid));
+        if std::env::var_os("KIRBY_VZ_PROBE_DROP_SERVICE_PIDS").is_some() {
+            tracing::warn!(
+                pid,
+                service_pids = ?service_pids,
+                "KIRBY_VZ_PROBE_DROP_SERVICE_PIDS set; dropping discovered service pids before meter attach"
+            );
+            service_pids.clear();
+        }
         if service_pids.is_empty() {
             tracing::warn!(
                 pid,
-                "could not identify VZ VirtualMachine service pid; macOS G2 CPU sampling will only include the helper"
+                "could not identify VZ VirtualMachine service pid; metered macOS G2 runs will fail closed"
             );
         } else {
             tracing::info!(

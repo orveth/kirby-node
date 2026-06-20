@@ -299,6 +299,14 @@ impl Meter {
         config: &HostProcessMeterConfig,
         treasury: Treasury,
     ) -> Result<Self, MeterError> {
+        if config.service_pids.is_empty() {
+            return Err(MeterError::HostProcessUnreadable {
+                root_pid: config.root_pid,
+                reason:
+                    "no VZ VirtualMachine service pid discovered; refusing helper-only CPU metering"
+                        .to_string(),
+            });
+        }
         let memory_cap_bytes = (config.memory_mib as u64)
             .checked_mul(1024 * 1024)
             .ok_or_else(|| MeterError::HostProcessUnreadable {
@@ -742,5 +750,31 @@ mod tests {
         // CPU + mem + egress all contribute and sum.
         let all = rates.burn_for_tick(100_000, 64 * 1024 * 1024, 200, Duration::from_millis(1000));
         assert_eq!(all, 100 + 64 + 200);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn host_process_attach_requires_vz_service_pid() {
+        let treasury = crate::treasury::Treasury::open_temporary(1_000).expect("treasury opens");
+        let config = HostProcessMeterConfig {
+            root_pid: std::process::id(),
+            service_pids: Vec::new(),
+            memory_mib: 128,
+            tick: Duration::from_millis(100),
+            rates: BurnRates::default(),
+        };
+
+        let err = match Meter::attach_host_process(&config, treasury) {
+            Ok(_) => panic!("empty VZ service pid set must not attach"),
+            Err(err) => err,
+        };
+        match err {
+            MeterError::HostProcessUnreadable { root_pid, reason } => {
+                assert_eq!(root_pid, config.root_pid);
+                assert!(reason.contains("no VZ VirtualMachine service pid discovered"));
+                assert!(reason.contains("refusing helper-only CPU metering"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }
