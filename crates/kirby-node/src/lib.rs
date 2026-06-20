@@ -179,11 +179,11 @@ pub mod full_loop_run;
 pub mod gateway;
 #[cfg(target_os = "linux")]
 pub mod idempotent_run;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod meter;
 #[cfg(target_os = "linux")]
 pub mod meter_egress;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod metered_run;
 pub mod mint_rig;
 pub mod nerve;

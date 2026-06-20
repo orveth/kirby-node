@@ -18,9 +18,10 @@ capability (C-10), and the nerve/presence layer all run in the daemon, identical
 every node. The Mac node differs only BELOW the seam, and only in two node-LOCAL ways,
 neither of which is visible to consensus or custody:
 
-- Metering is coarser: `MeterSource::HostRusage` (host-thread rusage/Mach + boot-time
-  memory cap) instead of cgroup v2. The daemon widens the budget-halt margin via a
-  `MeterFidelity` tag. Same `MeterSample` shape, same treasury debit (D-9).
+- Metering is coarser: `MeterSource::HostProcess` (host-process rusage for the VZ
+  helper + discovered VM service pids, plus boot-time memory cap) instead of cgroup
+  v2. The daemon declares this with `MeterFidelity::HostCoarse`. Same burn/debit
+  math, same treasury debit (D-9).
 - Resume is app-checkpoint only: `BackendCapabilities { snapshot: None,
   app_checkpoint: true }`. No VM-snapshot can reach a VZ node (structural: a
   mem+vmstate save is Mac-bound + arm64). The Mac node resumes by booting fresh and
@@ -129,11 +130,11 @@ M4 Max manually until a self-hosted Mac runner exists (section 6).
   needs com.apple.vm.networking or root, gives pf rules + counters directly). Gate G4:
   egress is default-denied + counted; the brokered-act allowlist is the only opening.
 
-- **VZ-5 (metering + halt, macOS G2):** `MeterSource::HostRusage` returning the same
-  `MeterSample` shape + a `MeterFidelity` so the daemon widens the halt margin;
-  boot-time memory cap. Halt = `VZVirtualMachine` stop + vmnet/pf teardown. Gate G2:
-  a budget-exhausted VZ genome is halted by the daemon (the genome cannot stop it),
-  within the widened margin.
+- **VZ-5 (metering + halt, macOS G2):** `MeterSource::HostProcess` samples
+  host-process CPU for the VZ helper + discovered VM service pids and bills the
+  boot-time memory cap with `MeterFidelity::HostCoarse`. Halt = `VZVirtualMachine`
+  stop. Gate G2: a budget-exhausted VZ genome is halted by the daemon (the genome
+  cannot stop it), within the widened margin.
 
 - **VZ-6 (boot-with-restore_from):** the VZ side of Track A. `boot()` honors
   `GuestSpec.restore_from: Option<CheckpointRef>` (kernel cmdline

@@ -1,9 +1,10 @@
 //! Host-authoritative metering of the booted microVM (spec 3.3, 4.1, gate G2).
 //!
 //! The meter is the daemon-side, host-authoritative accounting the genome
-//! cannot forge (D-9). It reads the VM's cgroup v2 `cpu.stat` (`usage_usec`) and
-//! `memory.current` on a fixed tick, converts the per-tick consumption to a
-//! synthetic sat burn, and debits the SAME daemon-owned treasury counter every
+//! cannot forge (D-9). It reads the backend's host-authoritative sample source
+//! on a fixed tick (Linux cgroup v2 `cpu.stat`/`memory.current`, macOS VZ
+//! host-process CPU plus boot-time memory cap), converts per-tick consumption to
+//! a synthetic sat burn, and debits the SAME daemon-owned treasury counter every
 //! capability spend debits (D-9). When cumulative metered burn reaches the
 //! genome's budget the treasury refuses the tick (`DebitOutcome::Insufficient`),
 //! and that refusal is the budget-death HALT trigger: the daemon pauses then
@@ -19,8 +20,8 @@
 //! AUTHORITY: only this host-side meter and the capability path move the
 //! counter. The genome's `ReportEvent` numbers are advisory and are NEVER billed
 //! (gate G3c): a genome under-reporting CPU (or reporting cpu=0) is still billed
-//! by what its cgroup actually consumed, because the meter reads the cgroup, not
-//! the genome's claims.
+//! by what the host actually consumed, because the meter reads the host source,
+//! not the genome's claims.
 //!
 //! EGRESS BYTES (spec 3.3, C-5): the aya/eBPF TC classifier on the VM's TAP
 //! counts the bytes the VM emits, and this meter bills them per-byte on the same
@@ -33,18 +34,24 @@
 //! G4), so the egress term is normally a no-op; it exists so that any bytes that
 //! DO leave the TAP are metered, and so the meter shape is complete (spec 3.3).
 
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use cgroups_rs::fs::cpu::CpuController;
+#[cfg(target_os = "linux")]
 use cgroups_rs::fs::hierarchies::V2;
+#[cfg(target_os = "linux")]
 use cgroups_rs::fs::memory::MemController;
+#[cfg(target_os = "linux")]
 use cgroups_rs::fs::Cgroup;
 
 use crate::treasury::{DebitOutcome, Treasury, TreasuryError};
 
 /// The cgroup v2 unified mount root. The VM's cgroup is addressed relative to
 /// this (cgroups-rs takes the path relative to the mount).
+#[cfg(target_os = "linux")]
 const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
 
 /// How a metered run ended. The daemon drives the VM to one of these terminal
@@ -64,7 +71,11 @@ pub enum MeterOutcome {
     },
     /// The meter loop was asked to stop (the VM ended for another reason, e.g. a
     /// failover kill in a later chunk) before the budget was exhausted.
-    Stopped { burned_sats: u64, remaining: u64, ticks: u64 },
+    Stopped {
+        burned_sats: u64,
+        remaining: u64,
+        ticks: u64,
+    },
 }
 
 /// The synthetic burn rates: how cgroup consumption converts to sats per tick.
@@ -111,6 +122,7 @@ impl Default for BurnRates {
 
 /// Configuration for one metered run.
 #[derive(Clone)]
+#[cfg(target_os = "linux")]
 pub struct MeterConfig {
     /// The VM's cgroup path RELATIVE to the cgroup v2 mount root, e.g.
     /// `user.slice/user-1001.slice/user@1001.service/kirby/<jail_id>`. The jailer
@@ -124,6 +136,7 @@ pub struct MeterConfig {
     pub rates: BurnRates,
 }
 
+#[cfg(target_os = "linux")]
 impl MeterConfig {
     /// A meter for `cgroup_rel_path` with a 100 ms tick and the default rates.
     pub fn new(cgroup_rel_path: impl Into<PathBuf>) -> Self {
@@ -135,27 +148,70 @@ impl MeterConfig {
     }
 }
 
-/// A handle the daemon polls each tick: it reads the cgroup, computes the
+/// Configuration for macOS VZ host-process metering. CPU is sampled from
+/// `proc_pid_rusage` for the helper process plus discovered VZ VM service pids;
+/// memory is billed against the configured VZ memory cap.
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+pub struct HostProcessMeterConfig {
+    pub root_pid: u32,
+    pub service_pids: Vec<u32>,
+    pub memory_mib: usize,
+    /// The sampling tick. The halt is accurate to one of these (spec section 11).
+    pub tick: Duration,
+    /// The synthetic burn rates.
+    pub rates: BurnRates,
+}
+
+/// A handle the daemon polls each tick: it reads the host meter source, computes the
 /// per-tick burn, and debits the treasury. Held by the metered-run loop, which
 /// owns the VM-lifecycle transition to the terminal state on exhaustion.
 pub struct Meter {
-    cgroup: Cgroup,
+    source: MeterSampleSource,
     treasury: Treasury,
     rates: BurnRates,
     tick: Duration,
-    /// Last observed cumulative `cpu.stat usage_usec` (the CPU bill is the
-    /// delta; the gauge is cumulative so we bill the increment).
+    /// Last observed cumulative CPU usec. The CPU bill is the delta; every host
+    /// source is cumulative, so we bill the increment.
     last_cpu_usec: u64,
     /// The optional eBPF egress-byte meter on the VM's TAP (C-5, spec 3.3). A
     /// vsock-only VM (no TAP) has none, so this is `None` and egress bills 0. When
     /// present, the cumulative byte counter is read each tick and the delta is
     /// billed per-byte (the egress term in `BurnRates::burn_for_tick`).
+    #[cfg(target_os = "linux")]
     egress: Option<crate::meter_egress::EgressMeter>,
     /// Last observed cumulative egress bytes (the egress bill is the delta).
+    #[cfg(target_os = "linux")]
     last_egress_bytes: u64,
     /// Running totals (diagnostics and the G2 evidence).
     burned_sats: u64,
+    cpu_usec: u64,
     ticks: u64,
+}
+
+enum MeterSampleSource {
+    #[cfg(target_os = "linux")]
+    Cgroup(CgroupMeterSource),
+    #[cfg(target_os = "macos")]
+    HostProcess(HostProcessMeterSource),
+}
+
+#[cfg(target_os = "linux")]
+struct CgroupMeterSource {
+    cgroup: Cgroup,
+    abs_path: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+struct HostProcessMeterSource {
+    root_pid: u32,
+    service_pids: Vec<u32>,
+    memory_cap_bytes: u64,
+}
+
+struct MeterSample {
+    cpu_usec: u64,
+    mem_bytes: u64,
 }
 
 impl Meter {
@@ -164,6 +220,7 @@ impl Meter {
     /// Returns an error if the cgroup is absent or its cpu/memory controllers are
     /// not readable (a misconfigured placement: the daemon must meter a real
     /// cgroup, never silently bill zero).
+    #[cfg(target_os = "linux")]
     pub fn attach(config: &MeterConfig, treasury: Treasury) -> Result<Self, MeterError> {
         Self::attach_with_egress(config, treasury, None)
     }
@@ -173,6 +230,7 @@ impl Meter {
     /// each tick and the delta is billed per-byte against the same treasury (the
     /// egress term in `BurnRates::burn_for_tick`). Pass `None` for a vsock-only VM
     /// (no TAP, egress bills 0).
+    #[cfg(target_os = "linux")]
     pub fn attach_with_egress(
         config: &MeterConfig,
         treasury: Treasury,
@@ -195,7 +253,10 @@ impl Meter {
         // probing the raw files here makes attach fail LOUDLY instead (the
         // C-2-verifier flag: metering must read a real, dedicated cgroup).
         if std::fs::read_to_string(abs.join("cpu.stat")).is_err() {
-            return Err(MeterError::CpuUnreadable(abs.clone(), "cpu.stat not readable".into()));
+            return Err(MeterError::CpuUnreadable(
+                abs.clone(),
+                "cpu.stat not readable".into(),
+            ));
         }
         if std::fs::read_to_string(abs.join("memory.current")).is_err() {
             return Err(MeterError::MemUnreadable(
@@ -205,54 +266,93 @@ impl Meter {
         }
 
         // Seed the CPU baseline so the first tick bills only post-attach usage.
-        let last_cpu_usec = read_cpu_usec(&cgroup)
-            .map_err(|e| MeterError::CpuUnreadable(abs.clone(), e))?;
+        let last_cpu_usec =
+            read_cpu_usec(&cgroup).map_err(|e| MeterError::CpuUnreadable(abs.clone(), e))?;
 
         // Seed the egress baseline so the first tick bills only post-attach bytes.
         let last_egress_bytes = egress.as_ref().map(|e| e.egress_bytes()).unwrap_or(0);
 
         Ok(Meter {
-            cgroup,
+            source: MeterSampleSource::Cgroup(CgroupMeterSource {
+                cgroup,
+                abs_path: abs,
+            }),
             treasury,
             rates: config.rates,
             tick: config.tick,
             last_cpu_usec,
+            #[cfg(target_os = "linux")]
             egress,
+            #[cfg(target_os = "linux")]
             last_egress_bytes,
             burned_sats: 0,
+            cpu_usec: 0,
             ticks: 0,
         })
     }
 
-    /// Read the cgroup once, compute this tick's synthetic burn, and debit the
+    /// Attach a macOS host-process meter. CPU comes from the VZ helper plus the
+    /// launchd-owned VZ service pids discovered at boot; memory is billed as
+    /// cap-time using the memory size VZ was configured with.
+    #[cfg(target_os = "macos")]
+    pub fn attach_host_process(
+        config: &HostProcessMeterConfig,
+        treasury: Treasury,
+    ) -> Result<Self, MeterError> {
+        if config.service_pids.is_empty() {
+            return Err(MeterError::HostProcessUnreadable {
+                root_pid: config.root_pid,
+                reason:
+                    "no VZ VirtualMachine service pid discovered; refusing helper-only CPU metering"
+                        .to_string(),
+            });
+        }
+        let memory_cap_bytes = (config.memory_mib as u64)
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| MeterError::HostProcessUnreadable {
+                root_pid: config.root_pid,
+                reason: format!("memory cap {} MiB overflows bytes", config.memory_mib),
+            })?;
+        let source = HostProcessMeterSource {
+            root_pid: config.root_pid,
+            service_pids: config.service_pids.clone(),
+            memory_cap_bytes,
+        };
+        let baseline = source.sample()?;
+
+        Ok(Meter {
+            source: MeterSampleSource::HostProcess(source),
+            treasury,
+            rates: config.rates,
+            tick: config.tick,
+            last_cpu_usec: baseline.cpu_usec,
+            burned_sats: 0,
+            cpu_usec: 0,
+            ticks: 0,
+        })
+    }
+
+    /// Read the host meter source once, compute this tick's synthetic burn, and debit the
     /// treasury. Returns the debit outcome so the caller halts on `Insufficient`.
-    /// INVARIANT: every sat billed here comes from the cgroup the kernel charged,
+    /// INVARIANT: every sat billed here comes from the host-side meter source,
     /// never from the genome's self-reported numbers (G3c).
     pub fn tick_once(&mut self) -> Result<DebitOutcome, MeterError> {
         self.ticks += 1;
 
         // CPU: bill the increment of cumulative usage since the last read.
-        let cpu_usec = read_cpu_usec(&self.cgroup)
-            .map_err(|e| MeterError::CpuUnreadable(self.abs_path(), e))?;
-        let cpu_delta_usec = cpu_usec.saturating_sub(self.last_cpu_usec);
-        self.last_cpu_usec = cpu_usec;
-
-        // Memory: bill the current resident set integrated over the tick
-        // (mem-time, spec 3.3). memory.current is a gauge, so this is
-        // current_bytes * tick_seconds, scaled by the per-MiB-second rate.
-        let mem_bytes = read_mem_current(&self.cgroup)
-            .map_err(|e| MeterError::MemUnreadable(self.abs_path(), e))?;
+        let sample = self.source.sample()?;
+        let cpu_delta_usec = sample.cpu_usec.saturating_sub(self.last_cpu_usec);
+        self.last_cpu_usec = sample.cpu_usec;
+        self.cpu_usec = self.cpu_usec.saturating_add(cpu_delta_usec);
 
         // Egress: bill the bytes that left the VM TAP since the last read (the
         // eBPF TC classifier's cumulative counter, C-5). With the default-deny
         // lockdown this delta is ~0 (gate G4). No TAP => no egress meter => 0.
-        let egress_bytes = self.egress.as_ref().map(|e| e.egress_bytes()).unwrap_or(0);
-        let egress_delta = egress_bytes.saturating_sub(self.last_egress_bytes);
-        self.last_egress_bytes = egress_bytes;
+        let egress_delta = self.next_egress_delta();
 
-        let burn = self
-            .rates
-            .burn_for_tick(cpu_delta_usec, mem_bytes, egress_delta, self.tick);
+        let burn =
+            self.rates
+                .burn_for_tick(cpu_delta_usec, sample.mem_bytes, egress_delta, self.tick);
 
         // A tick that consumed nothing measurable (and the workload is idle)
         // still advances the loop; debiting 0 is a no-op debit that keeps the
@@ -270,9 +370,15 @@ impl Meter {
         self.burned_sats
     }
 
+    /// Cumulative CPU microseconds sampled and billed by the host meter.
+    pub fn cpu_usec(&self) -> u64 {
+        self.cpu_usec
+    }
+
     /// Cumulative egress bytes the eBPF classifier counted on the VM TAP (the G4
     /// evidence: ~0 IP bytes left the TAP under the default-deny lockdown). 0 when
     /// there is no TAP/egress meter.
+    #[cfg(target_os = "linux")]
     pub fn egress_bytes(&self) -> u64 {
         self.egress.as_ref().map(|e| e.egress_bytes()).unwrap_or(0)
     }
@@ -280,8 +386,22 @@ impl Meter {
     /// Take the egress meter out of the meter (so the caller can `shutdown()` it,
     /// which detaches the eBPF classifier via the privileged child). Leaves the
     /// meter with no egress meter (subsequent ticks bill 0 egress).
+    #[cfg(target_os = "linux")]
     pub fn take_egress(&mut self) -> Option<crate::meter_egress::EgressMeter> {
         self.egress.take()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn next_egress_delta(&mut self) -> u64 {
+        let egress_bytes = self.egress.as_ref().map(|e| e.egress_bytes()).unwrap_or(0);
+        let egress_delta = egress_bytes.saturating_sub(self.last_egress_bytes);
+        self.last_egress_bytes = egress_bytes;
+        egress_delta
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn next_egress_delta(&mut self) -> u64 {
+        0
     }
 
     /// Ticks elapsed (the halt is accurate to one of these).
@@ -300,9 +420,92 @@ impl Meter {
     pub fn treasury_remaining_best_effort(&self) -> u64 {
         self.treasury.remaining().unwrap_or(0)
     }
+}
 
-    fn abs_path(&self) -> PathBuf {
-        Path::new(CGROUP_V2_ROOT).join(self.cgroup.path())
+impl MeterSampleSource {
+    fn sample(&self) -> Result<MeterSample, MeterError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            MeterSampleSource::Cgroup(source) => source.sample(),
+            #[cfg(target_os = "macos")]
+            MeterSampleSource::HostProcess(source) => source.sample(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CgroupMeterSource {
+    fn sample(&self) -> Result<MeterSample, MeterError> {
+        let cpu_usec = read_cpu_usec(&self.cgroup)
+            .map_err(|e| MeterError::CpuUnreadable(self.abs_path.clone(), e))?;
+        let mem_bytes = read_mem_current(&self.cgroup)
+            .map_err(|e| MeterError::MemUnreadable(self.abs_path.clone(), e))?;
+        Ok(MeterSample {
+            cpu_usec,
+            mem_bytes,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl HostProcessMeterSource {
+    fn sample(&self) -> Result<MeterSample, MeterError> {
+        let mut pids = macos_process_tree_pids(self.root_pid).map_err(|e| {
+            MeterError::HostProcessUnreadable {
+                root_pid: self.root_pid,
+                reason: e,
+            }
+        })?;
+        for service_pid in &self.service_pids {
+            let service_tree = macos_process_tree_pids(*service_pid).map_err(|e| {
+                MeterError::HostProcessUnreadable {
+                    root_pid: self.root_pid,
+                    reason: format!("VZ service pid {service_pid} unreadable: {e}"),
+                }
+            })?;
+            for pid in service_tree {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+
+        let mut cpu_nsec = 0u64;
+        let mut sampled = 0usize;
+        for pid in pids {
+            match macos_process_cpu_nsec(pid) {
+                Ok(pid_cpu_nsec) => {
+                    cpu_nsec = cpu_nsec.saturating_add(pid_cpu_nsec);
+                    sampled += 1;
+                }
+                Err(e) if pid == self.root_pid || self.service_pids.contains(&pid) => {
+                    return Err(MeterError::HostProcessUnreadable {
+                        root_pid: self.root_pid,
+                        reason: e,
+                    });
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        pid,
+                        root_pid = self.root_pid,
+                        error = %e,
+                        "skipping disappeared non-root process during macOS VZ meter sample"
+                    );
+                }
+            }
+        }
+
+        if sampled == 0 {
+            return Err(MeterError::HostProcessUnreadable {
+                root_pid: self.root_pid,
+                reason: "no live process in VZ helper/service pid set".to_string(),
+            });
+        }
+
+        Ok(MeterSample {
+            cpu_usec: cpu_nsec / 1000,
+            mem_bytes: self.memory_cap_bytes,
+        })
     }
 }
 
@@ -322,8 +525,7 @@ impl BurnRates {
         egress_delta_bytes: u64,
         tick: Duration,
     ) -> u64 {
-        let cpu_sats = cpu_delta_usec
-            .saturating_mul(self.cpu_sats_per_usec_num)
+        let cpu_sats = cpu_delta_usec.saturating_mul(self.cpu_sats_per_usec_num)
             / self.cpu_sats_per_usec_den.max(1);
 
         // mem-time: MiB-seconds this tick = (bytes / 2^20) * (tick_ms / 1000).
@@ -337,8 +539,7 @@ impl BurnRates {
             / (mib.saturating_mul(1000)).max(1);
 
         // egress: bill the bytes that left the TAP this tick (spec 3.3, C-5).
-        let egress_sats = egress_delta_bytes
-            .saturating_mul(self.egress_sats_per_byte_num)
+        let egress_sats = egress_delta_bytes.saturating_mul(self.egress_sats_per_byte_num)
             / self.egress_sats_per_byte_den.max(1);
 
         cpu_sats
@@ -350,6 +551,7 @@ impl BurnRates {
 /// Read cumulative CPU usage (`cpu.stat usage_usec`) from the cgroup (v2). The
 /// cgroups-rs `CpuController::cpu()` parses `cpu.stat`; in v2 the usage line is
 /// `usage_usec`. cgroups-rs exposes it as `usage_usec` on the parsed struct.
+#[cfg(target_os = "linux")]
 fn read_cpu_usec(cgroup: &Cgroup) -> Result<u64, String> {
     let cpu: &CpuController = cgroup
         .controller_of()
@@ -364,6 +566,7 @@ fn read_cpu_usec(cgroup: &Cgroup) -> Result<u64, String> {
 /// Read current resident memory (`memory.current`) in bytes from the cgroup
 /// (v2). cgroups-rs `MemController::memory_stat().usage_in_bytes` reads
 /// `memory.current` on the v2 hierarchy.
+#[cfg(target_os = "linux")]
 fn read_mem_current(cgroup: &Cgroup) -> Result<u64, String> {
     let mem: &MemController = cgroup
         .controller_of()
@@ -373,6 +576,7 @@ fn read_mem_current(cgroup: &Cgroup) -> Result<u64, String> {
 }
 
 /// Parse a value from flat-keyed cgroup text (`key value` per line).
+#[cfg(target_os = "linux")]
 fn parse_flat_keyed(text: &str, key: &str) -> Option<u64> {
     for line in text.lines() {
         let mut it = line.split_whitespace();
@@ -383,17 +587,98 @@ fn parse_flat_keyed(text: &str, key: &str) -> Option<u64> {
     None
 }
 
+#[cfg(target_os = "macos")]
+fn macos_process_tree_pids(root_pid: u32) -> Result<Vec<u32>, String> {
+    let mut out = vec![root_pid];
+    let mut stack = vec![root_pid];
+
+    while let Some(pid) = stack.pop() {
+        for child in macos_child_pids(pid)? {
+            if !out.contains(&child) {
+                out.push(child);
+                stack.push(child);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_child_pids(pid: u32) -> Result<Vec<u32>, String> {
+    let pid = macos_pid_to_c_int(pid)?;
+    let count = unsafe { libc::proc_listchildpids(pid, std::ptr::null_mut(), 0) };
+    if count < 0 {
+        return Err(format!(
+            "proc_listchildpids({pid}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut pids = vec![0 as libc::pid_t; count as usize];
+    let bytes = pids
+        .len()
+        .checked_mul(std::mem::size_of::<libc::pid_t>())
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(|| format!("proc_listchildpids({pid}) buffer size overflow"))?;
+    let found =
+        unsafe { libc::proc_listchildpids(pid, pids.as_mut_ptr().cast::<libc::c_void>(), bytes) };
+    if found < 0 {
+        return Err(format!(
+            "proc_listchildpids({pid}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let found = (found as usize).min(pids.len());
+    pids.truncate(found);
+    Ok(pids
+        .into_iter()
+        .filter_map(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_cpu_nsec(pid: u32) -> Result<u64, String> {
+    let pid = macos_pid_to_c_int(pid)?;
+    let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+    let rc = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, usage.as_mut_ptr().cast()) };
+    if rc != 0 {
+        return Err(format!(
+            "proc_pid_rusage({pid}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let usage = unsafe { usage.assume_init() };
+    Ok(usage.ri_user_time.saturating_add(usage.ri_system_time))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_pid_to_c_int(pid: u32) -> Result<libc::c_int, String> {
+    libc::c_int::try_from(pid).map_err(|_| format!("pid {pid} does not fit c_int"))
+}
+
 /// Errors the meter surfaces. These are host-side faults (a missing or
-/// unreadable cgroup, a treasury storage fault), never genome-driven: the meter
-/// must fail loudly rather than silently bill zero on a bad placement.
+/// unreadable meter source, a treasury storage fault), never genome-driven: the
+/// meter must fail loudly rather than silently bill zero on a bad placement.
 #[derive(Debug, thiserror::Error)]
 pub enum MeterError {
+    #[cfg(target_os = "linux")]
     #[error("the VM cgroup directory is missing at {0} (placement failed: nothing to meter)")]
     CgroupMissing(PathBuf),
+    #[cfg(target_os = "linux")]
     #[error("cpu.stat unreadable for cgroup {0}: {1}")]
     CpuUnreadable(PathBuf, String),
+    #[cfg(target_os = "linux")]
     #[error("memory.current unreadable for cgroup {0}: {1}")]
     MemUnreadable(PathBuf, String),
+    #[cfg(target_os = "macos")]
+    #[error("host-process meter source rooted at pid {root_pid} is unreadable: {reason}")]
+    HostProcessUnreadable { root_pid: u32, reason: String },
     #[error(transparent)]
     Treasury(#[from] TreasuryError),
 }
@@ -403,6 +688,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn parse_flat_keyed_reads_usage_usec() {
         let stat = "usage_usec 1003338\nuser_usec 900000\nsystem_usec 103338\n";
         assert_eq!(parse_flat_keyed(stat, "usage_usec"), Some(1003338));
@@ -450,11 +736,45 @@ mod tests {
 
         // A sub-1-sat-per-byte rate (1 sat per KiB) floors small deltas but is
         // expressible via the num/den.
-        let per_kib = BurnRates { egress_sats_per_byte_num: 1, egress_sats_per_byte_den: 1024, ..rates };
-        assert_eq!(per_kib.burn_for_tick(0, 0, 4096, Duration::from_millis(100)), 4, "4096 bytes at 1 sat/KiB = 4");
+        let per_kib = BurnRates {
+            egress_sats_per_byte_num: 1,
+            egress_sats_per_byte_den: 1024,
+            ..rates
+        };
+        assert_eq!(
+            per_kib.burn_for_tick(0, 0, 4096, Duration::from_millis(100)),
+            4,
+            "4096 bytes at 1 sat/KiB = 4"
+        );
 
         // CPU + mem + egress all contribute and sum.
         let all = rates.burn_for_tick(100_000, 64 * 1024 * 1024, 200, Duration::from_millis(1000));
         assert_eq!(all, 100 + 64 + 200);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn host_process_attach_requires_vz_service_pid() {
+        let treasury = crate::treasury::Treasury::open_temporary(1_000).expect("treasury opens");
+        let config = HostProcessMeterConfig {
+            root_pid: std::process::id(),
+            service_pids: Vec::new(),
+            memory_mib: 128,
+            tick: Duration::from_millis(100),
+            rates: BurnRates::default(),
+        };
+
+        let err = match Meter::attach_host_process(&config, treasury) {
+            Ok(_) => panic!("empty VZ service pid set must not attach"),
+            Err(err) => err,
+        };
+        match err {
+            MeterError::HostProcessUnreadable { root_pid, reason } => {
+                assert_eq!(root_pid, config.root_pid);
+                assert!(reason.contains("no VZ VirtualMachine service pid discovered"));
+                assert!(reason.contains("refusing helper-only CPU metering"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }

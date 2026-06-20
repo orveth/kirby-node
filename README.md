@@ -205,7 +205,7 @@ The image is content-addressed, so the store path is identical however it was pr
 | Boot | `fctools` + jailer | `VZLinuxBootLoader` + `VZVirtualMachine` through the Swift sidecar helper; backend converts ELF `vmlinux` to raw arm64 `Image` |
 | vsock host-side | Firecracker Unix socket per CID: `GatewayTransport::FirecrackerVsockUds` | `VZVirtioSocketDevice` / `VZVirtioSocketConnection`: add a `GatewayTransport::VzVsock` variant; the gateway service itself is unchanged |
 | Egress lockdown | TAP + nftables default-deny + eBPF byte counter | vmnet interface + pf default-deny + pf counters (or vsock-proxied) |
-| CPU+memory meter | cgroup v2 `cpu.stat` / `memory.current`: `MeterSource::CgroupV2` | host-thread rusage/Mach + boot-time memory cap: add `MeterSource::HostRusage`; declare `MeterFidelity` as coarser so the daemon widens the halt margin |
+| CPU+memory meter | cgroup v2 `cpu.stat` / `memory.current`: `MeterSource::CgroupV2` | host-process rusage for the VZ helper + VM service pids, plus boot-time memory cap: `MeterSource::HostProcess`; `MeterFidelity::HostCoarse` declares the looser accounting |
 | Halt | cgroup-kill + TAP teardown | `VZVirtualMachine` stop + vmnet/pf teardown |
 | Resume | VM-snapshot (mem+vmstate): `snapshot()` / `restore()` | App-level checkpoint (boot fresh + rehydrate logical state): `BackendCapabilities { snapshot: None, app_checkpoint: true }` -- see `docs/vz-app-checkpoint-resume.md` |
 | Isolation | Hardware VM + jailer (chroot/seccomp/namespaces) | Hardware VM only; no jailer equivalent. Run the VZ host process as a dedicated low-priv user, no VirtioFS, minimal home. Document the weaker post-escape profile. |

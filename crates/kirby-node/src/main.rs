@@ -8,9 +8,11 @@
 
 use std::time::Duration;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use kirby_node::metered_run;
 use kirby_node::{boot, gateway, nerve, prereqs, rail, treasury};
 #[cfg(target_os = "linux")]
-use kirby_node::{brokered_run, egress_run, metered_run, mint_rig, snapshot_run};
+use kirby_node::{brokered_run, egress_run, mint_rig, snapshot_run};
 
 use clap::{Parser, Subcommand};
 
@@ -914,7 +916,7 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
 }
 
 /// Parsed `meter` arguments.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 struct MeterArgs {
     image_dir: Option<std::path::PathBuf>,
     node_id: String,
@@ -929,7 +931,7 @@ struct MeterArgs {
     max_run_secs: u64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::main]
 async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
     // The daemon refuses to run on a host that fails the prereqs gate.
@@ -983,13 +985,14 @@ async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
     let exhausted = outcome.terminated == metered_run::Terminated::BudgetExhausted;
     println!(
         "G2 {}: terminal={:?} ; metered_burn_sats={} (budget={}) ; remaining_at_halt={} ; \
-         daemon_initiated_kill={} ; ticks={} ; tick_granularity_ms={}",
+         daemon_initiated_kill={} ; metered_cpu_usec={} ; ticks={} ; tick_granularity_ms={}",
         if exhausted { "PASS" } else { "FAIL" },
         outcome.terminated,
         outcome.burned_sats,
         outcome.budget_sats,
         outcome.remaining_at_halt,
         outcome.daemon_initiated_kill,
+        outcome.cpu_usec,
         outcome.ticks,
         outcome.tick.as_millis(),
     );
@@ -1001,9 +1004,9 @@ async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run_meter(_args: MeterArgs) -> anyhow::Result<()> {
-    anyhow::bail!("`kirby-node meter` is Linux-only until the VZ HostRusage meter lands")
+    anyhow::bail!("`kirby-node meter` is only supported on Linux/Firecracker and macOS/VZ")
 }
 
 /// Parsed `egress` arguments.

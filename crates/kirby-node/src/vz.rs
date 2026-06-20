@@ -78,6 +78,7 @@ impl SandboxBackend for VzBackend {
             prepare_vz_kernel(&spec.image.kernel, &spec.instance_id, spec.gateway_port).await?;
         let (vz_rootfs, temp_rootfs) =
             prepare_vz_rootfs(&spec.image.rootfs, &spec.instance_id, spec.gateway_port).await?;
+        let vz_service_pids_before = list_vz_virtual_machine_service_pids();
 
         let mut command = Command::new(&helper);
         command
@@ -158,10 +159,34 @@ impl SandboxBackend for VzBackend {
                 );
             }
         }
+        let mut service_pids = list_vz_virtual_machine_service_pids();
+        service_pids.retain(|pid| !vz_service_pids_before.contains(pid));
+        if std::env::var_os("KIRBY_VZ_PROBE_DROP_SERVICE_PIDS").is_some() {
+            tracing::warn!(
+                pid,
+                service_pids = ?service_pids,
+                "KIRBY_VZ_PROBE_DROP_SERVICE_PIDS set; dropping discovered service pids before meter attach"
+            );
+            service_pids.clear();
+        }
+        if service_pids.is_empty() {
+            tracing::warn!(
+                pid,
+                "could not identify VZ VirtualMachine service pid; metered macOS G2 runs will fail closed"
+            );
+        } else {
+            tracing::info!(
+                pid,
+                service_pids = ?service_pids,
+                "identified VZ VirtualMachine service pids for host-process metering"
+            );
+        }
 
         Ok(Box::new(BootedVzVm {
             child,
             pid,
+            service_pids,
+            memory_mib: spec.mem_size_mib,
             gateway_uds,
             gateway_port: spec.gateway_port,
             temp_kernel,
@@ -187,6 +212,8 @@ impl SandboxBackend for VzBackend {
 pub(crate) struct BootedVzVm {
     child: Child,
     pid: u32,
+    service_pids: Vec<u32>,
+    memory_mib: usize,
     gateway_uds: PathBuf,
     gateway_port: u32,
     temp_kernel: Option<PathBuf>,
@@ -221,7 +248,11 @@ impl SandboxInstance for BootedVzVm {
     }
 
     fn meter_source(&self) -> MeterSource {
-        MeterSource::HostProcess { pid: self.pid }
+        MeterSource::HostProcess {
+            root_pid: self.pid,
+            service_pids: self.service_pids.clone(),
+            memory_mib: self.memory_mib,
+        }
     }
 
     fn egress_control(&self) -> Option<&dyn crate::sandbox::EgressControl> {
@@ -296,6 +327,58 @@ fn validate_vz_boot_spec(spec: &GuestSpec) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn list_vz_virtual_machine_service_pids() -> Vec<u32> {
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Vec::new();
+    }
+
+    let mut pids = vec![0 as libc::pid_t; count as usize];
+    let bytes = match pids
+        .len()
+        .checked_mul(std::mem::size_of::<libc::pid_t>())
+        .and_then(|n| i32::try_from(n).ok())
+    {
+        Some(bytes) => bytes,
+        None => return Vec::new(),
+    };
+    let found = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast::<libc::c_void>(), bytes) };
+    if found <= 0 {
+        return Vec::new();
+    }
+
+    let found = (found as usize).min(pids.len());
+    pids.truncate(found);
+    pids.into_iter()
+        .filter_map(|pid| {
+            let pid = u32::try_from(pid).ok()?;
+            let path = macos_process_path(pid)?;
+            if path.contains("com.apple.Virtualization.VirtualMachine") {
+                Some(pid)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn macos_process_path(pid: u32) -> Option<String> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len() as u32,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn vz_gateway_uds_path(instance_id: &str, gateway_port: u32) -> PathBuf {

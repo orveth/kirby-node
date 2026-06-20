@@ -16,7 +16,11 @@
 use std::time::Duration;
 
 use crate::boot::{self, BootConfig};
-use crate::meter::{Meter, MeterConfig, MeterOutcome};
+#[cfg(target_os = "macos")]
+use crate::meter::HostProcessMeterConfig;
+#[cfg(target_os = "linux")]
+use crate::meter::MeterConfig;
+use crate::meter::{Meter, MeterOutcome};
 use crate::sandbox::MeterSource;
 use crate::treasury::DebitOutcome;
 
@@ -42,6 +46,8 @@ pub struct MeteredRunOutcome {
     pub terminated: Terminated,
     /// Total sats the host meter debited (the G2 metered-burn figure).
     pub burned_sats: u64,
+    /// Cumulative CPU microseconds sampled by the host meter.
+    pub cpu_usec: u64,
     /// The treasury balance reported by the refused (over-budget) tick: the
     /// leftover smaller than one tick's burn (G2: remaining `~= 0`).
     pub remaining_at_halt: u64,
@@ -96,55 +102,98 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
         anyhow::bail!("metered run: VM did not reach Running");
     }
 
-    // The meter source the backend reports for this guest (spec 3.3). The burn
-    // math is backend-agnostic; only the source is backend-specific. Firecracker
-    // reports a cgroup v2 path; a future macOS backend would report a host-thread
-    // source and this match would gain an arm (the burn math untouched).
-    let cgroup_rel_path = match vm.meter_source() {
-        MeterSource::CgroupV2 { rel_path } => rel_path,
-    };
-
-    // Attach the meter to the VM's dedicated cgroup (the jailer placed it under
-    // the daemon's delegated slice, so the read is rootless). attach() fails
-    // loudly if the cgroup is missing or unreadable, so a bad placement is an
-    // error, never a silent zero-bill.
-    let meter_config = MeterConfig {
-        cgroup_rel_path: cgroup_rel_path.clone(),
-        tick,
-        rates: Default::default(),
-    };
-    let mut meter = match Meter::attach(&meter_config, treasury) {
-        Ok(m) => m,
-        Err(e) => {
+    // Attach the backend-reported host meter source. The burn math and treasury
+    // debit are shared; only the sample source differs by platform.
+    let mut meter = match vm.meter_source() {
+        #[cfg(target_os = "linux")]
+        MeterSource::CgroupV2 { rel_path } => {
+            let meter_config = MeterConfig {
+                cgroup_rel_path: rel_path.clone(),
+                tick,
+                rates: Default::default(),
+            };
+            let meter = match Meter::attach(&meter_config, treasury) {
+                Ok(m) => m,
+                Err(e) => {
+                    vm.halt().await;
+                    return Err(anyhow::anyhow!(
+                        "metered run: cgroup meter attach failed: {e}"
+                    ));
+                }
+            };
+            tracing::info!(
+                budget_sats,
+                tick_ms = tick.as_millis() as u64,
+                cgroup = %rel_path.display(),
+                "metering started from cgroup source (host-authoritative; ReportEvent numbers are never billed, G3c)"
+            );
+            meter
+        }
+        #[cfg(not(target_os = "linux"))]
+        MeterSource::CgroupV2 { .. } => {
             vm.halt().await;
-            return Err(anyhow::anyhow!("metered run: meter attach failed: {e}"));
+            anyhow::bail!("metered run: cgroup meter source is unsupported on this host")
+        }
+        #[cfg(target_os = "macos")]
+        MeterSource::HostProcess {
+            root_pid,
+            service_pids,
+            memory_mib,
+        } => {
+            let meter_config = HostProcessMeterConfig {
+                root_pid,
+                service_pids: service_pids.clone(),
+                memory_mib,
+                tick,
+                rates: Default::default(),
+            };
+            let meter = match Meter::attach_host_process(&meter_config, treasury) {
+                Ok(m) => m,
+                Err(e) => {
+                    vm.halt().await;
+                    return Err(anyhow::anyhow!(
+                        "metered run: host-process meter attach failed: {e}"
+                    ));
+                }
+            };
+            tracing::info!(
+                budget_sats,
+                tick_ms = tick.as_millis() as u64,
+                root_pid,
+                service_pids = ?service_pids,
+                memory_mib,
+                "metering started from macOS VZ host-process source (HostCoarse; memory is billed as cap-time)"
+            );
+            meter
         }
     };
-
-    tracing::info!(
-        budget_sats,
-        tick_ms = tick.as_millis() as u64,
-        cgroup = %cgroup_rel_path.display(),
-        "metering started (host-authoritative; the genome's ReportEvent numbers are never billed, G3c)"
-    );
 
     // The meter loop: tick, read the cgroup, debit. On the over-budget tick the
     // treasury refuses (Insufficient) and we HALT. A safety deadline bounds the
     // loop so a non-burning genome cannot hang the run.
-    let meter_outcome = tick_until_exhausted(&mut meter, max_run).await?;
+    let meter_outcome = match tick_until_exhausted(&mut meter, max_run).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            vm.halt().await;
+            return Err(anyhow::anyhow!("metered run: meter tick failed: {e}"));
+        }
+    };
 
     // The budget-death HALT: the daemon pauses then kills the VM (NOT the
     // genome cooperating). Done for both terminal paths so the jail is always
     // cleaned. This is the spec 4.1 transition to Terminated, owned by the daemon.
     tracing::info!(
         burned_sats = meter.burned_sats(),
+        cpu_usec = meter.cpu_usec(),
         ticks = meter.ticks(),
         "budget reached: daemon HALTING the VM (pause then kill), recording terminated:budget_exhausted"
     );
     vm.halt().await;
 
     let (terminated, remaining_at_halt) = match meter_outcome {
-        MeterOutcome::BudgetExhausted { remaining_at_halt, .. } => {
+        MeterOutcome::BudgetExhausted {
+            remaining_at_halt, ..
+        } => {
             tracing::info!("terminated:budget_exhausted (death by exhaustion, G2)");
             (Terminated::BudgetExhausted, remaining_at_halt)
         }
@@ -157,6 +206,7 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
     Ok(MeteredRunOutcome {
         terminated,
         burned_sats: meter.burned_sats(),
+        cpu_usec: meter.cpu_usec(),
         remaining_at_halt,
         budget_sats,
         ticks: meter.ticks(),

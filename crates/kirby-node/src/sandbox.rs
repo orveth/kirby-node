@@ -395,11 +395,16 @@ pub enum MeterSource {
     /// slice, so the daemon reads `cpu.stat usage_usec` + `memory.current` there
     /// rootlessly (C-4).
     CgroupV2 { rel_path: PathBuf },
-    /// A macOS VZ process/thread accounting source. The first Mac milestone only
-    /// needs cold boot plus gateway transport; real HostRusage sampling lands with
-    /// macOS G2.
+    /// A macOS VZ process accounting source. CPU is read from the helper process
+    /// plus the discovered launchd-owned VZ VM service pids; memory is billed
+    /// against the VZ boot-time cap because macOS has no cgroup-style running
+    /// memory ceiling.
     #[cfg(target_os = "macos")]
-    HostProcess { pid: u32 },
+    HostProcess {
+        root_pid: u32,
+        service_pids: Vec<u32>,
+        memory_mib: usize,
+    },
 }
 
 /// A booted genome guest: the per-instance handle the daemon drives. The backend

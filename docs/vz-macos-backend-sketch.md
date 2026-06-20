@@ -77,9 +77,10 @@ mechanics differ. Work items, roughly sequenced:
    pf rules + counters directly on the interface) needs com.apple.vm.networking (or root).
    Pick before building G4.
 5. Metering (macOS G2, honestly looser): no cgroups, so CPU via host-thread rusage/Mach,
-   memory hard-capped at boot (no running ceiling). Return the SAME MeterSample shape so
-   the treasury debit (D-9) is shared, plus a MeterFidelity so the daemon trusts the macOS
-   sample less and WIDENS the budget-halt margin.
+   memory hard-capped at boot (no running ceiling). The implemented source is
+   `MeterSource::HostProcess`: helper + discovered VM service pids for CPU, memory cap
+   for mem-time. Return the same burn/debit shape so the treasury debit (D-9) is shared,
+   plus a MeterFidelity so the daemon trusts the macOS sample less.
 6. Halt: VZVirtualMachine stop + teardown of the vmnet/pf plumbing (the macOS analogue of
    the cgroup-kill + TAP teardown).
 7. Resume (the C-7 sync point, see section 3 and docs/vz-app-checkpoint-resume.md):
