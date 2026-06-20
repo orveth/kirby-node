@@ -41,6 +41,8 @@
 //! exactly like the other real-VM gates, so `cargo test` stays green on an image-less
 //! host. The verifier runs it with the var set as the C-11 producing command.
 
+#![cfg(target_os = "linux")]
+
 use std::sync::Arc;
 
 use kirby_node::full_loop_run::{self, FullLoopConfig};

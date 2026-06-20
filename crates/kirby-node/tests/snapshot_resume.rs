@@ -24,6 +24,8 @@
 //! node 1's VMM was killed (the source node is gone); and the single persisted
 //! treasury continued across the move (D-9: node 2's balance equals node 1's).
 
+#![cfg(target_os = "linux")]
+
 use std::time::Duration;
 
 use kirby_node::boot::{BootConfig, ImagePaths};

@@ -31,6 +31,8 @@
 //! (green), so `cargo test` stays green on a host without the image; the verifier
 //! runs them with the var set as the G7 producing commands.
 
+#![cfg(target_os = "linux")]
+
 use std::time::Duration;
 
 use kirby_node::boot::{BootConfig, ImagePaths};
