@@ -61,6 +61,7 @@ async fn g4_raw_egress_denied_and_metered_about_zero() {
         workload: Some("raw-egress".to_string()),
         lockdown_egress: true,
         snapshot_capable: false,
+        restore_checkpoint: None,
     };
 
     // A probe window long enough for the genome's four probes (each up to a 3s

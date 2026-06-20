@@ -10,7 +10,7 @@ use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use kirby_node::metered_run;
-use kirby_node::{boot, gateway, nerve, prereqs, rail, treasury};
+use kirby_node::{app_checkpoint_run, boot, gateway, nerve, prereqs, rail, treasury};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use kirby_node::{brokered_run, mint_rig};
 #[cfg(target_os = "linux")]
@@ -321,6 +321,41 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         act_secs: u64,
     },
+    /// Prove portable app-checkpoint handoff. Node 1 boots a checkpoint-aware
+    /// genome and accepts its logical checkpoint over the gateway; node 2 boots
+    /// fresh with that checkpoint in `GetSessionContext` and reports that it saw
+    /// the restore state. This is the Linux<->macOS resume mechanism because no
+    /// VM memory snapshot crosses the backend boundary.
+    AppCheckpoint {
+        /// The genome image directory (the `nix build .#genome-image` output).
+        /// Defaults to the KIRBY_GENOME_IMAGE env var if set.
+        #[arg(long)]
+        image_dir: Option<std::path::PathBuf>,
+        /// Node 1's id. Node 2 derives its id from this.
+        #[arg(long, default_value = "node-1")]
+        node_id: String,
+        /// The session task descriptor handed to the genome at boot.
+        #[arg(long, default_value = "kirby-app-checkpoint-stub")]
+        task: String,
+        /// The vsock guest CID for node 1's VM. Node 2 uses this + 1.
+        #[arg(long, default_value_t = 3)]
+        vsock_cid: u32,
+        /// The vsock port node 1's gateway serves on. Node 2 uses this + 1.
+        #[arg(long, default_value_t = 5000)]
+        vsock_port: u32,
+        /// vCPU count for each fresh boot.
+        #[arg(long, default_value_t = 1)]
+        vcpu_count: u8,
+        /// Memory for each fresh boot, in MiB.
+        #[arg(long, default_value_t = 128)]
+        mem_mib: usize,
+        /// Seconds to wait for node 1's checkpoint submission.
+        #[arg(long, default_value_t = 40)]
+        checkpoint_secs: u64,
+        /// Seconds to wait for node 2's restore observation.
+        #[arg(long, default_value_t = 40)]
+        restore_secs: u64,
+    },
     /// Prove snapshot + cross-node resume (gate G6), the spike's hardest seam. The
     /// daemon boots the genome microVM on "node 1" (CPU-template normalized so the
     /// snapshot restores on a compatible different CPU), SNAPSHOTS the running VM
@@ -552,6 +587,30 @@ fn main() -> anyhow::Result<()> {
                 mem_mib,
                 hello_timeout_secs,
                 act_secs,
+            })
+        }
+        Command::AppCheckpoint {
+            image_dir,
+            node_id,
+            task,
+            vsock_cid,
+            vsock_port,
+            vcpu_count,
+            mem_mib,
+            checkpoint_secs,
+            restore_secs,
+        } => {
+            init_tracing();
+            run_app_checkpoint(AppCheckpointArgs {
+                image_dir,
+                node_id,
+                task,
+                vsock_cid,
+                vsock_port,
+                vcpu_count,
+                mem_mib,
+                checkpoint_secs,
+                restore_secs,
             })
         }
         Command::Snapshot {
@@ -880,6 +939,7 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
         // G1 does not snapshot (no CPU template); snapshot is the `snapshot`
         // subcommand (C-7, G6).
         snapshot_capable: false,
+        restore_checkpoint: None,
     };
 
     let (vm, outcome, _treasury, _events) = boot::boot_and_observe(config).await?;
@@ -973,6 +1033,7 @@ async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
         // `egress` subcommand (C-5, G4). Vsock-only here.
         lockdown_egress: false,
         snapshot_capable: false,
+        restore_checkpoint: None,
     };
 
     let config = metered_run::MeteredRunConfig {
@@ -1064,6 +1125,7 @@ async fn run_egress(args: EgressArgs) -> anyhow::Result<()> {
         workload: Some("raw-egress".to_string()),
         lockdown_egress: true,
         snapshot_capable: false,
+        restore_checkpoint: None,
     };
 
     let config =
@@ -1171,6 +1233,7 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
         workload: Some("brokered".to_string()),
         lockdown_egress: false,
         snapshot_capable: false,
+        restore_checkpoint: None,
     };
 
     let config =
@@ -1228,6 +1291,68 @@ fn run_brokered(_args: BrokeredArgs) -> anyhow::Result<()> {
     anyhow::bail!("`kirby-node brokered` is only supported on Linux/Firecracker and macOS/VZ")
 }
 
+/// Parsed `app-checkpoint` arguments.
+struct AppCheckpointArgs {
+    image_dir: Option<std::path::PathBuf>,
+    node_id: String,
+    task: String,
+    vsock_cid: u32,
+    vsock_port: u32,
+    vcpu_count: u8,
+    mem_mib: usize,
+    checkpoint_secs: u64,
+    restore_secs: u64,
+}
+
+#[tokio::main]
+async fn run_app_checkpoint(args: AppCheckpointArgs) -> anyhow::Result<()> {
+    let report = prereqs::check();
+    if !report.all_satisfied() {
+        tracing::error!("host prerequisites not satisfied; run `kirby-node prereqs` for detail");
+        anyhow::bail!("host prerequisites not satisfied");
+    }
+
+    let image_dir = args
+        .image_dir
+        .or_else(|| std::env::var_os("KIRBY_GENOME_IMAGE").map(std::path::PathBuf::from))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no image: pass --image-dir or set KIRBY_GENOME_IMAGE to the genome-image output"
+            )
+        })?;
+    let image = boot::ImagePaths::from_dir(&image_dir)?;
+
+    let boot_config = boot::BootConfig {
+        image,
+        node_id: args.node_id,
+        task: args.task,
+        budget_sats: 1_000_000,
+        initial_sats: 1_000_000,
+        allow: vec!["mint.test.local".to_string()],
+        guest_cid: args.vsock_cid,
+        gateway_port: args.vsock_port,
+        vcpu_count: args.vcpu_count,
+        mem_size_mib: args.mem_mib,
+        hello_timeout: Duration::from_secs(args.checkpoint_secs),
+        workload: Some("app-checkpoint".to_string()),
+        lockdown_egress: false,
+        snapshot_capable: false,
+        restore_checkpoint: None,
+    };
+    let mut config = app_checkpoint_run::AppCheckpointRunConfig::new(boot_config);
+    config.checkpoint_timeout = Duration::from_secs(args.checkpoint_secs);
+    config.restore_timeout = Duration::from_secs(args.restore_secs);
+
+    let outcome = app_checkpoint_run::run(config).await?;
+    println!("{}", app_checkpoint_run::evidence_line(&outcome));
+
+    if outcome.passed() {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
 /// Parsed `snapshot` arguments.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct SnapshotArgs {
@@ -1282,6 +1407,7 @@ async fn run_snapshot(args: SnapshotArgs) -> anyhow::Result<()> {
         // fresh TAP only if this is true. Vsock-only keeps the demo lean.
         lockdown_egress: false,
         snapshot_capable: true,
+        restore_checkpoint: None,
     };
 
     let mut config = snapshot_run::SnapshotRunConfig::new(boot_config);

@@ -129,6 +129,7 @@ async fn g5_brokered_ecash_settle_real_metered_no_vm_egress() {
         // BrokeredRunConfig chooses the backend-specific profile.
         lockdown_egress: false,
         snapshot_capable: false,
+        restore_checkpoint: None,
     };
 
     // A window long enough for the genome to issue the request and the daemon to

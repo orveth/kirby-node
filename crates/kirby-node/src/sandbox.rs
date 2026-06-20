@@ -178,6 +178,38 @@ impl SnapshotClass {
     }
 }
 
+/// Which resume path a scheduler should use for a source snapshot class and a
+/// candidate target backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeMechanism {
+    /// Fast same-class VM snapshot restore through [`SandboxBackend::restore`].
+    VmSnapshot,
+    /// Portable app-level checkpoint: boot fresh through [`SandboxBackend::boot`]
+    /// and provide logical state through the gateway session context.
+    AppCheckpoint,
+    /// The target cannot resume this guest by either mechanism.
+    Unavailable,
+}
+
+/// Pick the resume mechanism for a source snapshot and a target backend. A
+/// matching snapshot class wins; otherwise the scheduler falls back to the
+/// portable app-checkpoint path when the target declares support for it.
+pub fn choose_resume_mechanism(
+    source_class: SnapshotClass,
+    target: BackendCapabilities,
+) -> ResumeMechanism {
+    if let Some(target_class) = target.snapshot {
+        if source_class.restorable_on(&target_class) {
+            return ResumeMechanism::VmSnapshot;
+        }
+    }
+    if target.app_checkpoint {
+        ResumeMechanism::AppCheckpoint
+    } else {
+        ResumeMechanism::Unavailable
+    }
+}
+
 /// A produced VM snapshot: the mem+vmstate pair plus the backend-private data a
 /// restore needs, tagged with its [`SnapshotClass`]. Backend-neutral so the
 /// orchestration can transfer it (the D-13 seam) and hand it to a backend's
@@ -530,9 +562,9 @@ pub trait SandboxBackend: Send + Sync {
     /// via [`SandboxBackend::boot`] (NOT this method) and hands the genome a
     /// `restore_from: CheckpointRef` so it rehydrates its logical state and
     /// re-derives ephemeral secrets (the SAME no-secret-survives-a-move invariant as
-    /// G7, enforced on the checkpoint blob). That path adds two gateway RPCs
-    /// (`Checkpoint(reason) -> CheckpointBlob` and a boot-time checkpoint ref) and a
-    /// checkpoint-aware genome workload; it does NOT change this `restore` (the
+    /// G7, enforced on the checkpoint blob). That path uses the agnostic gateway's
+    /// genome-pushed `SubmitCheckpoint(CheckpointBlob)` RPC and boot-time checkpoint
+    /// metadata in `GetSessionContext`; it does NOT change this `restore` (the
     /// VM-snapshot path) or the five boot/transport/meter/egress/halt methods. The
     /// scheduler chooses between them by [`SnapshotClass::restorable_on`] over the
     /// source class and the target backend's `snapshot`/`app_checkpoint` caps, so
@@ -542,4 +574,86 @@ pub trait SandboxBackend: Send + Sync {
         artifact: SnapshotArtifact,
         spec: RestoreSpec,
     ) -> anyhow::Result<Box<dyn SandboxInstance>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        choose_resume_mechanism, BackendCapabilities, BackendKind, CpuClass, GuestArch,
+        IsolationTier, MeterFidelity, ResumeMechanism, SnapshotClass,
+    };
+
+    fn firecracker_snapshot_class() -> SnapshotClass {
+        SnapshotClass {
+            backend: BackendKind::Firecracker,
+            guest_arch: GuestArch::X86_64,
+            cpu_class: CpuClass::IntelT2CL,
+        }
+    }
+
+    fn firecracker_caps(
+        snapshot: Option<SnapshotClass>,
+        app_checkpoint: bool,
+    ) -> BackendCapabilities {
+        BackendCapabilities {
+            backend: BackendKind::Firecracker,
+            guest_arch: GuestArch::X86_64,
+            isolation: IsolationTier::HardwareVmJailed,
+            metering: MeterFidelity::CgroupExact,
+            snapshot,
+            app_checkpoint,
+        }
+    }
+
+    #[test]
+    fn resume_prefers_matching_vm_snapshot() {
+        let class = firecracker_snapshot_class();
+        let target = firecracker_caps(Some(class), true);
+
+        assert_eq!(
+            choose_resume_mechanism(class, target),
+            ResumeMechanism::VmSnapshot
+        );
+    }
+
+    #[test]
+    fn resume_falls_back_to_app_checkpoint_when_snapshot_unavailable() {
+        let source = firecracker_snapshot_class();
+        let target = firecracker_caps(None, true);
+
+        assert_eq!(
+            choose_resume_mechanism(source, target),
+            ResumeMechanism::AppCheckpoint
+        );
+    }
+
+    #[test]
+    fn resume_is_unavailable_without_snapshot_or_app_checkpoint() {
+        let source = firecracker_snapshot_class();
+        let target = firecracker_caps(None, false);
+
+        assert_eq!(
+            choose_resume_mechanism(source, target),
+            ResumeMechanism::Unavailable
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn firecracker_to_vz_uses_app_checkpoint() {
+        let source = firecracker_snapshot_class();
+        let target = BackendCapabilities {
+            backend: BackendKind::VirtualizationFramework,
+            guest_arch: GuestArch::Aarch64,
+            isolation: IsolationTier::HardwareVm,
+            metering: MeterFidelity::HostCoarse,
+            snapshot: None,
+            app_checkpoint: true,
+        };
+
+        assert_eq!(
+            choose_resume_mechanism(source, target),
+            ResumeMechanism::AppCheckpoint
+        );
+    }
 }

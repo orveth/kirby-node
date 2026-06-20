@@ -109,6 +109,7 @@ impl IdempotentRunConfig {
             // G9 is vsock-only (the egress lockdown is G4); keeps the move lean.
             lockdown_egress: false,
             snapshot_capable: true,
+            restore_checkpoint: None,
         };
         Ok(Self::from_boot(boot))
     }

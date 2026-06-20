@@ -20,6 +20,11 @@ service NodeGateway {
   // only and is never trusted for billing (spec 3.3).
   rpc ReportEvent(Event) returns (Ack);
 
+  // app checkpoint: the genome pushes a logical-state checkpoint at a safe
+  // boundary. The daemon content-addresses and retains the latest blob; this is
+  // the portable resume path used when VM snapshots cannot cross backends.
+  rpc SubmitCheckpoint(CheckpointBlob) returns (Ack);
+
   // agency: the brokered-act path. request, then the daemon authorizes against
   // the treasury and meters, then the daemon performs, then a receipt
   // (spec 3.2).
@@ -37,6 +42,8 @@ message SessionContext {
   string task_descriptor = 2;   // what the stub genome should do this session
   uint64 budget_sats = 3;       // budget snapshot, non-secret
   repeated string allowlisted_destinations = 4; // mint ids and endpoint hosts, non-secret
+  CheckpointRef restore_checkpoint = 5; // optional logical checkpoint ref for a fresh app-level restore
+  bytes restore_checkpoint_blob = 6;    // inline checkpoint payload for the spike harness
 }
 
 message EntropyRequest {
@@ -57,6 +64,16 @@ message Event {
 
 message Ack {
   uint32 schema_version = 1;
+}
+
+message CheckpointRef {
+  string sha256 = 1;            // lowercase hex SHA-256 of CheckpointBlob.payload
+  uint64 len = 2;               // payload byte length
+}
+
+message CheckpointBlob {
+  uint32 schema_version = 1;
+  bytes payload = 2;            // opaque logical genome state, no ephemeral secrets
 }
 
 // The capability and treasury-gateway contract (spec 3.2), the load-bearing

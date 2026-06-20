@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use kirby_proto::Event;
 
+use crate::checkpoint::{CheckpointArtifact, LatestCheckpoint};
 #[cfg(target_os = "linux")]
 use crate::firecracker::FirecrackerBackend;
 use crate::gateway::{GatewayService, Session};
@@ -37,6 +38,7 @@ use crate::vz::VzBackend;
 /// Where the genome image artifacts live (built by `nix build .#genome-image`).
 /// Resolved from `--image-dir` or the `KIRBY_GENOME_IMAGE` env var, both of
 /// which point at the image output (containing vmlinux and rootfs.squashfs).
+#[derive(Clone)]
 pub struct ImagePaths {
     pub vmlinux: PathBuf,
     pub rootfs: PathBuf,
@@ -59,6 +61,7 @@ impl ImagePaths {
 }
 
 /// Inputs for one boot demonstration.
+#[derive(Clone)]
 pub struct BootConfig {
     pub image: ImagePaths,
     pub node_id: String,
@@ -88,6 +91,11 @@ pub struct BootConfig {
     /// G6): the backend applies the cross-CPU template (T2CL) at create. The
     /// C-2..C-6 default is false (no template, no snapshot).
     pub snapshot_capable: bool,
+    /// Optional app-level checkpoint to hand to a freshly booted genome through
+    /// `GetSessionContext`. This is the portable Linux<->macOS resume path: the
+    /// backend performs an ordinary cold boot, while the shared gateway tells the
+    /// genome which logical state blob to rehydrate.
+    pub restore_checkpoint: Option<CheckpointArtifact>,
 }
 
 /// The gateway event receiver the genome's `ReportEvent`s arrive on (diagnostic
@@ -104,6 +112,10 @@ pub struct BootOutcome {
     pub hello: Option<Event>,
     /// The session context the gateway handed the genome (the budget snapshot).
     pub budget_sats: u64,
+    /// Shared handle to checkpoints this boot's gateway accepted from the genome.
+    /// Most boot/meter/egress paths ignore it; app-checkpoint resume uses it to
+    /// persist the exact logical-state blob the daemon accepted.
+    pub checkpoints: LatestCheckpoint,
 }
 
 /// Boot the genome through the sandbox backend, serve the agnostic gateway over
@@ -150,6 +162,9 @@ pub async fn boot_and_observe_with_rail(
     // counter, D-9): metered ticks and capability spends debit the same balance.
     let meter_treasury = treasury.clone();
     let mut service = GatewayService::new(treasury, rail, session);
+    if let Some(checkpoint) = config.restore_checkpoint.clone() {
+        service = service.with_restore_checkpoint(checkpoint);
+    }
 
     // Observe ReportEvents so we can await the genome's boot hello (G1).
     let mut events = service.observe_events();
@@ -221,6 +236,7 @@ pub async fn boot_and_observe_with_rail(
         reached_running,
         hello,
         budget_sats: config.budget_sats,
+        checkpoints: service.checkpoint_handle(),
     };
     Ok((instance, outcome, meter_treasury, events))
 }

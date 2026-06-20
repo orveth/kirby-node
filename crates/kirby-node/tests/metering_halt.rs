@@ -69,6 +69,7 @@ async fn g2_meters_and_halts_on_budget() {
         lockdown_egress: false,
         // G2 does not snapshot; snapshot + resume is C-7 (gate G6).
         snapshot_capable: false,
+        restore_checkpoint: None,
     };
 
     let config = MeteredRunConfig {

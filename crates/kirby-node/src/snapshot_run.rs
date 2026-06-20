@@ -456,6 +456,9 @@ async fn boot_node1(
         allowlisted_destinations: config.boot.allow.clone(),
     };
     let mut gateway = GatewayService::new(treasury.clone(), rail, session);
+    if let Some(checkpoint) = config.boot.restore_checkpoint.clone() {
+        gateway = gateway.with_restore_checkpoint(checkpoint);
+    }
     let events = gateway.observe_events();
 
     let spec = GuestSpec {

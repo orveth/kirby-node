@@ -65,6 +65,7 @@ async fn g6_snapshot_and_resume_on_node2() {
         // G6 is vsock-only (the egress lockdown is G4); keeps the move lean.
         lockdown_egress: false,
         snapshot_capable: true,
+        restore_checkpoint: None,
     };
 
     let config = SnapshotRunConfig::new(boot);

@@ -169,9 +169,11 @@
 //!   guest side: egress-denied, brokered act with key K, heartbeat + entropy
 //!   fingerprint, re-issue K on resume).
 
+pub mod app_checkpoint_run;
 pub mod boot;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod brokered_run;
+pub mod checkpoint;
 #[cfg(target_os = "linux")]
 pub mod egress_run;
 #[cfg(target_os = "linux")]

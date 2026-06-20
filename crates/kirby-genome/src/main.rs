@@ -56,7 +56,7 @@ use std::time::Duration;
 use kirby_proto::capability_request::Act;
 use kirby_proto::node_gateway_client::NodeGatewayClient;
 use kirby_proto::{
-    CapabilityRequest, EntropyRequest, Event, Outcome, SessionRequest, SettleEcash,
+    CapabilityRequest, CheckpointBlob, EntropyRequest, Event, Outcome, SessionRequest, SettleEcash,
 };
 use tokio_vsock::{VsockAddr, VsockStream};
 use tonic::transport::{Endpoint, Uri};
@@ -90,6 +90,7 @@ fn main() {
 /// Mount the kernel pseudo-filesystems the genome needs as PID 1. Raw `mount`
 /// syscalls (no init system in the image). Errors are non-fatal: /proc feeds the
 /// gateway-port lookup, which has a default fallback.
+#[cfg(target_os = "linux")]
 fn mount_pseudo_filesystems() {
     // (source, target, fstype). The mount points exist in the read-only squashfs.
     let mounts = [("proc", "/proc", "proc"), ("sysfs", "/sys", "sysfs")];
@@ -114,6 +115,11 @@ fn mount_pseudo_filesystems() {
             boot_log(&format!("WARN: mount {target} failed: {err}"));
         }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_pseudo_filesystems() {
+    boot_log("WARN: pseudo-filesystem mounts skipped outside the Linux guest target");
 }
 
 async fn run() {
@@ -149,8 +155,12 @@ async fn run() {
         }
     };
     boot_log(&format!(
-        "GetSessionContext ok: task={:?} budget_sats={} allowlist={:?}",
-        ctx.task_descriptor, ctx.budget_sats, ctx.allowlisted_destinations
+        "GetSessionContext ok: task={:?} budget_sats={} allowlist={:?} restore_checkpoint={:?} restore_blob_len={}",
+        ctx.task_descriptor,
+        ctx.budget_sats,
+        ctx.allowlisted_destinations,
+        ctx.restore_checkpoint,
+        ctx.restore_checkpoint_blob.len()
     ));
 
     // Report the boot "hello" event tagged with the session task. This is the
@@ -190,6 +200,25 @@ async fn run() {
             // The request is done and reported; park (PID 1 must not exit) so the
             // daemon can read the receipt and the egress counters, then tear the
             // VM down (G5).
+            idle_forever().await;
+        }
+        Some("app-checkpoint") => {
+            boot_log("workload=app-checkpoint: submitting a portable logical checkpoint over vsock");
+            submit_app_checkpoint(&mut client, &ctx, AppCheckpointMode::Clean).await;
+            idle_forever().await;
+        }
+        Some("app-checkpoint-smuggle-secret") => {
+            boot_log(
+                "workload=app-checkpoint-smuggle-secret: NEGATIVE CONTROL, smuggles raw entropy material in the logical checkpoint",
+            );
+            submit_app_checkpoint(&mut client, &ctx, AppCheckpointMode::SmuggleNonce).await;
+            idle_forever().await;
+        }
+        Some("app-checkpoint-reuse-smuggled-nonce") => {
+            boot_log(
+                "workload=app-checkpoint-reuse-smuggled-nonce: NEGATIVE CONTROL, reuses checkpoint-smuggled entropy material after restore",
+            );
+            submit_app_checkpoint(&mut client, &ctx, AppCheckpointMode::ReuseSmuggledNonce).await;
             idle_forever().await;
         }
         Some("snapshot") => {
@@ -254,6 +283,158 @@ async fn run() {
             idle_forever().await;
         }
     }
+}
+
+/// Submit one portable logical checkpoint. The payload is intentionally small and
+/// deterministic: it contains only non-secret session metadata plus any restore
+/// reference the daemon supplied. Ephemeral secrets still come from GetEntropyNonce
+/// after boot, never from this blob.
+enum AppCheckpointMode {
+    Clean,
+    SmuggleNonce,
+    ReuseSmuggledNonce,
+}
+
+struct EntropyMaterial {
+    fingerprint: String,
+    generation: u64,
+    nonce: Vec<u8>,
+}
+
+async fn submit_app_checkpoint(
+    client: &mut NodeGatewayClient<tonic::transport::Channel>,
+    ctx: &kirby_proto::SessionContext,
+    mode: AppCheckpointMode,
+) {
+    let restore = ctx
+        .restore_checkpoint
+        .as_ref()
+        .map(|r| format!("sha256={} len={}", r.sha256, r.len))
+        .unwrap_or_else(|| "none".to_string());
+
+    let restored = ctx.restore_checkpoint.is_some();
+    let phase = if restored { "post" } else { "pre" };
+    let (fingerprint, fp_gen, source, smuggled) = match mode {
+        AppCheckpointMode::ReuseSmuggledNonce if restored => {
+            match smuggled_entropy_material(&ctx.restore_checkpoint_blob) {
+                Some((nonce, generation)) => (
+                    fingerprint::derive(&nonce, generation),
+                    generation,
+                    "reused",
+                    None,
+                ),
+                None => {
+                    report_brokered(
+                        client,
+                        "app_checkpoint_fingerprint",
+                        "phase=post source=reused_missing fingerprint=<none> fp_gen=<none>",
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        _ => match fresh_entropy_material(client).await {
+            Some(material) => {
+                let smuggled = if matches!(mode, AppCheckpointMode::SmuggleNonce) {
+                    Some((material.generation, material.nonce.clone()))
+                } else {
+                    None
+                };
+                (material.fingerprint, material.generation, "fresh", smuggled)
+            }
+            None => {
+                report_brokered(
+                    client,
+                    "app_checkpoint_fingerprint",
+                    &format!(
+                        "phase={phase} source=fresh_failed fingerprint=<none> fp_gen=<none>"
+                    ),
+                )
+                .await;
+                return;
+            }
+        },
+    };
+    report_brokered(
+        client,
+        "app_checkpoint_fingerprint",
+        &format!("phase={phase} source={source} fingerprint={fingerprint} fp_gen={fp_gen}"),
+    )
+    .await;
+
+    if ctx.restore_checkpoint.is_some() {
+        let detail = format!(
+            "restore_seen {restore} blob_len={}",
+            ctx.restore_checkpoint_blob.len()
+        );
+        report_brokered(client, "checkpoint_restore_seen", &detail).await;
+    }
+
+    let mut payload = format!(
+        "task={} budget_sats={} restore={restore}",
+        ctx.task_descriptor, ctx.budget_sats
+    )
+    .into_bytes();
+    if let Some((generation, nonce)) = smuggled {
+        payload.extend_from_slice(&generation.to_be_bytes());
+        payload.extend_from_slice(&nonce);
+    }
+    let payload_len = payload.len();
+
+    match client
+        .submit_checkpoint(CheckpointBlob {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            payload,
+        })
+        .await
+    {
+        Ok(resp) => {
+            let ack = resp.into_inner();
+            let detail = format!(
+                "checkpoint_submitted payload_len={payload_len} ack_schema={}",
+                ack.schema_version
+            );
+            report_brokered(client, "checkpoint_submitted", &detail).await;
+            boot_log(&detail);
+        }
+        Err(status) => {
+            let detail = format!("checkpoint_submit_failed status={status}");
+            report_brokered(client, "checkpoint_submit_failed", &detail).await;
+            boot_log(&detail);
+        }
+    }
+}
+
+async fn fresh_entropy_material(
+    client: &mut NodeGatewayClient<tonic::transport::Channel>,
+) -> Option<EntropyMaterial> {
+    let nonce = client
+        .get_entropy_nonce(EntropyRequest {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+        })
+        .await
+        .ok()?
+        .into_inner();
+    let fingerprint = fingerprint::derive(&nonce.nonce, nonce.vm_generation);
+    Some(EntropyMaterial {
+        fingerprint,
+        generation: nonce.vm_generation,
+        nonce: nonce.nonce,
+    })
+}
+
+fn smuggled_entropy_material(payload: &[u8]) -> Option<(Vec<u8>, u64)> {
+    const GENERATION_LEN: usize = 8;
+    const NONCE_LEN: usize = 32;
+    const TRAILER_LEN: usize = GENERATION_LEN + NONCE_LEN;
+    if payload.len() < TRAILER_LEN {
+        return None;
+    }
+    let trailer = &payload[payload.len() - TRAILER_LEN..];
+    let generation = u64::from_be_bytes(trailer[..GENERATION_LEN].try_into().ok()?);
+    let nonce = trailer[GENERATION_LEN..].to_vec();
+    Some((nonce, generation))
 }
 
 /// The brokered-act workload (spec 3.2, D-6, gate G5). The genome asks the daemon
