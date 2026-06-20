@@ -11,8 +11,10 @@ use std::time::Duration;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use kirby_node::metered_run;
 use kirby_node::{boot, gateway, nerve, prereqs, rail, treasury};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use kirby_node::{brokered_run, mint_rig};
 #[cfg(target_os = "linux")]
-use kirby_node::{brokered_run, egress_run, mint_rig, snapshot_run};
+use kirby_node::{egress_run, snapshot_run};
 
 use clap::{Parser, Subcommand};
 
@@ -274,12 +276,12 @@ enum Command {
     /// a local CDK fakewallet mint over its OWN host networking, using a host-held
     /// credential (a funded cashu wallet) the genome never sees, metered +
     /// treasury-debited, with the sandboxed VM issuing ZERO raw network. The genome
-    /// (locked down, no raw egress, the C-5 posture) issues a `RequestCapability`
-    /// ecash settle over vsock; the daemon authorizes it (the 5-step order),
-    /// performs the real melt against the mint, meters + debits it, and returns the
-    /// receipt. The eBPF TAP egress meter shows ~0 bytes (the act left via the
-    /// daemon host net, not the VM). The mint URL is passed as `--mint-url`; this
-    /// subcommand expects a mint already running (the G5 TEST boots its own mint).
+    /// issues a `RequestCapability` ecash settle over vsock; the daemon authorizes
+    /// it (the 5-step order), performs the real melt against the mint, meters +
+    /// debits it, and returns the receipt. Linux proves raw-egress absence with the
+    /// eBPF TAP meter. macOS VZ proves the MVP shape structurally by booting with no
+    /// guest network device. The mint URL is passed as `--mint-url`; this subcommand
+    /// expects a mint already running (the G5 TEST boots its own mint).
     Brokered {
         /// The genome image directory (the `nix build .#genome-image` output).
         /// Defaults to the KIRBY_GENOME_IMAGE env var if set.
@@ -1101,7 +1103,7 @@ fn run_egress(_args: EgressArgs) -> anyhow::Result<()> {
 }
 
 /// Parsed `brokered` arguments.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 struct BrokeredArgs {
     image_dir: Option<std::path::PathBuf>,
     mint_url: String,
@@ -1116,7 +1118,7 @@ struct BrokeredArgs {
     act_secs: u64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::main]
 async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
     use std::sync::Arc;
@@ -1151,7 +1153,9 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
     ));
 
     // The allowlist contains the mint URL so the brokered act authorizes (step 2).
-    // The TAP + the `brokered` workload are forced on by BrokeredRunConfig.
+    // The backend raw-egress profile + the `brokered` workload are forced on by
+    // BrokeredRunConfig: Linux uses locked-down TAP/eBPF evidence; macOS VZ uses
+    // the no-guest-network-device MVP proof.
     let boot_config = boot::BootConfig {
         image,
         node_id: args.node_id,
@@ -1165,7 +1169,7 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
         mem_size_mib: args.mem_mib,
         hello_timeout: Duration::from_secs(args.hello_timeout_secs),
         workload: Some("brokered".to_string()),
-        lockdown_egress: true,
+        lockdown_egress: false,
         snapshot_capable: false,
     };
 
@@ -1174,13 +1178,13 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
     let rail_dyn: Arc<dyn rail::Rail> = cdk_rail.clone();
     let outcome = brokered_run::run(config, rail_dyn).await?;
 
-    let ebpf_zero_ceiling = egress_run::EBPF_ZERO_CEILING_BYTES;
+    let ebpf_zero_ceiling = brokered_egress_zero_ceiling();
     let passed = outcome.passed(ebpf_zero_ceiling);
 
     // The G5 evidence lines for the verifier.
     println!(
         "G5 {}: performed={} ; cost_sats={} ; treasury_before={} ; treasury_after={} ; \
-         treasury_drop={} ; ebpf_egress_bytes={} (<= {ebpf_zero_ceiling}) ; proof_len={}",
+         treasury_drop={} ; ebpf_egress_bytes={} (<= {ebpf_zero_ceiling}) ; raw_egress={} ; proof_len={}",
         if passed { "PASS" } else { "FAIL" },
         outcome.receipt.performed,
         outcome.receipt.cost_sats,
@@ -1188,6 +1192,7 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
         outcome.treasury_after,
         outcome.treasury_drop(),
         outcome.ebpf_egress_bytes,
+        outcome.raw_egress.summary(ebpf_zero_ceiling),
         outcome.receipt.proof_len,
     );
     println!("  genome result: {}", outcome.receipt.result_detail);
@@ -1208,11 +1213,19 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "linux")]
+fn brokered_egress_zero_ceiling() -> u64 {
+    egress_run::EBPF_ZERO_CEILING_BYTES
+}
+
+#[cfg(target_os = "macos")]
+fn brokered_egress_zero_ceiling() -> u64 {
+    0
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run_brokered(_args: BrokeredArgs) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "`kirby-node brokered` is Linux-only until the VZ cold-boot and egress paths land"
-    )
+    anyhow::bail!("`kirby-node brokered` is only supported on Linux/Firecracker and macOS/VZ")
 }
 
 /// Parsed `snapshot` arguments.

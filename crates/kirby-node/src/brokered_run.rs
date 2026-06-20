@@ -3,34 +3,37 @@
 //! both drive the SAME path.
 //!
 //! The flow proves D-6 agency: isolation preserved while agency is granted. The
-//! genome, locked down (no raw network, the C-5 posture), asks the daemon to
-//! SETTLE ECASH on the mint over vsock (`RequestCapability`). The daemon authorizes
-//! it against the treasury (the C-3 5-step order), PERFORMS the real settle using
-//! a host-held credential the genome never sees (the [`crate::rail::CdkEcashRail`]
-//! melts against the LOCAL mint over the daemon's HOST networking), meters + debits
-//! it, and returns the receipt. Meanwhile the eBPF TC meter on the VM TAP shows ~0
-//! IP bytes: the act did NOT leave via the VM (it left via the daemon's host net).
+//! genome asks the daemon to SETTLE ECASH on the mint over vsock
+//! (`RequestCapability`). The daemon authorizes it against the treasury (the C-3
+//! 5-step order), PERFORMS the real settle using a host-held credential the genome
+//! never sees (the [`crate::rail::CdkEcashRail`] melts against the LOCAL mint over
+//! the daemon's HOST networking), meters + debits it, and returns the receipt.
 //!
 //! The G5 evidence this orchestration gathers covers three of the five checks: the
 //! daemon AUTHORIZED it (the genome's receipt outcome is AUTHORIZED_AND_PERFORMED,
 //! which only the 5-step order produces, check i); a non-zero cost_sats was debited
 //! and the daemon-owned treasury dropped by EXACTLY that, read before/after (check
-//! iii); and the VM issued NO raw network for the act, the eBPF TAP egress counter
-//! staying ~0 during the settle, reusing the C-5 meter and ceiling (check iv). The
-//! other two are asserted by the G5 test directly: the settle is REAL, the rail's
-//! wallet balance dropping and the mint showing the proofs spent (check ii); and
-//! the genome never received the credential, the wire types carrying no credential
-//! field and the wallet living only host-side (check v). The contrast with gate G4
-//! (the SAME mint destination is unreachable directly from the VM) is the D-6 point.
+//! iii); and the VM issued NO raw network for the act (check iv). Linux proves
+//! check iv with the eBPF TC meter on the VM TAP staying ~0 during the settle,
+//! reusing the C-5 meter and ceiling. macOS VZ's MVP proves check iv structurally:
+//! the guest is booted vsock-only with no network device, so there is no raw IP
+//! egress path for the act to use. The other two are asserted by the G5 test
+//! directly: the settle is REAL, the rail's wallet balance dropping and the mint
+//! showing the proofs spent (check ii); and the genome never received the
+//! credential, the wire types carrying no credential field and the wallet living
+//! only host-side (check v).
 //!
-//! The VM is always halted (and the TAP plus the eBPF meter torn down) before
-//! returning, including on the error path.
+//! The VM is halted before returning after a successful boot. On Linux, the TAP
+//! eBPF meter is torn down before halt.
 
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 use kirby_proto::Event;
 
 use crate::boot::{self, BootConfig};
+#[cfg(target_os = "linux")]
 use crate::meter_egress::EgressMeter;
 use crate::sandbox::EgressDropCounter;
 
@@ -68,15 +71,59 @@ pub struct BrokeredRunOutcome {
     /// The daemon-authoritative treasury balance AFTER the act. `treasury_before
     /// - treasury_after` is the real debit; G5(iii) asserts it equals cost_sats.
     pub treasury_after: u64,
-    /// The eBPF classifier's cumulative egress bytes the VM put on its TAP during
-    /// the run. ~0 for the brokered act (it left via the daemon's host networking,
-    /// NOT the VM TAP), gate G5(iv). Reuses the C-5 meter and its zero-ceiling.
+    /// Backend-specific raw-egress proof for G5(iv). Linux carries TAP/eBPF
+    /// evidence; macOS VZ carries the structural no-network-device proof.
+    pub raw_egress: BrokeredRawEgressProof,
+    /// Linux compatibility evidence: the eBPF classifier's cumulative egress
+    /// bytes the VM put on its TAP during the run. ~0 for the brokered act (it
+    /// left via the daemon's host networking, NOT the VM TAP), gate G5(iv).
+    /// On macOS VZ no TAP exists, so this is 0 and `raw_egress` carries the
+    /// no-network-device proof.
     pub ebpf_egress_bytes: u64,
-    /// The host-kernel egress drop counter for the VM (packets, bytes). The VM
-    /// stays locked down during the brokered act (the C-5 default-deny is still in
-    /// force), so any stray VM-originated packet is still dropped; the brokered act
-    /// itself does not appear here (it is the daemon's host networking).
+    /// Linux compatibility evidence: the host-kernel egress drop counter for the
+    /// VM (packets, bytes). On macOS VZ no TAP/pf path exists for the no-NIC MVP,
+    /// so this is zero and `raw_egress` carries the structural proof.
     pub nft_drop: EgressDropCounter,
+}
+
+/// The raw-egress proof attached to a brokered run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokeredRawEgressProof {
+    /// Linux/Firecracker: a locked-down TAP exists, and the eBPF classifier saw
+    /// at most the verifier's zero ceiling during the brokered act.
+    LinuxTap {
+        ebpf_egress_bytes: u64,
+        nft_drop: EgressDropCounter,
+    },
+    /// macOS/VZ MVP: no guest network device is attached. The only guest/daemon
+    /// channel is virtio-vsock, so the brokered act cannot leave via guest IP.
+    NoGuestNetworkDevice,
+}
+
+impl BrokeredRawEgressProof {
+    pub fn passed(&self, ebpf_zero_ceiling: u64) -> bool {
+        match self {
+            BrokeredRawEgressProof::LinuxTap {
+                ebpf_egress_bytes, ..
+            } => *ebpf_egress_bytes <= ebpf_zero_ceiling,
+            BrokeredRawEgressProof::NoGuestNetworkDevice => true,
+        }
+    }
+
+    pub fn summary(&self, ebpf_zero_ceiling: u64) -> String {
+        match self {
+            BrokeredRawEgressProof::LinuxTap {
+                ebpf_egress_bytes,
+                nft_drop,
+            } => format!(
+                "linux_tap: ebpf_egress_bytes={ebpf_egress_bytes} (<= {ebpf_zero_ceiling}) ; nft_drop_packets={} ; nft_drop_bytes={}",
+                nft_drop.packets, nft_drop.bytes
+            ),
+            BrokeredRawEgressProof::NoGuestNetworkDevice => {
+                "vz_no_guest_network_device: raw IP egress structurally absent".to_string()
+            }
+        }
+    }
 }
 
 impl BrokeredRunOutcome {
@@ -94,12 +141,14 @@ impl BrokeredRunOutcome {
         self.receipt.performed
             && self.receipt.cost_sats > 0
             && self.treasury_drop() == self.receipt.cost_sats
-            && self.ebpf_egress_bytes <= ebpf_zero_ceiling
+            && self.raw_egress.passed(ebpf_zero_ceiling)
     }
 }
 
-/// Inputs for a brokered-act run (reuses the boot config). The per-VM TAP and the
-/// `brokered` workload are forced on here, so the caller need not set them.
+/// Inputs for a brokered-act run (reuses the boot config). The `brokered`
+/// workload is forced on here. Linux also forces the per-VM TAP so the eBPF
+/// egress meter can prove the act did not leave via the VM. macOS VZ forces a
+/// vsock-only no-NIC guest, which is the MVP raw-egress proof.
 pub struct BrokeredRunConfig {
     pub boot: BootConfig,
     /// How long to wait for the genome's brokered-act result and the meters to
@@ -110,13 +159,22 @@ pub struct BrokeredRunConfig {
 }
 
 impl BrokeredRunConfig {
-    /// Build a brokered-run config from a boot config, forcing the per-VM TAP
-    /// (so the eBPF egress meter can prove the act did NOT leave via the VM) and
-    /// the genome's `brokered` workload.
+    /// Build a brokered-run config from a boot config, forcing the backend's
+    /// brokered-act raw-egress profile and the genome's `brokered` workload.
     pub fn new(mut boot: BootConfig, act_window: Duration) -> Self {
-        boot.lockdown_egress = true;
+        if cfg!(target_os = "linux") {
+            boot.lockdown_egress = true;
+        } else if cfg!(target_os = "macos") {
+            // VZ currently attaches no network device. Keep that explicit so the
+            // Mac brokered MVP proves agency over vsock without opening raw IP.
+            boot.lockdown_egress = false;
+        }
         boot.workload = Some("brokered".to_string());
-        BrokeredRunConfig { boot, act_window, egress_tick: Duration::from_millis(100) }
+        BrokeredRunConfig {
+            boot,
+            act_window,
+            egress_tick: Duration::from_millis(100),
+        }
     }
 }
 
@@ -135,9 +193,9 @@ pub async fn run(
     let act_window = config.act_window;
     let egress_tick = config.egress_tick;
 
-    // Boot with the TAP wired and the real rail injected; keep the event stream so
-    // we can read the genome's brokered-act result. The returned treasury is the
-    // daemon-owned counter the gateway debits (D-9).
+    // Boot with the real rail injected; keep the event stream so we can read the
+    // genome's brokered-act result. The returned treasury is the daemon-owned
+    // counter the gateway debits (D-9).
     let (vm, outcome, treasury, mut events) =
         boot::boot_and_observe_with_rail(config.boot, rail).await?;
     if !outcome.reached_running {
@@ -145,19 +203,49 @@ pub async fn run(
         anyhow::bail!("brokered run: VM did not reach Running");
     }
 
+    let result = async {
+        // The authoritative treasury balance BEFORE the act (D-9). The genome
+        // has not acted yet (it acts after the boot hello, which
+        // boot_and_observe awaited), so this is the pre-act balance.
+        let treasury_before = treasury.remaining()?;
+
+        run_platform_brokered(
+            &*vm,
+            treasury_before,
+            &treasury,
+            &mut events,
+            act_window,
+            egress_tick,
+        )
+        .await
+    }
+    .await;
+
+    vm.halt().await;
+    result
+}
+
+#[cfg(target_os = "linux")]
+async fn run_platform_brokered(
+    vm: &dyn crate::sandbox::SandboxInstance,
+    treasury_before: u64,
+    treasury: &crate::treasury::Treasury,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    act_window: Duration,
+    egress_tick: Duration,
+) -> anyhow::Result<BrokeredRunOutcome> {
     // The authoritative treasury balance BEFORE the act (D-9). The genome has not
     // acted yet (it acts after the boot hello, which boot_and_observe awaited), so
     // this is the pre-act balance.
-    let treasury_before = treasury.remaining()?;
-
     // The egress control must exist (lockdown_egress was forced on). Resolve the
     // metered interface so we can attach the eBPF egress meter, the G5(iv)
     // instrument: it shows the VM TAP egress stays ~0 during the host-side settle.
     let tap_name = match vm.egress_control() {
         Some(egress) => egress.iface_name().to_string(),
         None => {
-            vm.halt().await;
-            anyhow::bail!("brokered run: no egress control on the guest (lockdown_egress was not honored)");
+            anyhow::bail!(
+                "brokered run: no egress control on the guest (lockdown_egress was not honored)"
+            );
         }
     };
     // The same working passwordless sudo the jailer launches through, discovered
@@ -167,16 +255,16 @@ pub async fn run(
     let sudo_bin = match crate::prereqs::resolve_sudo() {
         Ok(s) => s,
         Err(e) => {
-            vm.halt().await;
-            return Err(e.context("brokered run: could not resolve sudo for the eBPF egress meter"));
+            return Err(e.context("brokered run: could not resolve sudo for the eBPF egress meter"))
         }
     };
 
     let egress_meter = match EgressMeter::spawn(&tap_name, sudo_bin, egress_tick).await {
         Ok(m) => m,
         Err(e) => {
-            vm.halt().await;
-            return Err(anyhow::anyhow!("brokered run: eBPF egress meter attach failed: {e}"));
+            return Err(anyhow::anyhow!(
+                "brokered run: eBPF egress meter attach failed: {e}"
+            ))
         }
     };
 
@@ -188,10 +276,10 @@ pub async fn run(
 
     // Collect the genome's brokered-act result over the window. The genome reports
     // a `brokered_request` then a `brokered_result` summary; we key on the result.
-    let receipt = collect_brokered_outcome(&mut events, act_window).await;
+    let receipt = collect_brokered_outcome(events, act_window).await;
 
     // The authoritative treasury AFTER the act (D-9). The drop is the real debit.
-    let treasury_after = treasury.remaining()?;
+    let treasury_after = treasury.remaining();
 
     // The eBPF egress counter: ~0 for the brokered act (it left via the daemon's
     // host networking, not the VM TAP), gate G5(iv).
@@ -200,27 +288,74 @@ pub async fn run(
         .egress_control()
         .map(|e| e.drop_counter())
         .unwrap_or_default();
+    let raw_egress = BrokeredRawEgressProof::LinuxTap {
+        ebpf_egress_bytes,
+        nft_drop,
+    };
+
+    tracing::info!(
+        performed = receipt.performed,
+        cost_sats = receipt.cost_sats,
+        treasury_before,
+        ?treasury_after = treasury_after.as_ref().ok(),
+        ebpf_egress_bytes,
+        "G5 evidence gathered; halting the VM and tearing down the TAP"
+    );
+
+    // Tear down the eBPF meter child (detaches the classifier). The caller halts
+    // the VM afterward, which tears down the TAP and nftables lockdown.
+    egress_meter.shutdown().await;
+    let treasury_after = treasury_after?;
+
+    Ok(BrokeredRunOutcome {
+        receipt,
+        treasury_before,
+        treasury_after,
+        raw_egress,
+        ebpf_egress_bytes,
+        nft_drop,
+    })
+}
+
+#[cfg(target_os = "macos")]
+async fn run_platform_brokered(
+    vm: &dyn crate::sandbox::SandboxInstance,
+    treasury_before: u64,
+    treasury: &crate::treasury::Treasury,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    act_window: Duration,
+    _egress_tick: Duration,
+) -> anyhow::Result<BrokeredRunOutcome> {
+    if let Some(egress) = vm.egress_control() {
+        anyhow::bail!(
+            "macOS VZ brokered MVP expected a vsock-only guest with no network device, but backend exposed egress interface {}",
+            egress.iface_name()
+        );
+    }
+
+    tracing::info!(
+        treasury_before,
+        "brokered act in flight: VZ genome requesting an ecash settle over vsock; daemon performs it host-side with no guest network device (gate G5)"
+    );
+
+    let receipt = collect_brokered_outcome(events, act_window).await;
+    let treasury_after = treasury.remaining()?;
 
     tracing::info!(
         performed = receipt.performed,
         cost_sats = receipt.cost_sats,
         treasury_before,
         treasury_after,
-        ebpf_egress_bytes,
-        "G5 evidence gathered; halting the VM and tearing down the TAP"
+        "G5 evidence gathered for macOS VZ no-NIC brokered act"
     );
-
-    // Tear down: stop the eBPF meter child (detaches the classifier), then halt
-    // the VM (which tears down the TAP and its nftables lockdown).
-    egress_meter.shutdown().await;
-    vm.halt().await;
 
     Ok(BrokeredRunOutcome {
         receipt,
         treasury_before,
         treasury_after,
-        ebpf_egress_bytes,
-        nft_drop,
+        raw_egress: BrokeredRawEgressProof::NoGuestNetworkDevice,
+        ebpf_egress_bytes: 0,
+        nft_drop: EgressDropCounter::default(),
     })
 }
 
@@ -242,8 +377,8 @@ async fn collect_brokered_outcome(
                 return parse_brokered_result(&ev.detail);
             }
             Ok(Some(_)) => continue, // the request line or a late hello; keep waiting
-            Ok(None) => break,        // observer dropped
-            Err(_) => break,          // window elapsed
+            Ok(None) => break,       // observer dropped
+            Err(_) => break,         // window elapsed
         }
     }
     BrokeredReceipt {

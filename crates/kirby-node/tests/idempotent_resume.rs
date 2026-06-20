@@ -195,6 +195,7 @@ async fn g9_dedupe_survives_persisted_store_reopen() {
 /// DUPLICATE_IGNORED, the act is NOT performed twice on the rail (perform_count stays
 /// 1), and the treasury is debited by C EXACTLY ONCE total. Needs the genome image,
 /// so it SKIPS cleanly (green) when `KIRBY_GENOME_IMAGE` is unset.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn g9_idempotent_capability_across_resume() {
     let Some(image_dir) = std::env::var_os("KIRBY_GENOME_IMAGE") else {

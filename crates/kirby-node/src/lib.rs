@@ -67,11 +67,13 @@
 //!   awaits the perform step (the order and the treasury economics are unchanged).
 //! - [`mint_rig`]: build and fund a `cdk::Wallet` against the mint (the rail's
 //!   credential), shared by the rail and the G5 test.
-//! - [`brokered_run`]: boot the locked-down VM with the real rail injected, let the
-//!   genome issue a `RequestCapability` ecash settle over vsock, and gather the G5
+//! - [`brokered_run`]: boot the VM with the real rail injected, let the genome
+//!   issue a `RequestCapability` ecash settle over vsock, and gather the G5
 //!   evidence (the daemon authorized + performed it, cost_sats debited, treasury
-//!   dropped by exactly that, and the eBPF TAP egress stayed ~0 during the host-side
-//!   settle, gate G5(iv)). The mint is booted in the G5 test (cdk-mintd, dev-only).
+//!   dropped by exactly that, and the guest raw-egress proof held). Linux proves
+//!   raw-egress absence with the eBPF TAP meter; macOS VZ's MVP proves it
+//!   structurally by booting a vsock-only guest with no network device. The mint is
+//!   booted in the G5 test (cdk-mintd, dev-only).
 //!
 //! C-7 adds snapshot + cross-node resume (spec D-8, 4.1, section 5 transfer seam,
 //! gate G6), the spike's hardest seam:
@@ -168,7 +170,7 @@
 //!   fingerprint, re-issue K on resume).
 
 pub mod boot;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod brokered_run;
 #[cfg(target_os = "linux")]
 pub mod egress_run;

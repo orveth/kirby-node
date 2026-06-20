@@ -271,6 +271,7 @@ async fn g8_lease_no_split_brain_pure_raft() {
 /// SKIPS cleanly (green) when `KIRBY_GENOME_IMAGE` is unset. The pure-Raft test above
 /// proves the lease/fence mechanics; this proves the lease DRIVES the C-7 restore so
 /// the failover keeps the genome alive on the surviving majority.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn g8_handoff_restores_the_vm() {
     let Some(image_dir) = std::env::var_os("KIRBY_GENOME_IMAGE") else {

@@ -9,8 +9,9 @@
 //!      cdk-fake-wallet Lightning backend) on a host port;
 //!   2. builds + funds the daemon's cashu wallet (the rail credential, host-only);
 //!   3. constructs the real CdkEcashRail over that wallet;
-//!   4. boots the genome microVM with the per-VM TAP locked down (the C-5 posture)
-//!      and the eBPF egress meter attached, and the `brokered` workload;
+//!   4. boots the genome microVM with the backend's brokered raw-egress profile:
+//!      Linux uses the locked-down TAP and eBPF meter; macOS VZ uses a vsock-only
+//!      no-network-device guest;
 //!   5. the genome issues a `RequestCapability` ecash settle over vsock, which the
 //!      daemon performs for real (a melt against the mint over HOST networking);
 //!   6. asserts G5 (i)-(v).
@@ -23,26 +24,25 @@
 //!         not a mock;
 //!   (iii) cost_sats > 0 was debited AND the daemon-authoritative treasury dropped
 //!         by EXACTLY that;
-//!   (iv)  the VM issued NO raw network for the act: the eBPF TAP egress counter
-//!         stays ~0 during the settle (the act left via the daemon's HOST
-//!         networking, not the VM TAP); reuses the C-5 meter + the zero-ceiling;
+//!   (iv)  the VM issued NO raw network for the act: Linux proves this with the
+//!         eBPF TAP egress counter staying ~0; macOS VZ proves the MVP shape by
+//!         exposing no guest network device at all;
 //!   (v)   the genome never received the rail credential: the wire types carry no
 //!         credential field, asserted structurally; the wallet/proofs live only
 //!         host-side.
 //! The contrast (the D-6 point): the SAME mint destination is reachable when the
-//! daemon brokers it (here) but NOT directly from the VM (gate G4).
+//! daemon brokers it (here) but NOT directly from the VM (gate G4 / VZ no-NIC).
 //!
-//! This boots a REAL mint + a REAL Firecracker microVM under the jailer, so it
-//! SKIPS (green no-op) when `KIRBY_GENOME_IMAGE` is unset, exactly like
-//! genome_boot / metering_halt / egress_lockdown, so `cargo test` stays green on
-//! an image-less host. The verifier runs it with the var set as the G5 producing
-//! command.
+//! This boots a REAL mint + a REAL microVM, so it SKIPS (green no-op) when
+//! `KIRBY_GENOME_IMAGE` is unset, exactly like genome_boot / metering_halt /
+//! egress_lockdown, so `cargo test` stays green on an image-less host. The
+//! verifier runs it with the var set as the G5 producing command.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use kirby_node::boot::{BootConfig, ImagePaths};
-use kirby_node::brokered_run::{self, BrokeredRunConfig};
+use kirby_node::brokered_run::{self, BrokeredRawEgressProof, BrokeredRunConfig};
 use kirby_node::mint_rig;
 use kirby_node::rail::CdkEcashRail;
 
@@ -82,7 +82,9 @@ async fn g5_brokered_ecash_settle_real_metered_no_vm_egress() {
 
     // 2) Build + fund the daemon's wallet (the rail credential, host-only). Fund a
     // small amount so the settle has proofs to spend.
-    let wallet = mint_rig::build_wallet(&mint_url).await.expect("build wallet");
+    let wallet = mint_rig::build_wallet(&mint_url)
+        .await
+        .expect("build wallet");
     mint_rig::fund_wallet(wallet.clone(), 1000)
         .await
         .expect("fund the wallet on the local mint");
@@ -95,8 +97,14 @@ async fn g5_brokered_ecash_settle_real_metered_no_vm_egress() {
 
     // The proofs the rail will spend (captured BEFORE the act, so we can prove
     // they are SPENT on the mint afterwards, gate G5(ii)).
-    let pre_proofs = wallet.get_unspent_proofs().await.expect("pre-act unspent proofs");
-    assert!(!pre_proofs.is_empty(), "the funded wallet must hold spendable proofs");
+    let pre_proofs = wallet
+        .get_unspent_proofs()
+        .await
+        .expect("pre-act unspent proofs");
+    assert!(
+        !pre_proofs.is_empty(),
+        "the funded wallet must hold spendable proofs"
+    );
 
     // 3) The real rail over the funded wallet. The mint_id (the allowlist
     // destination) is the mint URL.
@@ -118,7 +126,8 @@ async fn g5_brokered_ecash_settle_real_metered_no_vm_egress() {
         mem_size_mib: 128,
         hello_timeout: Duration::from_secs(40),
         workload: Some("brokered".to_string()),
-        lockdown_egress: true,
+        // BrokeredRunConfig chooses the backend-specific profile.
+        lockdown_egress: false,
         snapshot_capable: false,
     };
 
@@ -135,13 +144,14 @@ async fn g5_brokered_ecash_settle_real_metered_no_vm_egress() {
     // A clear evidence block (the verifier reads it).
     eprintln!(
         "G5 evidence: performed={} ; cost_sats={} ; treasury_before={} ; treasury_after={} ; \
-         treasury_drop={} ; ebpf_egress_bytes={} ; proof_len={}",
+         treasury_drop={} ; ebpf_egress_bytes={} ; raw_egress={} ; proof_len={}",
         outcome.receipt.performed,
         outcome.receipt.cost_sats,
         outcome.treasury_before,
         outcome.treasury_after,
         outcome.treasury_drop(),
         outcome.ebpf_egress_bytes,
+        outcome.raw_egress.summary(raw_egress_zero_ceiling()),
         outcome.receipt.proof_len,
     );
     eprintln!("  genome result: {}", outcome.receipt.result_detail);
@@ -190,7 +200,12 @@ async fn g5_brokered_ecash_settle_real_metered_no_vm_egress() {
          none of {} proofs are Spent (a mock would not move the mint)",
         states.len()
     );
-    let post_balance = rail.wallet().total_balance().await.map(u64::from).unwrap_or(0);
+    let post_balance = rail
+        .wallet()
+        .total_balance()
+        .await
+        .map(u64::from)
+        .unwrap_or(0);
     assert!(
         post_balance < funded_balance,
         "(ii) the wallet balance must DROP after the real settle ({funded_balance} -> {post_balance})"
@@ -201,20 +216,36 @@ async fn g5_brokered_ecash_settle_real_metered_no_vm_egress() {
     );
 
     // ---- (iv) the VM issued NO raw network for the act ----
-    // The eBPF TAP egress counter stays ~0: the settle left via the daemon's HOST
-    // networking, not the VM TAP. (The C-5 meter and ceiling.)
-    let ebpf_zero_ceiling = kirby_node::egress_run::EBPF_ZERO_CEILING_BYTES;
+    // Linux proves this with the eBPF TAP egress counter. macOS VZ proves the
+    // MVP shape structurally by exposing no guest network device at all.
+    let ebpf_zero_ceiling = raw_egress_zero_ceiling();
     assert!(
-        outcome.ebpf_egress_bytes <= ebpf_zero_ceiling,
-        "(iv) the VM TAP egress must stay ~0 during the brokered act (<= {ebpf_zero_ceiling}); \
-         got {} bytes (the act must leave via the daemon host net, not the VM)",
-        outcome.ebpf_egress_bytes
+        outcome.raw_egress.passed(ebpf_zero_ceiling),
+        "(iv) raw-egress proof must pass; got {}",
+        outcome.raw_egress.summary(ebpf_zero_ceiling)
     );
-    eprintln!(
-        "G5 (iv): VM TAP egress stayed ~0 during the settle: {} bytes (<= {ebpf_zero_ceiling}); \
-         the act left via the daemon HOST networking, not the VM TAP",
-        outcome.ebpf_egress_bytes
-    );
+    match &outcome.raw_egress {
+        BrokeredRawEgressProof::LinuxTap {
+            ebpf_egress_bytes,
+            nft_drop,
+        } => {
+            assert_eq!(*ebpf_egress_bytes, outcome.ebpf_egress_bytes);
+            assert_eq!(*nft_drop, outcome.nft_drop);
+            eprintln!(
+                "G5 (iv): VM TAP egress stayed ~0 during the settle: {ebpf_egress_bytes} bytes \
+                 (<= {ebpf_zero_ceiling}); the act left via the daemon HOST networking, not the VM TAP",
+            );
+        }
+        BrokeredRawEgressProof::NoGuestNetworkDevice => {
+            assert_eq!(outcome.ebpf_egress_bytes, 0);
+            assert_eq!(outcome.nft_drop.packets, 0);
+            assert_eq!(outcome.nft_drop.bytes, 0);
+            eprintln!(
+                "G5 (iv): VZ guest had no network device; raw IP egress was structurally absent, \
+                 so the act could only leave through the daemon HOST networking"
+            );
+        }
+    }
 
     // ---- (v) the genome never received the rail credential ----
     // Structural: the gateway wire types carry NO credential field. The wallet
@@ -238,20 +269,30 @@ async fn g5_brokered_ecash_settle_real_metered_no_vm_egress() {
     // The composite G5 pass for the checks the run can see (i, iii, iv).
     assert!(
         outcome.passed(ebpf_zero_ceiling),
-        "G5 must pass: authorized+performed AND cost debited == treasury drop AND eBPF ~0 bytes"
+        "G5 must pass: authorized+performed AND cost debited == treasury drop AND raw-egress proof passes"
     );
 
     eprintln!(
         "G5 PASS: the daemon authorized + PERFORMED a REAL ecash settle on the local mint over HOST \
-         networking ; cost_sats={} debited ; treasury {} -> {} ; the VM TAP egress stayed ~0 ({} bytes) ; \
+         networking ; cost_sats={} debited ; treasury {} -> {} ; raw_egress={} ; \
          the credential never crossed vsock. Isolation preserved while agency granted (D-6).",
         outcome.receipt.cost_sats,
         outcome.treasury_before,
         outcome.treasury_after,
-        outcome.ebpf_egress_bytes,
+        outcome.raw_egress.summary(ebpf_zero_ceiling),
     );
 
     mint.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+fn raw_egress_zero_ceiling() -> u64 {
+    kirby_node::egress_run::EBPF_ZERO_CEILING_BYTES
+}
+
+#[cfg(target_os = "macos")]
+fn raw_egress_zero_ceiling() -> u64 {
+    0
 }
 
 /// (v) machine-checkable assertion that the gateway wire types carry NO credential
@@ -286,7 +327,11 @@ fn assert_no_credential_on_the_wire() {
         budget_sats: _,
     } = &req;
     if let Some(Act::SettleEcash(s)) = act {
-        let SettleEcash { mint_id: _, amount: _, recipient_or_quote: _ } = s;
+        let SettleEcash {
+            mint_id: _,
+            amount: _,
+            recipient_or_quote: _,
+        } = s;
         // Only a mint id, an amount, and a recipient/quote string: the destination
         // and the intent, never the credential to spend.
     }
@@ -365,7 +410,12 @@ mod mint_fixture {
             // Wait for the mint to be ready: a wallet's fetch_mint_info succeeds
             // once /v1/info is served. Bounded so a boot failure surfaces.
             wait_ready(port, Duration::from_secs(30)).await?;
-            Ok(FakeMint { port, shutdown, handle, _work_dir: work_dir })
+            Ok(FakeMint {
+                port,
+                shutdown,
+                handle,
+                _work_dir: work_dir,
+            })
         }
 
         /// The mint's base URL.
@@ -465,11 +515,7 @@ mod mint_fixture {
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!(
-                "{prefix}-{}-{}",
-                std::process::id(),
-                n
-            ));
+            let path = std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), n));
             std::fs::create_dir_all(&path).expect("create mint work dir");
             TempDir { path }
         }

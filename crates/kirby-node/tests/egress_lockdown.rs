@@ -23,6 +23,8 @@
 //! stays green on a host without the image; the verifier runs it with the var set
 //! as the G4 producing command.
 
+#![cfg(target_os = "linux")]
+
 use std::time::Duration;
 
 use kirby_node::boot::{BootConfig, ImagePaths};
