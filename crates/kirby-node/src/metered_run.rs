@@ -22,8 +22,86 @@ use crate::meter::HostProcessMeterConfig;
 #[cfg(target_os = "linux")]
 use crate::meter::MeterConfig;
 use crate::meter::{Meter, MeterOutcome};
+use crate::nerve::{self, NodeIdentity};
 use crate::sandbox::MeterSource;
 use crate::treasury::DebitOutcome;
+
+/// The lifecycle phase carried in a periodic 31000 agent-state emission DURING a
+/// metered run. The terminal "dead" state is emitted by the run sequence at
+/// budget-death (alongside the 9100 died), not from inside this loop.
+const LIFECYCLE_RUNNING: &str = "running";
+const LIFECYCLE_DYING: &str = "dying";
+
+/// The fraction of the initial budget below which the agent is "dying" (the live
+/// "Kirby face" turns anxious). 15% of the budget, matching the contract's
+/// "treasury below ~15%" guidance.
+const DYING_TREASURY_FRACTION_NUM: u64 = 15;
+const DYING_TREASURY_FRACTION_DEN: u64 = 100;
+/// The runway (seconds-to-broke) below which the agent is "dying", matching the
+/// contract's "runway below ~30s" guidance. Whichever of the two thresholds trips
+/// first marks the agent dying.
+const DYING_RUNWAY_SECS: u64 = 30;
+
+/// Periodically emits the live 31000 agent-state event ("the Kirby face") during a
+/// metered run, sourcing the LIVE treasury balance + burn rate from the meter loop.
+/// Held by the metered run and ticked on its own cadence (the presence interval).
+/// Best-effort: a publish error is logged, never aborts the agent (like the 9100
+/// lifecycle). `None` for callers that do not want fleet observability (the gate
+/// tests), so the money/meter path is byte-identical when it is absent.
+pub struct AgentStateEmitter {
+    /// The node's signing identity (the same key the 9100/10100 events use).
+    pub identity: NodeIdentity,
+    /// The relay websocket URL.
+    pub relay_url: String,
+    /// The agent id (the addressable `d`-tag value).
+    pub agent_id: String,
+    /// The node id (the `["node",X]` tag value).
+    pub node_id: String,
+    /// The resolved backend label ("firecracker" | "vz").
+    pub backend: String,
+    /// How often to (re-)publish the live state (the presence cadence is fine: 31000
+    /// is addressable/replaceable, so the relay keeps only the latest per agent).
+    pub interval: Duration,
+    /// The initial budget, for the "dying" treasury-fraction threshold.
+    pub budget_sats: u64,
+}
+
+impl AgentStateEmitter {
+    /// Decide the lifecycle phase from the live treasury + runway: "dying" when the
+    /// treasury is below ~15% of the budget OR the runway is under ~30s, else
+    /// "running". (The terminal "dead" is emitted by the run sequence, not here.)
+    fn phase(&self, treasury_sats: u64, runway_secs: Option<u64>) -> &'static str {
+        let dying_floor = self
+            .budget_sats
+            .saturating_mul(DYING_TREASURY_FRACTION_NUM)
+            / DYING_TREASURY_FRACTION_DEN.max(1);
+        let low_treasury = treasury_sats <= dying_floor;
+        let low_runway = runway_secs.is_some_and(|r| r <= DYING_RUNWAY_SECS);
+        if low_treasury || low_runway {
+            LIFECYCLE_DYING
+        } else {
+            LIFECYCLE_RUNNING
+        }
+    }
+
+    /// Publish one live 31000 agent-state event (best-effort; logs on failure).
+    async fn emit(&self, treasury_sats: u64, runway_secs: Option<u64>) {
+        let lifecycle = self.phase(treasury_sats, runway_secs);
+        let content = nerve::AgentStateContent::sovereign(
+            &self.agent_id,
+            treasury_sats,
+            runway_secs,
+            lifecycle,
+            &self.backend,
+        );
+        if let Err(e) =
+            nerve::publish_agent_state(&self.identity, &self.relay_url, &self.node_id, &content)
+                .await
+        {
+            tracing::warn!(error = %e, lifecycle, "failed to publish 31000 agent-state (will retry next interval)");
+        }
+    }
+}
 
 /// The terminal state of the VM after a metered run (spec 4.1). The genome
 /// cannot reach these; the daemon drives the transition.
@@ -77,15 +155,22 @@ pub struct MeteredRunConfig {
     /// A safety ceiling so a misconfigured run (e.g. an idle genome that never
     /// burns) cannot loop forever. Reaching it returns `Terminated::Stopped`.
     pub max_run: Duration,
+    /// Optional periodic 31000 agent-state emitter (the live "Kirby face"). When
+    /// set, the meter loop publishes the LIVE treasury + runway on this emitter's
+    /// cadence; when `None` (the gate tests), the money/meter path is byte-identical
+    /// and no state is emitted. Best-effort: a publish error never aborts the run.
+    pub agent_state: Option<AgentStateEmitter>,
 }
 
 impl MeteredRunConfig {
-    /// A metered run with a 100 ms tick and a generous safety ceiling.
+    /// A metered run with a 100 ms tick and a generous safety ceiling, no agent-state
+    /// emission (the gate-test default).
     pub fn new(boot: BootConfig) -> Self {
         MeteredRunConfig {
             boot,
             tick: Duration::from_millis(100),
             max_run: Duration::from_secs(120),
+            agent_state: None,
         }
     }
 }
@@ -97,6 +182,7 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
     let budget_sats = config.boot.budget_sats;
     let tick = config.tick;
     let max_run = config.max_run;
+    let agent_state = config.agent_state;
 
     // Boot the VM and serve the gateway (C-2 path); get the shared treasury so
     // the meter debits the SAME counter the gateway uses (D-9).
@@ -176,8 +262,10 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
 
     // The meter loop: tick, read the cgroup, debit. On the over-budget tick the
     // treasury refuses (Insufficient) and we HALT. A safety deadline bounds the
-    // loop so a non-burning genome cannot hang the run.
-    let meter_outcome = match tick_until_exhausted(&mut meter, max_run).await {
+    // loop so a non-burning genome cannot hang the run. The optional agent-state
+    // emitter publishes the LIVE treasury + runway on its cadence (best-effort
+    // observability only; the money/meter path is unchanged).
+    let meter_outcome = match tick_until_exhausted(&mut meter, max_run, agent_state.as_ref()).await {
         Ok(outcome) => outcome,
         Err(e) => {
             vm.halt().await;
@@ -232,17 +320,28 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
 /// Tick the meter until the treasury refuses a tick (budget exhausted) or the
 /// safety deadline elapses. Sleeps one tick between reads (the granularity the
 /// halt is accurate to). Returns the meter outcome; the caller halts the VM.
+///
+/// If `agent_state` is `Some`, also publishes the LIVE 31000 agent-state on its
+/// cadence (immediately on the first tick so the UI flips off "pending" promptly,
+/// then every `interval`), sourcing the live treasury + runway from the meter. The
+/// emission is best-effort and additive: it reads the meter, never the money path.
 async fn tick_until_exhausted(
     meter: &mut Meter,
     max_run: Duration,
+    agent_state: Option<&AgentStateEmitter>,
 ) -> anyhow::Result<MeterOutcome> {
     let tick = meter.tick_interval();
-    let deadline = tokio::time::Instant::now() + max_run;
+    let start = tokio::time::Instant::now();
+    let deadline = start + max_run;
+    // The next instant a 31000 agent-state should be published. The first emission
+    // fires on the first tick (right after the meter has a reading) so the live face
+    // appears quickly; thereafter on the emitter's interval.
+    let mut next_emit = start;
 
     loop {
         tokio::time::sleep(tick).await;
 
-        match meter.tick_once()? {
+        let (remaining, exhausted) = match meter.tick_once()? {
             DebitOutcome::Debited { remaining, .. } => {
                 // Burn accrued; keep ticking. Trace occasionally for the log.
                 if meter.ticks().is_multiple_of(10) {
@@ -253,19 +352,37 @@ async fn tick_until_exhausted(
                         "metering tick"
                     );
                 }
+                (remaining, false)
             }
             DebitOutcome::Insufficient { remaining } => {
                 // The over-budget tick: cumulative burn reached the budget. This
                 // is the HALT trigger (spec 3.3 / 4.1, gate G2).
-                return Ok(MeterOutcome::BudgetExhausted {
-                    burned_sats: meter.burned_sats(),
-                    remaining_at_halt: remaining,
-                    ticks: meter.ticks(),
-                });
+                (remaining, true)
             }
             // debit_metered never writes a ledger key, so it never returns
             // Duplicate; treat it defensively as a no-op continue.
-            DebitOutcome::Duplicate(_) => {}
+            DebitOutcome::Duplicate(_) => (meter.treasury_remaining_best_effort(), false),
+        };
+
+        // Publish the live 31000 face on the emitter cadence (best-effort). Done
+        // before the exhaustion return so the dying phase shows; the terminal "dead"
+        // is emitted by the run sequence at budget-death. Skipped entirely when no
+        // emitter is configured (the gate-test path, byte-identical money flow).
+        if let Some(emitter) = agent_state {
+            let now = tokio::time::Instant::now();
+            if now >= next_emit {
+                let runway_secs = estimate_runway_secs(remaining, meter.burned_sats(), start, now);
+                emitter.emit(remaining, runway_secs).await;
+                next_emit = now + emitter.interval;
+            }
+        }
+
+        if exhausted {
+            return Ok(MeterOutcome::BudgetExhausted {
+                burned_sats: meter.burned_sats(),
+                remaining_at_halt: remaining,
+                ticks: meter.ticks(),
+            });
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -275,5 +392,96 @@ async fn tick_until_exhausted(
                 ticks: meter.ticks(),
             });
         }
+    }
+}
+
+/// Estimate seconds-to-broke at the current burn rate: `remaining / (burned /
+/// elapsed_secs)`. Returns `None` (the contract's `null` runway) until a burn rate
+/// is established (no elapsed time or nothing burned yet), so the UI never shows a
+/// divide-by-zero or a bogus infinite runway on the first tick.
+fn estimate_runway_secs(
+    remaining_sats: u64,
+    burned_sats: u64,
+    start: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> Option<u64> {
+    let elapsed_secs = now.duration_since(start).as_secs_f64();
+    if elapsed_secs <= 0.0 || burned_sats == 0 {
+        return None; // no established burn rate yet -> null runway
+    }
+    let burn_rate_per_sec = burned_sats as f64 / elapsed_secs;
+    if burn_rate_per_sec <= 0.0 {
+        return None;
+    }
+    Some((remaining_sats as f64 / burn_rate_per_sec) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn emitter(budget_sats: u64) -> AgentStateEmitter {
+        // A per-call unique dir (pid + a process-wide counter) so parallel tests do
+        // not collide on the node key file (load_or_create uses create_new).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "kirby-emitter-test-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = NodeIdentity::load_or_create(&dir.join("node.key")).unwrap();
+        AgentStateEmitter {
+            identity,
+            relay_url: "ws://127.0.0.1:7777".to_string(),
+            agent_id: "agent-0".to_string(),
+            node_id: "node-1".to_string(),
+            backend: "firecracker".to_string(),
+            interval: Duration::from_secs(15),
+            budget_sats,
+        }
+    }
+
+    #[test]
+    fn runway_is_null_until_a_burn_rate_is_established() {
+        let t0 = tokio::time::Instant::now();
+        // No elapsed time yet -> null (no rate).
+        assert_eq!(estimate_runway_secs(1_000, 0, t0, t0), None);
+        // Elapsed but nothing burned yet -> null.
+        let later = t0 + Duration::from_secs(1);
+        assert_eq!(estimate_runway_secs(1_000, 0, t0, later), None);
+    }
+
+    #[test]
+    fn runway_divides_remaining_by_burn_rate() {
+        let t0 = tokio::time::Instant::now();
+        let later = t0 + Duration::from_secs(2);
+        // Burned 1000 sats over 2s = 500 sats/s; 1000 remaining -> 2s of runway.
+        assert_eq!(estimate_runway_secs(1_000, 1_000, t0, later), Some(2));
+        // 5000 remaining at the same 500 sats/s -> 10s.
+        assert_eq!(estimate_runway_secs(5_000, 1_000, t0, later), Some(10));
+    }
+
+    #[test]
+    fn phase_running_when_well_funded() {
+        let e = emitter(10_000);
+        // Plenty of treasury (above the 15% floor of 1500) and a long runway.
+        assert_eq!(e.phase(8_000, Some(120)), LIFECYCLE_RUNNING);
+        // A high treasury with an as-yet-unknown runway is still running.
+        assert_eq!(e.phase(8_000, None), LIFECYCLE_RUNNING);
+    }
+
+    #[test]
+    fn phase_dying_on_low_treasury_or_low_runway() {
+        let e = emitter(10_000);
+        // Treasury below 15% (1500) -> dying, regardless of runway.
+        assert_eq!(e.phase(1_000, Some(120)), LIFECYCLE_DYING);
+        assert_eq!(e.phase(1_500, None), LIFECYCLE_DYING);
+        // Runway under 30s -> dying, even with treasury above the floor.
+        assert_eq!(e.phase(8_000, Some(10)), LIFECYCLE_DYING);
+        // Exactly at the runway threshold counts as dying (<=).
+        assert_eq!(e.phase(8_000, Some(30)), LIFECYCLE_DYING);
     }
 }

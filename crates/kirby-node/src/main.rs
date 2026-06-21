@@ -1081,6 +1081,9 @@ async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
         boot: boot_config,
         tick: Duration::from_millis(args.tick_ms),
         max_run: Duration::from_secs(args.max_run_secs),
+        // The standalone `metered-run` subcommand is the G2 gate harness, not a
+        // fleet member: no 31000 agent-state emission (that is `kirby run`).
+        agent_state: None,
     };
 
     let outcome = metered_run::run(config).await?;

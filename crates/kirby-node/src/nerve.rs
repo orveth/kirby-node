@@ -31,7 +31,7 @@ use anyhow::Context as _;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use kirby_proto::{KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE};
+use kirby_proto::{KIND_KIRBY_AGENT_STATE, KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE};
 
 /// The default file name for the persisted node Nostr secret key, under the node
 /// state directory (the `--treasury-path` dir, unless `--nostr-key-path` overrides
@@ -59,6 +59,9 @@ const TAG_NODE: &str = "node";
 /// The agent-scope tag (`["a",<agent_id>]`) on agent-scoped events (the 9100
 /// lifecycle event). The UI filters per-agent by it.
 const TAG_A: &str = "a";
+/// The NIP-01 addressable `d` tag. For the 31000 agent-state event the value is the
+/// `agent_id`, so the relay keeps only the latest state per agent (per pubkey/kind).
+const TAG_D: &str = "d";
 
 /// The node's cryptographic identity: a Nostr (secp256k1/BIP340) keypair. The npub
 /// is the node's stable cluster identity across restarts.
@@ -506,6 +509,118 @@ pub async fn publish_lifecycle(
     Ok(id)
 }
 
+/// The JSON content shape of a 31000 agent-state event (the live "Kirby face"), per
+/// the unified event-kinds contract (`plans/kirby-cluster-event-kinds-20260619.md`):
+/// `{ agent_id, treasury_sats, runway_secs, lifecycle, backend, lease_holder_node,
+/// lease_term }`. `treasury_sats` is the LIVE current balance (never a genesis
+/// number); `runway_secs` is the estimated seconds until broke at the current burn
+/// (`null` until a burn rate is established). On a sovereign node there is no Raft
+/// lease, so `lease_holder_node`/`lease_term` are always `null`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentStateContent {
+    /// The agent this state event is about (e.g. "agent-0"); also the `d`-tag value.
+    pub agent_id: String,
+    /// The LIVE current treasury balance in sats.
+    pub treasury_sats: u64,
+    /// Estimated seconds until the treasury is exhausted at the current burn rate.
+    /// `None` (serialized `null`) until a burn rate is established (the first tick).
+    #[serde(default)]
+    pub runway_secs: Option<u64>,
+    /// "running" while alive + funded; "dying" near budget exhaustion; "dead" once
+    /// at budget-death (the final state, after which the node stops emitting).
+    pub lifecycle: String,
+    /// The sandbox backend: "firecracker" or "vz".
+    pub backend: String,
+    /// The Raft lease holder node, or `null` on a sovereign node (no Raft lease).
+    #[serde(default)]
+    pub lease_holder_node: Option<String>,
+    /// The Raft lease term, or `null` on a sovereign node (no Raft lease).
+    #[serde(default)]
+    pub lease_term: Option<u64>,
+}
+
+impl AgentStateContent {
+    /// Build the sovereign-path content from the live fields: `lease_*` are always
+    /// `null` (no Raft lease). `runway_secs` is `None` until a burn rate is known.
+    pub fn sovereign(
+        agent_id: &str,
+        treasury_sats: u64,
+        runway_secs: Option<u64>,
+        lifecycle: &str,
+        backend: &str,
+    ) -> Self {
+        AgentStateContent {
+            agent_id: agent_id.to_string(),
+            treasury_sats,
+            runway_secs,
+            lifecycle: lifecycle.to_string(),
+            backend: backend.to_string(),
+            lease_holder_node: None,
+            lease_term: None,
+        }
+    }
+}
+
+/// Build a 31000 `KIND_KIRBY_AGENT_STATE` [`EventBuilder`] (an ADDRESSABLE event, the
+/// live agent face) from `content` on `node_id`, mirroring [`build_lifecycle`]'s
+/// shape. Tags per the contract: `["d",<agent_id>]`, `["t","kirby"]`,
+/// `["a",<agent_id>]`, `["node",<node_id>]`. The `d` tag makes it addressable, so the
+/// relay keeps only the latest state per agent. Signed by the node key at publish
+/// time.
+fn build_agent_state(content: &AgentStateContent, node_id: &str) -> anyhow::Result<EventBuilder> {
+    let json = serde_json::to_string(content).context("serialize agent-state content")?;
+    let tags: Vec<Tag> = vec![
+        Tag::parse([TAG_D, &content.agent_id])?,
+        Tag::parse([TAG_T, TAG_T_KIRBY])?,
+        Tag::parse([TAG_A, &content.agent_id])?,
+        Tag::parse([TAG_NODE, node_id])?,
+    ];
+    Ok(EventBuilder::new(Kind::from(KIND_KIRBY_AGENT_STATE), json).tags(tags))
+}
+
+/// Publish ONE 31000 `KIND_KIRBY_AGENT_STATE` event (the live "Kirby face") to the
+/// relay, signed by this node's key, then disconnect. A one-shot
+/// connect-publish-disconnect mirroring [`publish_lifecycle`]: the event is
+/// addressable (keyed by the `agent_id` `d` tag), so each publish REPLACES the prior
+/// state on the relay, and the UI reads the latest per agent. Re-published on the
+/// presence cadence with the LIVE treasury balance.
+///
+/// `content` carries the live current balance + runway (`None` until a burn rate is
+/// established) + lifecycle ("running" | "dying" | "dead") + backend ("firecracker" |
+/// "vz"). The content/tags follow the contract
+/// (`plans/kirby-cluster-event-kinds-20260619.md`): `["d",<agent_id>]`,
+/// `["t","kirby"]`, `["a",<agent_id>]`, `["node",<node_id>]`, content `{ agent_id,
+/// treasury_sats, runway_secs, lifecycle, backend, lease_holder_node, lease_term }`.
+/// Returns the published event id on success.
+pub async fn publish_agent_state(
+    identity: &NodeIdentity,
+    relay_url: &str,
+    node_id: &str,
+    content: &AgentStateContent,
+) -> anyhow::Result<String> {
+    let builder = build_agent_state(content, node_id)?;
+    let client = connect_client(identity, relay_url).await?;
+    let result = client
+        .send_event_builder(builder)
+        .await
+        .context("publish agent-state event");
+    // Best-effort clean disconnect regardless of the send outcome.
+    client.disconnect().await;
+    let output = result?;
+    let id = output.val.to_hex();
+    tracing::debug!(
+        agent_id = %content.agent_id,
+        node_id,
+        treasury_sats = content.treasury_sats,
+        runway_secs = content.runway_secs,
+        lifecycle = %content.lifecycle,
+        backend = %content.backend,
+        event_id = %id,
+        "published 31000 agent-state event (the live Kirby face)"
+    );
+    Ok(id)
+}
+
 /// Fold a received presence event into the peer set, logging JOIN / REFRESH and the
 /// current fleet size. Ignores our own beacon.
 fn ingest_event(
@@ -867,6 +982,73 @@ mod tests {
         assert_eq!(dc.event, "died");
         assert_eq!(dc.treasury_sats, 0);
         assert_eq!(dc.reason, "broke");
+    }
+
+    #[test]
+    fn agent_state_event_shape_matches_the_contract() {
+        // 31000 running: addressable (d=agent_id), tags
+        // ["d",agent]+["t","kirby"]+["a",agent]+["node",node], content
+        // {agent_id, treasury_sats, runway_secs, lifecycle, backend,
+        // lease_holder_node, lease_term} with null leases on the sovereign path.
+        let keys = Keys::generate();
+        let content = AgentStateContent::sovereign("agent-0", 1_234, Some(42), "running", "firecracker");
+        let event = build_agent_state(&content, "node-1")
+            .unwrap()
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_eq!(event.kind, Kind::from(KIND_KIRBY_AGENT_STATE));
+        assert!(
+            event.kind.is_addressable(),
+            "31000 is an ADDRESSABLE kind so the relay keeps only the latest per (pubkey, kind, d)"
+        );
+        let has_tag = |name: &str, val: &str| {
+            event.tags.iter().any(|t| {
+                let s = t.as_slice();
+                s.first().map(String::as_str) == Some(name)
+                    && s.get(1).map(String::as_str) == Some(val)
+            })
+        };
+        assert!(has_tag("d", "agent-0"), "the addressable d tag is the agent_id");
+        assert!(has_tag("t", "kirby"));
+        assert!(has_tag("a", "agent-0"));
+        assert!(has_tag("node", "node-1"));
+        let content: AgentStateContent = serde_json::from_str(&event.content).unwrap();
+        assert_eq!(
+            content,
+            AgentStateContent {
+                agent_id: "agent-0".to_string(),
+                treasury_sats: 1_234,
+                runway_secs: Some(42),
+                lifecycle: "running".to_string(),
+                backend: "firecracker".to_string(),
+                lease_holder_node: None,
+                lease_term: None,
+            }
+        );
+        // The lease fields serialize as JSON null (sovereign = no Raft lease).
+        let raw: serde_json::Value = serde_json::from_str(&event.content).unwrap();
+        assert!(raw["lease_holder_node"].is_null());
+        assert!(raw["lease_term"].is_null());
+
+        // A first-tick state with no established burn rate: runway_secs is null.
+        let no_runway_content = AgentStateContent::sovereign("agent-0", 3_000, None, "running", "vz");
+        let no_runway = build_agent_state(&no_runway_content, "node-1")
+            .unwrap()
+            .sign_with_keys(&keys)
+            .unwrap();
+        let raw2: serde_json::Value = serde_json::from_str(&no_runway.content).unwrap();
+        assert!(raw2["runway_secs"].is_null(), "no burn rate yet -> null runway");
+        assert_eq!(raw2["backend"], "vz");
+
+        // The final dead state at budget-death: treasury 0, lifecycle "dead".
+        let dead_content = AgentStateContent::sovereign("agent-0", 0, None, "dead", "firecracker");
+        let dead = build_agent_state(&dead_content, "node-1")
+            .unwrap()
+            .sign_with_keys(&keys)
+            .unwrap();
+        let dc: AgentStateContent = serde_json::from_str(&dead.content).unwrap();
+        assert_eq!(dc.lifecycle, "dead");
+        assert_eq!(dc.treasury_sats, 0);
     }
 
     #[test]
