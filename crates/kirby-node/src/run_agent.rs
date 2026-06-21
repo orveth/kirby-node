@@ -259,6 +259,52 @@ async fn stop_presence(task: PresenceTask) {
     }
 }
 
+/// Build the periodic 31000 agent-state emitter (the live "Kirby face") for this
+/// run, signed by the node identity. The emitter publishes the LIVE treasury +
+/// runway on the presence cadence; the `backend` is the resolved sandbox label. Used
+/// by the metered (bootstrap) loop; resume emits its state directly (no meter loop).
+fn agent_state_emitter(
+    identity: &NodeIdentity,
+    config: &KirbyConfig,
+    backend: ResolvedBackend,
+) -> crate::metered_run::AgentStateEmitter {
+    crate::metered_run::AgentStateEmitter {
+        identity: identity.clone(),
+        relay_url: config.relay.url.clone(),
+        agent_id: config.agent_id.clone(),
+        node_id: config.node_id.clone(),
+        backend: backend.label().to_string(),
+        interval: Duration::from_secs(config.relay.presence_interval_secs),
+        budget_sats: config.funding.initial_sats,
+    }
+}
+
+/// Emit ONE 31000 agent-state event (best-effort; logs on failure, never aborts the
+/// run). Used for the milestone states the metered loop does not cover: the terminal
+/// "dead" at budget-death, and the running state on the resume path. `runway_secs` is
+/// `None` (null) when no burn rate applies (resume; the final dead state).
+async fn emit_agent_state(
+    identity: &NodeIdentity,
+    config: &KirbyConfig,
+    backend: ResolvedBackend,
+    treasury_sats: u64,
+    runway_secs: Option<u64>,
+    lifecycle: &str,
+) {
+    let content = nerve::AgentStateContent::sovereign(
+        &config.agent_id,
+        treasury_sats,
+        runway_secs,
+        lifecycle,
+        backend.label(),
+    );
+    if let Err(e) =
+        nerve::publish_agent_state(identity, &config.relay.url, &config.node_id, &content).await
+    {
+        tracing::warn!(error = %e, lifecycle, "failed to publish 31000 agent-state");
+    }
+}
+
 /// Emit a single 9100 lifecycle event, logging (not failing the run) on a publish
 /// error. Returns whether the publish landed (the gate evidence). Lifecycle is a
 /// milestone log, not a correctness dependency, so a transient relay hiccup must
@@ -388,6 +434,9 @@ async fn run_bootstrap(
         boot,
         tick: run.meter_tick,
         max_run: run.max_run,
+        // Emit the live 31000 "Kirby face" on the presence cadence during the run,
+        // sourcing the live treasury + burn rate from the meter loop.
+        agent_state: Some(agent_state_emitter(identity, &run.config, backend)),
     };
     let outcome = metered_run::run(metered).await?;
 
@@ -423,6 +472,20 @@ async fn run_bootstrap(
         &run.config,
         Lifecycle::Died(death_reason),
         lifecycle_treasury,
+    )
+    .await;
+
+    // The terminal 31000 "dead" face, emitted once when the agent is gone (alongside
+    // the 9100 died), AFTER which the node stops emitting agent-state. runway is null
+    // at death (no forward burn). Budget-death is treasury 0; a clean stop carries
+    // the leftover balance the meter reported.
+    emit_agent_state(
+        identity,
+        &run.config,
+        backend,
+        lifecycle_treasury,
+        None,
+        "dead",
     )
     .await;
 
@@ -467,16 +530,37 @@ async fn run_resume(
     // already lived, it is continuing). The genome rehydrates the logical state and
     // reports a restore-seen event.
     let boot = agent_boot_config(run, Some(checkpoint.clone()))?;
-    let (vm, outcome, _treasury, mut events, _serve_guard) = boot::boot_and_observe(boot).await?;
+    let (vm, outcome, treasury, mut events, _serve_guard) = boot::boot_and_observe(boot).await?;
     if !outcome.reached_running {
         vm.halt().await;
         anyhow::bail!("resume: agent did not reach Running");
     }
 
+    // The agent is alive again: emit a live 31000 "running" face so the UI flips off
+    // "pending" on resume too. There is no metered burn loop on the resume path (the
+    // run only confirms the restore, then tears down), so runway is null. The
+    // treasury balance is the daemon-owned authoritative one (the persisted balance
+    // on resume, which the seed does not refill), best-effort.
+    let treasury_sats = treasury.remaining().unwrap_or(run.config.funding.initial_sats);
+    emit_agent_state(
+        identity,
+        &run.config,
+        backend,
+        treasury_sats,
+        None,
+        "running",
+    )
+    .await;
+
     // 6. Observe the restore (the agent saw its prior logical state). v0 then runs
     // present + heartbeat; we confirm the restore, then tear down cleanly.
     let restore_seen = wait_for_restore_seen(&mut events, &checkpoint, run.hello_timeout).await;
     vm.halt().await;
+
+    // The terminal 31000 "dead" face, emitted once as the resume demonstration run
+    // tears the agent down (alongside the 9100 died below), after which the node
+    // stops emitting agent-state.
+    emit_agent_state(identity, &run.config, backend, treasury_sats, None, "dead").await;
 
     // A resume run ends as "continue", not a budget-death, so it emits died only on
     // its own clean shutdown here (the agent is being torn down at the end of this
@@ -589,7 +673,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_root() -> PathBuf {
-        let root = std::env::temp_dir().join(format!("kirby-run-test-{}", std::process::id()));
+        // A per-call unique dir (pid + a process-wide counter) so parallel tests do
+        // not race on the shared `img/manifest.env` under one PID-keyed dir.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let root =
+            std::env::temp_dir().join(format!("kirby-run-test-{}-{}", std::process::id(), n));
         let image = root.join("img");
         std::fs::create_dir_all(&image).unwrap();
         std::fs::write(

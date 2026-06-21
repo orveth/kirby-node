@@ -38,6 +38,22 @@ pub const KIND_KIRBY_PRESENCE: u16 = 10100;
 /// here in the shared contract crate so every node and the UI agree on one value.
 pub const KIND_KIRBY_LIFECYCLE: u16 = 9100;
 
+/// The Nostr event kind for a Kirby agent's LIVE state (the "Kirby face": current
+/// treasury, runway, lifecycle phase).
+///
+/// Unlike the append-only 9100 birth/death log, this is an ADDRESSABLE event kind
+/// (30000..40000, per NIP-01): keyed by a `d` tag set to the `agent_id`, the relay
+/// keeps only the LATEST event per `(pubkey, kind, d)`. The agent re-publishes it
+/// on its presence cadence with the live treasury balance, so the current event IS
+/// the agent's current state; frequent updates are cheap (each replaces the prior).
+///
+/// The content JSON is `{ agent_id, treasury_sats, runway_secs, lifecycle, backend,
+/// lease_holder_node, lease_term }` and the tags are `["d",<agent_id>]`,
+/// `["t","kirby"]`, `["a",<agent_id>]`, `["node",<node_id>]`, per the unified
+/// event-kinds contract (`plans/kirby-cluster-event-kinds-20260619.md`). It lives
+/// here in the shared contract crate so every node and the UI agree on one value.
+pub const KIND_KIRBY_AGENT_STATE: u16 = 31000;
+
 pub mod gateway {
     //! Generated tonic types for `kirby.gateway.v1`.
     tonic::include_proto!("kirby.gateway.v1");

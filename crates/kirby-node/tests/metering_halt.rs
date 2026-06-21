@@ -79,6 +79,8 @@ async fn g2_meters_and_halts_on_budget() {
         // read zero (a broken placement) the run would hit this and the
         // terminal-state assertion below would fail loudly (NOT a false pass).
         max_run: Duration::from_secs(60),
+        // G2 metering-halt gate: no fleet observability needed here.
+        agent_state: None,
     };
 
     let outcome = metered_run::run(config)
