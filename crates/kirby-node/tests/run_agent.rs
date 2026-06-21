@@ -18,10 +18,13 @@
 //! gates (G-run-1's relay assertion is the keeper's relay-query step, documented).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use kirby_node::config::{
-    Backend, FundingConfig, GenomeImage, IdentityConfig, KirbyConfig, RelayConfig, RunMode, Workload,
+    Backend, FundingConfig, GenomeImage, IdentityConfig, KirbyConfig, RelayConfig, RunMode,
+    Workload,
 };
+use kirby_node::nerve;
 use kirby_node::run_agent::{self, EndReason, RunAgentConfig};
 
 /// The image dir, or `None` (skip) when `KIRBY_GENOME_IMAGE` is unset.
@@ -65,7 +68,7 @@ fn bootstrap_config(test: &str, image_dir: PathBuf, funding_sats: u64) -> KirbyC
         // so the SAME config drives both the Linux gates here and the Mac G-run-4.
         backend: Backend::Auto,
         genome_image: GenomeImage::Path(image_dir),
-        workload: Workload::Presence,
+        workload: Workload::AppCheckpoint,
         mode: RunMode::Bootstrap,
         funding: FundingConfig {
             initial_sats: funding_sats,
@@ -85,9 +88,10 @@ async fn g_run_1_fresh_config_boots_and_is_born() {
     let Some(image_dir) = image_dir_or_skip("g_run_1") else {
         return;
     };
-    // A generous budget so the agent stays alive while we observe birth + presence
-    // (it does not need to die for G-run-1).
-    let config = bootstrap_config("grun1", image_dir, 1_000_000);
+    let config = bootstrap_config("grun1", image_dir, 3_000);
+    let relay_url = config.relay.url.clone();
+    let node_id = config.node_id.clone();
+    let stale_after = config.relay.presence_stale_after_secs;
     let run = RunAgentConfig::from_config(config).expect("build run config");
     let backend = run.backend();
 
@@ -98,7 +102,10 @@ async fn g_run_1_fresh_config_boots_and_is_born() {
         outcome.reached_running,
         "the agent must reach Running (the one-command sovereign-node birth)"
     );
-    assert_eq!(outcome.backend, backend, "the run resolved the native backend");
+    assert_eq!(
+        outcome.backend, backend,
+        "the run resolved the native backend"
+    );
     assert!(
         outcome.born_emitted,
         "a bootstrap run must emit a 9100 born (the signed birth log)"
@@ -107,6 +114,19 @@ async fn g_run_1_fresh_config_boots_and_is_born() {
         !outcome.npub.is_empty() && outcome.npub.starts_with("npub1"),
         "the node minted/loaded a Nostr identity (npub), got {:?}",
         outcome.npub
+    );
+    let records = nerve::read_fleet_once(
+        &relay_url,
+        Duration::from_secs(stale_after),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("query relay presence after bootstrap");
+    assert!(
+        records
+            .iter()
+            .any(|record| record.npub == outcome.npub && record.node_id == node_id && record.alive),
+        "the node's 10100 presence must land on the relay; records={records:?}"
     );
     assert!(
         outcome.bootstrap_birth_passed(),
@@ -123,7 +143,7 @@ async fn g_run_2_dies_when_broke() {
     let Some(image_dir) = image_dir_or_skip("g_run_2") else {
         return;
     };
-    // A small budget so the burn workload drains it in a couple of seconds.
+    // A small budget so VM-time metering drains it in a few seconds.
     let config = bootstrap_config("grun2", image_dir, 3_000);
     let run = RunAgentConfig::from_config(config).expect("build run config");
 
@@ -156,37 +176,37 @@ async fn g_run_2_dies_when_broke() {
 /// logical state, the genome reports the restore, and NO born is emitted (resume is
 /// continue, not birth).
 ///
-/// Resume needs a checkpoint in the store first. A real harness run produces one in
-/// a prior bootstrap (the app-checkpoint workload), so this test SKIPS when the
-/// store is empty (no checkpoint to restore), the same env-gated discipline: it is
-/// ready for the keeper to run after seeding a checkpoint, and never fails on a host
-/// without one.
 #[tokio::test]
 async fn g_run_3_resume_restores_from_checkpoint() {
     let Some(image_dir) = image_dir_or_skip("g_run_3") else {
         return;
     };
-    let mut config = bootstrap_config("grun3", image_dir, 1_000_000);
+    let mut config = bootstrap_config("grun3", image_dir, 3_000);
+    let bootstrap_run =
+        RunAgentConfig::from_config(config.clone()).expect("build bootstrap run config");
+    let checkpoint_dir = bootstrap_run.checkpoint_dir.clone();
+    let seed = run_agent::run(bootstrap_run)
+        .await
+        .expect("kirby run bootstrap seed sequence");
+    eprintln!("{}", run_agent::evidence_line(&seed));
+    assert!(
+        seed.bootstrap_birth_passed(),
+        "bootstrap must seed the agent before resume: {}",
+        run_agent::evidence_line(&seed)
+    );
+    assert!(
+        std::fs::read_dir(&checkpoint_dir)
+            .map(|mut d| d.any(|e| e.is_ok()))
+            .unwrap_or(false),
+        "bootstrap must persist a checkpoint in {}",
+        checkpoint_dir.display()
+    );
+
     config.mode = RunMode::Resume;
-    let run = RunAgentConfig::from_config(config).expect("build run config");
-    let checkpoint_dir = run.checkpoint_dir.clone();
-
-    // Resume requires a seeded checkpoint store. With none present there is nothing
-    // to restore: skip cleanly (the keeper seeds one via a prior bootstrap/app-
-    // checkpoint run, then this gate restores it).
-    let has_checkpoint = std::fs::read_dir(&checkpoint_dir)
-        .map(|mut d| d.any(|e| e.is_ok()))
-        .unwrap_or(false);
-    if !has_checkpoint {
-        eprintln!(
-            "SKIP g_run_3: no checkpoint in {} to resume from; seed one with a prior bootstrap \
-             (app-checkpoint) run, then re-run this gate",
-            checkpoint_dir.display()
-        );
-        return;
-    }
-
-    let outcome = run_agent::run(run).await.expect("kirby run resume sequence");
+    let run = RunAgentConfig::from_config(config).expect("build resume run config");
+    let outcome = run_agent::run(run)
+        .await
+        .expect("kirby run resume sequence");
     eprintln!("{}", run_agent::evidence_line(&outcome));
 
     assert!(

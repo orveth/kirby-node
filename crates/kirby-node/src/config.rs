@@ -8,9 +8,9 @@
 //!
 //! A sovereign node is its OWN single agent. It does NOT join a Raft voter set, so
 //! this config has NO cluster fields (no peer set, no lease); the Raft cluster is a
-//! separate, internal resilience showcase. v0 "contribute" is presence + heartbeat
-//! (the agent boots and the daemon beacons the relay); earn workloads are the layer
-//! after this milestone.
+//! separate, internal resilience showcase. v0 "contribute" is a checkpoint-aware
+//! metered agent workload plus host-side presence beacons; earn workloads are the
+//! layer after this milestone.
 
 use std::path::{Path, PathBuf};
 
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 /// ```toml
 /// backend = "auto"                              # auto | firecracker | vz
 /// genome_image = { path = "/var/lib/kirby/genome-image" }
-/// workload = "presence"                         # v0
+/// workload = "app-checkpoint"                   # v0
 /// mode = "bootstrap"                            # bootstrap | resume
 ///
 /// [identity]
@@ -47,7 +47,7 @@ pub struct KirbyConfig {
     /// The genome image to boot: a local path, or (TODO) a prebuilt-artifact URL to
     /// fetch and cache. See [`GenomeImage`].
     pub genome_image: GenomeImage,
-    /// The v0 workload the agent runs once alive. Defaults to [`Workload::Presence`].
+    /// The v0 workload the agent runs once alive. Defaults to [`Workload::AppCheckpoint`].
     #[serde(default)]
     pub workload: Workload,
     /// bootstrap (fund to born) or resume (restore from the latest checkpoint).
@@ -196,15 +196,32 @@ impl GenomeImage {
     }
 }
 
-/// The v0 workload. Only presence is supported this milestone.
+/// The v0 workload. The daemon publishes presence for the node; the genome workload
+/// is the checkpoint-aware agent loop so bootstrap can seed resume.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Workload {
-    /// Present + heartbeat: the agent boots in the sandbox and the daemon beacons
-    /// the relay. The agent runs a trivial metered loop so the budget-death path is
-    /// exercisable (die-when-broke). Earn workloads are the layer after this.
+    /// The v0 agent workload: submit a portable app checkpoint, then stay alive
+    /// while the host meter charges VM time. The daemon beacons fleet presence.
+    #[serde(rename = "app-checkpoint")]
     #[default]
-    Presence,
+    AppCheckpoint,
+}
+
+impl Workload {
+    /// Kernel command-line workload understood by the current genome.
+    pub fn genome_workload(self) -> &'static str {
+        match self {
+            Workload::AppCheckpoint => "app-checkpoint",
+        }
+    }
+
+    /// Whether bootstrap must persist a genome-submitted checkpoint for resume.
+    pub fn submits_checkpoint(self) -> bool {
+        match self {
+            Workload::AppCheckpoint => true,
+        }
+    }
 }
 
 /// bootstrap (fund to born) or resume (restore from the latest checkpoint).
@@ -308,6 +325,95 @@ impl KirbyConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenomeArch {
+    Aarch64,
+    X86_64,
+}
+
+impl GenomeArch {
+    fn label(self) -> &'static str {
+        match self {
+            GenomeArch::Aarch64 => "aarch64",
+            GenomeArch::X86_64 => "x86_64",
+        }
+    }
+}
+
+impl ResolvedBackend {
+    fn expected_genome_arch(self) -> GenomeArch {
+        match self {
+            ResolvedBackend::Vz => GenomeArch::Aarch64,
+            ResolvedBackend::Firecracker => GenomeArch::X86_64,
+        }
+    }
+}
+
+impl GenomeImage {
+    /// Validate a resolved local image directory against the selected backend before
+    /// boot. Prefer `manifest.env` because the prebuilt artifact publishes it; fall
+    /// back to the ELF machine field in `vmlinux` for local/dev images.
+    pub fn validate_local_arch(image_dir: &Path, backend: ResolvedBackend) -> anyhow::Result<()> {
+        let actual = read_genome_arch(image_dir)?;
+        let expected = backend.expected_genome_arch();
+        if actual != expected {
+            anyhow::bail!(
+                "genome_image arch mismatch for backend {backend}: expected {}, got {} at {}",
+                expected.label(),
+                actual.label(),
+                image_dir.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn read_genome_arch(image_dir: &Path) -> anyhow::Result<GenomeArch> {
+    let manifest = image_dir.join("manifest.env");
+    if manifest.exists() {
+        let text = std::fs::read_to_string(&manifest)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", manifest.display()))?;
+        if let Some(arch) = text.lines().find_map(|line| line.strip_prefix("arch=")) {
+            return parse_arch_label(arch.trim()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsupported genome image arch {arch:?} in {}",
+                    manifest.display()
+                )
+            });
+        }
+    }
+
+    let kernel = image_dir.join("vmlinux");
+    let bytes =
+        std::fs::read(&kernel).map_err(|e| anyhow::anyhow!("read {}: {e}", kernel.display()))?;
+    read_elf_arch(&bytes).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not determine genome image arch from {}",
+            kernel.display()
+        )
+    })
+}
+
+fn parse_arch_label(label: &str) -> Option<GenomeArch> {
+    match label {
+        "aarch64" | "arm64" => Some(GenomeArch::Aarch64),
+        "x86_64" | "amd64" => Some(GenomeArch::X86_64),
+        _ => None,
+    }
+}
+
+fn read_elf_arch(bytes: &[u8]) -> Option<GenomeArch> {
+    if bytes.get(0..4) != Some(b"\x7fELF") || bytes.get(5) != Some(&1) {
+        return None;
+    }
+    let machine = u16::from_le_bytes([*bytes.get(18)?, *bytes.get(19)?]);
+    match machine {
+        62 => Some(GenomeArch::X86_64),
+        183 => Some(GenomeArch::Aarch64),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,14 +436,17 @@ mod tests {
     #[test]
     fn minimal_config_parses_with_defaults() {
         let cfg = KirbyConfig::from_toml_str(minimal_toml()).unwrap();
-        assert_eq!(cfg.identity.key_path, PathBuf::from("/tmp/kirby/node.nostr.key"));
+        assert_eq!(
+            cfg.identity.key_path,
+            PathBuf::from("/tmp/kirby/node.nostr.key")
+        );
         // treasury_dir defaults to the key path's parent.
         assert_eq!(cfg.identity.treasury_dir(), PathBuf::from("/tmp/kirby"));
         assert_eq!(cfg.relay.url, "ws://127.0.0.1:7777");
         assert_eq!(cfg.relay.presence_interval_secs, 15);
         assert_eq!(cfg.relay.presence_stale_after_secs, 45);
         assert_eq!(cfg.backend, Backend::Auto);
-        assert_eq!(cfg.workload, Workload::Presence);
+        assert_eq!(cfg.workload, Workload::AppCheckpoint);
         assert_eq!(cfg.mode, RunMode::Bootstrap);
         assert_eq!(cfg.funding.initial_sats, 1_000_000);
         assert_eq!(cfg.agent_id, "agent-0");
@@ -354,7 +463,7 @@ mod tests {
             agent_id = "agent-7"
             node_id = "mac-mini"
             backend = "auto"
-            workload = "presence"
+            workload = "app-checkpoint"
             mode = "resume"
             genome_image = { url = "https://example.com/kirby-arm64.tar" }
 
@@ -377,7 +486,10 @@ mod tests {
         assert_eq!(cfg.relay.presence_interval_secs, 30);
         assert_eq!(cfg.relay.presence_stale_after_secs, 90);
         assert_eq!(cfg.funding.initial_sats, 250000);
-        assert_eq!(cfg.identity.treasury_dir(), PathBuf::from("/var/lib/kirby/treasury"));
+        assert_eq!(
+            cfg.identity.treasury_dir(),
+            PathBuf::from("/var/lib/kirby/treasury")
+        );
         assert_eq!(
             cfg.genome_image,
             GenomeImage::Url("https://example.com/kirby-arm64.tar".to_string())
@@ -466,6 +578,49 @@ mod tests {
         );
         // The local-path form resolves cleanly.
         let local = GenomeImage::Path(PathBuf::from("/tmp/img"));
-        assert_eq!(local.resolve_local_dir().unwrap(), PathBuf::from("/tmp/img"));
+        assert_eq!(
+            local.resolve_local_dir().unwrap(),
+            PathBuf::from("/tmp/img")
+        );
+    }
+
+    #[test]
+    fn genome_image_arch_validation_uses_manifest() {
+        let dir = unique_temp_dir("kirby-config-arch-manifest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let expected = Backend::auto_for_host().expected_genome_arch();
+        std::fs::write(
+            dir.join("manifest.env"),
+            format!("arch={}\n", expected.label()),
+        )
+        .unwrap();
+
+        GenomeImage::validate_local_arch(&dir, Backend::auto_for_host()).unwrap();
+    }
+
+    #[test]
+    fn genome_image_arch_mismatch_is_rejected() {
+        let dir = unique_temp_dir("kirby-config-arch-mismatch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let native = Backend::auto_for_host();
+        let wrong = match native.expected_genome_arch() {
+            GenomeArch::Aarch64 => GenomeArch::X86_64,
+            GenomeArch::X86_64 => GenomeArch::Aarch64,
+        };
+        std::fs::write(
+            dir.join("manifest.env"),
+            format!("arch={}\n", wrong.label()),
+        )
+        .unwrap();
+
+        let err = GenomeImage::validate_local_arch(&dir, native).unwrap_err();
+        assert!(
+            err.to_string().contains("arch mismatch"),
+            "expected an arch mismatch error, got: {err}"
+        );
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
     }
 }

@@ -983,7 +983,7 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
         restore_checkpoint: None,
     };
 
-    let (vm, outcome, _treasury, _events) = boot::boot_and_observe(config).await?;
+    let (vm, outcome, _treasury, _events, _serve_guard) = boot::boot_and_observe(config).await?;
 
     // The G1 verdict: the VM reached Running AND the boot hello round-trip
     // landed. Print a clear evidence line for the verifier.

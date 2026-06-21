@@ -11,11 +11,11 @@
 //!    restore path), skipping born.
 //! 5. Boot the agent in the sandbox via the selected backend (the existing boot
 //!    path; backend chosen by platform).
-//! 6. Run the v0 workload (presence + heartbeat; the agent alive). The agent runs a
-//!    trivial metered loop so metering has something to meter (die-when-broke is
-//!    exercisable).
+//! 6. Run the v0 app-checkpoint workload. It submits a portable logical checkpoint
+//!    for resume, then stays alive while the host-authoritative meter charges VM
+//!    time. The daemon continues fleet presence on the host side.
 //! 7. Meter; on budget exhaustion HALT (the existing budget-death path) and emit a
-//!    9100 `died`. Clean shutdown also emits `died`.
+//!    9100 `died` with reason `broke`. Clean shutdown emits an honest stop reason.
 //!
 //! A sovereign node is its OWN single agent: it does NOT join a Raft voter set, so
 //! there is no cluster orchestration here. The 9100 lifecycle is the single-agent
@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::checkpoint::{CheckpointArtifact, CheckpointStore, LocalDirCheckpointStore};
-use crate::config::{KirbyConfig, ResolvedBackend, RunMode};
+use crate::config::{GenomeImage, KirbyConfig, ResolvedBackend, RunMode};
 use crate::nerve::{self, NodeIdentity, PresenceConfig};
 
 /// The default metering tick for the v0 workload's die-when-broke path.
@@ -58,9 +58,25 @@ const DEFAULT_HELLO_TIMEOUT: Duration = Duration::from_secs(40);
 pub enum Lifecycle {
     /// Emitted once when a bootstrap agent boots (reason "funded").
     Born,
-    /// Emitted once when the agent's budget is exhausted or it shuts down (reason
-    /// "broke").
-    Died,
+    /// Emitted once when the agent's budget is exhausted or it shuts down.
+    Died(DeathReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeathReason {
+    /// Budget exhausted.
+    Broke,
+    /// Clean stop or safety ceiling before budget exhaustion.
+    Stopped,
+}
+
+impl DeathReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            DeathReason::Broke => "broke",
+            DeathReason::Stopped => "stopped",
+        }
+    }
 }
 
 /// The reason a run ended.
@@ -117,7 +133,10 @@ impl RunAgentOutcome {
     /// G-run-3 (resume): a resume run restored the agent and observed the restore,
     /// without emitting a born (resume is continue, not birth).
     pub fn resume_passed(&self) -> bool {
-        self.mode == RunMode::Resume && self.reached_running && self.restore_seen && !self.born_emitted
+        self.mode == RunMode::Resume
+            && self.reached_running
+            && self.restore_seen
+            && !self.born_emitted
     }
 }
 
@@ -171,6 +190,7 @@ impl RunAgentConfig {
     pub fn from_config(config: KirbyConfig) -> anyhow::Result<Self> {
         config.validate()?;
         let image_dir = config.genome_image.resolve_local_dir()?;
+        GenomeImage::validate_local_arch(&image_dir, config.resolved_backend())?;
         let checkpoint_dir = config
             .identity
             .treasury_dir()
@@ -251,7 +271,7 @@ async fn emit_lifecycle(
 ) -> bool {
     let (event, reason) = match which {
         Lifecycle::Born => ("born", "funded"),
-        Lifecycle::Died => ("died", "broke"),
+        Lifecycle::Died(reason) => ("died", reason.as_str()),
     };
     match nerve::publish_lifecycle(
         identity,
@@ -272,9 +292,9 @@ async fn emit_lifecycle(
     }
 }
 
-/// The genome [`BootConfig`] for the v0 agent, shared by bootstrap and resume. The
-/// v0 workload is a trivial metered loop ("burn") so metering has something to meter
-/// and die-when-broke is exercisable; `restore_checkpoint` is set for resume.
+/// The genome [`BootConfig`] for the v0 agent, shared by bootstrap and resume.
+/// `workload` is the real genome workload from `kirby.toml`; `restore_checkpoint`
+/// is set for resume.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn agent_boot_config(
     run: &RunAgentConfig,
@@ -295,10 +315,7 @@ fn agent_boot_config(
         vcpu_count: run.vcpu_count,
         mem_size_mib: run.mem_size_mib,
         hello_timeout: run.hello_timeout,
-        // v0 = a trivial metered loop so die-when-broke is exercisable. The "burn"
-        // workload spins CPU + touches memory so the host meter reads real usage and
-        // the budget-death halt trips (the same workload the G2 meter path uses).
-        workload: Some("burn".to_string()),
+        workload: Some(cfg.workload.genome_workload().to_string()),
         // Sovereign single-agent v0 is vsock-only (no TAP egress lockdown; that is
         // the C-5 lane). The membrane still holds structurally (no guest network).
         lockdown_egress: false,
@@ -362,10 +379,10 @@ async fn run_bootstrap(
     // 9100 born (reason "funded") at this funding milestone.
     let born_emitted = emit_lifecycle(identity, &run.config, Lifecycle::Born, funding).await;
 
-    // 5-7. Boot the agent, run the v0 metered workload, and halt on exhaustion. The
-    // metered run boots the agent through the selected backend, attaches the host
-    // meter, and pauses-then-kills the VM when cumulative burn reaches the budget
-    // (die-when-broke), recording Terminated{budget_exhausted}.
+    // 5-7. Boot the agent, run the v0 metered workload, persist the checkpoint it
+    // submits, and halt on exhaustion. The metered run boots the agent through the
+    // selected backend, attaches the host meter, and pauses-then-kills the VM when
+    // cumulative burn reaches the budget.
     let boot = agent_boot_config(run, None)?;
     let metered = MeteredRunConfig {
         boot,
@@ -374,14 +391,40 @@ async fn run_bootstrap(
     };
     let outcome = metered_run::run(metered).await?;
 
+    if run.config.workload.submits_checkpoint() {
+        let checkpoint = outcome.latest_checkpoint.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "bootstrap: workload {} did not submit an app checkpoint; resume would have no state",
+                run.config.workload.genome_workload()
+            )
+        })?;
+        let store = LocalDirCheckpointStore::new(run.checkpoint_dir.clone());
+        let reference = store.put(&checkpoint)?;
+        tracing::info!(
+            sha256 = %reference.sha256,
+            len = reference.len,
+            dir = %run.checkpoint_dir.display(),
+            "bootstrap: stored app checkpoint for future resume"
+        );
+    }
+
     let end_reason = match outcome.terminated {
         Terminated::BudgetExhausted => EndReason::BudgetExhausted,
         Terminated::Stopped => EndReason::Stopped,
     };
 
-    // 7/8. Death (budget exhaustion) OR clean stop both emit a 9100 died (reason
-    // "broke", treasury 0): the agent is gone.
-    let died_emitted = emit_lifecycle(identity, &run.config, Lifecycle::Died, 0).await;
+    let (death_reason, lifecycle_treasury) = match end_reason {
+        EndReason::BudgetExhausted => (DeathReason::Broke, 0),
+        EndReason::Stopped => (DeathReason::Stopped, outcome.remaining_at_halt),
+        EndReason::Resumed => unreachable!("bootstrap cannot end as resumed"),
+    };
+    let died_emitted = emit_lifecycle(
+        identity,
+        &run.config,
+        Lifecycle::Died(death_reason),
+        lifecycle_treasury,
+    )
+    .await;
 
     Ok(RunAgentOutcome {
         npub,
@@ -424,7 +467,7 @@ async fn run_resume(
     // already lived, it is continuing). The genome rehydrates the logical state and
     // reports a restore-seen event.
     let boot = agent_boot_config(run, Some(checkpoint.clone()))?;
-    let (vm, outcome, _treasury, mut events) = boot::boot_and_observe(boot).await?;
+    let (vm, outcome, _treasury, mut events, _serve_guard) = boot::boot_and_observe(boot).await?;
     if !outcome.reached_running {
         vm.halt().await;
         anyhow::bail!("resume: agent did not reach Running");
@@ -438,7 +481,13 @@ async fn run_resume(
     // A resume run ends as "continue", not a budget-death, so it emits died only on
     // its own clean shutdown here (the agent is being torn down at the end of this
     // demonstration run).
-    let died_emitted = emit_lifecycle(identity, &run.config, Lifecycle::Died, 0).await;
+    let died_emitted = emit_lifecycle(
+        identity,
+        &run.config,
+        Lifecycle::Died(DeathReason::Stopped),
+        run.config.funding.initial_sats,
+    )
+    .await;
 
     Ok(RunAgentOutcome {
         npub,
@@ -488,8 +537,8 @@ fn latest_stored_checkpoint(dir: &std::path::Path) -> anyhow::Result<CheckpointA
             newest = Some((modified, reference));
         }
     }
-    let (_, reference) =
-        newest.ok_or_else(|| anyhow::anyhow!("resume: checkpoint store {} is empty", dir.display()))?;
+    let (_, reference) = newest
+        .ok_or_else(|| anyhow::anyhow!("resume: checkpoint store {} is empty", dir.display()))?;
     Ok(store.get(&reference)?)
 }
 
@@ -534,14 +583,35 @@ pub async fn run(_run: RunAgentConfig) -> anyhow::Result<RunAgentOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Backend, FundingConfig, GenomeImage, IdentityConfig, RelayConfig, Workload};
+    use crate::config::{
+        Backend, FundingConfig, GenomeImage, IdentityConfig, RelayConfig, Workload,
+    };
     use std::path::PathBuf;
 
+    fn test_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("kirby-run-test-{}", std::process::id()));
+        let image = root.join("img");
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::write(
+            image.join("manifest.env"),
+            format!(
+                "arch={}\n",
+                match Backend::auto_for_host() {
+                    ResolvedBackend::Vz => "aarch64",
+                    ResolvedBackend::Firecracker => "x86_64",
+                }
+            ),
+        )
+        .unwrap();
+        root
+    }
+
     fn test_config(mode: RunMode) -> KirbyConfig {
+        let root = test_root();
         KirbyConfig {
             identity: IdentityConfig {
-                key_path: PathBuf::from("/tmp/kirby-run-test/node.key"),
-                treasury_dir: Some(PathBuf::from("/tmp/kirby-run-test")),
+                key_path: root.join("node.key"),
+                treasury_dir: Some(root.clone()),
             },
             relay: RelayConfig {
                 url: "ws://127.0.0.1:7777".to_string(),
@@ -549,8 +619,8 @@ mod tests {
                 presence_stale_after_secs: 45,
             },
             backend: Backend::Auto,
-            genome_image: GenomeImage::Path(PathBuf::from("/tmp/kirby-run-test/img")),
-            workload: Workload::Presence,
+            genome_image: GenomeImage::Path(root.join("img")),
+            workload: Workload::AppCheckpoint,
             mode,
             funding: FundingConfig {
                 initial_sats: 3_000,
@@ -563,14 +633,11 @@ mod tests {
     #[test]
     fn run_config_resolves_local_image_and_defaults() {
         let run = RunAgentConfig::from_config(test_config(RunMode::Bootstrap)).unwrap();
-        assert_eq!(run.image_dir, PathBuf::from("/tmp/kirby-run-test/img"));
+        assert!(run.image_dir.ends_with("img"));
         assert_eq!(run.meter_tick, DEFAULT_METER_TICK);
         assert_eq!(run.vcpu_count, DEFAULT_VCPU);
         // The checkpoint dir lives under the treasury dir, keyed by the agent id.
-        assert_eq!(
-            run.checkpoint_dir,
-            PathBuf::from("/tmp/kirby-run-test/checkpoints-agent-0")
-        );
+        assert!(run.checkpoint_dir.ends_with("checkpoints-agent-0"));
     }
 
     #[test]

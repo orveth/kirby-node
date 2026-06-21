@@ -5,9 +5,9 @@
 # Takes a node from nothing to a live sovereign Kirby agent in the Nostr fleet:
 # load-or-mint identity, join the fleet (presence + heartbeat + 9100 lifecycle),
 # bootstrap (fund to born) or resume (restore from the latest checkpoint), boot the
-# agent in the sandbox, run the v0 workload (present + heartbeat), meter, die when
-# broke. A teammate normally edits just identity.key_path, relay.url, and
-# genome_image; everything else defaults.
+# agent in the sandbox, run the v0 checkpoint-aware workload, meter, die when
+# broke. A teammate normally edits identity.key_path, relay.url, genome_image, and
+# the state paths; everything else defaults.
 #
 # NOTE: top-level scalar keys (backend, genome_image, workload, mode, agent_id,
 # node_id) MUST appear BEFORE any [table] header, per TOML rules.
@@ -20,13 +20,14 @@ backend = "auto"
 
 # The genome image to boot. Use a local image directory (the
 # `nix build .#genome-image` output, holding vmlinux + rootfs.squashfs):
-genome_image = { path = "/var/lib/kirby/genome-image" }
+genome_image = { path = "./.kirby/genome-image" }
 # A prebuilt-artifact URL to fetch + cache is planned (not yet implemented):
 # genome_image = { url = "https://example.com/kirby-genome-arm64.tar" }
 
-# The v0 workload: present + heartbeat (the agent boots and the daemon beacons the
-# relay). Earn workloads are the layer after this milestone.
-workload = "presence"
+# The v0 workload: the genome submits an app checkpoint for future resume, then
+# stays alive while the host meter charges VM time. Fleet presence is published by
+# the daemon on the host side. Earn workloads are the layer after this milestone.
+workload = "app-checkpoint"
 
 # bootstrap = fund to born (first run); resume = restore from the latest checkpoint.
 mode = "bootstrap"
@@ -39,9 +40,9 @@ node_id  = "node-1"
 [identity]
 # This node's BIP340 Nostr secret key. Minted (0600) on first run, loaded after, so
 # the node keeps the SAME npub across restarts. May be a file or a directory.
-key_path = "/var/lib/kirby/node.nostr.key"
+key_path = "./.kirby/state/node.nostr.key"
 # The persisted, daemon-owned treasury directory (defaults to key_path's parent).
-treasury_dir = "/var/lib/kirby/treasury"
+treasury_dir = "./.kirby/state/treasury"
 
 [relay]
 # The fleet relay websocket URL (ws:// or wss://).

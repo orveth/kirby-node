@@ -193,7 +193,7 @@ pub async fn run(
     // Boot with the real rail injected; keep the event stream so we can read the
     // genome's brokered-act result. The returned treasury is the daemon-owned
     // counter the gateway debits (D-9).
-    let (vm, outcome, treasury, mut events) =
+    let (vm, outcome, treasury, mut events, _serve_guard) =
         boot::boot_and_observe_with_rail(config.boot, rail).await?;
     if !outcome.reached_running {
         vm.halt().await;
