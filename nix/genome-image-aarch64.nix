@@ -77,13 +77,17 @@ let
   };
 
   # The binutils for the aarch64 cross (the musl cross set, consistent with the
-  # genome). The image-bundle below strips the guest vmlinux, which is an aarch64
-  # ELF, so it MUST use the aarch64-targeting strip: the host (x86_64) binutils
-  # strip is single-target and rejects an aarch64 ELF ("Unable to recognise the
-  # format of the input file"). This is the one place the arm64 image build needs
-  # a target-aware tool the x86 image got from the plain host binutils.
+  # genome). The image-bundle below runs objcopy on the guest vmlinux, which is an
+  # aarch64 ELF, so it MUST use the aarch64-targeting objcopy: the host (x86_64)
+  # binutils objcopy is single-target and rejects an aarch64 ELF ("Unable to
+  # recognise the format of the input file"). This is the one place the arm64 image
+  # build needs a target-aware tool the x86 image got from the plain host binutils.
   aarch64Bintools = muslPkgs.stdenv.cc.bintools.bintools;
-  aarch64Strip = "${aarch64Bintools}/bin/${muslPkgs.stdenv.cc.targetPrefix}strip";
+  # objcopy -O binary turns the vmlinux ELF into a raw arm64 `Image`: the PT_LOAD
+  # segments laid out by paddr into a flat binary, dropping the non-loadable
+  # debug/symbol sections. This is the exact transform the VZ backend used to do at
+  # boot, moved to build time so the shipped image is ready-to-boot.
+  aarch64Objcopy = "${aarch64Bintools}/bin/${muslPkgs.stdenv.cc.targetPrefix}objcopy";
 
   # The whole workspace is the source (the genome depends on kirby-proto). Filter
   # to the inputs that affect the build so unrelated edits do not change the
@@ -183,16 +187,16 @@ let
         -no-progress
     '';
 
-  # The image output carries the uncompressed vmlinux ELF. VZLinuxBootLoader
-  # actually boots a raw arm64 `Image`; the macOS backend derives that from the
-  # ELF PT_LOAD segments at boot until this derivation exports Image directly.
-  # nixpkgs installs vmlinux into the kernel's dev output for every arch when
-  # CONFIG_MODULES=y (build.nix `cp vmlinux $dev/`); module support stays enabled
-  # (see the kernel file), so this path exists on aarch64 exactly as on x86. The
-  # dev output's vmlinux carries debug info; the image build strips it (a stripped
-  # guest kernel, spec 3.6) so the image is small. strip removes only the symbol
-  # and debug sections; the PT_LOAD segments the backend conversion uses are
-  # untouched.
+  # The source kernel is the uncompressed vmlinux ELF from the kernel's dev output
+  # (nixpkgs installs it for every arch when CONFIG_MODULES=y, build.nix
+  # `cp vmlinux $dev/`; module support stays enabled, see the kernel file, so this
+  # path exists on aarch64 exactly as on x86). The image-bundle below does NOT ship
+  # this ELF: VZLinuxBootLoader (and Firecracker-aarch64) boot a raw arm64 `Image`,
+  # so the bundle runs objcopy -O binary to export the raw Image directly (which
+  # also drops the debug/symbol sections, so the result is small). The bundle file
+  # is still named `vmlinux` (the daemon reads that fixed filename), but its content
+  # is now the raw Image, not the ELF, so the VZ backend's at-boot ELF-to-raw
+  # conversion no-ops (the bytes are already raw).
   vmlinux = "${kernel.dev}/vmlinux";
 
 in
@@ -203,13 +207,23 @@ pkgs.runCommand "kirby-genome-image-aarch64"
   }
   ''
     mkdir -p "$out"
-    # Strip the guest kernel (drop debug and symbol sections; loadable segments
-    # are preserved so the VZ boot loader still boots it). The vmlinux is an
-    # aarch64 ELF, so the AARCH64 cross strip is used (the host x86_64 strip is
-    # single-target and rejects an aarch64 ELF). aarch64Strip resolves to the
-    # cross binutils strip provided on nativeBuildInputs above.
-    ${aarch64Strip} -s -o "$out/vmlinux" ${vmlinux}
+    # Export the guest kernel as a raw arm64 `Image` (NOT the ELF): objcopy -O
+    # binary lays the PT_LOAD segments out by paddr into a flat binary, dropping
+    # non-loadable debug/symbol sections. The result is the bytes VZLinuxBootLoader
+    # / Firecracker-aarch64 boot directly, so the daemon does no at-boot conversion.
+    # The AARCH64 cross objcopy is used (the host x86_64 objcopy rejects an aarch64
+    # ELF); it is provided on nativeBuildInputs above. The output file keeps the
+    # name `vmlinux` (the daemon reads that fixed filename) though its content is
+    # now the raw Image.
+    ${aarch64Objcopy} -O binary ${vmlinux} "$out/vmlinux"
     cp ${rootfs} "$out/rootfs.squashfs"
+    # The copy inherits the read-only mode of the nix-store source, so make it
+    # writable for the pad below (nix re-seals the store path read-only afterward).
+    chmod u+w "$out/rootfs.squashfs"
+    # VZ's disk attachment requires the rootfs file size to be a multiple of the
+    # 512-byte block size; pad it up here (squashfs records its real size in the
+    # superblock and ignores the zero tail) so the daemon does no at-boot padding.
+    truncate -s %512 "$out/rootfs.squashfs"
 
     # A manifest the daemon reads to locate the boot artifacts without hardcoding
     # nix store paths. Plain key=value lines, no timestamps, so it stays
