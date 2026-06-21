@@ -100,7 +100,8 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
 
     // Boot the VM and serve the gateway (C-2 path); get the shared treasury so
     // the meter debits the SAME counter the gateway uses (D-9).
-    let (vm, outcome, treasury, _events) = boot::boot_and_observe(config.boot).await?;
+    let (vm, outcome, treasury, _events, _serve_guard) =
+        boot::boot_and_observe(config.boot).await?;
     if !outcome.reached_running {
         vm.halt().await;
         anyhow::bail!("metered run: VM did not reach Running");

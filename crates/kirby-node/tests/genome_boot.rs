@@ -53,8 +53,9 @@ async fn g1_genome_boots_and_completes_session_context_round_trip() {
         restore_checkpoint: None,
     };
 
-    let (vm, outcome, _treasury, _events) = match boot::boot_and_observe(config).await {
-        Ok(triple) => triple,
+    let (vm, outcome, _treasury, _events, _serve_guard) = match boot::boot_and_observe(config).await
+    {
+        Ok(parts) => parts,
         Err(e) => panic!("boot_and_observe failed: {e:#}"),
     };
 

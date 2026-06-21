@@ -104,6 +104,33 @@ pub struct BootConfig {
 /// post-boot events (the C-5 raw-egress probe outcomes, gate G4).
 pub type EventStream = tokio::sync::mpsc::UnboundedReceiver<Event>;
 
+/// Aborts the detached gateway serve task when the run tears down. The serve task
+/// holds a `GatewayService` clone, and that clone holds a `Treasury` Arc, which
+/// holds the sled exclusive lock on the per-node treasury dir. `serve_gateway_over`
+/// is a listener loop that never returns on its own (the genome legitimately
+/// reconnects during a live run), so without this the task outlives the VM and
+/// pins the treasury lock indefinitely. A same-process resume on the same `node_id`
+/// (the G-run-3 sequence) then cannot reopen the treasury (sled `WouldBlock`).
+///
+/// Dropping this guard aborts the task; the runtime then drops the serve task's
+/// `GatewayService` (and its `Treasury` Arc), releasing the lock. The abort is
+/// asynchronous, so the next [`open_treasury_retrying`] absorbs the brief window
+/// until the dropped Arc actually frees the lock. The money / authorize-order /
+/// dedupe logic is untouched: this only ends a listener task, it never debits.
+///
+/// Bound by every caller (as `_serve_guard`) so it lives exactly as long as the
+/// run that owns the VM, then drops at run-end alongside the instance halt.
+#[must_use = "dropping the ServeGuard aborts the gateway serve task and frees the treasury lock; bind it for the run's lifetime"]
+pub struct ServeGuard {
+    handle: tokio::task::AbortHandle,
+}
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// The outcome of a boot demonstration (the G1 evidence).
 pub struct BootOutcome {
     /// The VM reached Running.
@@ -119,20 +146,48 @@ pub struct BootOutcome {
     pub checkpoints: LatestCheckpoint,
 }
 
+/// Open the daemon treasury, tolerating a transient sled exclusive-lock (the FIX-4
+/// race): when a prior holder on the same `node_id` (e.g. a just-finished bootstrap
+/// run, before a `resume` run) drops its sled handle, the OS file-descriptor reclaim
+/// can lag, so a back-to-back open occasionally races the lock. Retry ONLY on lock
+/// contention, up to `timeout`; any other error (corruption, real I/O) returns at once.
+/// Same store, balance, and dedupe ledger; only the open is retried.
+async fn open_treasury_retrying(
+    path: &std::path::Path,
+    seed_sats: u64,
+    timeout: Duration,
+) -> Result<Treasury, crate::treasury::TreasuryError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match Treasury::open(path, seed_sats) {
+            Ok(t) => return Ok(t),
+            Err(e)
+                if crate::idempotent_run::is_lock_contention(&e)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Boot the genome through the sandbox backend, serve the agnostic gateway over
 /// its vsock transport, and wait for the boot hello event (gate G1). Returns the
 /// booted instance (so the caller halts it after inspecting the outcome), the
 /// outcome, the daemon-owned treasury (so a metered run, C-4, debits the SAME
-/// counter the gateway uses, D-9), and the gateway event receiver (so the caller
+/// counter the gateway uses, D-9), the gateway event receiver (so the caller
 /// can keep reading post-boot genome events, e.g. the C-5 raw-egress probe
-/// outcomes, gate G4). On a boot failure the guest is halted here and the error
-/// is returned.
+/// outcomes, gate G4), and a [`ServeGuard`] the caller binds for the run's
+/// lifetime (its drop aborts the gateway serve task so the treasury lock is
+/// freed for a same-process resume). On a boot failure the guest is halted here
+/// and the error is returned.
 ///
 /// Uses the mock rail (the C-2/C-4/C-5 paths do no real brokered act); the C-6
 /// brokered act injects the real rail via [`boot_and_observe_with_rail`].
 pub async fn boot_and_observe(
     config: BootConfig,
-) -> anyhow::Result<(Box<dyn SandboxInstance>, BootOutcome, Treasury, EventStream)> {
+) -> anyhow::Result<(Box<dyn SandboxInstance>, BootOutcome, Treasury, EventStream, ServeGuard)> {
     boot_and_observe_with_rail(config, Arc::new(MockRail::new())).await
 }
 
@@ -148,12 +203,12 @@ pub async fn boot_and_observe(
 pub async fn boot_and_observe_with_rail(
     config: BootConfig,
     rail: Arc<dyn Rail>,
-) -> anyhow::Result<(Box<dyn SandboxInstance>, BootOutcome, Treasury, EventStream)> {
+) -> anyhow::Result<(Box<dyn SandboxInstance>, BootOutcome, Treasury, EventStream, ServeGuard)> {
     // The persisted, daemon-owned treasury (D-9). A per-node temp store keeps two
     // node processes distinct on one host. The session is the non-secret snapshot
     // the genome pulls at boot (spec 3.1).
     let treasury_path = std::env::temp_dir().join(format!("kirby-treasury-{}", config.node_id));
-    let treasury = Treasury::open(&treasury_path, config.initial_sats)?;
+    let treasury = open_treasury_retrying(&treasury_path, config.initial_sats, Duration::from_secs(5)).await?;
     let session = Session {
         task_descriptor: config.task.clone(),
         budget_sats: config.budget_sats,
@@ -216,11 +271,18 @@ pub async fn boot_and_observe_with_rail(
     // every backend; only the transport it binds is backend-specific.
     let transport = instance.gateway_transport();
     let serve_service = service.clone();
-    tokio::spawn(async move {
+    let serve_task = tokio::spawn(async move {
         if let Err(e) = serve_gateway_over(serve_service, transport).await {
             tracing::error!(error = %e, "gateway serve loop ended with error");
         }
     });
+    // The serve task holds a GatewayService clone (and thus a Treasury Arc, holding
+    // the sled lock). It is a listener loop that never returns on its own, so it
+    // must be aborted at run-end to release the lock; the ServeGuard does that on
+    // drop. The caller binds it for the run's lifetime.
+    let serve_guard = ServeGuard {
+        handle: serve_task.abort_handle(),
+    };
 
     // Wait for the genome's boot hello event (session=<task>). This is the G1
     // round-trip proof: the genome connected over vsock, pulled the session
@@ -239,7 +301,7 @@ pub async fn boot_and_observe_with_rail(
         budget_sats: config.budget_sats,
         checkpoints: service.checkpoint_handle(),
     };
-    Ok((instance, outcome, meter_treasury, events))
+    Ok((instance, outcome, meter_treasury, events, serve_guard))
 }
 
 /// Serve the agnostic [`GatewayService`] over a guest's backend-specific

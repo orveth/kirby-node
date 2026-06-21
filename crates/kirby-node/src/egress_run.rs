@@ -103,7 +103,8 @@ pub async fn run(config: EgressRunConfig) -> anyhow::Result<EgressRunOutcome> {
 
     // Boot with the TAP wired and locked down; keep the event stream so we can
     // read the genome's raw-egress probe outcomes.
-    let (vm, outcome, _treasury, mut events) = boot::boot_and_observe(config.boot).await?;
+    let (vm, outcome, _treasury, mut events, _serve_guard) =
+        boot::boot_and_observe(config.boot).await?;
     if !outcome.reached_running {
         vm.halt().await;
         anyhow::bail!("egress run: VM did not reach Running");

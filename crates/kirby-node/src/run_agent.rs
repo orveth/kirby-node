@@ -467,7 +467,7 @@ async fn run_resume(
     // already lived, it is continuing). The genome rehydrates the logical state and
     // reports a restore-seen event.
     let boot = agent_boot_config(run, Some(checkpoint.clone()))?;
-    let (vm, outcome, _treasury, mut events) = boot::boot_and_observe(boot).await?;
+    let (vm, outcome, _treasury, mut events, _serve_guard) = boot::boot_and_observe(boot).await?;
     if !outcome.reached_running {
         vm.halt().await;
         anyhow::bail!("resume: agent did not reach Running");
