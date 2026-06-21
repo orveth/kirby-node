@@ -398,6 +398,22 @@ enum Command {
         #[arg(long, default_value_t = 40)]
         post_resume_secs: u64,
     },
+    /// The fleet-MVP keystone (`kirby run`): take a node from nothing to a live
+    /// sovereign Kirby agent in the Nostr fleet, reading ONE config file
+    /// (`kirby.toml`). It loads-or-mints the node identity, joins the fleet
+    /// (presence + heartbeat), bootstraps (fund to born, emit a 9100 born) or
+    /// resumes (restore the agent from the latest checkpoint, skip born), boots the
+    /// agent in the sandbox via the config's backend (`auto` = VZ on macOS-aarch64
+    /// else Firecracker), runs the v0 workload (present + heartbeat with a trivial
+    /// metered loop), meters, and on budget exhaustion HALTS (die-when-broke) and
+    /// emits a 9100 died. A teammate edits identity + relay + genome_image in the
+    /// config and runs this; everything else defaults. This is the single-agent
+    /// sovereign-fleet path, NOT the Raft cluster.
+    Agent {
+        /// Path to the `kirby run` config file (TOML, e.g. `kirby.toml`).
+        #[arg(long, default_value = "kirby.toml")]
+        config: std::path::PathBuf,
+    },
     /// INTERNAL (not for direct use): the privileged eBPF egress-byte meter, run
     /// by the daemon through sudo (the D-7 path) because loading and attaching
     /// eBPF needs CAP_BPF the unprivileged daemon lacks. It loads the embedded TC
@@ -637,7 +653,32 @@ fn main() -> anyhow::Result<()> {
                 post_resume_secs,
             })
         }
+        Command::Agent { config } => {
+            init_tracing();
+            run_agent_cmd(config)
+        }
         Command::EbpfEgress { iface, tick_ms } => run_ebpf_egress(iface, tick_ms),
+    }
+}
+
+/// The `kirby run` keystone: load the config, then run the sovereign-agent sequence
+/// (identity, fleet-join, bootstrap-or-resume, boot, meter, die). Prints the gate
+/// evidence line. Exits non-zero if the agent never reached Running so the keeper's
+/// harness run fails loudly on a broken boot.
+#[tokio::main]
+async fn run_agent_cmd(config_path: std::path::PathBuf) -> anyhow::Result<()> {
+    use kirby_node::config::KirbyConfig;
+    use kirby_node::run_agent::{self, RunAgentConfig};
+
+    let config = KirbyConfig::load(&config_path)?;
+    tracing::info!(path = %config_path.display(), "loaded kirby run config");
+    let run = RunAgentConfig::from_config(config)?;
+    let outcome = run_agent::run(run).await?;
+    println!("{}", run_agent::evidence_line(&outcome));
+    if outcome.reached_running {
+        Ok(())
+    } else {
+        std::process::exit(1);
     }
 }
 
@@ -942,7 +983,7 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
         restore_checkpoint: None,
     };
 
-    let (vm, outcome, _treasury, _events) = boot::boot_and_observe(config).await?;
+    let (vm, outcome, _treasury, _events, _serve_guard) = boot::boot_and_observe(config).await?;
 
     // The G1 verdict: the VM reached Running AND the boot hello round-trip
     // landed. Print a clear evidence line for the verifier.

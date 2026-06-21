@@ -31,7 +31,7 @@ use anyhow::Context as _;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use kirby_proto::KIND_KIRBY_PRESENCE;
+use kirby_proto::{KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE};
 
 /// The default file name for the persisted node Nostr secret key, under the node
 /// state directory (the `--treasury-path` dir, unless `--nostr-key-path` overrides
@@ -46,6 +46,19 @@ const TAG_NODE_ID: &str = "node_id";
 /// The optional advertised-endpoint tag (informational in slice 1; all coordination
 /// is via the relay).
 const TAG_ENDPOINT: &str = "endpoint";
+/// The relay-wide discovery tag every Kirby event carries (`["t","kirby"]`), so the
+/// UI (and any consumer) can subscribe with a single `#t=kirby` filter and receive
+/// every Kirby kind. Used on the 9100 lifecycle event per the unified tag vocabulary
+/// (`plans/kirby-cluster-event-kinds-20260619.md`).
+const TAG_T: &str = "t";
+/// The discovery-tag value: every Kirby node/agent event is tagged `#t=kirby`.
+const TAG_T_KIRBY: &str = "kirby";
+/// The node-scope tag (`["node",<node_id>]`) the unified vocabulary uses. kirby-ui
+/// filters and groups by it.
+const TAG_NODE: &str = "node";
+/// The agent-scope tag (`["a",<agent_id>]`) on agent-scoped events (the 9100
+/// lifecycle event). The UI filters per-agent by it.
+const TAG_A: &str = "a";
 
 /// The node's cryptographic identity: a Nostr (secp256k1/BIP340) keypair. The npub
 /// is the node's stable cluster identity across restarts.
@@ -208,6 +221,48 @@ fn build_presence(node_id: &str, endpoint: Option<&str>) -> anyhow::Result<Event
         tags.push(Tag::parse([TAG_ENDPOINT, ep])?);
     }
     Ok(EventBuilder::new(Kind::from(KIND_KIRBY_PRESENCE), json).tags(tags))
+}
+
+/// The JSON content shape of a 9100 lifecycle event (`born`/`died`), per the unified
+/// event-kinds contract (`plans/kirby-cluster-event-kinds-20260619.md`):
+/// `{ agent_id, event, treasury_sats, reason }`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleContent {
+    /// The agent this lifecycle event is about (e.g. "agent-0").
+    pub agent_id: String,
+    /// "born" or "died".
+    pub event: String,
+    /// born: the committed initial budget; died: 0 (the treasury is exhausted).
+    pub treasury_sats: u64,
+    /// born: "funded"; died: "broke".
+    pub reason: String,
+}
+
+/// Build a 9100 `KIND_KIRBY_LIFECYCLE` [`EventBuilder`] (a REGULAR/stored event, the
+/// signed birth/death log) for `agent_id` on `node_id`, mirroring [`build_presence`]'s
+/// shape. Tags per the contract: `["t","kirby"]`, `["a",<agent_id>]`, `["node",<node_id>]`.
+/// Signed by the node key at publish time. The `event`/`treasury_sats`/`reason` are the
+/// caller's (born = funded + initial budget; died = broke + 0).
+fn build_lifecycle(
+    agent_id: &str,
+    node_id: &str,
+    event: &str,
+    treasury_sats: u64,
+    reason: &str,
+) -> anyhow::Result<EventBuilder> {
+    let content = LifecycleContent {
+        agent_id: agent_id.to_string(),
+        event: event.to_string(),
+        treasury_sats,
+        reason: reason.to_string(),
+    };
+    let json = serde_json::to_string(&content).context("serialize lifecycle content")?;
+    let tags: Vec<Tag> = vec![
+        Tag::parse([TAG_T, TAG_T_KIRBY])?,
+        Tag::parse([TAG_A, agent_id])?,
+        Tag::parse([TAG_NODE, node_id])?,
+    ];
+    Ok(EventBuilder::new(Kind::from(KIND_KIRBY_LIFECYCLE), json).tags(tags))
 }
 
 /// Decode a received presence [`Event`] into a [`PresenceRecord`], computing age +
@@ -403,6 +458,52 @@ async fn publish_presence(client: &Client, config: &PresenceConfig) {
         },
         Err(e) => tracing::error!(error = %e, "failed to build presence beacon"),
     }
+}
+
+/// Publish ONE 9100 `KIND_KIRBY_LIFECYCLE` event (a born/died milestone) to the relay,
+/// signed by this node's key, then disconnect. A one-shot connect-publish-disconnect:
+/// births and deaths are rare (not an interval cadence), so a dedicated short-lived
+/// client is the simplest correct shape and never contends with the persistent presence
+/// client. Returns the published event id on success.
+///
+/// This is the SINGLE-AGENT lifecycle path for a sovereign node: it emits `born` once
+/// on its own boot and `died` once on its own budget-death (or clean shutdown). It does
+/// NOT carry the cluster's at-most-once-across-fleet dedup (that is the Raft cluster's
+/// concern, and a sovereign node IS its own single agent on its own machine).
+///
+/// `node_id` is this node's id as the contract's `["node",X]` value. The content/tags
+/// follow the contract (`plans/kirby-cluster-event-kinds-20260619.md`): `["t","kirby"]`,
+/// `["a",<agent_id>]`, `["node",<node_id>]`, content `{ agent_id, event, treasury_sats,
+/// reason }`.
+pub async fn publish_lifecycle(
+    identity: &NodeIdentity,
+    relay_url: &str,
+    agent_id: &str,
+    node_id: &str,
+    event: &str,
+    treasury_sats: u64,
+    reason: &str,
+) -> anyhow::Result<String> {
+    let builder = build_lifecycle(agent_id, node_id, event, treasury_sats, reason)?;
+    let client = connect_client(identity, relay_url).await?;
+    let result = client
+        .send_event_builder(builder)
+        .await
+        .context("publish lifecycle event");
+    // Best-effort clean disconnect regardless of the send outcome.
+    client.disconnect().await;
+    let output = result?;
+    let id = output.val.to_hex();
+    tracing::info!(
+        agent_id,
+        node_id,
+        event,
+        treasury_sats,
+        reason,
+        event_id = %id,
+        "published 9100 lifecycle event (the signed birth/death log)"
+    );
+    Ok(id)
 }
 
 /// Fold a received presence event into the peer set, logging JOIN / REFRESH and the
@@ -720,6 +821,52 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
         assert!(record_from_event(&ev, now_unix(), Duration::from_secs(45)).is_none());
+    }
+
+    #[test]
+    fn lifecycle_event_shape_matches_the_contract() {
+        // 9100 born: tags ["t","kirby"]+["a",agent]+["node",node], content
+        // {agent_id, event, treasury_sats, reason}.
+        let keys = Keys::generate();
+        let event = build_lifecycle("agent-0", "node-1", "born", 1_000_000, "funded")
+            .unwrap()
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_eq!(event.kind, Kind::from(KIND_KIRBY_LIFECYCLE));
+        assert!(
+            event.kind.is_regular(),
+            "9100 is a REGULAR (stored) kind so the relay keeps the birth/death log"
+        );
+        let has_tag = |name: &str, val: &str| {
+            event.tags.iter().any(|t| {
+                let s = t.as_slice();
+                s.first().map(String::as_str) == Some(name)
+                    && s.get(1).map(String::as_str) == Some(val)
+            })
+        };
+        assert!(has_tag("t", "kirby"));
+        assert!(has_tag("a", "agent-0"));
+        assert!(has_tag("node", "node-1"));
+        let content: LifecycleContent = serde_json::from_str(&event.content).unwrap();
+        assert_eq!(
+            content,
+            LifecycleContent {
+                agent_id: "agent-0".to_string(),
+                event: "born".to_string(),
+                treasury_sats: 1_000_000,
+                reason: "funded".to_string(),
+            }
+        );
+
+        // 9100 died: treasury 0, reason broke.
+        let died = build_lifecycle("agent-0", "node-1", "died", 0, "broke")
+            .unwrap()
+            .sign_with_keys(&keys)
+            .unwrap();
+        let dc: LifecycleContent = serde_json::from_str(&died.content).unwrap();
+        assert_eq!(dc.event, "died");
+        assert_eq!(dc.treasury_sats, 0);
+        assert_eq!(dc.reason, "broke");
     }
 
     #[test]

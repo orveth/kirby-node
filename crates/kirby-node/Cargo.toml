@@ -26,6 +26,9 @@ anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# toml parses the `kirby run` config file (kirby.toml). Host-side only (the genome
+# never parses config), so it stays out of the musl build.
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true

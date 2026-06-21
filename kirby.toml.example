@@ -1,0 +1,57 @@
+# Example `kirby run` config (copy to `kirby.toml` and edit).
+#
+#   kirby-node agent --config kirby.toml
+#
+# Takes a node from nothing to a live sovereign Kirby agent in the Nostr fleet:
+# load-or-mint identity, join the fleet (presence + heartbeat + 9100 lifecycle),
+# bootstrap (fund to born) or resume (restore from the latest checkpoint), boot the
+# agent in the sandbox, run the v0 checkpoint-aware workload, meter, die when
+# broke. A teammate normally edits identity.key_path, relay.url, genome_image, and
+# the state paths; everything else defaults.
+#
+# NOTE: top-level scalar keys (backend, genome_image, workload, mode, agent_id,
+# node_id) MUST appear BEFORE any [table] header, per TOML rules.
+
+# Which sandbox backend to boot in:
+#   auto        -> VZ on macOS-aarch64, Firecracker on Linux (recommended)
+#   firecracker -> force Firecracker (Linux)
+#   vz          -> force Apple Virtualization (macOS)
+backend = "auto"
+
+# The genome image to boot. Use a local image directory (the
+# `nix build .#genome-image` output, holding vmlinux + rootfs.squashfs):
+genome_image = { path = "./.kirby/genome-image" }
+# A prebuilt-artifact URL to fetch + cache is planned (not yet implemented):
+# genome_image = { url = "https://example.com/kirby-genome-arm64.tar" }
+
+# The v0 workload: the genome submits an app checkpoint for future resume, then
+# stays alive while the host meter charges VM time. Fleet presence is published by
+# the daemon on the host side. Earn workloads are the layer after this milestone.
+workload = "app-checkpoint"
+
+# bootstrap = fund to born (first run); resume = restore from the latest checkpoint.
+mode = "bootstrap"
+
+# The agent id (the `["a",X]` lifecycle tag) and node label (the `["node",X]` tag
+# and presence node_id). Defaults are agent-0 / node-1.
+agent_id = "agent-0"
+node_id  = "node-1"
+
+[identity]
+# This node's BIP340 Nostr secret key. Minted (0600) on first run, loaded after, so
+# the node keeps the SAME npub across restarts. May be a file or a directory.
+key_path = "./.kirby/state/node.nostr.key"
+# The persisted, daemon-owned treasury directory (defaults to key_path's parent).
+treasury_dir = "./.kirby/state/treasury"
+
+[relay]
+# The fleet relay websocket URL (ws:// or wss://).
+url = "ws://185.18.221.222:7777"
+# Seconds between presence beacon re-publishes, and the staleness threshold.
+presence_interval_secs = 15
+presence_stale_after_secs = 45
+
+[funding]
+# Initial treasury balance in sats, seeded only on first creation (play-money for
+# the spike; real funds are gated). A resume keeps the persisted balance.
+initial_sats = 1000000

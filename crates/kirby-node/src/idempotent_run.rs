@@ -582,7 +582,7 @@ fn open_treasury_when_unlocked(
 /// folding the underlying `WouldBlock` into the message rather than the outer io kind, so the
 /// stable discriminator is that message. Any other storage error (corruption, a real I/O
 /// fault) is NOT retried.
-fn is_lock_contention(err: &crate::treasury::TreasuryError) -> bool {
+pub(crate) fn is_lock_contention(err: &crate::treasury::TreasuryError) -> bool {
     matches!(
         err,
         crate::treasury::TreasuryError::Storage(sled::Error::Io(io))

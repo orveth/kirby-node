@@ -174,6 +174,7 @@ pub mod boot;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod brokered_run;
 pub mod checkpoint;
+pub mod config;
 #[cfg(target_os = "linux")]
 pub mod egress_run;
 #[cfg(target_os = "linux")]
@@ -198,6 +199,7 @@ pub mod nosplitbrain_run;
 pub mod prereqs;
 pub mod raft_lease;
 pub mod rail;
+pub mod run_agent;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod snapshot_run;

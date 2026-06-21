@@ -28,6 +28,10 @@ clap = { version = "4.5", features = ["derive"] }
 prost = "0.13"
 tonic = "0.12"
 tonic-build = "0.12"
+# toml parses the `kirby run` config file (kirby.toml): one file from nothing to a
+# live sovereign agent. default-features keep it lean; it is daemon/host-side only
+# (the genome crate never parses config), so it does not touch the musl build.
+toml = "0.8"
 
 # openraft drives the embedded lease + no-split-brain consensus (spec 3.5, 4.3,
 # D-4, D-17, gate G8). Pinned EXACTLY: openraft is pre-1.0 and churns (spec

@@ -163,7 +163,7 @@ pub async fn run(config: AppCheckpointRunConfig) -> anyhow::Result<AppCheckpoint
     node1_boot.snapshot_capable = false;
     node1_boot.restore_checkpoint = None;
 
-    let (node1, node1_outcome, _treasury1, mut node1_events) =
+    let (node1, node1_outcome, _treasury1, mut node1_events, _node1_serve_guard) =
         boot::boot_and_observe(node1_boot).await?;
     if !node1_outcome.reached_running {
         node1.halt().await;
@@ -205,7 +205,7 @@ pub async fn run(config: AppCheckpointRunConfig) -> anyhow::Result<AppCheckpoint
     node2_boot.snapshot_capable = false;
     node2_boot.restore_checkpoint = Some(loaded.clone());
 
-    let (node2, node2_outcome, _treasury2, mut node2_events) =
+    let (node2, node2_outcome, _treasury2, mut node2_events, _node2_serve_guard) =
         boot::boot_and_observe(node2_boot).await?;
     if !node2_outcome.reached_running {
         node2.halt().await;
