@@ -119,6 +119,8 @@
           rustToolchain
           pkgs.protobuf      # protoc, for tonic-build (the vsock gateway proto)
           pkgs.pkg-config
+          pkgs.python3       # the cfg-gating lint (scripts/lint-macos-cfg.py), part
+                             # of the Linux reference gate; stdlib-only, no deps
         ];
 
         linuxBuildTools = [

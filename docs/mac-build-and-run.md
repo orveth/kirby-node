@@ -203,14 +203,35 @@ status of 0 after daemon-initiated halt.
 
 ## Linux Reference Gate
 
-This doc-only Mac PR still comes from a shared repository. Before merge, run the
-Linux reference gate on a Linux host:
+Mac changes land in a shared repository, and the recurring failure mode is a
+*cross-platform* code path that references a Linux-only symbol: it builds on Linux
+but breaks on macOS, where the Linux-gated module is `#[cfg]`'d out -- and the Linux
+CI never sees it. See `8f0ef6b`: `is_lock_contention` was reached from the
+cross-platform `boot` treasury-retry while it lived in the Linux-only
+`idempotent_run`, so a teammate's Mac build broke while Linux stayed green.
+
+Before merge, run the Linux reference gate on a Linux host (from inside `nix develop`):
 
 ```bash
-cargo check -p kirby-node --lib && cargo check -p kirby-node --bin kirby-node \
+python3 scripts/lint-macos-cfg.py \
+ && cargo check -p kirby-node --lib && cargo check -p kirby-node --bin kirby-node \
  && cargo clippy -p kirby-node --all-targets -- -D warnings \
  && cargo test -p kirby-node --tests --no-run
 ```
 
-If it cannot be run from the Mac authoring environment, leave the PR marked with
+`scripts/lint-macos-cfg.py` is the **pre-Mac cfg gate** (added to the dev shell as
+`python3`): from a Linux host it flags any reference into a Linux-only module (e.g.
+`idempotent_run`, `firecracker`, `network`) from code that also compiles on macOS,
+unless that reference is itself under a `#[cfg(target_os = "linux")]` scope. It catches
+*inline* refs, not just `use` lines -- bob's break was an inline `crate::idempotent_run::...`
+inside a cross-platform fn, which a naive grep misses. It reads the Linux-only module
+set from `lib.rs`, so it stays correct as modules are added or regated.
+
+A full macOS-target `cargo check` from Linux would catch this (and more) at compile
+time, but it is blocked on a Linux-only host: the C `-sys` crates (secp256k1-sys, ring,
+zstd-sys) cannot cross-compile their C for arm64-darwin without an Apple SDK / darwin
+cross-cc. The lint is the proportionate stand-in; the authoritative check is still a
+real macOS build (a teammate re-pulling `main`).
+
+If the gate cannot be run from the Mac authoring environment, leave the PR marked with
 that fact so keeper:kirby can run it pre-merge.
