@@ -41,6 +41,20 @@ pub enum TreasuryError {
     Corrupt(String),
 }
 
+/// True iff a treasury open error is sled's exclusive-lock contention, the transient
+/// that clears once the prior holder's handles are fully reclaimed. sled (0.34)
+/// reports a failed `flock` as `Error::Io(ErrorKind::Other, "could not acquire lock
+/// on <path>: <WouldBlock>")`, folding the underlying `WouldBlock` into the message
+/// rather than the outer io kind, so the stable discriminator is that message. Any
+/// other storage error (corruption, a real I/O fault) is NOT retried.
+pub(crate) fn is_lock_contention(err: &TreasuryError) -> bool {
+    matches!(
+        err,
+        TreasuryError::Storage(sled::Error::Io(io))
+            if io.to_string().contains("could not acquire lock")
+    )
+}
+
 /// A persisted record of one performed capability, keyed by idempotency_key.
 /// Storing the whole receipt (not just a flag) lets a resume-replay return the
 /// exact prior receipt (spec step 1, gate G9).
@@ -289,4 +303,29 @@ fn decode_u64_tx(raw: &[u8]) -> Result<u64, ConflictableTransactionError<String>
         .try_into()
         .map_err(|_| abort(format!("expected 8 bytes, got {}", raw.len())))?;
     Ok(u64::from_be_bytes(arr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_lock_contention, TreasuryError};
+
+    #[test]
+    fn lock_contention_matches_sled_lock_message() {
+        let err = TreasuryError::Storage(sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "could not acquire lock on /tmp/kirby-treasury: <WouldBlock>",
+        )));
+
+        assert!(is_lock_contention(&err));
+    }
+
+    #[test]
+    fn lock_contention_ignores_other_storage_errors() {
+        let err = TreasuryError::Storage(sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "disk is unavailable",
+        )));
+
+        assert!(!is_lock_contention(&err));
+    }
 }

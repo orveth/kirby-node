@@ -61,7 +61,7 @@ use crate::sandbox::{
     GuestImage, GuestSpec, LocalDirTransfer, RestoreSpec, SandboxBackend, SandboxInstance,
     SnapshotTransfer,
 };
-use crate::treasury::Treasury;
+use crate::treasury::{is_lock_contention, Treasury};
 
 /// Inputs for the G9 idempotent-across-resume run. Reuses the genome image; the
 /// node-1 boot, the node-2 derivation, and the same-host transfer seam mirror the
@@ -574,20 +574,6 @@ fn open_treasury_when_unlocked(
             Err(e) => return Err(e),
         }
     }
-}
-
-/// True iff a treasury open error is sled's exclusive-lock contention, the transient that
-/// clears once the prior holder's handles are fully reclaimed. sled (0.34) reports a failed
-/// `flock` as `Error::Io(ErrorKind::Other, "could not acquire lock on <path>: <WouldBlock>")`,
-/// folding the underlying `WouldBlock` into the message rather than the outer io kind, so the
-/// stable discriminator is that message. Any other storage error (corruption, a real I/O
-/// fault) is NOT retried.
-pub(crate) fn is_lock_contention(err: &crate::treasury::TreasuryError) -> bool {
-    matches!(
-        err,
-        crate::treasury::TreasuryError::Storage(sled::Error::Io(io))
-            if io.to_string().contains("could not acquire lock")
-    )
 }
 
 /// Wait for the genome's next idem outcome event of `kind` (`idem_first` /

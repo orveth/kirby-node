@@ -31,7 +31,7 @@ use crate::firecracker::FirecrackerBackend;
 use crate::gateway::{GatewayService, Session};
 use crate::rail::{MockRail, Rail};
 use crate::sandbox::{GatewayTransport, GuestImage, GuestSpec, SandboxBackend, SandboxInstance};
-use crate::treasury::Treasury;
+use crate::treasury::{is_lock_contention, Treasury};
 #[cfg(target_os = "macos")]
 use crate::vz::VzBackend;
 
@@ -161,10 +161,7 @@ async fn open_treasury_retrying(
     loop {
         match Treasury::open(path, seed_sats) {
             Ok(t) => return Ok(t),
-            Err(e)
-                if crate::idempotent_run::is_lock_contention(&e)
-                    && tokio::time::Instant::now() < deadline =>
-            {
+            Err(e) if is_lock_contention(&e) && tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             Err(e) => return Err(e),
