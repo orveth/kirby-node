@@ -311,8 +311,7 @@ mod tests {
 
     #[test]
     fn lock_contention_matches_sled_lock_message() {
-        let err = TreasuryError::Storage(sled::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        let err = TreasuryError::Storage(sled::Error::Io(std::io::Error::other(
             "could not acquire lock on /tmp/kirby-treasury: <WouldBlock>",
         )));
 
@@ -321,8 +320,7 @@ mod tests {
 
     #[test]
     fn lock_contention_ignores_other_storage_errors() {
-        let err = TreasuryError::Storage(sled::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        let err = TreasuryError::Storage(sled::Error::Io(std::io::Error::other(
             "disk is unavailable",
         )));
 
