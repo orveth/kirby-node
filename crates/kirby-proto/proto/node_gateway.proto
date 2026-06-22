@@ -97,6 +97,24 @@ message PaidHttp {
   uint64 max_cost_sats = 4;    // covers a generic paid service or L402
 }
 
+// A chat message, structured so the GENOME never builds JSON (brain-stub F5). prost
+// handles the wire; the daemon assembles the OpenAI request JSON from these (the
+// RoutstrBrain does later; the StubBrain assembles nothing real).
+message ChatMessage {
+  string role    = 1;          // "system" | "user" | "assistant"
+  string content = 2;
+}
+
+// The brain act (brain-stub): a brokered LLM completion. The genome never speaks
+// OpenAI HTTP; the daemon proxies to the inference backend, pays, and returns the
+// model's reply text. Stub-first behind a BrainBackend trait (StubBrain now,
+// RoutstrBrain later, same wire).
+message Completion {
+  string   model        = 1;   // e.g. "anthropic/claude-sonnet-4.6"
+  repeated ChatMessage messages = 2;   // structured (NOT bytes json) -- genome stays dep-free
+  uint64   max_cost_sats = 3;  // per-call budget cap (the estimate the gate enforces)
+}
+
 message CapabilityRequest {
   uint32 schema_version = 1;
   string idempotency_key = 2;  // genome-chosen; the daemon dedupes on it (replay safety across a resume)
@@ -104,6 +122,7 @@ message CapabilityRequest {
     PayInvoice  pay_invoice  = 3;
     SettleEcash settle_ecash = 4;
     PaidHttp    paid_http    = 5;
+    Completion  completion   = 7;   // brain act -- field 7, NOT 6 (budget_sats holds 6; oneof + sibling fields share one number space)
   }
   uint64 budget_sats = 6;      // max the genome authorizes for THIS act; must be <= remaining treasury
 }
@@ -137,4 +156,8 @@ message CapabilityReceipt {
   uint64 cost_sats = 3;          // actual metered cost debited (0 on any DENIED)
   uint64 treasury_remaining = 4; // authoritative post-debit balance, daemon-owned
   bytes proof = 5;               // opaque act receipt (ecash proof, LN preimage, or HTTP status and body hash)
+  bytes completion = 6;          // brain-stub: the assistant reply TEXT, populated only for a Completion act.
+                                 // These are the words the brain needs back to keep thinking; empty for every
+                                 // other act. Returned verbatim on a DUPLICATE_IGNORED replay too (the ledger
+                                 // persists it), so a post-resume re-issue gets the same words, not just the proof.
 }

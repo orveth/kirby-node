@@ -300,13 +300,16 @@ impl GatewayService {
 
         // STEP 1: dedupe on idempotency_key. A re-issue of an already-performed
         // key returns the stored receipt and performs nothing (resume-replay
-        // safety, spec 4.2 idempotent-across-resume, gate G9).
+        // safety, spec 4.2 idempotent-across-resume, gate G9). For a Completion the
+        // stored `completion` rides back too (brain-stub R1), so a post-resume
+        // re-issue gets the SAME assistant words, not just the proof.
         if let Some(prior) = self.treasury.lookup(&req.idempotency_key)? {
             return Ok(receipt(
                 Outcome::DuplicateIgnored,
                 prior.cost_sats,
                 prior.treasury_remaining_after,
                 prior.proof,
+                prior.completion,
             ));
         }
 
@@ -335,10 +338,15 @@ impl GatewayService {
 
         // STEP 4: perform. The daemon performs via the host-held credential the
         // genome never sees. D-20: the actual spend is capped at the estimate,
-        // so actual <= estimate <= treasury_remaining even after the act.
+        // so actual <= estimate <= treasury_remaining even after the act. For a
+        // Completion the rail also returns the assistant reply TEXT (brain-stub).
         let performed = self.rail.perform(act, estimate).await;
-        let (actual_cost, proof) = match performed {
-            RailOutcome::Performed { actual_cost, proof } => (actual_cost, proof),
+        let (actual_cost, proof, completion) = match performed {
+            RailOutcome::Performed {
+                actual_cost,
+                proof,
+                completion,
+            } => (actual_cost, proof, completion),
             RailOutcome::UpstreamFailed => {
                 // The act did not happen; debit nothing.
                 return Ok(denied(Outcome::UpstreamFailed, remaining));
@@ -347,11 +355,15 @@ impl GatewayService {
 
         // STEP 5: meter + debit actual atomically with recording the receipt
         // (spec 4.2 atomic debit+receipt). The debit is keyed by idempotency_key
-        // so the record is the dedupe entry future replays match.
-        match self
-            .treasury
-            .debit_and_record(&req.idempotency_key, actual_cost, proof.clone())?
-        {
+        // so the record is the dedupe entry future replays match. The Completion
+        // reply text is persisted alongside the proof so a replay returns it
+        // verbatim (brain-stub R1).
+        match self.treasury.debit_and_record(
+            &req.idempotency_key,
+            actual_cost,
+            proof.clone(),
+            completion.clone(),
+        )? {
             DebitOutcome::Debited {
                 cost_sats,
                 remaining,
@@ -360,15 +372,18 @@ impl GatewayService {
                 cost_sats,
                 remaining,
                 proof,
+                completion,
             )),
             // A concurrent request performed this key first: return its stored
             // receipt (the act we just did on the rail is the same idempotent
-            // act; the dedupe key collapses them to one debit, G9).
+            // act; the dedupe key collapses them to one debit, G9). The stored
+            // completion rides back too (brain-stub R1).
             DebitOutcome::Duplicate(prior) => Ok(receipt(
                 Outcome::DuplicateIgnored,
                 prior.cost_sats,
                 prior.treasury_remaining_after,
                 prior.proof,
+                prior.completion,
             )),
             // Defense-in-depth: the estimate gate already refused over-treasury
             // spends, and the actual is capped at that estimate, so this is
@@ -524,12 +539,15 @@ impl NodeGateway for GatewayService {
     }
 }
 
-/// Build a receipt with the standard schema version.
+/// Build a receipt with the standard schema version. `completion` is the assistant
+/// reply TEXT for a Completion act (brain-stub), empty for every other act and every
+/// denial.
 fn receipt(
     outcome: Outcome,
     cost_sats: u64,
     treasury_remaining: u64,
     proof: Vec<u8>,
+    completion: Vec<u8>,
 ) -> CapabilityReceipt {
     CapabilityReceipt {
         schema_version: kirby_proto::SCHEMA_VERSION,
@@ -537,12 +555,14 @@ fn receipt(
         cost_sats,
         treasury_remaining,
         proof,
+        completion,
     }
 }
 
-/// A DENIED receipt: cost 0, no proof, the current (unchanged) treasury balance.
+/// A DENIED receipt: cost 0, no proof, no completion, the current (unchanged)
+/// treasury balance.
 fn denied(outcome: Outcome, treasury_remaining: u64) -> CapabilityReceipt {
-    receipt(outcome, 0, treasury_remaining, Vec::new())
+    receipt(outcome, 0, treasury_remaining, Vec::new(), Vec::new())
 }
 
 /// Map a host-side treasury fault to a gRPC internal error. Genome-driven

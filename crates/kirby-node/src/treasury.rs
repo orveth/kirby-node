@@ -64,11 +64,20 @@ pub(crate) fn is_lock_contention(err: &TreasuryError) -> bool {
 /// A persisted record of one performed capability, keyed by idempotency_key.
 /// Storing the whole receipt (not just a flag) lets a resume-replay return the
 /// exact prior receipt (spec step 1, gate G9).
+///
+/// `completion` (brain-stub R1) holds the assistant reply TEXT for a Completion act
+/// (empty for every other act), so a post-resume `DUPLICATE_IGNORED` replay returns
+/// the WORDS the brain needs, not just the proof. It is `#[serde(default)]` so an
+/// OLD-shape record (the `{cost_sats, treasury_remaining_after, proof}` rows already
+/// persisted in sled before this field existed) still deserializes on resume -- it
+/// decodes with an empty completion, never a decode error.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PerformedRecord {
     pub cost_sats: u64,
     pub treasury_remaining_after: u64,
     pub proof: Vec<u8>,
+    #[serde(default)]
+    pub completion: Vec<u8>,
 }
 
 /// The daemon-owned treasury. Cheap to clone (an `Arc` over the sled handles),
@@ -221,6 +230,7 @@ impl Treasury {
         key: &str,
         cost_sats: u64,
         proof: Vec<u8>,
+        completion: Vec<u8>,
     ) -> Result<DebitOutcome, TreasuryError> {
         let key_bytes = key.as_bytes();
         let record_json = serde_json::to_vec(&PerformedRecord {
@@ -228,6 +238,10 @@ impl Treasury {
             // placeholder; the real post-debit balance is written inside the txn
             treasury_remaining_after: 0,
             proof: proof.clone(),
+            // The assistant reply TEXT for a Completion act (empty otherwise), so a
+            // resume-replay returns the words verbatim (brain-stub R1). The txn
+            // re-decodes the WHOLE record below, so this rides through unchanged.
+            completion,
         })
         .map_err(|e| TreasuryError::Corrupt(format!("encode record: {e}")))?;
 

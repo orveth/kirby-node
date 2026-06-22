@@ -29,18 +29,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use kirby_proto::capability_request::Act;
+use kirby_proto::ChatMessage;
+
+/// The fixed allowlist sentinel for a [`Act::Completion`] (brain-stub R2). The
+/// allowlist step calls the free fn [`destination`] (it has no `[brain]`/
+/// `CompositeRail` access, and a Completion has no endpoint field), so the
+/// brain's "destination" is this constant. A brain-mode gateway allowlists
+/// EXACTLY this string. The real `RoutstrBrain` (later) maps the sentinel to its
+/// pinned host INSIDE the backend, so this destination/allowlist API never
+/// changes when the real backend swaps in.
+pub const BRAIN_COMPLETION_DESTINATION: &str = "brain.completion";
 
 /// The allowlist key for an act: the destination the daemon would reach. The
 /// gateway allowlist step (spec step 2) matches this against its static set.
 /// For a BOLT11 invoice the "destination" is the node it pays; the spike does
 /// not parse BOLT11, so the invoice string itself is the key (the allowlist
 /// holds the exact invoice or its node id as configured). For ecash it is the
-/// mint id; for paid HTTP it is the URL host.
+/// mint id; for paid HTTP it is the URL host. A Completion has no endpoint field,
+/// so its destination is the fixed [`BRAIN_COMPLETION_DESTINATION`] sentinel
+/// (brain-stub R2).
 pub fn destination(act: &Act) -> String {
     match act {
         Act::PayInvoice(p) => p.bolt11.clone(),
         Act::SettleEcash(s) => s.mint_id.clone(),
         Act::PaidHttp(h) => host_of(&h.url),
+        Act::Completion(_) => BRAIN_COMPLETION_DESTINATION.to_string(),
     }
 }
 
@@ -70,6 +83,9 @@ pub fn act_max_sats(act: &Act) -> Option<u64> {
         Act::PayInvoice(p) => Some(p.max_fee_sats),
         Act::PaidHttp(h) => Some(h.max_cost_sats),
         Act::SettleEcash(_) => None,
+        // The Completion's per-call cap IS its estimate (brain-stub R5): the LLM
+        // cost is unknown pre-call, so the genome-declared cap bounds it.
+        Act::Completion(c) => Some(c.max_cost_sats),
     }
 }
 
@@ -78,8 +94,15 @@ pub enum RailOutcome {
     /// The act was performed; `actual_cost` is what to debit (already capped at
     /// `cap_sats`, D-20) and `proof` is the rail's own receipt (ecash settle
     /// preimage, LN preimage, HTTP status+body hash; possibly empty for non-rail,
-    /// D-18).
-    Performed { actual_cost: u64, proof: Vec<u8> },
+    /// D-18). `completion` is the assistant reply TEXT for a [`Act::Completion`]
+    /// (brain-stub), empty for every other act -- it is the words the brain needs
+    /// back, plumbed into `CapabilityReceipt.completion` and persisted in the
+    /// ledger so a resume-replay returns it verbatim.
+    Performed {
+        actual_cost: u64,
+        proof: Vec<u8>,
+        completion: Vec<u8>,
+    },
     /// The upstream rail failed; nothing was spent (the gateway debits 0 and
     /// returns UPSTREAM_FAILED).
     UpstreamFailed,
@@ -158,11 +181,13 @@ impl MockRail {
 impl Rail for MockRail {
     fn estimate(&self, act: &Act) -> u64 {
         // The mock's estimate is the act's intrinsic amount: the ecash amount,
-        // or the genome's declared per-act max for the fee-bearing acts.
+        // or the genome's declared per-act max for the fee-bearing acts (and the
+        // Completion's per-call cap, brain-stub R5).
         match act {
             Act::SettleEcash(s) => s.amount,
             Act::PayInvoice(p) => p.max_fee_sats,
             Act::PaidHttp(h) => h.max_cost_sats,
+            Act::Completion(c) => c.max_cost_sats,
         }
     }
 
@@ -175,7 +200,10 @@ impl Rail for MockRail {
         // D-20: never spend past the cap, even if the rail overshoots.
         let actual_cost = natural.min(cap_sats);
         let proof = format!("mock-receipt:{}:cost={actual_cost}", destination(act)).into_bytes();
-        RailOutcome::Performed { actual_cost, proof }
+        // The mock is not a brain; a Completion on it carries no reply text (a
+        // brain-mode run uses CompositeRail, which routes Completion to the
+        // BrainBackend, never to this mock base).
+        RailOutcome::Performed { actual_cost, proof, completion: Vec::new() }
     }
 }
 
@@ -323,6 +351,7 @@ impl Rail for CdkEcashRail {
             Act::SettleEcash(s) => s.amount,
             Act::PayInvoice(p) => p.max_fee_sats,
             Act::PaidHttp(h) => h.max_cost_sats,
+            Act::Completion(c) => c.max_cost_sats,
         }
     }
 
@@ -366,10 +395,173 @@ impl Rail for CdkEcashRail {
                     spent = actual_cost,
                     "brokered act PERFORMED: settled ecash on the local mint over host networking (receipt = mint preimage)"
                 );
-                RailOutcome::Performed { actual_cost, proof: preimage }
+                RailOutcome::Performed { actual_cost, proof: preimage, completion: Vec::new() }
             }
             Err(e) => {
                 tracing::error!(error = %e, "brokered ecash settle failed upstream; debiting nothing");
+                RailOutcome::UpstreamFailed
+            }
+        }
+    }
+}
+
+// ---- The brain (the think -> pay -> meter -> repeat seam), stub-first ----------------
+
+/// The inference backend the daemon proxies a [`Act::Completion`] through (brain-stub).
+/// Mirrors the [`Rail`] seam: the impl holds any host-only credential (a Cashu token,
+/// later) the genome never sees, and exposes only `complete`. `StubBrain` is the
+/// deterministic, no-network, no-money impl built now; `RoutstrBrain` swaps in later
+/// (same trait, same proto, zero genome change) -- it assembles the OpenAI JSON,
+/// attaches an X-Cashu token, POSTs, parses the reply + change, and computes
+/// `actual_cost = token_in_value - change_out_value`.
+#[async_trait::async_trait]
+pub trait BrainBackend: Send + Sync {
+    /// Produce a completion for `messages` under `model`, capping the actual cost at
+    /// `max_cost_sats`. Returns `(completion_text, actual_cost_sats)`; the actual cost
+    /// MUST be `<= max_cost_sats` (D-20, the never-overspend cap applied to thinking).
+    /// The completion text is the assistant reply the brain needs back to keep thinking.
+    async fn complete(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        max_cost_sats: u64,
+    ) -> anyhow::Result<(Vec<u8>, u64)>;
+}
+
+/// The stub inference backend (brain-stub): NO network, NO money, NO real model. It
+/// returns a deterministic canned reply (echoing the last user message plus a tick
+/// marker) and a SIMULATED, deterministic, non-zero cost, so the metabolism of
+/// thinking is real (the treasury visibly drains per think) while nothing is actually
+/// spent or fetched. Deterministic so the tests are stable; non-zero so the runway
+/// falls. The real `RoutstrBrain` swaps in behind [`BrainBackend`] with no change here.
+#[derive(Clone)]
+pub struct StubBrain {
+    /// The simulated cost knob: sats charged per (message-bytes + reply-bytes)
+    /// `bytes_per_sat`. A larger value charges fewer sats per byte. The cost is
+    /// `ceil(total_bytes / bytes_per_sat)`, clamped to `>= 1` so a think is never
+    /// free, then clamped to the per-call cap by [`Self::complete`].
+    bytes_per_sat: u64,
+}
+
+impl StubBrain {
+    /// A stub brain charging a deterministic `ceil(total_bytes / bytes_per_sat)` sats
+    /// per completion (minimum 1). `bytes_per_sat` must be non-zero; 0 is treated as 1
+    /// (charge a sat per byte) so the cost fn never divides by zero.
+    pub fn new(bytes_per_sat: u64) -> Self {
+        StubBrain {
+            bytes_per_sat: bytes_per_sat.max(1),
+        }
+    }
+
+    /// The canned, deterministic reply for a history: echo the last user message and
+    /// tag it with the history depth (the "tick"), so a multi-turn loop produces a
+    /// distinct-but-deterministic reply each turn and the round-trip TEXT is checkable.
+    /// No model is consulted; this is the stub's only "thinking".
+    fn canned_reply(messages: &[ChatMessage]) -> String {
+        let last_user = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .unwrap_or("(nothing)");
+        let turn = messages.len();
+        format!("[stub-brain turn {turn}] I am a Kirby agent; my runway is draining. You said: {last_user}")
+    }
+
+    /// The deterministic simulated cost of a completion: `ceil(total_bytes /
+    /// bytes_per_sat)`, at least 1 sat, where `total_bytes` is the summed length of
+    /// every message plus the reply. Deterministic (stable tests) and non-zero (the
+    /// runway visibly falls each think). The caller clamps it to the per-call cap.
+    fn simulated_cost(&self, messages: &[ChatMessage], reply: &str) -> u64 {
+        let msg_bytes: usize = messages.iter().map(|m| m.role.len() + m.content.len()).sum();
+        let total = (msg_bytes + reply.len()) as u64;
+        total.div_ceil(self.bytes_per_sat).max(1)
+    }
+}
+
+#[async_trait::async_trait]
+impl BrainBackend for StubBrain {
+    async fn complete(
+        &self,
+        _model: &str,
+        messages: &[ChatMessage],
+        max_cost_sats: u64,
+    ) -> anyhow::Result<(Vec<u8>, u64)> {
+        let reply = Self::canned_reply(messages);
+        // D-20: the simulated cost is clamped to the per-call cap, so the brain can
+        // never debit past what the gateway's budget gate checked.
+        let actual_cost = self.simulated_cost(messages, &reply).min(max_cost_sats);
+        Ok((reply.into_bytes(), actual_cost))
+    }
+}
+
+/// A rail that routes the brain act to a [`BrainBackend`] and everything else to a
+/// base [`Rail`] (brain-stub F3). The base is the existing performer (the MockRail in
+/// the stub run, the CdkEcashRail later); the brain is the inference backend.
+///
+/// FAIL-CLOSED MEMBRANE (brain-stub R3): in brain mode the gateway's allowlist holds
+/// ONLY [`BRAIN_COMPLETION_DESTINATION`], so a non-Completion act is denied at the
+/// gateway's allowlist step (`DENIED_NOT_ALLOWLISTED`) before `perform` is ever
+/// reached. As a defense-in-depth backstop, `perform` here ALSO refuses any
+/// non-Completion act (returns `UpstreamFailed`, performing nothing on the base rail):
+/// a buggy or hostile brain genome cannot smuggle an ecash settle through the brain
+/// rail even if the allowlist were misconfigured. "The brain only thinks."
+pub struct CompositeRail {
+    base: Arc<dyn Rail>,
+    brain: Arc<dyn BrainBackend>,
+}
+
+impl CompositeRail {
+    /// Build a composite rail over a base performer and a brain backend.
+    pub fn new(base: Arc<dyn Rail>, brain: Arc<dyn BrainBackend>) -> Self {
+        CompositeRail { base, brain }
+    }
+}
+
+#[async_trait::async_trait]
+impl Rail for CompositeRail {
+    fn estimate(&self, act: &Act) -> u64 {
+        match act {
+            // R5: the LLM cost is unknown pre-call, so the genome-declared per-call
+            // cap IS the estimate (the gateway then enforces estimate <= budget <=
+            // treasury, D-20, and perform caps the actual at it).
+            Act::Completion(c) => c.max_cost_sats,
+            // Every other act estimates through the base rail unchanged.
+            other => self.base.estimate(other),
+        }
+    }
+
+    async fn perform(&self, act: &Act, cap_sats: u64) -> RailOutcome {
+        match act {
+            Act::Completion(c) => match self.brain.complete(&c.model, &c.messages, cap_sats).await {
+                Ok((completion, actual_cost)) => {
+                    // D-20 backstop: the backend already capped, clamp again so the
+                    // debit can never exceed the gateway-checked estimate.
+                    let actual_cost = actual_cost.min(cap_sats);
+                    // The proof is a brain-act fact (the thinking happened); the words
+                    // ride in `completion`, which the gateway plumbs into the receipt.
+                    let proof = format!(
+                        "brain-completion:model={}:reply_len={}",
+                        c.model,
+                        completion.len()
+                    )
+                    .into_bytes();
+                    RailOutcome::Performed { actual_cost, proof, completion }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "brain backend failed to complete; debiting nothing");
+                    RailOutcome::UpstreamFailed
+                }
+            },
+            // R3 fail-closed: the brain rail performs ONLY completions. A non-Completion
+            // act is refused here (the allowlist already denied it; this is the
+            // defense-in-depth backstop so a misconfigured allowlist still cannot route
+            // a spend through the brain rail). Debit nothing.
+            other => {
+                tracing::warn!(
+                    destination = %destination(other),
+                    "CompositeRail (brain mode) asked to perform a non-Completion act; refusing (the brain only thinks, R3)"
+                );
                 RailOutcome::UpstreamFailed
             }
         }
