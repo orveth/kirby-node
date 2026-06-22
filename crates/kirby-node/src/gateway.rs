@@ -18,17 +18,19 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use kirby_proto::capability_request::Act;
 use kirby_proto::node_gateway_server::{NodeGateway, NodeGatewayServer};
 use kirby_proto::{
     Ack, CapabilityReceipt, CapabilityRequest, CheckpointBlob, EntropyNonce, EntropyRequest, Event,
-    Outcome, SessionContext, SessionRequest,
+    Memory, MemoryOp, MemoryResult, Outcome, SessionContext, SessionRequest, WriteStatus,
 };
+use prost::Message;
 use rand::TryRngCore;
 use tonic::{Request, Response, Status};
 
 use crate::checkpoint::{CheckpointArtifact, LatestCheckpoint};
 use crate::raft_lease::{FenceVerdict, LeaseHandle};
-use crate::rail::{self, Rail, RailOutcome};
+use crate::rail::{self, MemoryBackend, MemoryWrite, Rail, RailOutcome};
 use crate::treasury::{DebitOutcome, Treasury, TreasuryError};
 
 /// Non-secret session snapshot handed to the genome at boot (spec 3.1). Holds
@@ -70,6 +72,15 @@ pub struct GatewayService {
     /// in-band: the lease gates the money-path inside the gateway, not only in the
     /// orchestration.
     lease_fence: Option<LeaseFence>,
+    /// The OPTIONAL memory store for the durable-mind-state (Memory) act. `Some` for a
+    /// memory-mode gateway (the durable-mind-state workload); `None` for every other
+    /// workload, where a Memory act fails closed (debit 0, perform nothing). It is held
+    /// HERE, on the gateway, rather than inside the [`Rail`] like the brain, because a
+    /// Memory act's metering DIVERGES from the act-agnostic pipeline (free reads bypass
+    /// the ledger; writes are host-costed and never clamped, design doc 11/12) -- and
+    /// that fork is a treasury/ledger concern the gateway owns. `Arc<dyn MemoryBackend>`
+    /// keeps the service cheap to clone (the serve path clones it per connection).
+    memory: Option<Arc<dyn MemoryBackend>>,
 }
 
 /// The lease fence attached to a gateway (spec 4.3): the node's lease handle plus
@@ -106,7 +117,17 @@ impl GatewayService {
             checkpoints: LatestCheckpoint::default(),
             event_observer: None,
             lease_fence: None,
+            memory: None,
         }
+    }
+
+    /// Attach the durable-mind-state memory store (the Memory act backend). A memory-mode
+    /// gateway sets this (the `boot_and_observe` path injects a `StubMemory` for the
+    /// durable-mind-state workload); without it a Memory act fails closed. Mirrors the
+    /// brain's swap-ready seam: `StubMemory` now, `EngramStore` later, same call.
+    pub fn with_memory_backend(mut self, backend: Arc<dyn MemoryBackend>) -> Self {
+        self.memory = Some(backend);
+        self
     }
 
     /// Boot this gateway with an app-level checkpoint for the genome to
@@ -310,6 +331,10 @@ impl GatewayService {
                 prior.treasury_remaining_after,
                 prior.proof,
                 prior.completion,
+                // A Memory WRITE replay returns the SAME structured result (the ledger
+                // persists the encoded MemoryResult); decode it back (None for a brain or
+                // any non-memory act, whose `memory` is empty).
+                decode_memory(&prior.memory),
             ));
         }
 
@@ -318,6 +343,17 @@ impl GatewayService {
         let dest = rail::destination(act);
         if !self.allowlist.contains(&dest) {
             return Ok(denied(Outcome::DeniedNotAllowlisted, self.balance()?));
+        }
+
+        // FORK (durable-mind-state): a Memory act diverges from the act-agnostic
+        // STEP3/4/5 here. STEP0 (lease), STEP1 (dedupe), and STEP2 (allowlist) above
+        // ALREADY ran for it -- the divergence is only the metering, which the
+        // treasury-owning gateway must do itself (design doc 11/12): READS are free and
+        // bypass the ledger (G3); WRITES are HOST-costed and never clamped to the caller's
+        // ceiling (G2). Everything else (the brain, ecash, paid HTTP) stays on the
+        // uniform path below, unchanged (no regression).
+        if let Act::Memory(m) = act {
+            return self.authorize_memory(req, m).await;
         }
 
         // STEP 3: budget gate. The estimate must be within BOTH the genome's
@@ -363,6 +399,9 @@ impl GatewayService {
             actual_cost,
             proof.clone(),
             completion.clone(),
+            // The generic path performs no Memory act (a Memory act forks to
+            // `authorize_memory` before STEP3), so no memory result is persisted here.
+            Vec::new(),
         )? {
             DebitOutcome::Debited {
                 cost_sats,
@@ -373,6 +412,7 @@ impl GatewayService {
                 remaining,
                 proof,
                 completion,
+                None,
             )),
             // A concurrent request performed this key first: return its stored
             // receipt (the act we just did on the rail is the same idempotent
@@ -384,11 +424,146 @@ impl GatewayService {
                 prior.treasury_remaining_after,
                 prior.proof,
                 prior.completion,
+                decode_memory(&prior.memory),
             )),
             // Defense-in-depth: the estimate gate already refused over-treasury
             // spends, and the actual is capped at that estimate, so this is
             // unreachable unless an invariant upstream broke. Surface it as a
             // denial that debited nothing rather than overspending.
+            DebitOutcome::Insufficient { remaining } => {
+                Ok(denied(Outcome::DeniedInsufficientTreasury, remaining))
+            }
+        }
+    }
+
+    /// The Memory act's authorize path (durable-mind-state), forked out of the
+    /// act-agnostic order because its metering DIVERGES (design doc 11/12). STEP0 (lease),
+    /// STEP1 (dedupe), and STEP2 (allowlist) already ran in `authorize_capability`; this
+    /// does only the memory-specific STEP3/4/5:
+    ///   - validate the per-op invariants (G5); a malformed request denies + debits 0
+    ///     BEFORE any store work or cost classification;
+    ///   - READ (GET/LS): serve FREE and BYPASS `debit_and_record` -- no ledger row, no
+    ///     debit (G3). A broke agent still recalls its past (zero treasury bypasses
+    ///     PAYMENT, not the lease/allowlist gates above);
+    ///   - WRITE (SET/RM): the cost is HOST-computed (G2); `max_cost_sats` is the caller's
+    ///     CEILING (a real cost above it is OVER_BUDGET, NEVER clamped down); then it
+    ///     performs, debits, and records exactly once (the wseq idempotency key dedupes a
+    ///     resume replay via STEP1; a concurrent insert collapses to one debit in the txn).
+    async fn authorize_memory(
+        &self,
+        req: &CapabilityRequest,
+        m: &Memory,
+    ) -> Result<CapabilityReceipt, TreasuryError> {
+        // A memory-mode gateway MUST have a backend; if not, fail closed (this is a
+        // wiring bug, not a genome outcome) -- debit nothing, perform nothing.
+        let Some(backend) = self.memory.as_ref() else {
+            tracing::error!(
+                "Memory act on a gateway with no memory backend; refusing (fail-closed)"
+            );
+            return Ok(denied(Outcome::UpstreamFailed, self.balance()?));
+        };
+
+        // G5: validate BEFORE classifying read-vs-write or computing cost. A malformed
+        // request (bad slug, oversize value, a read carrying a write payload) is denied,
+        // debits 0, and reaches neither the store nor the treasury.
+        if let Err(e) = rail::validate_memory_request(m) {
+            tracing::warn!(error = %e, op = m.op, "Memory request malformed; refusing (debit 0, G5)");
+            return Ok(denied(Outcome::UpstreamFailed, self.balance()?));
+        }
+        let op = MemoryOp::try_from(m.op).unwrap_or(MemoryOp::Unspecified);
+
+        // READ PATH (GET/LS): free, and it must BYPASS `debit_and_record` so NO ledger row
+        // is ever written for a read (G3 -- otherwise free, unique-keyed reads would grow
+        // the dedupe ledger without bound). This is the one deliberate divergence from the
+        // act-agnostic pipeline.
+        if rail::is_read_op(op) {
+            return match backend.read(m).await {
+                Ok(result) => {
+                    let remaining = self.balance()?; // unchanged: a read debits nothing
+                    let proof =
+                        format!("memory-read:op={op:?}:found={}", result.found).into_bytes();
+                    Ok(receipt(
+                        Outcome::AuthorizedAndPerformed,
+                        0,
+                        remaining,
+                        proof,
+                        Vec::new(),
+                        Some(result),
+                    ))
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "memory read failed; debiting nothing");
+                    Ok(denied(Outcome::UpstreamFailed, self.balance()?))
+                }
+            };
+        }
+
+        // WRITE PATH (SET/RM): the HOST computes the cost (G2). `max_cost_sats` is a
+        // CEILING -- a real cost above it is DENIED_OVER_BUDGET (the cost is NEVER clamped
+        // down to the cap, which would silently under-charge the store). The act budget
+        // and then the treasury gate it too, before any mutation.
+        let cost = backend.write_cost(m);
+        let remaining = self.balance()?;
+        if cost > m.max_cost_sats || cost > req.budget_sats {
+            return Ok(denied(Outcome::DeniedOverBudget, remaining));
+        }
+        if cost > remaining {
+            return Ok(denied(Outcome::DeniedInsufficientTreasury, remaining));
+        }
+
+        // Perform the write, keyed by the wseq write token for store-event determinism
+        // (F3/G6). On a same-token re-perform the backend reports AlreadyCommittedSameWseq;
+        // the cost is the SAME recomputable `cost`, so the single debit still lands (G6).
+        let MemoryWrite { result, committed } = match backend.write(m, &req.idempotency_key).await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(error = %e, "memory write failed upstream; debiting nothing");
+                return Ok(denied(Outcome::UpstreamFailed, remaining));
+            }
+        };
+        tracing::debug!(?committed, cost, "memory write performed");
+
+        // Persist the encoded result so a resume replay returns the SAME structured result
+        // (not just the proof). The proof is the store fact (D-18 analog).
+        let memory_bytes = result.encode_to_vec();
+        let proof = format!(
+            "memory-write:op={op:?}:status={:?}",
+            WriteStatus::try_from(result.write_status).unwrap_or(WriteStatus::Unspecified)
+        )
+        .into_bytes();
+
+        match self.treasury.debit_and_record(
+            &req.idempotency_key,
+            cost,
+            proof.clone(),
+            Vec::new(), // not a brain act -- no completion text
+            memory_bytes,
+        )? {
+            DebitOutcome::Debited {
+                cost_sats,
+                remaining,
+            } => Ok(receipt(
+                Outcome::AuthorizedAndPerformed,
+                cost_sats,
+                remaining,
+                proof,
+                Vec::new(),
+                Some(result),
+            )),
+            // A concurrent request performed this wseq first: return its stored receipt
+            // (one debit, G6); the stored memory result rides back.
+            DebitOutcome::Duplicate(prior) => Ok(receipt(
+                Outcome::DuplicateIgnored,
+                prior.cost_sats,
+                prior.treasury_remaining_after,
+                prior.proof,
+                prior.completion,
+                decode_memory(&prior.memory),
+            )),
+            // Defense-in-depth: the ceiling + treasury gate already refused over-treasury
+            // writes and the host cost is exact, so this is unreachable unless an
+            // invariant upstream broke. Surface a denial that debited nothing.
             DebitOutcome::Insufficient { remaining } => {
                 Ok(denied(Outcome::DeniedInsufficientTreasury, remaining))
             }
@@ -541,13 +716,15 @@ impl NodeGateway for GatewayService {
 
 /// Build a receipt with the standard schema version. `completion` is the assistant
 /// reply TEXT for a Completion act (brain-stub), empty for every other act and every
-/// denial.
+/// denial. `memory` is the structured result of a Memory act (durable-mind-state),
+/// `None` for every other act and every denial.
 fn receipt(
     outcome: Outcome,
     cost_sats: u64,
     treasury_remaining: u64,
     proof: Vec<u8>,
     completion: Vec<u8>,
+    memory: Option<MemoryResult>,
 ) -> CapabilityReceipt {
     CapabilityReceipt {
         schema_version: kirby_proto::SCHEMA_VERSION,
@@ -556,13 +733,28 @@ fn receipt(
         treasury_remaining,
         proof,
         completion,
+        memory,
     }
 }
 
-/// A DENIED receipt: cost 0, no proof, no completion, the current (unchanged)
-/// treasury balance.
+/// A DENIED receipt: cost 0, no proof, no completion, no memory result, the current
+/// (unchanged) treasury balance.
 fn denied(outcome: Outcome, treasury_remaining: u64) -> CapabilityReceipt {
-    receipt(outcome, 0, treasury_remaining, Vec::new(), Vec::new())
+    receipt(outcome, 0, treasury_remaining, Vec::new(), Vec::new(), None)
+}
+
+/// Decode a persisted `PerformedRecord.memory` (the prost-encoded `MemoryResult` bytes)
+/// back into the structured receipt field for a resume replay. Empty bytes => no memory
+/// result (a non-memory act, or a free read which is never recorded), so this returns
+/// `None`; non-empty bytes decode to `Some`. Only WRITE acts ever persist a non-empty
+/// `memory` (reads bypass the ledger, G3), and a write result always has a non-default
+/// `write_status`, so its encoding is never empty -- the empty/None mapping is unambiguous.
+fn decode_memory(bytes: &[u8]) -> Option<MemoryResult> {
+    if bytes.is_empty() {
+        None
+    } else {
+        MemoryResult::decode(bytes).ok()
+    }
 }
 
 /// Map a host-side treasury fault to a gRPC internal error. Genome-driven

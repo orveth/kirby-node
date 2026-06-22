@@ -380,6 +380,8 @@ fn assert_no_credential_on_the_wire() {
         proof: vec![],
         // The brain-act reply text (empty for an ecash settle); still not a credential.
         completion: vec![],
+        // The durable-mind-state result (absent for an ecash settle); still not a credential.
+        memory: None,
     };
     let CapabilityReceipt {
         schema_version: _,
@@ -388,6 +390,7 @@ fn assert_no_credential_on_the_wire() {
         treasury_remaining: _,
         proof: _,
         completion: _,
+        memory: _,
     } = &receipt;
 }
 

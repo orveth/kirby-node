@@ -54,6 +54,10 @@ pub struct KirbyConfig {
     /// `workload = "brain"`; defaults so a bare `[brain]` (or none) runs.
     #[serde(default)]
     pub brain: BrainConfig,
+    /// The `[memory]` knobs for the durable-mind-state workload (Chunk-1 stub). Used
+    /// only when `workload = "memory"`; defaults so a bare `[memory]` (or none) runs.
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// bootstrap (fund to born) or resume (restore from the latest checkpoint).
     /// Defaults to [`RunMode::Bootstrap`].
     #[serde(default)]
@@ -216,6 +220,12 @@ pub enum Workload {
     /// dies when broke. Stub-first behind the daemon's `BrainBackend` seam (no real
     /// money, no network); the brain only thinks (no checkpoint, no other acts).
     Brain,
+    /// The durable-mind-state workload (memory-stub, Chunk-1): the genome runs a
+    /// scripted SET/GET/LS/RM loop issuing a brokered `Memory` act, the SIBLING of the
+    /// brain's `Completion`. WRITES drain the treasury by a host-computed storage cost;
+    /// READS are free. Stub-first behind the daemon's `MemoryBackend` seam (no crypto,
+    /// no relay); the real NIP-AE engram store swaps in at Chunk-2.
+    Memory,
 }
 
 impl Workload {
@@ -224,6 +234,7 @@ impl Workload {
         match self {
             Workload::AppCheckpoint => "app-checkpoint",
             Workload::Brain => "brain",
+            Workload::Memory => "memory",
         }
     }
 
@@ -234,6 +245,9 @@ impl Workload {
             // The brain only thinks; it submits no app checkpoint (durable
             // mind-state is a named later chunk, not this stub).
             Workload::Brain => false,
+            // The Chunk-1 memory stub stores into an in-memory map only (the durable,
+            // portable engram store is Chunk-2); it submits no app checkpoint here.
+            Workload::Memory => false,
         }
     }
 }
@@ -286,6 +300,52 @@ impl Default for BrainConfig {
             max_cost_sats: default_brain_max_cost_sats(),
             tick_secs: default_brain_tick_secs(),
             bytes_per_sat: default_brain_bytes_per_sat(),
+        }
+    }
+}
+
+/// The `[memory]` config block (memory-stub, Chunk-1): the knobs for the durable-mind-
+/// state workload. The genome reads `max_cost_sats` (its per-WRITE ceiling) and
+/// `tick_secs` (the op cadence) from the kernel command line (the daemon writes them when
+/// the workload is `memory`); the daemon's `StubMemory` reads `bytes_per_sat` (its
+/// host-computed storage-cost knob). Every field has a sane default so a bare `[memory]`
+/// (or none, when `workload = "memory"`) runs.
+///
+/// This is the swap-ready surface: the real `EngramStore` (Chunk-2) reads the SAME
+/// `max_cost_sats` ceiling, so pointing the agent at the real nerve-backed store is a
+/// config + backend change, not a genome or proto change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryConfig {
+    /// The per-WRITE budget CEILING (sats) the genome sets as `max_cost_sats` on every
+    /// SET/RM (design doc 12 G2). The gate refuses a write whose HOST-computed cost
+    /// exceeds it (it is NEVER clamped down). Reads ignore it (reads are free).
+    #[serde(default = "default_memory_max_cost_sats")]
+    pub max_cost_sats: u64,
+    /// Seconds the memory loop sleeps between scripted ops (the op cadence).
+    #[serde(default = "default_memory_tick_secs")]
+    pub tick_secs: u64,
+    /// The `StubMemory` cost knob: a write costs `ceil((slug+value bytes) / bytes_per_sat)`
+    /// sats (min 1), so the treasury visibly drains per write. Daemon-side only.
+    #[serde(default = "default_memory_bytes_per_sat")]
+    pub bytes_per_sat: u64,
+}
+
+fn default_memory_max_cost_sats() -> u64 {
+    64
+}
+fn default_memory_tick_secs() -> u64 {
+    5
+}
+fn default_memory_bytes_per_sat() -> u64 {
+    16
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        MemoryConfig {
+            max_cost_sats: default_memory_max_cost_sats(),
+            tick_secs: default_memory_tick_secs(),
+            bytes_per_sat: default_memory_bytes_per_sat(),
         }
     }
 }
@@ -383,6 +443,16 @@ impl KirbyConfig {
                     self.funding.initial_sats
                 );
             }
+        }
+        // The durable-mind-state agent must be able to afford at least one WRITE, or it
+        // can recall (reads are free) but never FORM a memory: a zero per-write ceiling is
+        // always DENIED_OVER_BUDGET. Checked only for the memory workload so other configs
+        // are unaffected. (No <= initial_sats check: reads stay free, so a broke memory
+        // agent still lives; the write cost is host-computed per op, not this ceiling.)
+        if self.workload == Workload::Memory && self.memory.max_cost_sats == 0 {
+            anyhow::bail!(
+                "memory.max_cost_sats must be > 0 (a zero per-write ceiling means every write is DENIED_OVER_BUDGET)"
+            );
         }
         // A pinned backend must match the host. `auto` resolves to the native one,
         // so it never trips this. This is a RUNTIME check (cfg!), not a compile-time

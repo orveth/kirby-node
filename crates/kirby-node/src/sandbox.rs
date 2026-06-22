@@ -380,6 +380,11 @@ pub struct GuestSpec {
     /// genome's brain loop reads its config, exactly as `gateway_port`/`workload`
     /// already travel. `None` for every non-brain guest (no brain cmdline params).
     pub brain: Option<crate::config::BrainConfig>,
+    /// The `[memory]` knobs for the durable-mind-state workload (memory-stub). `Some` only
+    /// when `workload = Some("memory")`: the backend writes `max_cost_sats` and `tick_secs`
+    /// onto the guest kernel command line (`kirby.memory_*=`) so the genome's memory loop
+    /// reads its config, exactly as the brain knobs travel. `None` for every non-memory guest.
+    pub memory: Option<crate::config::MemoryConfig>,
     /// Install the per-VM egress lockdown (default-deny on the guest's egress) and
     /// wire a metered network interface so the genome can ATTEMPT egress (spec 3.7,
     /// gate G4). When false, the guest is vsock-only (no network interface), which

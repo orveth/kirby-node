@@ -433,6 +433,7 @@ async fn boot_active_genome(
         mem_size_mib: config.mem_mib,
         workload: Some("snapshot".to_string()),
         brain: None,
+        memory: None,
         lockdown_egress: false,
         snapshot_capable: true,
     };

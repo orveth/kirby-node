@@ -356,12 +356,22 @@ fn agent_boot_config(
     // at the gateway allowlist step, fail-closed), and the `[brain]` knobs ride to the
     // genome via the kernel cmdline. Every other workload keeps the test-mint allowlist
     // and carries no brain config (the plain MockRail, no brain cmdline params).
-    let (allow, brain) = match cfg.workload {
+    // The durable-mind-state (memory) workload, like the brain, is workload-scoped: its
+    // allowlist is EXCLUSIVELY the memory sentinel (it can reach nothing else), and the
+    // `[memory]` knobs ride to the genome via the cmdline. The StubMemory backend is
+    // injected onto the gateway in `boot_and_observe` when `boot.memory` is Some.
+    let (allow, brain, memory) = match cfg.workload {
         Workload::Brain => (
             vec![crate::rail::BRAIN_COMPLETION_DESTINATION.to_string()],
             Some(cfg.brain.clone()),
+            None,
         ),
-        _ => (vec!["mint.test.local".to_string()], None),
+        Workload::Memory => (
+            vec![crate::rail::MEMORY_DESTINATION.to_string()],
+            None,
+            Some(cfg.memory.clone()),
+        ),
+        _ => (vec!["mint.test.local".to_string()], None, None),
     };
     Ok(BootConfig {
         image,
@@ -377,6 +387,7 @@ fn agent_boot_config(
         hello_timeout: run.hello_timeout,
         workload: Some(cfg.workload.genome_workload().to_string()),
         brain,
+        memory,
         // Sovereign single-agent v0 is vsock-only (no TAP egress lockdown; that is
         // the C-5 lane). The membrane still holds structurally (no guest network).
         lockdown_egress: false,
@@ -727,6 +738,7 @@ mod tests {
             genome_image: GenomeImage::Path(root.join("img")),
             workload: Workload::AppCheckpoint,
             brain: Default::default(),
+            memory: Default::default(),
             mode,
             funding: FundingConfig {
                 initial_sats: 3_000,

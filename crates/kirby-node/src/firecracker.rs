@@ -267,6 +267,7 @@ impl SandboxBackend for FirecrackerBackend {
             gateway_port: spec.gateway_port,
             workload: spec.workload.clone(),
             brain: spec.brain.clone(),
+            memory: spec.memory.clone(),
             vcpu_count: spec.vcpu_count,
             mem_size_mib: spec.mem_size_mib,
             jail_uid: uid,
@@ -322,6 +323,11 @@ pub(crate) struct BootParams {
     /// kernel command line (`kirby.brain_*=`) so the genome's brain loop reads its
     /// config, exactly as `gateway_port` and `workload` already travel.
     pub brain: Option<crate::config::BrainConfig>,
+    /// The `[memory]` knobs for the durable-mind-state workload (memory-stub). `Some` only
+    /// for a `memory` guest: `max_cost_sats` and `tick_secs` are written onto the kernel
+    /// command line (`kirby.memory_*=`) so the genome's memory loop reads its config,
+    /// exactly as the brain knobs travel.
+    pub memory: Option<crate::config::MemoryConfig>,
     /// vCPU count and memory for the microVM. Small for the spike.
     pub vcpu_count: u8,
     pub mem_size_mib: usize,
@@ -664,6 +670,16 @@ pub(crate) async fn boot(
         boot_args.push_str(&format!(
             " kirby.brain_model={} kirby.brain_max_cost_sats={} kirby.brain_tick_secs={}",
             brain.model, brain.max_cost_sats, brain.tick_secs
+        ));
+    }
+    // The memory knobs for the durable-mind-state workload (memory-stub): the genome's
+    // memory loop reads max_cost_sats (its per-write ceiling) and tick_secs from the
+    // cmdline, the same non-secret way the brain knobs travel. Only the genome-side knobs
+    // travel; the daemon's StubMemory cost knob (bytes_per_sat) stays host-side.
+    if let Some(memory) = &params.memory {
+        boot_args.push_str(&format!(
+            " kirby.memory_max_cost_sats={} kirby.memory_tick_secs={}",
+            memory.max_cost_sats, memory.tick_secs
         ));
     }
 

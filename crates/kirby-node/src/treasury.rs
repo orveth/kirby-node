@@ -71,6 +71,14 @@ pub(crate) fn is_lock_contention(err: &TreasuryError) -> bool {
 /// OLD-shape record (the `{cost_sats, treasury_remaining_after, proof}` rows already
 /// persisted in sled before this field existed) still deserializes on resume -- it
 /// decodes with an empty completion, never a decode error.
+///
+/// `memory` (durable-mind-state) holds the prost-encoded `MemoryResult` for a Memory
+/// WRITE act (empty for every other act, and never recorded for a free READ -- reads
+/// bypass the ledger entirely, design doc 12 G3), so a post-resume `DUPLICATE_IGNORED`
+/// write replay returns the SAME structured result, not just the proof. It is the LAST
+/// field and `#[serde(default)]` for the EXACT same reason `completion` is: an older
+/// record (incl. every brain-era row, which has `completion` but no `memory`) still
+/// deserializes on resume, decoding with an empty `memory`, never a decode error.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PerformedRecord {
     pub cost_sats: u64,
@@ -78,6 +86,8 @@ pub struct PerformedRecord {
     pub proof: Vec<u8>,
     #[serde(default)]
     pub completion: Vec<u8>,
+    #[serde(default)]
+    pub memory: Vec<u8>,
 }
 
 /// The daemon-owned treasury. Cheap to clone (an `Arc` over the sled handles),
@@ -231,6 +241,7 @@ impl Treasury {
         cost_sats: u64,
         proof: Vec<u8>,
         completion: Vec<u8>,
+        memory: Vec<u8>,
     ) -> Result<DebitOutcome, TreasuryError> {
         let key_bytes = key.as_bytes();
         let record_json = serde_json::to_vec(&PerformedRecord {
@@ -242,6 +253,10 @@ impl Treasury {
             // resume-replay returns the words verbatim (brain-stub R1). The txn
             // re-decodes the WHOLE record below, so this rides through unchanged.
             completion,
+            // The prost-encoded MemoryResult for a Memory WRITE act (empty otherwise),
+            // so a resume-replay returns the same structured result. Rides through the
+            // re-decode below unchanged, exactly like `completion` (durable-mind-state).
+            memory,
         })
         .map_err(|e| TreasuryError::Corrupt(format!("encode record: {e}")))?;
 

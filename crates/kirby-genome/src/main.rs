@@ -51,6 +51,7 @@
 
 mod brain;
 mod fingerprint;
+mod memory;
 
 use std::time::Duration;
 
@@ -284,6 +285,12 @@ async fn run() {
             // The brain loop never returns (PID 1): it thinks on a tick, parking when
             // the treasury can no longer cover a think so the daemon halts the VM.
             brain::brain_loop(client, port, &ctx).await;
+        }
+        Some("memory") => {
+            boot_log("workload=memory: the durable-mind-state loop (memory-stub) — SET/GET/LS/RM the Memory act; writes drain the treasury (storage cost), reads are free, death is the daemon halting the VM when a write is unaffordable (F4)");
+            // The memory loop never returns (PID 1): it forms memories on a tick, parking
+            // when the treasury can no longer cover a write so the daemon halts the VM.
+            memory::memory_loop(client, port, &ctx).await;
         }
         _ => {
             boot_log("no burn workload: idling (the daemon meters/halts or tears down)");
