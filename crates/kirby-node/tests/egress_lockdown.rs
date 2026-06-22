@@ -59,6 +59,7 @@ async fn g4_raw_egress_denied_and_metered_about_zero() {
         hello_timeout: Duration::from_secs(40),
         // Forced on by EgressRunConfig::new; set here for clarity.
         workload: Some("raw-egress".to_string()),
+        brain: None,
         lockdown_egress: true,
         snapshot_capable: false,
         restore_checkpoint: None,

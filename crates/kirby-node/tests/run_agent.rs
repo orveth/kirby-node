@@ -69,6 +69,7 @@ fn bootstrap_config(test: &str, image_dir: PathBuf, funding_sats: u64) -> KirbyC
         backend: Backend::Auto,
         genome_image: GenomeImage::Path(image_dir),
         workload: Workload::AppCheckpoint,
+        brain: Default::default(),
         mode: RunMode::Bootstrap,
         funding: FundingConfig {
             initial_sats: funding_sats,

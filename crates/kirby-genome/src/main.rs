@@ -49,6 +49,7 @@
 //! the gateway port, the workload) arrive on the kernel command line the daemon
 //! set when it booted the VM.
 
+mod brain;
 mod fingerprint;
 
 use std::time::Duration;
@@ -277,6 +278,12 @@ async fn run() {
             // PID 1 never exits; it keeps heartbeating so the new active node still
             // sees it ALIVE after the move.
             full_loop(client, port, &ctx).await;
+        }
+        Some("brain") => {
+            boot_log("workload=brain: the MIND loop (brain-stub) — think -> pay -> meter -> repeat; each think drains the treasury, death is the daemon halting the VM when broke (F4)");
+            // The brain loop never returns (PID 1): it thinks on a tick, parking when
+            // the treasury can no longer cover a think so the daemon halts the VM.
+            brain::brain_loop(client, port, &ctx).await;
         }
         _ => {
             boot_log("no burn workload: idling (the daemon meters/halts or tears down)");

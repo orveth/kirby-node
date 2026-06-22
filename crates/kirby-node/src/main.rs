@@ -974,6 +974,7 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
         // The `boot` subcommand demonstrates G1 only; the genome idles after the
         // round-trip. The metered run (G2) is the `meter` subcommand.
         workload: None,
+        brain: None,
         // G1 is vsock-only (no TAP); the egress lockdown is the `egress`
         // subcommand (C-5, G4).
         lockdown_egress: false,
@@ -1070,6 +1071,7 @@ async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
         mem_size_mib: args.mem_mib,
         hello_timeout: Duration::from_secs(args.hello_timeout_secs),
         workload: Some("burn".to_string()),
+        brain: None,
         // G2 meters CPU + memory; the egress meter rides with the TAP in the
         // `egress` subcommand (C-5, G4). Vsock-only here.
         lockdown_egress: false,
@@ -1167,6 +1169,7 @@ async fn run_egress(args: EgressArgs) -> anyhow::Result<()> {
         hello_timeout: Duration::from_secs(args.hello_timeout_secs),
         // Forced on by EgressRunConfig::new, set here for clarity.
         workload: Some("raw-egress".to_string()),
+        brain: None,
         lockdown_egress: true,
         snapshot_capable: false,
         restore_checkpoint: None,
@@ -1275,6 +1278,7 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
         mem_size_mib: args.mem_mib,
         hello_timeout: Duration::from_secs(args.hello_timeout_secs),
         workload: Some("brokered".to_string()),
+        brain: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
@@ -1379,6 +1383,7 @@ async fn run_app_checkpoint(args: AppCheckpointArgs) -> anyhow::Result<()> {
         mem_size_mib: args.mem_mib,
         hello_timeout: Duration::from_secs(args.checkpoint_secs),
         workload: Some("app-checkpoint".to_string()),
+        brain: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
@@ -1447,6 +1452,7 @@ async fn run_snapshot(args: SnapshotArgs) -> anyhow::Result<()> {
         hello_timeout: Duration::from_secs(args.pre_snapshot_secs),
         // Forced on by SnapshotRunConfig::new, set here for clarity.
         workload: Some("snapshot".to_string()),
+        brain: None,
         // G6 is vsock-only (the egress lockdown is G4); the restore re-wires a
         // fresh TAP only if this is true. Vsock-only keeps the demo lean.
         lockdown_egress: false,

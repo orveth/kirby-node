@@ -50,6 +50,10 @@ pub struct KirbyConfig {
     /// The v0 workload the agent runs once alive. Defaults to [`Workload::AppCheckpoint`].
     #[serde(default)]
     pub workload: Workload,
+    /// The `[brain]` knobs for the MIND workload (brain-stub). Used only when
+    /// `workload = "brain"`; defaults so a bare `[brain]` (or none) runs.
+    #[serde(default)]
+    pub brain: BrainConfig,
     /// bootstrap (fund to born) or resume (restore from the latest checkpoint).
     /// Defaults to [`RunMode::Bootstrap`].
     #[serde(default)]
@@ -206,6 +210,12 @@ pub enum Workload {
     #[serde(rename = "app-checkpoint")]
     #[default]
     AppCheckpoint,
+    /// The MIND workload (brain-stub): the genome runs a think -> pay -> meter ->
+    /// repeat loop, issuing a brokered `Completion` act each tick. Thinking drains
+    /// the treasury (the stub debits a deterministic simulated cost), so the agent
+    /// dies when broke. Stub-first behind the daemon's `BrainBackend` seam (no real
+    /// money, no network); the brain only thinks (no checkpoint, no other acts).
+    Brain,
 }
 
 impl Workload {
@@ -213,6 +223,7 @@ impl Workload {
     pub fn genome_workload(self) -> &'static str {
         match self {
             Workload::AppCheckpoint => "app-checkpoint",
+            Workload::Brain => "brain",
         }
     }
 
@@ -220,6 +231,61 @@ impl Workload {
     pub fn submits_checkpoint(self) -> bool {
         match self {
             Workload::AppCheckpoint => true,
+            // The brain only thinks; it submits no app checkpoint (durable
+            // mind-state is a named later chunk, not this stub).
+            Workload::Brain => false,
+        }
+    }
+}
+
+/// The `[brain]` config block (brain-stub): the knobs for the MIND workload. The
+/// genome reads `model`, `max_cost_sats`, and `tick_secs` from the kernel command
+/// line (the daemon writes them when the workload is `brain`); the daemon's
+/// `StubBrain` reads `bytes_per_sat` (its simulated-cost knob). Every field has a
+/// sane default so a bare `[brain]` (or none, when `workload = "brain"`) runs.
+///
+/// This is the swap-ready surface: `RoutstrBrain` (the next chunk) reads the SAME
+/// `model` and per-call `max_cost_sats`, so pointing the agent at a real model is a
+/// config change, not a genome or proto change (done-criteria #6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainConfig {
+    /// The model the brain "thinks" with. Passed through to the `Completion` act
+    /// (cosmetic for the stub, which ignores it; load-bearing for `RoutstrBrain`).
+    #[serde(default = "default_brain_model")]
+    pub model: String,
+    /// The per-call budget cap (sats) the genome sets as `budget_sats` on every
+    /// Completion (R4). The gate enforces `actual <= max_cost_sats <= treasury`.
+    #[serde(default = "default_brain_max_cost_sats")]
+    pub max_cost_sats: u64,
+    /// Seconds the brain sleeps between thoughts (the think cadence).
+    #[serde(default = "default_brain_tick_secs")]
+    pub tick_secs: u64,
+    /// The `StubBrain` cost knob: simulated cost is `ceil(total_bytes / bytes_per_sat)`
+    /// sats per think (min 1), so the treasury visibly drains. Daemon-side only.
+    #[serde(default = "default_brain_bytes_per_sat")]
+    pub bytes_per_sat: u64,
+}
+
+fn default_brain_model() -> String {
+    "anthropic/claude-sonnet-4.6".to_string()
+}
+fn default_brain_max_cost_sats() -> u64 {
+    64
+}
+fn default_brain_tick_secs() -> u64 {
+    5
+}
+fn default_brain_bytes_per_sat() -> u64 {
+    16
+}
+
+impl Default for BrainConfig {
+    fn default() -> Self {
+        BrainConfig {
+            model: default_brain_model(),
+            max_cost_sats: default_brain_max_cost_sats(),
+            tick_secs: default_brain_tick_secs(),
+            bytes_per_sat: default_brain_bytes_per_sat(),
         }
     }
 }
@@ -299,6 +365,24 @@ impl KirbyConfig {
         }
         if self.funding.initial_sats == 0 {
             anyhow::bail!("funding.initial_sats must be > 0 (the agent needs a budget to live)");
+        }
+        // The brain must be able to afford at least one think, or it dies before it
+        // thinks once: a zero per-call cap is always DENIED_OVER_BUDGET, and a cap
+        // above the treasury is always DENIED_INSUFFICIENT_TREASURY (D-20). Checked
+        // only for the brain workload so non-brain configs are unaffected.
+        if self.workload == Workload::Brain {
+            if self.brain.max_cost_sats == 0 {
+                anyhow::bail!(
+                    "brain.max_cost_sats must be > 0 (a zero per-call cap means every think is DENIED_OVER_BUDGET)"
+                );
+            }
+            if self.brain.max_cost_sats > self.funding.initial_sats {
+                anyhow::bail!(
+                    "brain.max_cost_sats ({}) must be <= funding.initial_sats ({}) so the agent can afford its first think",
+                    self.brain.max_cost_sats,
+                    self.funding.initial_sats
+                );
+            }
         }
         // A pinned backend must match the host. `auto` resolves to the native one,
         // so it never trips this. This is a RUNTIME check (cfg!), not a compile-time

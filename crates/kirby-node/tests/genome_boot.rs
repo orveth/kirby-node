@@ -46,6 +46,7 @@ async fn g1_genome_boots_and_completes_session_context_round_trip() {
         hello_timeout: Duration::from_secs(40),
         // G1 only needs the boot round-trip; the genome idles after the hello.
         workload: None,
+        brain: None,
         // G1 is vsock-only (no TAP / no egress lockdown; that is C-5 / G4).
         lockdown_egress: false,
         // G1 does not snapshot (no CPU template); snapshot is C-7 / G6.

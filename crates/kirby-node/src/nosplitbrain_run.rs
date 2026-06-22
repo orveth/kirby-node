@@ -432,6 +432,7 @@ async fn boot_active_genome(
         vcpu_count: config.vcpu_count,
         mem_size_mib: config.mem_mib,
         workload: Some("snapshot".to_string()),
+        brain: None,
         lockdown_egress: false,
         snapshot_capable: true,
     };

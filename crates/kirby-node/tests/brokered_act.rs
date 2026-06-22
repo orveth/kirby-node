@@ -126,6 +126,7 @@ async fn g5_brokered_ecash_settle_real_metered_no_vm_egress() {
         mem_size_mib: 128,
         hello_timeout: Duration::from_secs(40),
         workload: Some("brokered".to_string()),
+        brain: None,
         // BrokeredRunConfig chooses the backend-specific profile.
         lockdown_egress: false,
         snapshot_capable: false,

@@ -347,21 +347,36 @@ fn agent_boot_config(
     restore_checkpoint: Option<CheckpointArtifact>,
 ) -> anyhow::Result<crate::boot::BootConfig> {
     use crate::boot::{BootConfig, ImagePaths};
+    use crate::config::Workload;
     let image = ImagePaths::from_dir(&run.image_dir)?;
     let cfg = &run.config;
+    // The allowlist and the brain config are workload-scoped. For the MIND workload
+    // the allowlist is EXCLUSIVELY the brain completion sentinel (brain-stub R3): the
+    // brain only thinks, so it can reach NOTHING else (a non-Completion act is denied
+    // at the gateway allowlist step, fail-closed), and the `[brain]` knobs ride to the
+    // genome via the kernel cmdline. Every other workload keeps the test-mint allowlist
+    // and carries no brain config (the plain MockRail, no brain cmdline params).
+    let (allow, brain) = match cfg.workload {
+        Workload::Brain => (
+            vec![crate::rail::BRAIN_COMPLETION_DESTINATION.to_string()],
+            Some(cfg.brain.clone()),
+        ),
+        _ => (vec!["mint.test.local".to_string()], None),
+    };
     Ok(BootConfig {
         image,
         node_id: cfg.node_id.clone(),
         task: format!("kirby-run-{}", cfg.agent_id),
         budget_sats: cfg.funding.initial_sats,
         initial_sats: cfg.funding.initial_sats,
-        allow: vec!["mint.test.local".to_string()],
+        allow,
         guest_cid: run.guest_cid,
         gateway_port: run.gateway_port,
         vcpu_count: run.vcpu_count,
         mem_size_mib: run.mem_size_mib,
         hello_timeout: run.hello_timeout,
         workload: Some(cfg.workload.genome_workload().to_string()),
+        brain,
         // Sovereign single-agent v0 is vsock-only (no TAP egress lockdown; that is
         // the C-5 lane). The membrane still holds structurally (no guest network).
         lockdown_egress: false,
@@ -711,6 +726,7 @@ mod tests {
             backend: Backend::Auto,
             genome_image: GenomeImage::Path(root.join("img")),
             workload: Workload::AppCheckpoint,
+            brain: Default::default(),
             mode,
             funding: FundingConfig {
                 initial_sats: 3_000,

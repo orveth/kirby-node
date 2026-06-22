@@ -64,6 +64,7 @@ async fn g2_meters_and_halts_on_budget() {
         // The burn workload: allocate measurable memory and spin the CPU so the
         // host meter reads non-zero cgroup usage (the G2 burn-not-zero property).
         workload: Some("burn".to_string()),
+        brain: None,
         // G2 is vsock-only (CPU + memory metering); the egress meter and TAP are
         // C-5 (gate G4), exercised by the egress test.
         lockdown_egress: false,

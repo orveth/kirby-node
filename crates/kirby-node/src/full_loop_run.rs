@@ -813,6 +813,8 @@ async fn boot_active_node(
         vcpu_count: config.vcpu_count,
         mem_size_mib: config.mem_mib,
         workload: Some("full-loop".to_string()),
+        // Not the brain workload: no brain rail, no brain cmdline params.
+        brain: None,
         // The egress lockdown is ON throughout (gate G4 + G5(iv)): the VM gets a TAP it
         // can ATTEMPT egress on, the host kernel drops it, and the eBPF meter counts ~0.
         lockdown_egress: true,

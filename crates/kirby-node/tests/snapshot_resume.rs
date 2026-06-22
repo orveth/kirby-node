@@ -62,6 +62,7 @@ async fn g6_snapshot_and_resume_on_node2() {
         hello_timeout: Duration::from_secs(40),
         // Forced on by SnapshotRunConfig::new; set here for clarity.
         workload: Some("snapshot".to_string()),
+        brain: None,
         // G6 is vsock-only (the egress lockdown is G4); keeps the move lean.
         lockdown_egress: false,
         snapshot_capable: true,

@@ -266,6 +266,7 @@ impl SandboxBackend for FirecrackerBackend {
             guest_cid: spec.guest_cid,
             gateway_port: spec.gateway_port,
             workload: spec.workload.clone(),
+            brain: spec.brain.clone(),
             vcpu_count: spec.vcpu_count,
             mem_size_mib: spec.mem_size_mib,
             jail_uid: uid,
@@ -316,6 +317,11 @@ pub(crate) struct BootParams {
     /// (allocate memory + spin CPU, gate G2); `None` (the C-2 default) idles
     /// after the boot round-trip, so G1 is unaffected.
     pub workload: Option<String>,
+    /// The `[brain]` knobs for the MIND workload (brain-stub). `Some` only for a
+    /// `brain` guest: `model`, `max_cost_sats`, and `tick_secs` are written onto the
+    /// kernel command line (`kirby.brain_*=`) so the genome's brain loop reads its
+    /// config, exactly as `gateway_port` and `workload` already travel.
+    pub brain: Option<crate::config::BrainConfig>,
     /// vCPU count and memory for the microVM. Small for the spike.
     pub vcpu_count: u8,
     pub mem_size_mib: usize,
@@ -648,6 +654,17 @@ pub(crate) async fn boot(
     // boot (C-2) idles. Absent flag means idle.
     if let Some(workload) = &params.workload {
         boot_args.push_str(&format!(" kirby.workload={workload}"));
+    }
+    // The brain knobs for the MIND workload (brain-stub §4): the genome's brain loop
+    // reads model/max_cost_sats/tick_secs from the cmdline, so the `[brain]` config
+    // reaches it the same non-secret way the gateway port and workload do. Only the
+    // genome-side knobs travel; the daemon's StubBrain cost knob (bytes_per_sat) stays
+    // host-side. The model carries no spaces (a model id), so it needs no quoting.
+    if let Some(brain) = &params.brain {
+        boot_args.push_str(&format!(
+            " kirby.brain_model={} kirby.brain_max_cost_sats={} kirby.brain_tick_secs={}",
+            brain.model, brain.max_cost_sats, brain.tick_secs
+        ));
     }
 
     // When a TAP is wired (C-5, spec 3.7), configure the guest eth0 from the

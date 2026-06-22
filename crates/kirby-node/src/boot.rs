@@ -29,7 +29,7 @@ use crate::checkpoint::{CheckpointArtifact, LatestCheckpoint};
 #[cfg(target_os = "linux")]
 use crate::firecracker::FirecrackerBackend;
 use crate::gateway::{GatewayService, Session};
-use crate::rail::{MockRail, Rail};
+use crate::rail::{CompositeRail, MockRail, Rail, StubBrain};
 use crate::sandbox::{GatewayTransport, GuestImage, GuestSpec, SandboxBackend, SandboxInstance};
 use crate::treasury::Treasury;
 #[cfg(target_os = "macos")]
@@ -82,6 +82,12 @@ pub struct BootConfig {
     /// `Some("raw-egress")` runs the C-5 egress probe (attempt direct outbound,
     /// which must fail, gate G4).
     pub workload: Option<String>,
+    /// The `[brain]` knobs for the MIND workload (brain-stub). `Some` only when
+    /// `workload = Some("brain")`: it both selects the brain rail
+    /// (`CompositeRail { base: MockRail, brain: StubBrain }`, F3) and travels to the
+    /// genome on the kernel command line via [`crate::sandbox::GuestSpec::brain`].
+    /// `None` for every other workload (the plain `MockRail`, no brain cmdline).
+    pub brain: Option<crate::config::BrainConfig>,
     /// Wire a per-VM TAP into the VM and lock it down with nftables default-deny
     /// egress (C-5, spec 3.7, gate G4). When true, the VM gets a network interface
     /// it can ATTEMPT egress on, the host kernel drops that egress (counted), and
@@ -184,11 +190,23 @@ async fn open_treasury_retrying(
 /// and the error is returned.
 ///
 /// Uses the mock rail (the C-2/C-4/C-5 paths do no real brokered act); the C-6
-/// brokered act injects the real rail via [`boot_and_observe_with_rail`].
+/// brokered act injects the real rail via [`boot_and_observe_with_rail`]. The MIND
+/// workload (brain-stub F3) injects a [`CompositeRail`] instead: a `Completion` act
+/// routes to the [`StubBrain`] (the daemon's inference backend), every other act to
+/// the base `MockRail` (and in brain mode the gateway allowlist denies non-Completion
+/// acts before they reach it, R3). Selected by `config.brain`, which is `Some` iff
+/// the workload is `brain`.
 pub async fn boot_and_observe(
     config: BootConfig,
 ) -> anyhow::Result<(Box<dyn SandboxInstance>, BootOutcome, Treasury, EventStream, ServeGuard)> {
-    boot_and_observe_with_rail(config, Arc::new(MockRail::new())).await
+    let rail: Arc<dyn Rail> = match &config.brain {
+        Some(brain) => Arc::new(CompositeRail::new(
+            Arc::new(MockRail::new()),
+            Arc::new(StubBrain::new(brain.bytes_per_sat)),
+        )),
+        None => Arc::new(MockRail::new()),
+    };
+    boot_and_observe_with_rail(config, rail).await
 }
 
 /// As [`boot_and_observe`], but the caller supplies the [`Rail`] the gateway's
@@ -239,6 +257,9 @@ pub async fn boot_and_observe_with_rail(
         vcpu_count: config.vcpu_count,
         mem_size_mib: config.mem_size_mib,
         workload: config.workload.clone(),
+        // The brain knobs travel to the genome on the kernel command line (the
+        // backend writes `kirby.brain_*=` when this is Some, brain-stub §4).
+        brain: config.brain.clone(),
         lockdown_egress: config.lockdown_egress,
         snapshot_capable: config.snapshot_capable,
     };

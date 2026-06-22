@@ -110,6 +110,7 @@ fn base_config(test: &str, guest_cid: u32, gateway_port: u32) -> Option<BootConf
         mem_size_mib: 128,
         hello_timeout: Duration::from_secs(40),
         workload: Some("app-checkpoint".to_string()),
+        brain: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

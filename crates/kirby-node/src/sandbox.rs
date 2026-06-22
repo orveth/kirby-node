@@ -374,6 +374,12 @@ pub struct GuestSpec {
     /// `Some("burn")` runs the metering workload (C-4/G2); `Some("raw-egress")`
     /// runs the egress probe (C-5/G4).
     pub workload: Option<String>,
+    /// The `[brain]` knobs for the MIND workload (brain-stub). `Some` only when
+    /// `workload = Some("brain")`: the backend writes `model`, `max_cost_sats`, and
+    /// `tick_secs` onto the guest kernel command line (`kirby.brain_*=`) so the
+    /// genome's brain loop reads its config, exactly as `gateway_port`/`workload`
+    /// already travel. `None` for every non-brain guest (no brain cmdline params).
+    pub brain: Option<crate::config::BrainConfig>,
     /// Install the per-VM egress lockdown (default-deny on the guest's egress) and
     /// wire a metered network interface so the genome can ATTEMPT egress (spec 3.7,
     /// gate G4). When false, the guest is vsock-only (no network interface), which
