@@ -614,6 +614,83 @@ mod tests {
         );
     }
 
+    // ---- brain-stub: the [brain] validation guard (the spending membrane's
+    // "afford at least one think" gate). It is load-bearing — it closes the
+    // think-for-free path (a zero or over-treasury per-call cap) — so it has teeth:
+    // reject the two bad shapes for the BRAIN reason (not an unrelated field), and
+    // ACCEPT the valid shape (so the tests prove the guard discriminates, rather than
+    // erroring unconditionally). Each sets a valid funding/relay so ONLY the brain
+    // guard can be the failing check.
+
+    #[test]
+    fn brain_zero_max_cost_sats_is_rejected() {
+        let toml = r#"
+            workload = "brain"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            max_cost_sats = 0
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).unwrap_err();
+        // Rejected for THE brain reason (a zero per-call cap), not funding/backend/relay.
+        assert!(
+            err.to_string().contains("brain.max_cost_sats must be > 0"),
+            "expected the brain zero-cap validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn brain_max_cost_sats_over_treasury_is_rejected() {
+        let toml = r#"
+            workload = "brain"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 100
+            [brain]
+            max_cost_sats = 200
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).unwrap_err();
+        // Rejected for THE brain reason (cap exceeds the treasury → can't afford the
+        // first think), pinned to the brain field + funding so it is not the
+        // zero-funding guard ("initial_sats must be > 0") or another field.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("brain.max_cost_sats") && msg.contains("funding.initial_sats"),
+            "expected the brain cap-over-treasury validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn brain_valid_max_cost_sats_is_accepted() {
+        // The negative control: a well-formed brain config (0 < max_cost_sats <=
+        // initial_sats) must PASS validation — proving the guard rejects only the bad
+        // shapes above, not the brain workload unconditionally.
+        let toml = r#"
+            workload = "brain"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            max_cost_sats = 64
+        "#;
+        let cfg = KirbyConfig::from_toml_str(toml).expect("a valid brain config must validate");
+        assert_eq!(cfg.workload, Workload::Brain);
+        assert_eq!(cfg.brain.max_cost_sats, 64, "the brain block parsed");
+    }
+
     #[test]
     fn auto_backend_resolves_by_platform() {
         // The native backend matches the build target: VZ on macOS-aarch64, else
