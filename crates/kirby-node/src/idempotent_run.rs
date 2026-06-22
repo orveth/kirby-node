@@ -567,27 +567,16 @@ fn open_treasury_when_unlocked(
     loop {
         match Treasury::open(path, seed_sats) {
             Ok(t) => return Ok(t),
-            Err(e) if is_lock_contention(&e) && std::time::Instant::now() < deadline => {
+            Err(e)
+                if crate::treasury::is_lock_contention(&e)
+                    && std::time::Instant::now() < deadline =>
+            {
                 // The previous holder's lock has not been released yet; back off and retry.
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => return Err(e),
         }
     }
-}
-
-/// True iff a treasury open error is sled's exclusive-lock contention, the transient that
-/// clears once the prior holder's handles are fully reclaimed. sled (0.34) reports a failed
-/// `flock` as `Error::Io(ErrorKind::Other, "could not acquire lock on <path>: <WouldBlock>")`,
-/// folding the underlying `WouldBlock` into the message rather than the outer io kind, so the
-/// stable discriminator is that message. Any other storage error (corruption, a real I/O
-/// fault) is NOT retried.
-pub(crate) fn is_lock_contention(err: &crate::treasury::TreasuryError) -> bool {
-    matches!(
-        err,
-        crate::treasury::TreasuryError::Storage(sled::Error::Io(io))
-            if io.to_string().contains("could not acquire lock")
-    )
 }
 
 /// Wait for the genome's next idem outcome event of `kind` (`idem_first` /

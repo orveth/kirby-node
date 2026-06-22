@@ -41,6 +41,26 @@ pub enum TreasuryError {
     Corrupt(String),
 }
 
+/// Whether a `TreasuryError` is a transient sled lock contention (a same-host
+/// reopen racing the prior holder's still-reclaiming flock) rather than a real
+/// fault. sled (0.34) reports a failed `flock` as
+/// `Error::Io(ErrorKind::Other, "could not acquire lock on <path>: <WouldBlock>")`,
+/// folding the underlying `WouldBlock` into the message rather than the outer io
+/// kind, so the stable discriminator is that message. Any other storage error
+/// (corruption, a real I/O fault) is NOT lock contention and must not be retried.
+///
+/// Lives here (platform-independent — it only inspects a `TreasuryError`) so both
+/// the Linux-only `idempotent_run` retry loop and the cross-platform `boot`
+/// treasury-reopen retry can share it without dragging Linux orchestration onto
+/// macOS.
+pub(crate) fn is_lock_contention(err: &TreasuryError) -> bool {
+    matches!(
+        err,
+        TreasuryError::Storage(sled::Error::Io(io))
+            if io.to_string().contains("could not acquire lock")
+    )
+}
+
 /// A persisted record of one performed capability, keyed by idempotency_key.
 /// Storing the whole receipt (not just a flag) lets a resume-replay return the
 /// exact prior receipt (spec step 1, gate G9).

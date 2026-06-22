@@ -162,7 +162,7 @@ async fn open_treasury_retrying(
         match Treasury::open(path, seed_sats) {
             Ok(t) => return Ok(t),
             Err(e)
-                if crate::idempotent_run::is_lock_contention(&e)
+                if crate::treasury::is_lock_contention(&e)
                     && tokio::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(Duration::from_millis(25)).await;
