@@ -363,6 +363,7 @@ async fn brain_vm_boots_thinks_and_dies_when_broke() {
         // `Some(brain)` selects the CompositeRail (StubBrain) in boot_and_observe (F3)
         // and writes the brain knobs onto the genome's kernel cmdline.
         brain: Some(brain),
+        memory: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

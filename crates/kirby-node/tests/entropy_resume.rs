@@ -72,6 +72,7 @@ fn boot_config(image: ImagePaths, node_id: &str, task: &str, cid: u32, port: u32
         // Forced on by SnapshotRunConfig; set here for clarity.
         workload: Some("snapshot".to_string()),
         brain: None,
+        memory: None,
         // G7 is vsock-only (the egress lockdown is G4); keeps the move lean.
         lockdown_egress: false,
         snapshot_capable: true,

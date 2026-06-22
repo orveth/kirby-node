@@ -29,7 +29,7 @@ use crate::checkpoint::{CheckpointArtifact, LatestCheckpoint};
 #[cfg(target_os = "linux")]
 use crate::firecracker::FirecrackerBackend;
 use crate::gateway::{GatewayService, Session};
-use crate::rail::{CompositeRail, MockRail, Rail, StubBrain};
+use crate::rail::{CompositeRail, MockRail, Rail, StubBrain, StubMemory};
 use crate::sandbox::{GatewayTransport, GuestImage, GuestSpec, SandboxBackend, SandboxInstance};
 use crate::treasury::Treasury;
 #[cfg(target_os = "macos")]
@@ -88,6 +88,12 @@ pub struct BootConfig {
     /// genome on the kernel command line via [`crate::sandbox::GuestSpec::brain`].
     /// `None` for every other workload (the plain `MockRail`, no brain cmdline).
     pub brain: Option<crate::config::BrainConfig>,
+    /// The `[memory]` knobs for the durable-mind-state workload (memory-stub). `Some`
+    /// only when `workload = Some("memory")`: it both selects the memory backend
+    /// (`StubMemory`, injected onto the gateway via `with_memory_backend`) and travels the
+    /// genome-side knobs (`max_cost_sats`, `tick_secs`) to the genome on the kernel
+    /// command line. `None` for every other workload (no memory backend, no memory cmdline).
+    pub memory: Option<crate::config::MemoryConfig>,
     /// Wire a per-VM TAP into the VM and lock it down with nftables default-deny
     /// egress (C-5, spec 3.7, gate G4). When true, the VM gets a network interface
     /// it can ATTEMPT egress on, the host kernel drops that egress (counted), and
@@ -239,6 +245,12 @@ pub async fn boot_and_observe_with_rail(
     if let Some(checkpoint) = config.restore_checkpoint.clone() {
         service = service.with_restore_checkpoint(checkpoint);
     }
+    // The durable-mind-state workload injects a StubMemory backend onto the gateway (the
+    // Memory act is performed here, not through the rail -- its metering forks, design doc
+    // 11/12). `Some` only for `workload = memory`; otherwise a Memory act fails closed.
+    if let Some(mem) = &config.memory {
+        service = service.with_memory_backend(Arc::new(StubMemory::new(mem.bytes_per_sat)));
+    }
 
     // Observe ReportEvents so we can await the genome's boot hello (G1).
     let mut events = service.observe_events();
@@ -260,6 +272,8 @@ pub async fn boot_and_observe_with_rail(
         // The brain knobs travel to the genome on the kernel command line (the
         // backend writes `kirby.brain_*=` when this is Some, brain-stub §4).
         brain: config.brain.clone(),
+        // The memory knobs travel the same way (`kirby.memory_*=` when Some).
+        memory: config.memory.clone(),
         lockdown_egress: config.lockdown_egress,
         snapshot_capable: config.snapshot_capable,
     };
