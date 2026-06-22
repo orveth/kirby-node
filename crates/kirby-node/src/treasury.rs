@@ -310,3 +310,26 @@ fn decode_u64_tx(raw: &[u8]) -> Result<u64, ConflictableTransactionError<String>
         .map_err(|_| abort(format!("expected 8 bytes, got {}", raw.len())))?;
     Ok(u64::from_be_bytes(arr))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{is_lock_contention, TreasuryError};
+
+    #[test]
+    fn lock_contention_matches_sled_lock_message() {
+        let err = TreasuryError::Storage(sled::Error::Io(std::io::Error::other(
+            "could not acquire lock on /tmp/kirby-treasury: <WouldBlock>",
+        )));
+
+        assert!(is_lock_contention(&err));
+    }
+
+    #[test]
+    fn lock_contention_ignores_other_storage_errors() {
+        let err = TreasuryError::Storage(sled::Error::Io(std::io::Error::other(
+            "disk is unavailable",
+        )));
+
+        assert!(!is_lock_contention(&err));
+    }
+}
