@@ -57,6 +57,11 @@ pub mod shamir;
 /// condition-gated share release. The quorum primitive seal (H4b) + unseal (H5) drive.
 pub mod holder;
 
+/// H4b: the SEAL ceremony — the atomic-commit orchestration (quiesce -> persist -> split
+/// -> distribute -> publish -> VERIFY=PONR -> zeroize) composing H1/H2/H3/H4a, with
+/// abort-and-stay-awake (bump `seal_epoch`) before the point of no return.
+pub mod seal;
+
 /// The Shamir threshold for the thin slice: any `SEAL_THRESHOLD`-of-`SEAL_SHARES`
 /// shares reconstruct the master seed. 2-of-3 (survive losing one holder).
 pub const SEAL_THRESHOLD: u8 = 2;
