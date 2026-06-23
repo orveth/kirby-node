@@ -67,6 +67,12 @@ pub mod seal;
 /// live authority (barrier 3) on the aggregated lease.
 pub mod unseal;
 
+// H6: the end-to-end round-trip integration test (the "died & came back as itself"
+// capstone). Test-only: it composes seal (H4b) + reconstitute (H5) over the on-disk
+// artifacts and asserts the milestone; it adds no production surface.
+#[cfg(test)]
+mod roundtrip;
+
 /// The Shamir threshold for the thin slice: any `SEAL_THRESHOLD`-of-`SEAL_SHARES`
 /// shares reconstruct the master seed. 2-of-3 (survive losing one holder).
 pub const SEAL_THRESHOLD: u8 = 2;
