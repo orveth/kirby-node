@@ -186,6 +186,10 @@ pub mod firecracker;
 #[cfg(target_os = "linux")]
 pub mod full_loop_run;
 pub mod gateway;
+// Hibernation thin-slice shared types (H0): StateBundle/Share/Lease/WatcherRecord/
+// WakeRequest + the agent-scoped path helper. Platform-agnostic host-side serde
+// types (no genome/trait/sudo surface), like `nerve`/`engram` -- NOT cfg-gated.
+pub mod hibernate;
 #[cfg(target_os = "linux")]
 pub mod idempotent_run;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
