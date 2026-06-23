@@ -961,3 +961,505 @@ impl MemoryBackend for StubMemory {
         })
     }
 }
+
+// ---- RoutstrBrain: the REAL brain (Cashu-paid Routstr inference) --------------------
+//
+// A second [`BrainBackend`] impl (behind the already-merged trait, zero proto/genome
+// change). `complete()` mints an X-Cashu token worth the per-call cap from the treasury
+// wallet, POSTs the OpenAI-compat chat request to the pinned Routstr node with the token
+// as the `X-Cashu` bearer, parses the reply + the change token from the `X-Cashu`
+// response header, redeems the change back into the wallet, and debits
+// `actual_cost = cap - change_received` (the never-overspend `reconcile_cost`). The
+// node can never take more than the token's value, so the spend is bounded by the cap
+// by construction (D-20). See plans/build-spec-kirby-routstr-brain-20260622.md (v3).
+//
+// Money-path invariants (load-bearing, NOT inferred — spec §4/§5/§7):
+//   - The payment boundary is the MINT (`mint_send_token`), NOT the HTTP send (HIGH-1):
+//     once the token is minted the wallet's proofs are pending-spent, so ANY post-mint
+//     failure first reclaims our OWN un-consumed send via `revoke_send(operation_id)`
+//     (R2-1 — NOT `receive`, which is for foreign tokens), then the RIP-01 refund, then
+//     debits only the unrecovered remainder. Money-left-wallet => never UpstreamFailed/0
+//     unless the token was FULLY reclaimed (wallet made whole).
+//   - The kill-window is TWO bounded phases (R2-2): a `request_timeout`-bounded MAIN
+//     path (mint -> POST -> parse -> redeem change) whose minted handle is STASHED so a
+//     timeout that drops the main future leaves the handle for cleanup; then a
+//     `recovery_timeout`-bounded CLEANUP phase (revoke -> refund) run OUTSIDE the expired
+//     main future so it is never cancelled.
+//   - `max_cost_sats` is a CEILING: unredeemed change counts as zero recovered
+//     (`actual_cost = cap - change_SUCCESSFULLY_received`, §4 safe rule), keeping the
+//     counter debit from ever over-crediting past the real wallet spend.
+//   - Bearer-token safety (MED-3): the HTTP client disables redirects (a redirect would
+//     resend the X-Cashu bearer ecash to another host); HTTPS is enforced for non-local
+//     nodes at config-validate; the X-Cashu request/change/refund tokens are spendable
+//     instruments and are NEVER written to a log/trace, even at debug.
+
+use std::time::Duration;
+
+/// The cdk send-saga operation id: `Wallet::prepare_send` -> `operation_id()` ->
+/// `revoke_send(operation_id)`. Carried on a [`SendHandle`] so an un-consumed X-Cashu
+/// send can be reclaimed (R2-1, the same-wallet reclaim primitive).
+pub type OperationId = uuid::Uuid;
+
+/// A freshly-minted, reclaimable X-Cashu send: the wire token (`cashuB…` V4) plus the
+/// local send saga's [`OperationId`]. The operation id is what makes the send our OWN
+/// (revocable) rather than a foreign token to `receive` (R2-1).
+pub struct SendHandle {
+    /// The encoded `cashuB…` token to hand the node as the `X-Cashu` bearer. SPENDABLE
+    /// bearer money — never log it (MED-3).
+    pub token: String,
+    /// The local send saga id, for `revoke_send` (reclaim our own un-consumed send).
+    pub operation_id: OperationId,
+}
+
+/// The ecash seam RoutstrBrain mints/redeems through, so the HTTP + reconcile logic is
+/// testable without a live mint (a [`StubEcash`] models tokens/handles/amounts in CI;
+/// [`CdkEcash`] wraps the real treasury wallet). Mirrors the [`Rail`]/[`BrainBackend`]
+/// trait-seam idiom and is where the "which mint / how funded" money concern lives.
+#[async_trait::async_trait]
+pub trait EcashProvider: Send + Sync {
+    /// Mint a send token worth EXACTLY `amount_sats` from the wallet (the spend cap).
+    /// Returns the wire token + its operation id. THIS is the payment boundary (HIGH-1):
+    /// on `Ok` the wallet's proofs are already pending-spent.
+    async fn mint_send_token(&self, amount_sats: u64) -> anyhow::Result<SendHandle>;
+    /// Redeem a FOREIGN token (the node's change token, or a RIP-01 refund token) into
+    /// the wallet; returns the sats recovered. NOT for our own sends (use `revoke_send`).
+    async fn redeem_foreign(&self, token: &str) -> anyhow::Result<u64>;
+    /// Reclaim our OWN un-consumed send by its operation id (R2-1); returns sats back.
+    /// MUST fail cleanly (without corrupting wallet state) if the node already redeemed
+    /// the token (then the caller falls through to the RIP-01 refund).
+    async fn revoke_send(&self, op: &OperationId) -> anyhow::Result<u64>;
+    /// Boot-time recovery of any send/receive interrupted by a prior crash/timeout
+    /// (R2-4), run BEFORE the §7.2 wallet<->counter reconcile.
+    async fn recover_incomplete_sagas(&self) -> anyhow::Result<()>;
+}
+
+/// The real ecash provider: wraps the funded treasury `cdk::Wallet` (the host-only
+/// credential the genome never sees). All ops are the daemon's own host networking to
+/// the mint; nothing cdk crosses vsock.
+pub struct CdkEcash {
+    wallet: Arc<cdk::Wallet>,
+}
+
+impl CdkEcash {
+    /// Build the provider over a funded wallet.
+    pub fn new(wallet: Arc<cdk::Wallet>) -> Self {
+        CdkEcash { wallet }
+    }
+
+    /// The wrapped wallet (host-side only; for boot-time reconcile + tests to observe
+    /// the balance). Never exposed to the genome.
+    pub fn wallet(&self) -> &Arc<cdk::Wallet> {
+        &self.wallet
+    }
+}
+
+#[async_trait::async_trait]
+impl EcashProvider for CdkEcash {
+    async fn mint_send_token(&self, amount_sats: u64) -> anyhow::Result<SendHandle> {
+        // prepare_send selects/szwaps proofs to a token worth `amount_sats`; confirm
+        // materializes the `cashuB…` token. The operation id is captured BEFORE confirm
+        // (which consumes the PreparedSend) so an un-consumed send stays revocable.
+        let prepared = self
+            .wallet
+            .prepare_send(
+                cdk::Amount::from(amount_sats),
+                cdk::wallet::SendOptions::default(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("prepare_send {amount_sats} sat: {e}"))?;
+        let operation_id = prepared.operation_id();
+        let token = prepared
+            .confirm(None)
+            .await
+            .map_err(|e| anyhow::anyhow!("confirm send token: {e}"))?;
+        Ok(SendHandle {
+            token: token.to_string(),
+            operation_id,
+        })
+    }
+
+    async fn redeem_foreign(&self, token: &str) -> anyhow::Result<u64> {
+        let amount = self
+            .wallet
+            .receive(token, cdk::wallet::ReceiveOptions::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("receive (redeem) foreign token: {e}"))?;
+        Ok(amount.into())
+    }
+
+    async fn revoke_send(&self, op: &OperationId) -> anyhow::Result<u64> {
+        // revoke_send swaps our own un-consumed send proofs back; it returns a clean
+        // Err ("Operation is not a pending send") if the node already redeemed it.
+        let amount = self
+            .wallet
+            .revoke_send(*op)
+            .await
+            .map_err(|e| anyhow::anyhow!("revoke_send (reclaim our un-consumed send): {e}"))?;
+        Ok(amount.into())
+    }
+
+    async fn recover_incomplete_sagas(&self) -> anyhow::Result<()> {
+        self.wallet
+            .recover_incomplete_sagas()
+            .await
+            .map_err(|e| anyhow::anyhow!("recover_incomplete_sagas: {e}"))?;
+        Ok(())
+    }
+}
+
+/// The never-overspend cost reconciliation (the money invariant, §4). `actual_cost =
+/// cap - change_received`, clamped to `[0, cap]`: change greater than the cap clamps to
+/// 0 (never a negative/underflowed debit), and zero change debits the full cap. PURE so
+/// it is unit-tested directly, free of HTTP/cdk. `change_received` MUST be only the
+/// change SUCCESSFULLY redeemed (unredeemed change counts as zero — the safe rule that
+/// keeps the counter debit from over-crediting past the real wallet spend).
+pub fn reconcile_cost(cap: u64, change_received: u64) -> u64 {
+    cap.saturating_sub(change_received)
+}
+
+/// The OpenAI-compat chat request body (the daemon builds JSON; the genome stayed
+/// dep-free). `stream:false` is pinned: stateless X-Cashu mode cannot stream (the change
+/// is only knowable after the full response).
+#[derive(serde::Serialize)]
+struct ChatCompletionRequest<'a> {
+    model: &'a str,
+    messages: Vec<WireMessage<'a>>,
+    stream: bool,
+}
+
+#[derive(serde::Serialize)]
+struct WireMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+}
+
+/// The OpenAI-compat chat response. Unknown fields (id/usage/…) are ignored. A null
+/// `content` (tool-call replies, out of scope §10) fails to deserialize -> treated as a
+/// malformed body -> cleanup path.
+#[derive(serde::Deserialize)]
+struct ChatCompletionResponse {
+    choices: Vec<ResponseChoice>,
+}
+
+#[derive(serde::Deserialize)]
+struct ResponseChoice {
+    message: ResponseMessage,
+}
+
+#[derive(serde::Deserialize)]
+struct ResponseMessage {
+    content: String,
+}
+
+/// A RIP-01 refund response: a refund token to `receive`. Accepted from either the
+/// `X-Cashu` response header or this JSON body (node-specific; best-effort, Layer-C).
+#[derive(serde::Deserialize)]
+struct RefundResponse {
+    token: String,
+}
+
+/// The result of the bounded MAIN path (after a successful mint).
+enum MainOutcome {
+    /// A usable reply came back; `change_received` is the sats redeemed from the change
+    /// token (0 if absent/lost — §4 safe rule). The node consumed the token, so no
+    /// revoke is needed; debit `cap - change_received`.
+    Replied {
+        reply: Vec<u8>,
+        change_received: u64,
+    },
+    /// A post-mint failure (connect/send error, timeout, non-2xx, or malformed body):
+    /// the token may or may not have been consumed -> run the revoke/refund cleanup.
+    NeedsCleanup,
+}
+
+/// Why the main path produced no [`MainOutcome`].
+enum MainErr {
+    /// The mint itself failed: the token was NEVER (confirmed) minted, so no sats left
+    /// the wallet -> UpstreamFailed/0 (the only debit-0-after-the-boundary-safe case
+    /// besides full reclaim).
+    PreMint(String),
+    /// The whole main path exceeded `request_timeout` (the future was dropped). A token
+    /// MAY have been minted (check the stash) -> cleanup if so.
+    Timeout,
+}
+
+/// The real brain: Cashu-paid Routstr inference behind [`BrainBackend`]. Generic over
+/// the [`EcashProvider`] seam ([`CdkEcash`] live, a stub in CI).
+pub struct RoutstrBrain<E: EcashProvider> {
+    /// Built ONCE with redirects disabled + the per-call timeout (MED-3 / §5).
+    http: reqwest::Client,
+    /// The pinned Routstr base URL (the `brain.completion` sentinel maps here, R2). The
+    /// genome/gateway never see this host.
+    node_url: String,
+    ecash: E,
+    /// The MAIN-path kill-window (mint -> POST -> parse -> redeem change).
+    request_timeout: Duration,
+    /// The CLEANUP (revoke/refund) budget, separate from the main path so cleanup is
+    /// never cancelled by the main deadline (R2-2).
+    recovery_timeout: Duration,
+}
+
+impl<E: EcashProvider> RoutstrBrain<E> {
+    /// Build the brain over a pinned node URL and an ecash provider. The HTTP client is
+    /// constructed once with redirects DISABLED (a redirect would leak the X-Cashu
+    /// bearer ecash to another host, MED-3) and the per-call request timeout.
+    pub fn new(
+        node_url: String,
+        ecash: E,
+        request_timeout: Duration,
+        recovery_timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(request_timeout)
+            .build()
+            .map_err(|e| anyhow::anyhow!("build RoutstrBrain HTTP client: {e}"))?;
+        Ok(RoutstrBrain {
+            http,
+            node_url,
+            ecash,
+            request_timeout,
+            recovery_timeout,
+        })
+    }
+
+    /// The MAIN path AFTER a successful mint: POST the completion with the X-Cashu token,
+    /// parse the reply, read + redeem the change. Returns [`MainOutcome`]. Never panics;
+    /// any error maps to [`MainOutcome::NeedsCleanup`] (a reply, once parsed, is kept
+    /// even if the change redeem then fails/hangs — §4 safe rule).
+    async fn main_path(&self, token: &str, model: &str, messages: &[ChatMessage]) -> MainOutcome {
+        let url = format!("{}/v1/chat/completions", self.node_url.trim_end_matches('/'));
+        let body = ChatCompletionRequest {
+            model,
+            messages: messages
+                .iter()
+                .map(|m| WireMessage {
+                    role: &m.role,
+                    content: &m.content,
+                })
+                .collect(),
+            stream: false,
+        };
+        // The X-Cashu token is bearer money; it is attached as a header and NEVER logged.
+        let resp = match self
+            .http
+            .post(&url)
+            .header("X-Cashu", token)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Connect/send/timeout: the node never accepted the token (or we can't
+                // tell). Reclaim it. (e renders the URL but not our headers -> no token leak.)
+                tracing::warn!(error = %e, "routstr POST failed before a usable response; reclaiming the token");
+                return MainOutcome::NeedsCleanup;
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            tracing::warn!(%status, "routstr returned a non-success status; reclaiming the token");
+            return MainOutcome::NeedsCleanup;
+        }
+        // Read the change token from the X-Cashu RESPONSE header before consuming the body.
+        let change_token = resp
+            .headers()
+            .get("X-Cashu")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let parsed: ChatCompletionResponse = match resp.json().await {
+            Ok(b) => b,
+            Err(_) => {
+                tracing::warn!("routstr 200 body was malformed / unparseable; reclaiming the token");
+                return MainOutcome::NeedsCleanup;
+            }
+        };
+        let reply = match parsed.choices.into_iter().next() {
+            // A present content (even "") is a legal, paid (if wasted) think (§5): keep it.
+            Some(choice) => choice.message.content.into_bytes(),
+            None => {
+                tracing::warn!("routstr 200 had no choices/content; reclaiming the token");
+                return MainOutcome::NeedsCleanup;
+            }
+        };
+        // The node consumed the token (we have a reply). Redeem the change, BOUNDED so a
+        // hung redeem cannot cost us the reply we already hold (§4 safe rule: count 0).
+        let change_received = match change_token {
+            Some(tok) => tokio::time::timeout(self.recovery_timeout, self.ecash.redeem_foreign(&tok))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or(0),
+            None => 0,
+        };
+        MainOutcome::Replied {
+            reply,
+            change_received,
+        }
+    }
+
+    /// Reclaim sats after a post-mint failure (§5 recovery order), BOUNDED by
+    /// `recovery_timeout` and run OUTSIDE the (possibly expired) main future (R2-2).
+    /// (1) `revoke_send` our OWN un-consumed send (R2-1); (2) if that recovered nothing
+    /// (token consumed), the RIP-01 refund of the original token; (3) eat the remainder.
+    /// Returns total sats recovered.
+    async fn recover_after_failure(&self, handle: &SendHandle) -> u64 {
+        let cleanup = async {
+            let revoked = self.ecash.revoke_send(&handle.operation_id).await.unwrap_or(0);
+            if revoked > 0 {
+                return revoked;
+            }
+            // The node consumed the token; try the RIP-01 refund (works iff it reserved
+            // but did not fully charge), then redeem the returned refund token.
+            match self.request_refund(&handle.token).await {
+                Ok(refund_token) => self.ecash.redeem_foreign(&refund_token).await.unwrap_or(0),
+                Err(_) => 0,
+            }
+        };
+        tokio::time::timeout(self.recovery_timeout, cleanup).await.unwrap_or(0)
+    }
+
+    /// The RIP-01 refund: POST the original token to `{node}/v1/wallet/refund` and read
+    /// the returned refund token (from the `X-Cashu` header or a JSON body). Best-effort
+    /// (a failure just means we eat the remainder); the token is bearer money, never
+    /// logged. Exercised live at Layer C; in CI via the mock node + StubEcash.
+    async fn request_refund(&self, original_token: &str) -> anyhow::Result<String> {
+        let url = format!("{}/v1/wallet/refund", self.node_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-Cashu", original_token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("routstr refund returned status {}", resp.status());
+        }
+        if let Some(tok) = resp.headers().get("X-Cashu").and_then(|v| v.to_str().ok()) {
+            return Ok(tok.to_string());
+        }
+        let body: RefundResponse = resp.json().await?;
+        Ok(body.token)
+    }
+}
+
+#[async_trait::async_trait]
+impl<E: EcashProvider> BrainBackend for RoutstrBrain<E> {
+    async fn complete(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        max_cost_sats: u64,
+    ) -> anyhow::Result<(Vec<u8>, u64)> {
+        // The minted handle is stashed the instant the mint returns, so a timeout that
+        // DROPS the main future still leaves the handle for the cleanup phase (R2-2 +
+        // HIGH-1). A std Mutex is fine here: the guard is never held across an `.await`.
+        let minted: Arc<std::sync::Mutex<Option<SendHandle>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let main = {
+            let minted = minted.clone();
+            async move {
+                // Phase 1: MINT (the payment boundary). Stash IMMEDIATELY, before any
+                // network, so cleanup can find it even if this future is later dropped.
+                let handle = self
+                    .ecash
+                    .mint_send_token(max_cost_sats)
+                    .await
+                    .map_err(|e| MainErr::PreMint(format!("{e}")))?;
+                let token = handle.token.clone();
+                {
+                    *minted.lock().unwrap() = Some(handle);
+                }
+                // Phase 2: POST -> parse -> redeem change.
+                Ok::<MainOutcome, MainErr>(self.main_path(&token, model, messages).await)
+            }
+        };
+
+        // The MAIN path is bounded by request_timeout; on expiry the future is dropped
+        // (its handle survives in `minted`).
+        let outcome = match tokio::time::timeout(self.request_timeout, main).await {
+            Ok(inner) => inner,
+            Err(_) => Err(MainErr::Timeout),
+        };
+
+        let handle = { minted.lock().unwrap().take() };
+
+        match (outcome, handle) {
+            // Mint never produced a (confirmed) token: no sats left the wallet.
+            (Err(MainErr::PreMint(e)), _) => {
+                Err(anyhow::anyhow!("routstr pre-mint failure (no sats spent): {e}"))
+            }
+            (Err(MainErr::Timeout), None) => Err(anyhow::anyhow!(
+                "routstr mint timed out (no token confirmed; any reserved proofs are recovered on next boot)"
+            )),
+            // A usable reply: debit cap - change (the never-overspend reconcile).
+            (Ok(MainOutcome::Replied { reply, change_received }), _) => {
+                Ok((reply, reconcile_cost(max_cost_sats, change_received)))
+            }
+            // Post-mint failure WITH a minted token: reclaim, then debit the remainder.
+            (Ok(MainOutcome::NeedsCleanup), Some(h)) | (Err(MainErr::Timeout), Some(h)) => {
+                let recovered = self.recover_after_failure(&h).await;
+                let unrecovered = max_cost_sats.saturating_sub(recovered);
+                if unrecovered == 0 {
+                    // Fully reclaimed: the wallet is whole -> UpstreamFailed/0 is correct.
+                    Err(anyhow::anyhow!(
+                        "routstr completion failed; token fully reclaimed (no debit)"
+                    ))
+                } else {
+                    // Money left the wallet and was not fully recovered: debit it. The
+                    // empty completion is a legal Performed (genome pushes an empty turn).
+                    Ok((Vec::new(), unrecovered))
+                }
+            }
+            // Defensive: NeedsCleanup is only produced AFTER the stash, so a missing
+            // handle here means we never minted. No debit.
+            (Ok(MainOutcome::NeedsCleanup), None) => Err(anyhow::anyhow!(
+                "routstr failed before the mint stash (no sats spent)"
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod routstr_reconcile_tests {
+    use super::reconcile_cost;
+
+    // The never-overspend money invariant (§4), tested as a pure fn (no HTTP, no cdk).
+    #[test]
+    fn reconcile_change_less_than_cap_debits_the_difference() {
+        // cap 64, change 50 -> debit 14 (the real price the node charged).
+        assert_eq!(reconcile_cost(64, 50), 14);
+    }
+
+    #[test]
+    fn reconcile_zero_change_debits_the_full_cap() {
+        // No/lost change (the safe rule counts unredeemed change as zero) -> debit cap.
+        assert_eq!(reconcile_cost(64, 0), 64);
+    }
+
+    #[test]
+    fn reconcile_change_equal_to_cap_debits_zero() {
+        // The node charged nothing (full change) -> debit 0.
+        assert_eq!(reconcile_cost(64, 64), 0);
+    }
+
+    #[test]
+    fn reconcile_change_over_cap_clamps_to_zero_never_underflows() {
+        // A bogus change greater than the cap must clamp to 0, never underflow to a huge
+        // debit (or panic in debug). D-20 floor.
+        assert_eq!(reconcile_cost(64, 1000), 0);
+    }
+
+    #[test]
+    fn reconcile_is_bounded_by_the_cap() {
+        // For any change, the debit is in [0, cap] — the never-overspend ceiling.
+        for cap in [0u64, 1, 16, 64, 1000] {
+            for change in [0u64, 1, 32, 64, 1000, u64::MAX] {
+                let cost = reconcile_cost(cap, change);
+                assert!(cost <= cap, "reconcile_cost({cap},{change})={cost} exceeded the cap");
+            }
+        }
+    }
+}

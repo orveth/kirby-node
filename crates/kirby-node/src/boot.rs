@@ -19,17 +19,20 @@
 //! and the budget halt (C-4), the brokered act (C-6), snapshot and resume (C-7),
 //! the entropy re-derive (C-8), and consensus (C-9).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use kirby_proto::Event;
 
 use crate::checkpoint::{CheckpointArtifact, LatestCheckpoint};
+use crate::config::BrainBackendKind;
 #[cfg(target_os = "linux")]
 use crate::firecracker::FirecrackerBackend;
 use crate::gateway::{GatewayService, Session};
-use crate::rail::{CompositeRail, MockRail, Rail, StubBrain, StubMemory};
+use crate::rail::{
+    BrainBackend, CdkEcash, CompositeRail, MockRail, Rail, RoutstrBrain, StubBrain, StubMemory,
+};
 use crate::sandbox::{GatewayTransport, GuestImage, GuestSpec, SandboxBackend, SandboxInstance};
 use crate::treasury::Treasury;
 #[cfg(target_os = "macos")]
@@ -206,6 +209,17 @@ pub async fn boot_and_observe(
     config: BootConfig,
 ) -> anyhow::Result<(Box<dyn SandboxInstance>, BootOutcome, Treasury, EventStream, ServeGuard)> {
     let rail: Arc<dyn Rail> = match &config.brain {
+        // The REAL brain (brain-routstr): a CompositeRail whose brain is a RoutstrBrain
+        // over a funded, persistent cdk wallet. Building it opens the wallet, recovers
+        // any incomplete sagas, and reconciles wallet >= treasury BEFORE the VM boots
+        // (REFUSE-TO-BOOT on a shortfall, R2-5), so a real `Completion` is served by a
+        // real Routstr node, paid from the treasury.
+        Some(brain) if brain.backend == BrainBackendKind::Routstr => {
+            let treasury_remaining = peek_treasury_remaining(&config).await?;
+            let brain_backend = build_routstr_brain(brain, treasury_remaining).await?;
+            Arc::new(CompositeRail::new(Arc::new(MockRail::new()), brain_backend))
+        }
+        // The stub brain (unchanged): deterministic, no network, no money.
         Some(brain) => Arc::new(CompositeRail::new(
             Arc::new(MockRail::new()),
             Arc::new(StubBrain::new(brain.bytes_per_sat)),
@@ -213,6 +227,88 @@ pub async fn boot_and_observe(
         None => Arc::new(MockRail::new()),
     };
     boot_and_observe_with_rail(config, rail).await
+}
+
+/// The per-node treasury store path (the daemon-owned counter, D-9). A per-node temp
+/// store keeps two node processes distinct on one host.
+fn treasury_path_for(node_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("kirby-treasury-{node_id}"))
+}
+
+/// The §7.2 wallet<->counter reconcile decision (brain-routstr R2-3/R2-5): the wallet
+/// must back every sat the metabolism counter believes it has, so the gateway never
+/// authorizes a think the wallet can't fund. The invariant is `>=`, NEVER `==` (R2-3:
+/// the excess over the counter is the wallet/mint fee reserve, §4). On a shortfall this
+/// REFUSES TO BOOT (R2-5) — the safe, loud interim; the graceful counter clamp-down
+/// (`reconcile_down_to`) needs a durable treasury mutation and is DEFERRED to the
+/// gateway-hardening chunk (the same class as the §5.1 crash-journal).
+pub fn assert_wallet_backs_counter(wallet_balance: u64, treasury_remaining: u64) -> anyhow::Result<()> {
+    if wallet_balance < treasury_remaining {
+        anyhow::bail!(
+            "RoutstrBrain refuses to boot: wallet_balance ({wallet_balance} sat) < \
+             treasury_remaining ({treasury_remaining} sat). The wallet must back every sat the \
+             metabolism counter believes it has (brain-routstr §7.2 R2-3/R2-5; the counter \
+             clamp-down is deferred to the gateway-hardening chunk). Fund the wallet to >= the \
+             treasury (plus fee headroom) before resuming."
+        );
+    }
+    Ok(())
+}
+
+/// Read the AUTHORITATIVE `treasury_remaining` before wiring the brain wallet to it, so
+/// the §7.2 reconcile compares the wallet against the real counter: bootstrap seeds
+/// `initial_sats`; resume keeps the persisted balance (the seed arg is honored only on
+/// first creation). Opens the SAME per-node store the gateway will use, reads remaining,
+/// and drops it; [`boot_and_observe_with_rail`] reopens via [`open_treasury_retrying`],
+/// which absorbs the brief sled lock-release lag (the same FIX-4 back-to-back-open race).
+async fn peek_treasury_remaining(config: &BootConfig) -> anyhow::Result<u64> {
+    let path = treasury_path_for(&config.node_id);
+    let treasury =
+        open_treasury_retrying(&path, config.initial_sats, Duration::from_secs(5)).await?;
+    let remaining = treasury.remaining()?;
+    drop(treasury);
+    Ok(remaining)
+}
+
+/// Build the [`RoutstrBrain`] backend for `backend = "routstr"` (brain-routstr §7): open
+/// the persistent, funded wallet, recover incomplete cdk sagas FIRST (R2-4), then assert
+/// the wallet backs the counter (`wallet_balance >= treasury_remaining`, NOT `==` — the
+/// excess is the fee reserve, R2-3) and REFUSE TO BOOT on a shortfall (R2-5; the graceful
+/// counter clamp-down is deferred to the gateway-hardening chunk). Then construct the
+/// brain over the wallet with the configured kill-window timeouts.
+async fn build_routstr_brain(
+    brain: &crate::config::BrainConfig,
+    treasury_remaining: u64,
+) -> anyhow::Result<Arc<dyn BrainBackend>> {
+    // 1) Open the PERSISTENT wallet (file store + persisted seed, §7.1). The wallet is
+    //    funded out-of-band (§11); boot only opens an already-funded store.
+    let wallet =
+        crate::mint_rig::open_persistent_wallet(&brain.mint_url, Path::new(&brain.wallet_db_path))
+            .await?;
+    let ecash = CdkEcash::new(wallet.clone());
+
+    // 2) Recover incomplete cdk sagas FIRST (R2-4), BEFORE measuring the balance: a prior
+    //    crash/timeout mid send/receive can strand reserved/pending proofs or leave a
+    //    revocable token; reconciling first would burn budget for recoverable sats.
+    use crate::rail::EcashProvider as _;
+    ecash.recover_incomplete_sagas().await?;
+
+    // 3) Reconcile: the wallet must back every sat the counter believes it has. REFUSE
+    //    TO BOOT on a shortfall (R2-5) — loud and safe — rather than letting the genome
+    //    see repeated UPSTREAM_FAILED when the counter authorizes a think the wallet
+    //    can't fund.
+    let wallet_balance = wallet.total_balance().await.map(u64::from).unwrap_or(0);
+    assert_wallet_backs_counter(wallet_balance, treasury_remaining)?;
+
+    // 4) Build the brain over the funded wallet, with the configured kill-window.
+    let routstr = RoutstrBrain::new(
+        brain.node_url.clone(),
+        ecash,
+        Duration::from_secs(brain.request_timeout_secs),
+        Duration::from_secs(brain.recovery_timeout_secs),
+    )?;
+    let backend: Arc<dyn BrainBackend> = Arc::new(routstr);
+    Ok(backend)
 }
 
 /// As [`boot_and_observe`], but the caller supplies the [`Rail`] the gateway's
@@ -231,7 +327,7 @@ pub async fn boot_and_observe_with_rail(
     // The persisted, daemon-owned treasury (D-9). A per-node temp store keeps two
     // node processes distinct on one host. The session is the non-secret snapshot
     // the genome pulls at boot (spec 3.1).
-    let treasury_path = std::env::temp_dir().join(format!("kirby-treasury-{}", config.node_id));
+    let treasury_path = treasury_path_for(&config.node_id);
     let treasury = open_treasury_retrying(&treasury_path, config.initial_sats, Duration::from_secs(5)).await?;
     let session = Session {
         task_descriptor: config.task.clone(),

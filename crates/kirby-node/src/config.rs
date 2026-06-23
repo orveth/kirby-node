@@ -252,15 +252,34 @@ impl Workload {
     }
 }
 
+/// Which inference backend serves a `Completion` (brain-routstr §6). `stub` is the
+/// deterministic, no-network, no-money backend (the default, so an existing `[brain]`
+/// block with no `backend` key still parses); `routstr` is the REAL Cashu-paid Routstr
+/// inference backend (the daemon mints an X-Cashu token from the treasury wallet, POSTs
+/// the completion, redeems the change). Swapping is a config change, not a genome/proto
+/// change (done-criteria #6).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrainBackendKind {
+    /// The deterministic stub backend (default; backcompat).
+    #[default]
+    Stub,
+    /// The real Cashu-paid Routstr inference backend.
+    Routstr,
+}
+
 /// The `[brain]` config block (brain-stub): the knobs for the MIND workload. The
 /// genome reads `model`, `max_cost_sats`, and `tick_secs` from the kernel command
 /// line (the daemon writes them when the workload is `brain`); the daemon's
 /// `StubBrain` reads `bytes_per_sat` (its simulated-cost knob). Every field has a
 /// sane default so a bare `[brain]` (or none, when `workload = "brain"`) runs.
 ///
-/// This is the swap-ready surface: `RoutstrBrain` (the next chunk) reads the SAME
-/// `model` and per-call `max_cost_sats`, so pointing the agent at a real model is a
-/// config change, not a genome or proto change (done-criteria #6).
+/// This is the swap-ready surface: `RoutstrBrain` reads the SAME `model` and per-call
+/// `max_cost_sats`, so pointing the agent at a real model is a config change, not a
+/// genome or proto change (done-criteria #6). The `routstr`-only fields (`node_url`,
+/// `mint_url`, `wallet_db_path`, the timeouts, `fee_headroom_sats`) all default so a
+/// `stub` `[brain]` block is unaffected; they are required (validated) iff
+/// `backend = "routstr"`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrainConfig {
     /// The model the brain "thinks" with. Passed through to the `Completion` act
@@ -276,8 +295,40 @@ pub struct BrainConfig {
     pub tick_secs: u64,
     /// The `StubBrain` cost knob: simulated cost is `ceil(total_bytes / bytes_per_sat)`
     /// sats per think (min 1), so the treasury visibly drains. Daemon-side only.
+    /// STUB-ONLY (ignored by the routstr backend, which pays the real metered price).
     #[serde(default = "default_brain_bytes_per_sat")]
     pub bytes_per_sat: u64,
+    /// Which backend serves a Completion: `stub` (default) or `routstr` (brain-routstr).
+    #[serde(default)]
+    pub backend: BrainBackendKind,
+    /// (routstr) The pinned Routstr node base URL the `brain.completion` sentinel maps
+    /// to (e.g. `https://api.routstr.com`). Required iff `backend = "routstr"`.
+    #[serde(default)]
+    pub node_url: String,
+    /// (routstr) The mint the treasury wallet holds + spends ecash at (the node's
+    /// accepted mint, §11). Required iff `backend = "routstr"`.
+    #[serde(default)]
+    pub mint_url: String,
+    /// (routstr) The PERSISTENT wallet store path (cdk-sqlite file). The wallet SEED
+    /// persists alongside it (§7.1); funded proofs survive a reboot. Required iff
+    /// `backend = "routstr"`.
+    #[serde(default)]
+    pub wallet_db_path: String,
+    /// (routstr) The MAIN-path kill-window seconds (mint -> POST -> parse -> redeem
+    /// change). The meter cannot preempt an in-flight call, so this deadline IS the
+    /// kill bound for thinking (§5).
+    #[serde(default = "default_brain_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// (routstr) The CLEANUP (revoke/refund) budget seconds, separate from the main
+    /// path so recovery is never cancelled by the main deadline (§5 R2-2).
+    #[serde(default = "default_brain_recovery_timeout_secs")]
+    pub recovery_timeout_secs: u64,
+    /// (routstr) The wallet fee reserve: the live wallet is funded
+    /// `funding.initial_sats + fee_headroom_sats` to cover mint/swap fees, so the boot
+    /// invariant `wallet_balance >= treasury_remaining` holds with headroom (§4/§7.2
+    /// R2-3). Measured in Layer B (fake mint) / Layer C (real mint).
+    #[serde(default = "default_brain_fee_headroom_sats")]
+    pub fee_headroom_sats: u64,
 }
 
 fn default_brain_model() -> String {
@@ -292,6 +343,15 @@ fn default_brain_tick_secs() -> u64 {
 fn default_brain_bytes_per_sat() -> u64 {
     16
 }
+fn default_brain_request_timeout_secs() -> u64 {
+    30
+}
+fn default_brain_recovery_timeout_secs() -> u64 {
+    10
+}
+fn default_brain_fee_headroom_sats() -> u64 {
+    8
+}
 
 impl Default for BrainConfig {
     fn default() -> Self {
@@ -300,6 +360,13 @@ impl Default for BrainConfig {
             max_cost_sats: default_brain_max_cost_sats(),
             tick_secs: default_brain_tick_secs(),
             bytes_per_sat: default_brain_bytes_per_sat(),
+            backend: BrainBackendKind::default(),
+            node_url: String::new(),
+            mint_url: String::new(),
+            wallet_db_path: String::new(),
+            request_timeout_secs: default_brain_request_timeout_secs(),
+            recovery_timeout_secs: default_brain_recovery_timeout_secs(),
+            fee_headroom_sats: default_brain_fee_headroom_sats(),
         }
     }
 }
@@ -395,6 +462,20 @@ fn default_initial_sats() -> u64 {
     1_000_000
 }
 
+/// Whether `url` is safe to send the X-Cashu bearer token to in the clear: `https://`
+/// (TLS) always, or plain `http://` ONLY for a loopback host (a same-host node / tests).
+/// Any other plain-http host is refused (brain-routstr §3 MED-3).
+fn is_https_or_localhost(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
+        return matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]");
+    }
+    false
+}
+
 impl KirbyConfig {
     /// Parse a [`KirbyConfig`] from a TOML string.
     pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
@@ -442,6 +523,35 @@ impl KirbyConfig {
                     self.brain.max_cost_sats,
                     self.funding.initial_sats
                 );
+            }
+            // The real (routstr) backend needs a node, a mint, and a persistent wallet
+            // store: a `routstr` brain missing any of these is a config error caught at
+            // load, not a runtime panic deep in boot (brain-routstr §6). The stub backend
+            // ignores all of these.
+            if self.brain.backend == BrainBackendKind::Routstr {
+                if self.brain.node_url.trim().is_empty() {
+                    anyhow::bail!(
+                        "brain.node_url must be set when brain.backend = \"routstr\" (the pinned Routstr node)"
+                    );
+                }
+                if self.brain.mint_url.trim().is_empty() {
+                    anyhow::bail!(
+                        "brain.mint_url must be set when brain.backend = \"routstr\" (the treasury wallet's mint)"
+                    );
+                }
+                if self.brain.wallet_db_path.trim().is_empty() {
+                    anyhow::bail!(
+                        "brain.wallet_db_path must be set when brain.backend = \"routstr\" (the persistent wallet store)"
+                    );
+                }
+                // The X-Cashu token is bearer money: a non-local node MUST be https, or
+                // the bearer ecash would cross plaintext http (brain-routstr §3 MED-3).
+                if !is_https_or_localhost(&self.brain.node_url) {
+                    anyhow::bail!(
+                        "brain.node_url must be https:// for a non-localhost node (the X-Cashu bearer token must not cross plaintext http); got {:?}",
+                        self.brain.node_url
+                    );
+                }
             }
         }
         // The durable-mind-state agent must be able to afford at least one WRITE, or it
@@ -759,6 +869,185 @@ mod tests {
         let cfg = KirbyConfig::from_toml_str(toml).expect("a valid brain config must validate");
         assert_eq!(cfg.workload, Workload::Brain);
         assert_eq!(cfg.brain.max_cost_sats, 64, "the brain block parsed");
+    }
+
+    // ---- brain-routstr: the `backend = "routstr"` validation guards (the real-mode
+    // required fields + the bearer-token-over-https rule). Each sets a valid
+    // funding/relay/cap so ONLY the routstr guard under test can be the failing check,
+    // and the negative controls PASS so the guards are proven to discriminate.
+
+    #[test]
+    fn brain_backend_defaults_to_stub_for_backcompat() {
+        // An existing `[brain]` block with no `backend` key parses as Stub, and the
+        // routstr-only fields are NOT required (backcompat: a stub brain still runs).
+        let toml = r#"
+            workload = "brain"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            max_cost_sats = 64
+        "#;
+        let cfg = KirbyConfig::from_toml_str(toml).expect("a stub brain must validate");
+        assert_eq!(cfg.brain.backend, BrainBackendKind::Stub);
+        assert!(cfg.brain.node_url.is_empty(), "routstr fields default empty for the stub");
+    }
+
+    #[test]
+    fn brain_routstr_missing_node_url_is_rejected() {
+        let toml = r#"
+            workload = "brain"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr"
+            max_cost_sats = 64
+            mint_url = "https://mint.example.com"
+            wallet_db_path = "/var/lib/kirby/brain-wallet.sqlite"
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("brain.node_url must be set"),
+            "expected the routstr missing-node_url error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn brain_routstr_missing_mint_url_is_rejected() {
+        let toml = r#"
+            workload = "brain"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr"
+            max_cost_sats = 64
+            node_url = "https://api.routstr.com"
+            wallet_db_path = "/var/lib/kirby/brain-wallet.sqlite"
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("brain.mint_url must be set"),
+            "expected the routstr missing-mint_url error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn brain_routstr_missing_wallet_db_path_is_rejected() {
+        let toml = r#"
+            workload = "brain"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr"
+            max_cost_sats = 64
+            node_url = "https://api.routstr.com"
+            mint_url = "https://mint.example.com"
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("brain.wallet_db_path must be set"),
+            "expected the routstr missing-wallet_db_path error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn brain_routstr_plain_http_nonlocal_node_is_rejected() {
+        // A non-localhost node MUST be https (the X-Cashu bearer must not cross plaintext).
+        let toml = r#"
+            workload = "brain"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr"
+            max_cost_sats = 64
+            node_url = "http://api.routstr.com"
+            mint_url = "https://mint.example.com"
+            wallet_db_path = "/var/lib/kirby/brain-wallet.sqlite"
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("must be https://"),
+            "expected the routstr plaintext-node rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn brain_routstr_full_https_config_is_accepted() {
+        // The negative control: a well-formed routstr brain (https node + all fields)
+        // PASSES, proving the guards reject only the bad shapes, not routstr wholesale.
+        let toml = r#"
+            workload = "brain"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr"
+            max_cost_sats = 64
+            node_url = "https://api.routstr.com"
+            mint_url = "https://mint.minibits.cash/Bitcoin"
+            wallet_db_path = "/var/lib/kirby/brain-wallet.sqlite"
+            request_timeout_secs = 45
+            recovery_timeout_secs = 12
+            fee_headroom_sats = 16
+        "#;
+        let cfg = KirbyConfig::from_toml_str(toml).expect("a valid routstr brain must validate");
+        assert_eq!(cfg.brain.backend, BrainBackendKind::Routstr);
+        assert_eq!(cfg.brain.node_url, "https://api.routstr.com");
+        assert_eq!(cfg.brain.request_timeout_secs, 45);
+        assert_eq!(cfg.brain.fee_headroom_sats, 16);
+    }
+
+    #[test]
+    fn brain_routstr_localhost_http_is_accepted() {
+        // Plain http is allowed ONLY for a loopback node (a same-host node / the Layer-B
+        // test rig), so the mock-node tests can run without TLS.
+        let toml = r#"
+            workload = "brain"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr"
+            max_cost_sats = 64
+            node_url = "http://127.0.0.1:8181"
+            mint_url = "http://127.0.0.1:8086"
+            wallet_db_path = "/var/lib/kirby/brain-wallet.sqlite"
+        "#;
+        let cfg =
+            KirbyConfig::from_toml_str(toml).expect("a loopback-http routstr brain must validate");
+        assert_eq!(cfg.brain.node_url, "http://127.0.0.1:8181");
     }
 
     #[test]

@@ -344,6 +344,8 @@ async fn brain_vm_boots_thinks_and_dies_when_broke() {
         max_cost_sats: 64,
         tick_secs: 1,
         bytes_per_sat: 16,
+        // The routstr-only fields default (backend = Stub); this e2e exercises the stub.
+        ..BrainConfig::default()
     };
 
     let boot = BootConfig {

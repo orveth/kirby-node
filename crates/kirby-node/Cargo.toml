@@ -83,6 +83,19 @@ nostr-sdk = { version = "0.44", default-features = false }
 # resume seam. The blob stays opaque to the daemon; the hash is only the stable
 # reference.
 sha2 = "0.10"
+# reqwest is the daemon-side HTTP client RoutstrBrain POSTs the OpenAI-compat
+# completion to (an outbound HTTPS call on the same host-network path as the C-6
+# daemon->mint settle and the nerve relay websocket; the genome never makes it).
+# default-features = false + rustls-tls pins the SAME rustls/ring TLS stack already
+# in the tree (via nostr-sdk/cdk) so no second TLS provider (native-tls/aws-lc-rs)
+# is pulled; `json` for the request/response bodies. Bearer X-Cashu safety
+# (redirects disabled, redaction) is enforced in rail.rs, not here.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# uuid types the cdk send-saga operation_id (Wallet::prepare_send -> operation_id()
+# -> revoke_send): RoutstrBrain carries it on a SendHandle so an un-consumed X-Cashu
+# send can be reclaimed with revoke_send (R2-1, the same-wallet reclaim primitive).
+# Already in the tree transitively via cdk; declared direct so the seam can name it.
+uuid = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = { version = "0.7.2", features = ["tonic012"] }

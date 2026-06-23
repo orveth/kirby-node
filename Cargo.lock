@@ -2504,6 +2504,7 @@ dependencies = [
  "openraft",
  "prost 0.13.5",
  "rand 0.9.4",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -2517,6 +2518,7 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
