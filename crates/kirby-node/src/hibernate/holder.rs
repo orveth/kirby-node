@@ -7,7 +7,9 @@
 //!   "fsynced": [`Holder::receive_share`] verifies and persists its [`WatcherRecord`]
 //!   (with the held [`Share`]) with an atomic fsync write BEFORE it acks, and every
 //!   lease issuance / share release is likewise persisted BEFORE it returns
-//!   (write-before-release).
+//!   (write-before-release). All three mutating methods are PERSIST-BEFORE-COMMIT: the
+//!   candidate state is fsynced first, and only then does the in-memory state advance,
+//!   so a write failure can never leave memory ahead of disk.
 //! - **Barrier 3 — single live lease before resurrected authority.** A holder issues
 //!   AT MOST ONE live [`Lease`] per `(npub, resume_seq)` ([`LeaseKey`](super::LeaseKey)):
 //!   a competing spawner (different `lease_id`/ephemeral pubkey) is refused while a
@@ -30,9 +32,19 @@
 //!   a threshold. The LOGIC here (durable-before-ack, single-live-lease, condition-gated
 //!   release, seal-epoch honoring) is real and carries forward; the trust topology does
 //!   not.
-//! - A holder's lease "signature" is an in-process assent MARKER (its `holder_id`), not
-//!   a cryptographic signature. Move-2 replaces it with a real schnorr signature over
-//!   the lease's canonical bytes.
+//! - **Single-instance invariant.** The fence lives in one [`Holder`]'s in-memory +
+//!   on-disk state, so it holds only if there is at most ONE live `Holder` handle per
+//!   `(agent_id, holder_id)` at a time. The thin-slice ceremony honors this by driving
+//!   one handle per holder, sequentially. Concurrent / distributed holders (Move-2)
+//!   REQUIRE a file lock (flock) or a holder registry to make the read-modify-write of
+//!   `active_lease` atomic across handles; this is documented, not built, here.
+//! - **No proof-of-possession.** Lease issuance, renewal, and release trust the
+//!   caller-supplied `lease_id` + `spawner_ephemeral_pubkey` STRINGS; there is no proof
+//!   the caller holds the spawner's ephemeral key, so a replay of those values reads as
+//!   the same spawner. This is the honest-actor / assent-not-sig boundary: a holder's
+//!   `quorum_sigs` entry is an in-process assent MARKER (its `holder_id`), not a
+//!   signature. Move-2 adds a real schnorr proof-of-possession over the lease's
+//!   canonical bytes and a real signature.
 //!
 //! ## Composition
 //!
@@ -77,7 +89,8 @@ pub enum HolderError {
     /// that refuses a second/competing spawner.
     #[error("a live lease {held} is already held for ({npub}, seq {resume_seq}); refusing a second")]
     LeaseHeld { held: String, npub: String, resume_seq: u64 },
-    /// The presented lease is not this holder's current active lease.
+    /// The presented lease is not this holder's current active lease (id / spawner /
+    /// expiry mismatch — including a stale pre-renewal lease object).
     #[error("not the lease holder (lease does not match the active grant)")]
     NotLeaseHolder,
     /// The presented lease has expired.
@@ -128,6 +141,9 @@ pub struct Ack {
 /// `lease_id` is spawner-proposed and unique per resume attempt; a holder grants at
 /// most one LIVE `lease_id` per `(npub, resume_seq)`. A competing spawner proposing a
 /// different id is refused while the first is live (the fence).
+///
+/// Honest-actor scope: the `lease_id` + `spawner_ephemeral_pubkey` are trusted strings
+/// (no proof-of-possession of the ephemeral key) — see the module docs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnsealRequest {
     /// The agent npub being woken (must match the holder's sealed record).
@@ -157,6 +173,11 @@ struct HolderState {
 ///
 /// Constructed via [`Holder::open`], which loads any persisted state, so a holder
 /// survives a process exit (the thin slice's "died & came back" at the holder layer).
+///
+/// INVARIANT: at most one live `Holder` handle per `(agent_id, holder_id)` at a time
+/// (the single-instance invariant — see the module docs). The ceremony enforces it by
+/// construction; concurrent handles would each load `active_lease` independently and
+/// bypass the fence, which is why Move-2's concurrent holders need a file lock.
 pub struct Holder {
     holder_id: String,
     state_path: PathBuf,
@@ -169,11 +190,27 @@ pub fn holder_path(treasury_dir: &Path, agent_id: &str, holder_id: &str) -> Path
     hibernate_dir(treasury_dir, agent_id).join(format!("{holder_id}.holder.json"))
 }
 
+/// Build the public ack for `record` (no secret material).
+fn ack_from(holder_id: &str, record: &WatcherRecord) -> Ack {
+    Ack {
+        holder_id: holder_id.to_string(),
+        npub: record.npub.clone(),
+        seal_epoch: record.seal_epoch,
+        bundle_digest: record.bundle_digest.clone(),
+        share_commitment: record.share_commitment.clone(),
+    }
+}
+
 impl Holder {
     /// Open holder `holder_id` for `agent_id`, loading any persisted state. A holder
     /// with no persisted state is "unsealed" until it receives a share. Reloading is how
     /// a fresh process re-instantiates a holder WITH its share after the prior process
     /// exited.
+    ///
+    /// Caller's responsibility (single-instance invariant): do not hold two live
+    /// `Holder` handles for the same `(agent_id, holder_id)` concurrently — the fence is
+    /// per-handle and concurrent handles would bypass it. The thin-slice ceremony drives
+    /// one handle per holder; Move-2's concurrent holders need a file lock here.
     pub fn open(treasury_dir: &Path, agent_id: &str, holder_id: &str) -> Result<Self, HolderError> {
         let state_path = holder_path(treasury_dir, agent_id, holder_id);
         let state = if state_path.exists() {
@@ -209,11 +246,14 @@ impl Holder {
 
     /// Barrier 2: verify and durably accept a share, then ack.
     ///
-    /// Verifies the share against its commitment (H1 [`verify_share`]), refuses a
-    /// stale-epoch share (one older than the seal this holder already guards), builds
-    /// the [`WatcherRecord`], and persists `{record, share}` with an atomic fsync write
-    /// BEFORE returning the ack — so an ack provably means "fsynced". A higher epoch
-    /// supersedes the prior seal (a fresh generation: no live lease, empty history).
+    /// Verifies the share against its commitment (H1 [`verify_share`]), then by epoch:
+    /// - `seal_epoch < current` → refused as a stale re-seal ([`HolderError::StaleEpoch`]).
+    /// - `seal_epoch == current` → IDEMPOTENT no-op: a fresh seal BUMPS the epoch, so an
+    ///   equal epoch means "already sealed here". The established record is left intact —
+    ///   crucially preserving any LIVE lease + release history (rebuilding would silently
+    ///   clear the fence) — and its ack is returned.
+    /// - `seal_epoch > current` (or first seal) → a new generation: build the record,
+    ///   persist `{record, share}` BEFORE acking (persist-before-commit), and ack.
     pub fn receive_share(
         &mut self,
         share: Share,
@@ -231,6 +271,12 @@ impl Holder {
                     current: state.record.seal_epoch,
                 });
             }
+            if share.seal_epoch == state.record.seal_epoch {
+                // Idempotent: already sealed at this epoch. Preserve the live lease +
+                // history; just re-ack the established record.
+                return Ok(ack_from(&self.holder_id, &state.record));
+            }
+            // seal_epoch > current: a new seal generation supersedes — fall through.
         }
 
         let record = WatcherRecord {
@@ -243,15 +289,11 @@ impl Holder {
             active_lease: None,
             release_history: Vec::new(),
         };
-        let ack = Ack {
-            holder_id: self.holder_id.clone(),
-            npub: record.npub.clone(),
-            seal_epoch: record.seal_epoch,
-            bundle_digest: record.bundle_digest.clone(),
-            share_commitment: record.share_commitment.clone(),
-        };
-        self.state = Some(HolderState { record, share });
-        self.persist()?; // write-before-ack
+        let ack = ack_from(&self.holder_id, &record);
+        let candidate = HolderState { record, share };
+        // Persist-before-commit: durable BEFORE the in-memory state advances + before ack.
+        self.write_state(&candidate)?;
+        self.state = Some(candidate);
         Ok(ack)
     }
 
@@ -265,15 +307,18 @@ impl Holder {
     /// - If the prior lease has expired (or none), grants the requested `lease_id` — so
     ///   a retry after expiry gets a NEW lease.
     ///
-    /// The updated record (with the new `active_lease`) is fsynced BEFORE the lease is
-    /// returned (write-before-release).
+    /// Persist-before-commit: the updated record (with the new `active_lease`) is fsynced
+    /// BEFORE the lease is returned. Honest-actor scope: the request's `lease_id` +
+    /// `spawner_ephemeral_pubkey` are trusted strings (no proof-of-possession) — a replay
+    /// reads as the same spawner; Move-2 adds a schnorr PoP.
     pub fn issue_lease(&mut self, req: &UnsealRequest, now: u64) -> Result<Lease, HolderError> {
-        // assent marker captured before the &mut borrow (thin-slice stand-in for a sig).
+        // The assent marker is captured before borrowing state (thin-slice stand-in for
+        // a signature; see module docs).
         let assent = self.assent_tag();
 
-        let lease = {
-            let state = self.state.as_mut().ok_or(HolderError::NotSealed)?;
-            let record = &mut state.record;
+        let (lease, candidate) = {
+            let current = self.state.as_ref().ok_or(HolderError::NotSealed)?;
+            let record = &current.record;
 
             if req.npub != record.npub {
                 return Err(HolderError::AgentMismatch);
@@ -300,23 +345,27 @@ impl Holder {
             }
 
             let expires_at = now.saturating_add(req.lease_ttl_secs);
-            record.active_lease = Some(ActiveLease {
+            let mut candidate = current.clone();
+            candidate.record.active_lease = Some(ActiveLease {
                 lease_id: req.lease_id.clone(),
                 expires_at,
                 spawner_ephemeral_pubkey: req.spawner_ephemeral_pubkey.clone(),
             });
-            Lease {
-                npub: record.npub.clone(),
-                resume_seq: record.resume_seq,
+            let lease = Lease {
+                npub: candidate.record.npub.clone(),
+                resume_seq: candidate.record.resume_seq,
                 lease_id: req.lease_id.clone(),
-                bundle_digest: record.bundle_digest.clone(),
+                bundle_digest: candidate.record.bundle_digest.clone(),
                 expires_at,
                 spawner_ephemeral_pubkey: req.spawner_ephemeral_pubkey.clone(),
                 quorum_sigs: vec![assent],
-            }
+            };
+            (lease, candidate)
         };
 
-        self.persist()?; // write-before-release
+        // Persist-before-commit (write-before-release).
+        self.write_state(&candidate)?;
+        self.state = Some(candidate);
         Ok(lease)
     }
 
@@ -324,13 +373,16 @@ impl Holder {
     /// the release in `release_history` (fsynced BEFORE the share is returned).
     ///
     /// Refuses unless the presented lease matches the seal (npub / resume_seq /
-    /// bundle_digest) AND is this holder's active, unexpired lease. Releasing again to
-    /// the SAME lease is idempotent (the holder already gave this requester the share),
-    /// so history is not double-appended.
+    /// bundle_digest) AND is this holder's active, unexpired lease — bound to the EXACT
+    /// current incarnation including `expires_at`, so a stale pre-renewal lease object
+    /// cannot release after the lease was renewed. Releasing again to the SAME lease is
+    /// idempotent (the requester already has the share), so history is not double-appended
+    /// and no extra write is done. Honest-actor scope: no proof-of-possession of the
+    /// spawner key (see module docs).
     pub fn release_share(&mut self, lease: &Lease, now: u64) -> Result<Share, HolderError> {
-        let appended = {
-            let state = self.state.as_mut().ok_or(HolderError::NotSealed)?;
-            let record = &mut state.record;
+        let candidate = {
+            let current = self.state.as_ref().ok_or(HolderError::NotSealed)?;
+            let record = &current.record;
 
             if lease.npub != record.npub
                 || lease.resume_seq != record.resume_seq
@@ -340,8 +392,11 @@ impl Holder {
             }
             {
                 let active = record.active_lease.as_ref().ok_or(HolderError::NotLeaseHolder)?;
+                // Bind to the exact current incarnation (id + spawner + expiry), so a
+                // stale pre-renewal lease object is rejected.
                 if active.lease_id != lease.lease_id
                     || active.spawner_ephemeral_pubkey != lease.spawner_ephemeral_pubkey
+                    || active.expires_at != lease.expires_at
                 {
                     return Err(HolderError::NotLeaseHolder);
                 }
@@ -349,24 +404,28 @@ impl Holder {
                     return Err(HolderError::LeaseExpired { expires_at: active.expires_at, now });
                 }
             }
+            // Idempotent: already released to this lease -> no state change, return share.
             let already = record.release_history.iter().any(|e| {
                 e.lease_id == lease.lease_id
                     && e.spawner_ephemeral_pubkey == lease.spawner_ephemeral_pubkey
             });
-            if !already {
-                record.release_history.push(ReleaseEntry {
-                    lease_id: lease.lease_id.clone(),
-                    spawner_ephemeral_pubkey: lease.spawner_ephemeral_pubkey.clone(),
-                    released_at: now,
-                });
+            if already {
+                return Ok(current.share.clone());
             }
-            !already
+            let mut candidate = current.clone();
+            candidate.record.release_history.push(ReleaseEntry {
+                lease_id: lease.lease_id.clone(),
+                spawner_ephemeral_pubkey: lease.spawner_ephemeral_pubkey.clone(),
+                released_at: now,
+            });
+            candidate
         };
 
-        if appended {
-            self.persist()?; // write-before-release: the release is durable first
-        }
-        Ok(self.state.as_ref().expect("sealed above").share.clone())
+        // Persist-before-commit: the release is durable BEFORE the share leaves.
+        self.write_state(&candidate)?;
+        let share = candidate.share.clone();
+        self.state = Some(candidate);
+        Ok(share)
     }
 
     /// The in-process assent marker (NOT a cryptographic signature — see module docs).
@@ -374,10 +433,11 @@ impl Holder {
         format!("holder:{}", self.holder_id)
     }
 
-    /// Serialize the current state and durably write it (atomic + fsync, 0600). The
-    /// serialized buffer carries the share, so it is zeroized after the write.
-    fn persist(&self) -> Result<(), HolderError> {
-        let state = self.state.as_ref().ok_or(HolderError::NotSealed)?;
+    /// Durably write a CANDIDATE state (atomic + fsync, 0600) WITHOUT touching
+    /// `self.state` — the persist-before-commit primitive: callers persist the candidate,
+    /// and only on success advance `self.state`. The serialized buffer carries the share,
+    /// so it is zeroized after the write.
+    fn write_state(&self, state: &HolderState) -> Result<(), HolderError> {
         let bytes = Zeroizing::new(serde_json::to_vec(state).map_err(HolderError::Serialize)?);
         write_atomic(&self.state_path, bytes.as_slice())
     }
@@ -568,6 +628,28 @@ mod tests {
     }
 
     #[test]
+    fn receive_same_epoch_preserves_a_live_lease() {
+        // FIX: a same-epoch re-delivery must NOT rebuild the record and clear the fence.
+        let dir = tempdir();
+        let (mut h, _) = seal_one(&dir, "holder-0", 1);
+        h.issue_lease(&unseal_req("lease-A", "spawner-X", 100), WAKE_AT).unwrap();
+        assert!(h.record().unwrap().active_lease.is_some());
+        // re-deliver a share at the SAME epoch.
+        let ack = h
+            .receive_share(shares(1).remove(1), NPUB, DIGEST, RESUME_SEQ, WakeConditions { wake_at: WAKE_AT })
+            .unwrap();
+        assert_eq!(ack.seal_epoch, 1);
+        let active = h
+            .record()
+            .unwrap()
+            .active_lease
+            .as_ref()
+            .expect("the live lease must be preserved across a same-epoch receive");
+        assert_eq!(active.lease_id, "lease-A");
+        cleanup(&dir);
+    }
+
+    #[test]
     fn issue_lease_gates_on_wake_at() {
         let dir = tempdir();
         let (mut h, _) = seal_one(&dir, "holder-0", 1);
@@ -649,6 +731,25 @@ mod tests {
         // idempotent: releasing again to the same lease does not double-append history.
         let _ = h.release_share(&lease, WAKE_AT + 2).unwrap();
         assert_eq!(h.record().unwrap().release_history.len(), 1);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_stale_lease_object_is_rejected_after_renewal() {
+        // FIX: binding the release match to expires_at stops a pre-renewal lease object
+        // from releasing once the lease has been renewed to a later expiry.
+        let dir = tempdir();
+        let (mut h, _) = seal_one(&dir, "holder-0", 1);
+        let stale = h.issue_lease(&unseal_req("lease-A", "spawner-X", 30), WAKE_AT).unwrap();
+        let renewed = h.issue_lease(&unseal_req("lease-A", "spawner-X", 30), WAKE_AT + 5).unwrap();
+        assert_ne!(stale.expires_at, renewed.expires_at);
+        // the stale (pre-renewal) lease object — same id + spawner, OLD expiry — refused.
+        match h.release_share(&stale, WAKE_AT + 6) {
+            Err(HolderError::NotLeaseHolder) => {}
+            other => panic!("expected NotLeaseHolder for the stale lease, got {other:?}"),
+        }
+        // the renewed lease object releases fine.
+        let _ = h.release_share(&renewed, WAKE_AT + 6).unwrap();
         cleanup(&dir);
     }
 
