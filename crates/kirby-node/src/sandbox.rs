@@ -385,6 +385,11 @@ pub struct GuestSpec {
     /// onto the guest kernel command line (`kirby.memory_*=`) so the genome's memory loop
     /// reads its config, exactly as the brain knobs travel. `None` for every non-memory guest.
     pub memory: Option<crate::config::MemoryConfig>,
+    /// The `[diarist]` knobs for the DIARIST workload. `Some` only for a `diarist` guest
+    /// (alongside `brain` + `memory`): the backend writes `tick_secs` and `recall_count`
+    /// onto the guest kernel command line (`kirby.diarist_*=`) so the genome's diarist
+    /// loop reads its cadence + recall depth, exactly as the brain/memory knobs travel.
+    pub diarist: Option<crate::config::DiaristConfig>,
     /// Install the per-VM egress lockdown (default-deny on the guest's egress) and
     /// wire a metered network interface so the genome can ATTEMPT egress (spec 3.7,
     /// gate G4). When false, the guest is vsock-only (no network interface), which

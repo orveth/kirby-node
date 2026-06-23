@@ -68,6 +68,7 @@ async fn g2_meters_and_halts_on_budget() {
         memory: None,
         // G2 is vsock-only (CPU + memory metering); the egress meter and TAP are
         // C-5 (gate G4), exercised by the egress test.
+        diarist: None,
         lockdown_egress: false,
         // G2 does not snapshot; snapshot + resume is C-7 (gate G6).
         snapshot_capable: false,
@@ -83,6 +84,7 @@ async fn g2_meters_and_halts_on_budget() {
         max_run: Duration::from_secs(60),
         // G2 metering-halt gate: no fleet observability needed here.
         agent_state: None,
+        rates: kirby_node::meter::BurnRates::default(),
     };
 
     let outcome = metered_run::run(config)

@@ -101,6 +101,12 @@ pub struct BootConfig {
     /// genome-side knobs (`max_cost_sats`, `tick_secs`) to the genome on the kernel
     /// command line. `None` for every other workload (no memory backend, no memory cmdline).
     pub memory: Option<crate::config::MemoryConfig>,
+    /// The `[diarist]` knobs for the DIARIST workload. `Some` only when
+    /// `workload = Some("diarist")`, alongside BOTH `brain` and `memory` being `Some` (the
+    /// diarist composes the `Completion` rail + the `Memory` backend on one gateway). It
+    /// carries the loop cadence + recall depth to the genome on the kernel command line
+    /// (`kirby.diarist_*=`), the same way the brain/memory knobs travel. `None` otherwise.
+    pub diarist: Option<crate::config::DiaristConfig>,
     /// Wire a per-VM TAP into the VM and lock it down with nftables default-deny
     /// egress (C-5, spec 3.7, gate G4). When true, the VM gets a network interface
     /// it can ATTEMPT egress on, the host kernel drops that egress (counted), and
@@ -397,6 +403,9 @@ pub async fn boot_and_observe_with_rail(
         brain: config.brain.clone(),
         // The memory knobs travel the same way (`kirby.memory_*=` when Some).
         memory: config.memory.clone(),
+        // The diarist cadence/recall knobs travel the same way (`kirby.diarist_*=` when Some).
+        // `DiaristConfig` is `Copy`, so this copies (no clone needed).
+        diarist: config.diarist,
         lockdown_egress: config.lockdown_egress,
         snapshot_capable: config.snapshot_capable,
     };

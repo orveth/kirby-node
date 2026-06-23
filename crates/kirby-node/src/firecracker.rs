@@ -268,6 +268,7 @@ impl SandboxBackend for FirecrackerBackend {
             workload: spec.workload.clone(),
             brain: spec.brain.clone(),
             memory: spec.memory.clone(),
+            diarist: spec.diarist,
             vcpu_count: spec.vcpu_count,
             mem_size_mib: spec.mem_size_mib,
             jail_uid: uid,
@@ -328,6 +329,11 @@ pub(crate) struct BootParams {
     /// command line (`kirby.memory_*=`) so the genome's memory loop reads its config,
     /// exactly as the brain knobs travel.
     pub memory: Option<crate::config::MemoryConfig>,
+    /// The `[diarist]` knobs for the DIARIST workload. `Some` only for a `diarist` guest:
+    /// `tick_secs` and `recall_count` are written onto the kernel command line
+    /// (`kirby.diarist_*=`) so the genome's diarist loop reads its cadence + recall depth,
+    /// exactly as the brain/memory knobs travel.
+    pub diarist: Option<crate::config::DiaristConfig>,
     /// vCPU count and memory for the microVM. Small for the spike.
     pub vcpu_count: u8,
     pub mem_size_mib: usize,
@@ -680,6 +686,18 @@ pub(crate) async fn boot(
         boot_args.push_str(&format!(
             " kirby.memory_max_cost_sats={} kirby.memory_tick_secs={}",
             memory.max_cost_sats, memory.tick_secs
+        ));
+    }
+    // The diarist cadence + recall depth for the DIARIST workload: the genome's diarist
+    // loop reads its OWN tick (the one think+remember cadence, overriding the now-unused
+    // brain/memory ticks) and how many recent entries to RECALL, the same non-secret way
+    // the brain/memory knobs travel. For a diarist guest, `brain` and `memory` are ALSO
+    // Some, so all three blocks ride together; the diarist loop reads brain_model/
+    // brain_max_cost_sats (THINK) + memory_max_cost_sats (REMEMBER) + these two.
+    if let Some(diarist) = &params.diarist {
+        boot_args.push_str(&format!(
+            " kirby.diarist_tick_secs={} kirby.diarist_recall_count={}",
+            diarist.tick_secs, diarist.recall_count
         ));
     }
 

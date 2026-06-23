@@ -65,6 +65,7 @@ async fn g6_snapshot_and_resume_on_node2() {
         brain: None,
         memory: None,
         // G6 is vsock-only (the egress lockdown is G4); keeps the move lean.
+        diarist: None,
         lockdown_egress: false,
         snapshot_capable: true,
         restore_checkpoint: None,

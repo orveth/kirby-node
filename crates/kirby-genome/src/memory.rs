@@ -48,7 +48,12 @@ fn encode_wseq_checkpoint(wseq: u64) -> Vec<u8> {
 /// would re-issue `mem-write-1` and false-dedupe against the persistent ledger (the F1
 /// bug on a durable store, design doc §16). The daemon's wseq_floor (R2-7) is the
 /// authoritative backstop if this blob is ever stale.
-fn restore_wseq(ctx: &kirby_proto::SessionContext) -> u64 {
+///
+/// `pub(super)` so the DIARIST workload reuses the EXACT checkpoint-blob contract (same
+/// `KMEM1` format, same daemon `wseq_floor` backstop): the diarist drives its monotonic
+/// `seq` off this on resume, so a restart continues past the last journal entry rather
+/// than re-issuing an old write key (F1) or an old think key (F2). Behavior is unchanged.
+pub(super) fn restore_wseq(ctx: &kirby_proto::SessionContext) -> u64 {
     let blob = &ctx.restore_checkpoint_blob;
     if blob.len() == MEM_CKPT_MAGIC.len() + 8 && blob.starts_with(MEM_CKPT_MAGIC) {
         let mut be = [0u8; 8];
@@ -62,7 +67,9 @@ fn restore_wseq(ctx: &kirby_proto::SessionContext) -> u64 {
 /// Submit a checkpoint carrying the current `wseq` (Chunk-2). Called after a successful
 /// write so the daemon always holds the highest issued seq for a resume. A submit failure
 /// is logged, not fatal (the wseq_floor backstop still protects correctness on resume).
-async fn submit_wseq_checkpoint(
+///
+/// `pub(super)` so the DIARIST reuses the exact wseq-persist contract (see [`restore_wseq`]).
+pub(super) async fn submit_wseq_checkpoint(
     client: &mut NodeGatewayClient<tonic::transport::Channel>,
     wseq: u64,
 ) {

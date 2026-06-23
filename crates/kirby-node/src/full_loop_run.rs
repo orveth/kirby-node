@@ -816,6 +816,7 @@ async fn boot_active_node(
         // Not the brain workload: no brain rail, no brain cmdline params.
         brain: None,
         memory: None,
+        diarist: None,
         // The egress lockdown is ON throughout (gate G4 + G5(iv)): the VM gets a TAP it
         // can ATTEMPT egress on, the host kernel drops it, and the eBPF meter counts ~0.
         lockdown_egress: true,

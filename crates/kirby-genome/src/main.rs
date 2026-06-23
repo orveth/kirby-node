@@ -50,6 +50,7 @@
 //! set when it booted the VM.
 
 mod brain;
+mod diarist;
 mod fingerprint;
 mod memory;
 
@@ -291,6 +292,13 @@ async fn run() {
             // The memory loop never returns (PID 1): it forms memories on a tick, parking
             // when the treasury can no longer cover a write so the daemon halts the VM.
             memory::memory_loop(client, port, &ctx).await;
+        }
+        Some("diarist") => {
+            boot_log("workload=diarist: the persistent journaler — RECALL (free) -> THINK (Completion, the life-gating act) -> REMEMBER (Memory SET, encrypted-to-self) -> beacon; death is the daemon halting the VM when a THINK is unaffordable (F4)");
+            // The diarist loop never returns (PID 1): it recalls, thinks, and remembers on a
+            // tick, parking when the treasury can no longer cover a THINK so the daemon halts
+            // the VM. It composes the Completion + Memory acts on one gateway (no new act).
+            diarist::diarist_loop(client, port, &ctx).await;
         }
         _ => {
             boot_log("no burn workload: idling (the daemon meters/halts or tears down)");

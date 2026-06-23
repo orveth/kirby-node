@@ -71,6 +71,8 @@ fn bootstrap_config(test: &str, image_dir: PathBuf, funding_sats: u64) -> KirbyC
         workload: Workload::AppCheckpoint,
         brain: Default::default(),
         memory: Default::default(),
+        diarist: Default::default(),
+        meter: Default::default(),
         mode: RunMode::Bootstrap,
         funding: FundingConfig {
             initial_sats: funding_sats,

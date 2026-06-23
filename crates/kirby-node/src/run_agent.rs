@@ -338,6 +338,30 @@ async fn emit_lifecycle(
     }
 }
 
+/// F3 (the EngramStore self-encrypt key): the diarist's journal is encrypted-to-self on the
+/// relays, and that MUST use the NODE IDENTITY key — the ONE key that also roots presence and
+/// the nerve (design §2). If `[memory].key_path` is unset, `EngramStore` would default to a
+/// `/tmp/kirby-treasury-{node_id}.nostr.key` throwaway, so thoughts written this run become
+/// UNRECOVERABLE after a reboot (encrypted under an ephemeral key). Pin it to the resolved
+/// identity key by construction (the SAME `resolve_key_path` the run identity uses, so a
+/// directory `key_path` resolves to its `node.nostr.key` file), rather than trusting the
+/// operator to remember the §9 config pin. An explicit `[memory].key_path` is honored as-is.
+/// (Only matters when `[memory].relays` is non-empty, i.e. the real store; the StubMemory
+/// ignores the key.)
+fn pin_diarist_memory_key(
+    memory: &crate::config::MemoryConfig,
+    identity: &crate::config::IdentityConfig,
+) -> crate::config::MemoryConfig {
+    let mut pinned = memory.clone();
+    if pinned.key_path.is_none() {
+        pinned.key_path = Some(NodeIdentity::resolve_key_path(
+            Some(&identity.key_path),
+            &identity.treasury_dir(),
+        ));
+    }
+    pinned
+}
+
 /// The genome [`BootConfig`] for the v0 agent, shared by bootstrap and resume.
 /// `workload` is the real genome workload from `kirby.toml`; `restore_checkpoint`
 /// is set for resume.
@@ -360,18 +384,36 @@ fn agent_boot_config(
     // allowlist is EXCLUSIVELY the memory sentinel (it can reach nothing else), and the
     // `[memory]` knobs ride to the genome via the cmdline. The StubMemory backend is
     // injected onto the gateway in `boot_and_observe` when `boot.memory` is Some.
-    let (allow, brain, memory) = match cfg.workload {
+    // The DIARIST is the both-acts workload: its allowlist holds BOTH sentinels and it
+    // carries `brain` + `memory` + `diarist`, so `boot_and_observe` builds the Completion
+    // rail (CompositeRail, stub or routstr) AND injects the Memory backend on ONE gateway,
+    // and all three cmdline blocks travel. This is the only config-wiring the diarist needs
+    // (no new daemon act/rail/metering/nerve code — the two acts compose on orthogonal seams).
+    let (allow, brain, memory, diarist) = match cfg.workload {
         Workload::Brain => (
             vec![crate::rail::BRAIN_COMPLETION_DESTINATION.to_string()],
             Some(cfg.brain.clone()),
+            None,
             None,
         ),
         Workload::Memory => (
             vec![crate::rail::MEMORY_DESTINATION.to_string()],
             None,
             Some(cfg.memory.clone()),
+            None,
         ),
-        _ => (vec!["mint.test.local".to_string()], None, None),
+        Workload::Diarist => (
+            vec![
+                crate::rail::BRAIN_COMPLETION_DESTINATION.to_string(),
+                crate::rail::MEMORY_DESTINATION.to_string(),
+            ],
+            Some(cfg.brain.clone()),
+            // F3: enforce the ONE-key invariant by construction — pin the journal's
+            // EngramStore key to the NODE IDENTITY key when the operator left it unset.
+            Some(pin_diarist_memory_key(&cfg.memory, &cfg.identity)),
+            Some(cfg.diarist),
+        ),
+        _ => (vec!["mint.test.local".to_string()], None, None, None),
     };
     Ok(BootConfig {
         image,
@@ -388,6 +430,7 @@ fn agent_boot_config(
         workload: Some(cfg.workload.genome_workload().to_string()),
         brain,
         memory,
+        diarist,
         // Sovereign single-agent v0 is vsock-only (no TAP egress lockdown; that is
         // the C-5 lane). The membrane still holds structurally (no guest network).
         lockdown_egress: false,
@@ -463,6 +506,9 @@ async fn run_bootstrap(
         // Emit the live 31000 "Kirby face" on the presence cadence during the run,
         // sourcing the live treasury + burn rate from the meter loop.
         agent_state: Some(agent_state_emitter(identity, &run.config, backend)),
+        // The synthetic VM-rent rates from the `[meter]` block (F4): the deploy tunes the
+        // memory rent down so an always-on diarist VM does not rent-death before it thinks.
+        rates: crate::meter::BurnRates::from(&run.config.meter),
     };
     let outcome = metered_run::run(metered).await?;
 
@@ -739,6 +785,8 @@ mod tests {
             workload: Workload::AppCheckpoint,
             brain: Default::default(),
             memory: Default::default(),
+            diarist: Default::default(),
+            meter: Default::default(),
             mode,
             funding: FundingConfig {
                 initial_sats: 3_000,
@@ -746,6 +794,39 @@ mod tests {
             agent_id: "agent-0".to_string(),
             node_id: "node-1".to_string(),
         }
+    }
+
+    /// F3 (the ONE-key invariant): an unset `[memory].key_path` for the diarist is pinned to
+    /// the RESOLVED node identity key (so the journal self-encrypts under the same key that
+    /// roots presence/nerve, recoverable after a reboot — not an ephemeral /tmp key). An
+    /// explicit operator key is honored as-is.
+    #[test]
+    fn diarist_memory_key_pins_to_identity_when_unset() {
+        let identity = crate::config::IdentityConfig {
+            key_path: PathBuf::from("/var/lib/kirby/node.nostr.key"),
+            treasury_dir: None,
+        };
+
+        // Unset => pinned to the resolved identity key (the SAME resolution the run uses).
+        let mem = crate::config::MemoryConfig::default();
+        assert!(mem.key_path.is_none(), "the default memory key is unset");
+        let pinned = pin_diarist_memory_key(&mem, &identity);
+        let expected =
+            NodeIdentity::resolve_key_path(Some(&identity.key_path), &identity.treasury_dir());
+        assert_eq!(
+            pinned.key_path,
+            Some(expected),
+            "an unset memory key pins to the resolved node identity key (F3)"
+        );
+
+        // Explicit => honored, never overridden (the operator's override wins).
+        let explicit = PathBuf::from("/custom/journal.key");
+        let mem2 = crate::config::MemoryConfig {
+            key_path: Some(explicit.clone()),
+            ..crate::config::MemoryConfig::default()
+        };
+        let pinned2 = pin_diarist_memory_key(&mem2, &identity);
+        assert_eq!(pinned2.key_path, Some(explicit), "an explicit memory key is not overridden");
     }
 
     #[test]

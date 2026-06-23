@@ -564,6 +564,7 @@ async fn memory_vm_boots_records_and_dies_when_broke() {
         // `Some(memory)` selects the StubMemory backend in boot_and_observe and writes the
         // memory knobs onto the genome's kernel cmdline.
         memory: Some(memory),
+        diarist: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
@@ -576,6 +577,7 @@ async fn memory_vm_boots_records_and_dies_when_broke() {
         // drained treasury the run would hit this and the assertion below would fail loudly.
         max_run: Duration::from_secs(60),
         agent_state: None,
+        rates: kirby_node::meter::BurnRates::default(),
     };
 
     let outcome = metered_run::run(config).await.expect("memory metered run completed");

@@ -976,6 +976,7 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
         workload: None,
         brain: None,
         memory: None,
+        diarist: None,
         // G1 is vsock-only (no TAP); the egress lockdown is the `egress`
         // subcommand (C-5, G4).
         lockdown_egress: false,
@@ -1074,6 +1075,7 @@ async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
         workload: Some("burn".to_string()),
         brain: None,
         memory: None,
+        diarist: None,
         // G2 meters CPU + memory; the egress meter rides with the TAP in the
         // `egress` subcommand (C-5, G4). Vsock-only here.
         lockdown_egress: false,
@@ -1088,6 +1090,8 @@ async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
         // The standalone `metered-run` subcommand is the G2 gate harness, not a
         // fleet member: no 31000 agent-state emission (that is `kirby run`).
         agent_state: None,
+        // The G2 burn gate uses the default synthetic rates.
+        rates: kirby_node::meter::BurnRates::default(),
     };
 
     let outcome = metered_run::run(config).await?;
@@ -1173,6 +1177,7 @@ async fn run_egress(args: EgressArgs) -> anyhow::Result<()> {
         workload: Some("raw-egress".to_string()),
         brain: None,
         memory: None,
+        diarist: None,
         lockdown_egress: true,
         snapshot_capable: false,
         restore_checkpoint: None,
@@ -1283,6 +1288,7 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
         workload: Some("brokered".to_string()),
         brain: None,
         memory: None,
+        diarist: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
@@ -1389,6 +1395,7 @@ async fn run_app_checkpoint(args: AppCheckpointArgs) -> anyhow::Result<()> {
         workload: Some("app-checkpoint".to_string()),
         brain: None,
         memory: None,
+        diarist: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
@@ -1459,6 +1466,7 @@ async fn run_snapshot(args: SnapshotArgs) -> anyhow::Result<()> {
         workload: Some("snapshot".to_string()),
         brain: None,
         memory: None,
+        diarist: None,
         // G6 is vsock-only (the egress lockdown is G4); the restore re-wires a
         // fresh TAP only if this is true. Vsock-only keeps the demo lean.
         lockdown_egress: false,

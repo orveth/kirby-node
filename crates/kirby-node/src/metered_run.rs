@@ -160,6 +160,12 @@ pub struct MeteredRunConfig {
     /// cadence; when `None` (the gate tests), the money/meter path is byte-identical
     /// and no state is emitted. Best-effort: a publish error never aborts the run.
     pub agent_state: Option<AgentStateEmitter>,
+    /// The synthetic VM-rent burn rates the meter bills CPU + memory time at. Sourced from
+    /// the `[meter]` config block (F4): a deploy LOWERS `mem_sats_per_mib_sec` so an
+    /// always-on VM does not rent-death before it can think/journal. Defaults to
+    /// [`crate::meter::BurnRates::default`], so the gate tests (which build via
+    /// [`MeteredRunConfig::new`]) and any default-rate run are byte-identical to before.
+    pub rates: crate::meter::BurnRates,
 }
 
 impl MeteredRunConfig {
@@ -171,7 +177,27 @@ impl MeteredRunConfig {
             tick: Duration::from_millis(100),
             max_run: Duration::from_secs(120),
             agent_state: None,
+            rates: crate::meter::BurnRates::default(),
         }
+    }
+}
+
+/// The FLOOR-HALT threshold for a run, derived from its boot config (the diarist's death
+/// mechanism). Covers BOTH bootstrap and resume (it reads `config.boot`, not the run mode).
+fn diarist_halt_floor(boot: &BootConfig) -> u64 {
+    halt_floor_for(boot.workload.as_deref(), boot.brain.as_ref().map(|b| b.max_cost_sats))
+}
+
+/// Pure core of the floor derivation (unit-testable without a full `BootConfig`). ONLY the
+/// diarist (which runs at zero synthetic rent) gets a floor, equal to its per-think D-20 cap
+/// (`brain.max_cost_sats`): at or above the cap any think is affordable, so halting strictly
+/// below it is a real death (no premature kill) and forecloses the rent=0 zombie. Every other
+/// workload gets `0` (disabled) and keeps relying on synthetic rent for its halt — unchanged.
+fn halt_floor_for(workload: Option<&str>, brain_max_cost_sats: Option<u64>) -> u64 {
+    if workload == Some("diarist") {
+        brain_max_cost_sats.unwrap_or(0)
+    } else {
+        0
     }
 }
 
@@ -183,6 +209,12 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
     let tick = config.tick;
     let max_run = config.max_run;
     let agent_state = config.agent_state;
+    // The FLOOR-HALT threshold (the diarist's death mechanism). Captured BEFORE `config.boot`
+    // is moved into the boot below. For the diarist (which runs at zero synthetic rent) this
+    // is `brain.max_cost_sats` — the meter halts once the treasury can no longer guarantee a
+    // think, turning the genome's park into a real daemon halt instead of a zombie. `0`
+    // (every other workload) leaves the meter's behavior unchanged.
+    let halt_floor_sats = diarist_halt_floor(&config.boot);
 
     // Boot the VM and serve the gateway (C-2 path); get the shared treasury so
     // the meter debits the SAME counter the gateway uses (D-9).
@@ -202,7 +234,7 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
             let meter_config = MeterConfig {
                 cgroup_rel_path: rel_path.clone(),
                 tick,
-                rates: Default::default(),
+                rates: config.rates,
             };
             let meter = match Meter::attach(&meter_config, treasury) {
                 Ok(m) => m,
@@ -237,7 +269,7 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
                 service_pids: service_pids.clone(),
                 memory_mib,
                 tick,
-                rates: Default::default(),
+                rates: config.rates,
             };
             let meter = match Meter::attach_host_process(&meter_config, treasury) {
                 Ok(m) => m,
@@ -259,6 +291,9 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
             meter
         }
     };
+    // Arm the FLOOR-HALT for the diarist (no-op when 0, i.e. every other workload). With zero
+    // rent this is the diarist's death: the meter halts when remaining < brain.max_cost_sats.
+    meter.set_halt_floor(halt_floor_sats);
 
     // The meter loop: tick, read the cgroup, debit. On the over-budget tick the
     // treasury refuses (Insufficient) and we HALT. A safety deadline bounds the
@@ -442,6 +477,20 @@ mod tests {
             interval: Duration::from_secs(15),
             budget_sats,
         }
+    }
+
+    /// The FLOOR-HALT derivation (the diarist's death mechanism): ONLY the diarist floors, at
+    /// its per-think D-20 cap; every other workload keeps a 0 floor (disabled, rent-driven).
+    #[test]
+    fn halt_floor_is_the_per_think_cap_for_the_diarist_zero_otherwise() {
+        assert_eq!(halt_floor_for(Some("diarist"), Some(64)), 64, "the diarist floors at brain.max_cost_sats");
+        // Every other workload keeps a 0 floor (disabled): synthetic rent drives their halt.
+        assert_eq!(halt_floor_for(Some("brain"), Some(64)), 0);
+        assert_eq!(halt_floor_for(Some("memory"), Some(64)), 0);
+        assert_eq!(halt_floor_for(Some("burn"), Some(64)), 0);
+        assert_eq!(halt_floor_for(None, Some(64)), 0, "an idle/unset workload is not floored");
+        // A diarist with no brain (validate() forbids it) floors at 0 rather than panicking.
+        assert_eq!(halt_floor_for(Some("diarist"), None), 0);
     }
 
     #[test]

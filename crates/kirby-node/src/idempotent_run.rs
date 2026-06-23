@@ -109,6 +109,7 @@ impl IdempotentRunConfig {
             // Not the brain workload.
             brain: None,
             memory: None,
+            diarist: None,
             // G9 is vsock-only (the egress lockdown is G4); keeps the move lean.
             lockdown_egress: false,
             snapshot_capable: true,
@@ -525,6 +526,7 @@ async fn boot_node1(
         workload: config.boot.workload.clone(),
         brain: config.boot.brain.clone(),
         memory: config.boot.memory.clone(),
+        diarist: config.boot.diarist,
         lockdown_egress: config.boot.lockdown_egress,
         snapshot_capable: config.boot.snapshot_capable,
     };

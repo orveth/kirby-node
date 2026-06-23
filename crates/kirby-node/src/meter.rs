@@ -120,6 +120,33 @@ impl Default for BurnRates {
     }
 }
 
+impl From<&crate::config::MeterRatesConfig> for BurnRates {
+    /// Build the runtime burn rates from the `[meter]` config block (F4): a deploy LOWERS
+    /// `mem_sats_per_mib_sec` so an always-on VM does not rent-death before it can think
+    /// or journal. A field-for-field copy — `MeterRatesConfig`'s defaults are byte-
+    /// identical to [`BurnRates::default`], so an absent `[meter]` block is a no-op.
+    fn from(c: &crate::config::MeterRatesConfig) -> Self {
+        BurnRates {
+            cpu_sats_per_usec_num: c.cpu_sats_per_usec_num,
+            cpu_sats_per_usec_den: c.cpu_sats_per_usec_den,
+            mem_sats_per_mib_sec: c.mem_sats_per_mib_sec,
+            egress_sats_per_byte_num: c.egress_sats_per_byte_num,
+            egress_sats_per_byte_den: c.egress_sats_per_byte_den,
+        }
+    }
+}
+
+/// The FLOOR-HALT decision (the diarist's death mechanism). Halt when the floor is enabled
+/// (`> 0`) and the treasury can no longer GUARANTEE a think — `remaining < halt_floor_sats`.
+/// The floor is the per-think D-20 cap (`brain.max_cost_sats`): at or above it ANY think is
+/// affordable (so no premature death); strictly below it the next think is not guaranteed, so
+/// the genome will park (DENIED_INSUFFICIENT) and must be halted rather than left a zombie. A
+/// floor of 0 disables it entirely (every non-diarist workload). Pure, so it is unit-testable
+/// without a live meter source.
+fn floor_halt_reached(remaining: u64, halt_floor_sats: u64) -> bool {
+    halt_floor_sats > 0 && remaining < halt_floor_sats
+}
+
 /// Configuration for one metered run.
 #[derive(Clone)]
 #[cfg(target_os = "linux")]
@@ -171,6 +198,14 @@ pub struct Meter {
     treasury: Treasury,
     rates: BurnRates,
     tick: Duration,
+    /// The FLOOR-HALT threshold (the diarist's death mechanism). When `> 0`, a tick halts
+    /// the VM (returns `DebitOutcome::Insufficient`, the same path a budget exhaustion takes)
+    /// as soon as `treasury.remaining() < halt_floor_sats` — even with ZERO synthetic rent.
+    /// Set to the per-think D-20 cap (`brain.max_cost_sats`) for the diarist: below it the
+    /// next think is not GUARANTEED affordable, so the genome parks (DENIED_INSUFFICIENT) and
+    /// would otherwise be a ZOMBIE (rent=0 ⇒ the meter never exhausts and never halts). `0`
+    /// (every non-diarist workload) disables it, so all existing metered runs are unchanged.
+    halt_floor_sats: u64,
     /// Last observed cumulative CPU usec. The CPU bill is the delta; every host
     /// source is cumulative, so we bill the increment.
     last_cpu_usec: u64,
@@ -280,6 +315,8 @@ impl Meter {
             treasury,
             rates: config.rates,
             tick: config.tick,
+            // Disabled by default; the metered run sets it for the diarist (set_halt_floor).
+            halt_floor_sats: 0,
             last_cpu_usec,
             #[cfg(target_os = "linux")]
             egress,
@@ -325,11 +362,21 @@ impl Meter {
             treasury,
             rates: config.rates,
             tick: config.tick,
+            // Disabled by default; the metered run sets it for the diarist (set_halt_floor).
+            halt_floor_sats: 0,
             last_cpu_usec: baseline.cpu_usec,
             burned_sats: 0,
             cpu_usec: 0,
             ticks: 0,
         })
+    }
+
+    /// Set the FLOOR-HALT threshold (the diarist's death mechanism — see the field doc). The
+    /// metered run sets this to the per-think D-20 cap (`brain.max_cost_sats`) for the diarist
+    /// workload and leaves it `0` (disabled) for every other workload, so all existing metered
+    /// runs are byte-identical.
+    pub fn set_halt_floor(&mut self, halt_floor_sats: u64) {
+        self.halt_floor_sats = halt_floor_sats;
     }
 
     /// Read the host meter source once, compute this tick's synthetic burn, and debit the
@@ -358,8 +405,19 @@ impl Meter {
         // still advances the loop; debiting 0 is a no-op debit that keeps the
         // remaining balance reported for diagnostics.
         let outcome = self.treasury.debit_metered(burn)?;
-        if let DebitOutcome::Debited { cost_sats, .. } = &outcome {
+        if let DebitOutcome::Debited { cost_sats, remaining } = &outcome {
             self.burned_sats = self.burned_sats.saturating_add(*cost_sats);
+            // FLOOR-HALT (the diarist's death, the scope-add): with zero synthetic rent the
+            // treasury only falls as the genome THINKs/REMEMBERs through the gateway. When it
+            // can no longer GUARANTEE a think, halt the VM via the SAME `Insufficient` path a
+            // budget exhaustion takes — so the genome's park becomes a real daemon-initiated
+            // death (no zombie). It fires ONCE: the run loop breaks on `Insufficient`. A 0
+            // floor (every non-diarist run) skips this, so existing behavior is unchanged.
+            if floor_halt_reached(*remaining, self.halt_floor_sats) {
+                return Ok(DebitOutcome::Insufficient {
+                    remaining: *remaining,
+                });
+            }
         }
         Ok(outcome)
     }
@@ -687,6 +745,29 @@ pub enum MeterError {
 mod tests {
     use super::*;
 
+    /// The `[meter]` config block maps field-for-field into the runtime `BurnRates`, and
+    /// its defaults are byte-identical to `BurnRates::default` (so an absent block is a
+    /// no-op). BurnRates is `Copy` (no `PartialEq`), so the defaults are checked per field.
+    #[test]
+    fn burn_rates_from_meter_config_round_trips() {
+        let def: BurnRates = (&crate::config::MeterRatesConfig::default()).into();
+        let std = BurnRates::default();
+        assert_eq!(def.cpu_sats_per_usec_num, std.cpu_sats_per_usec_num);
+        assert_eq!(def.cpu_sats_per_usec_den, std.cpu_sats_per_usec_den);
+        assert_eq!(def.mem_sats_per_mib_sec, std.mem_sats_per_mib_sec);
+        assert_eq!(def.egress_sats_per_byte_num, std.egress_sats_per_byte_num);
+        assert_eq!(def.egress_sats_per_byte_den, std.egress_sats_per_byte_den);
+
+        // A tuned block (the F4 deploy lever: drop the memory rent) flows through verbatim.
+        let tuned = crate::config::MeterRatesConfig {
+            mem_sats_per_mib_sec: 0,
+            ..crate::config::MeterRatesConfig::default()
+        };
+        let rates: BurnRates = (&tuned).into();
+        assert_eq!(rates.mem_sats_per_mib_sec, 0, "the deploy can zero the memory rent");
+        assert_eq!(rates.cpu_sats_per_usec_den, 1000, "untouched fields keep defaults");
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn parse_flat_keyed_reads_usage_usec() {
@@ -694,6 +775,22 @@ mod tests {
         assert_eq!(parse_flat_keyed(stat, "usage_usec"), Some(1003338));
         assert_eq!(parse_flat_keyed(stat, "system_usec"), Some(103338));
         assert_eq!(parse_flat_keyed(stat, "absent"), None);
+    }
+
+    /// FLOOR-HALT (the diarist's death): with a floor enabled the meter halts strictly BELOW
+    /// the per-think cap (zombie-free — at/above the cap any think is affordable); a 0 floor
+    /// (every non-diarist run) never floor-halts, whatever the balance.
+    #[test]
+    fn floor_halt_fires_below_the_cap_and_is_disabled_at_zero() {
+        // floor = 0 (disabled): NEVER halts on the floor, even at a drained treasury.
+        assert!(!floor_halt_reached(0, 0));
+        assert!(!floor_halt_reached(1_000, 0));
+        // floor = the per-think cap (the diarist): halt strictly below it.
+        let floor = 64;
+        assert!(!floor_halt_reached(65, floor));
+        assert!(!floor_halt_reached(64, floor), "exactly the cap: a think is still guaranteed, no halt");
+        assert!(floor_halt_reached(63, floor), "below the cap: the next think is not guaranteed -> death");
+        assert!(floor_halt_reached(0, floor), "drained: death");
     }
 
     #[test]

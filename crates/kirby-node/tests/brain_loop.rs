@@ -366,6 +366,7 @@ async fn brain_vm_boots_thinks_and_dies_when_broke() {
         // and writes the brain knobs onto the genome's kernel cmdline.
         brain: Some(brain),
         memory: None,
+        diarist: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
@@ -379,6 +380,7 @@ async fn brain_vm_boots_thinks_and_dies_when_broke() {
         // terminal-state assertion below would fail loudly (NOT a false pass).
         max_run: Duration::from_secs(60),
         agent_state: None,
+        rates: kirby_node::meter::BurnRates::default(),
     };
 
     let outcome = metered_run::run(config).await.expect("brain metered run completed");

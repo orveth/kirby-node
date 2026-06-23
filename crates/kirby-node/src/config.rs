@@ -58,6 +58,20 @@ pub struct KirbyConfig {
     /// only when `workload = "memory"`; defaults so a bare `[memory]` (or none) runs.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// The `[diarist]` knobs for the DIARIST workload (the persistent journaler). Used
+    /// only when `workload = "diarist"`; defaults so a bare `[diarist]` (or none) runs.
+    /// The diarist's inference is configured by `[brain]` and its store by `[memory]`
+    /// (it REUSES both verbatim); this block carries only the diarist-specific cadence
+    /// and recall depth.
+    #[serde(default)]
+    pub diarist: DiaristConfig,
+    /// The `[meter]` knobs: the synthetic VM-rent burn rates (CPU + memory + egress).
+    /// Defaults match [`crate::meter::BurnRates::default`] so existing runs are
+    /// unchanged; a deploy LOWERS the memory rate so an always-on VM does not drain its
+    /// treasury to a rent-death before it can think/journal (the F4 finding — at the
+    /// default 1 sat/MiB-s a small VM dies in ~30-60s purely from rent).
+    #[serde(default)]
+    pub meter: MeterRatesConfig,
     /// bootstrap (fund to born) or resume (restore from the latest checkpoint).
     /// Defaults to [`RunMode::Bootstrap`].
     #[serde(default)]
@@ -226,6 +240,18 @@ pub enum Workload {
     /// READS are free. Stub-first behind the daemon's `MemoryBackend` seam (no crypto,
     /// no relay); the real NIP-AE engram store swaps in at Chunk-2.
     Memory,
+    /// The DIARIST workload (the first PERSISTENT Kirby): the genome runs ONE
+    /// mission-loop per tick — RECALL its recent journal (`Memory` GET/LS, free) ->
+    /// THINK one reflection (`Completion` via the brain) -> REMEMBER it (`Memory` SET,
+    /// encrypted-to-self) -> BEACON (the daemon's automatic nerve presence) -> sleep.
+    /// It is a genome-side COMPOSITION of the two acts the daemon already performs:
+    /// `brain = Some` selects the `Completion` rail (`CompositeRail`, stub or routstr)
+    /// and `memory = Some` injects the `Memory` backend (StubMemory or the real
+    /// EngramStore), and the allowlist holds BOTH sentinels. No new daemon act, rail,
+    /// metering, crypto, or nerve code — only this config wiring + the genome module.
+    /// THINK is the life-gating act: when the treasury can no longer cover a think the
+    /// genome parks and the daemon halts the VM (earn-or-die applied to the mind, F4).
+    Diarist,
 }
 
 impl Workload {
@@ -235,6 +261,7 @@ impl Workload {
             Workload::AppCheckpoint => "app-checkpoint",
             Workload::Brain => "brain",
             Workload::Memory => "memory",
+            Workload::Diarist => "diarist",
         }
     }
 
@@ -252,6 +279,13 @@ impl Workload {
             // resume (the run-agent restore path); the daemon's wseq_floor (R2-7) is the
             // authoritative backstop.
             Workload::Memory => true,
+            // The diarist persists its journal through the SAME wseq-keyed Memory write
+            // (REMEMBER), so it checkpoint-persists the monotonic `seq` exactly as the
+            // memory workload does: a restart continues PAST the last entry rather than
+            // re-issuing an old write key (the F1 false-dedupe) or an old think key (the
+            // F2 collision). The diarist drives BOTH its think and its write keys off
+            // this one checkpointed `seq`.
+            Workload::Diarist => true,
         }
     }
 }
@@ -445,6 +479,100 @@ impl Default for MemoryConfig {
     }
 }
 
+/// The `[diarist]` config block (the persistent journaler): the ONLY diarist-specific
+/// knobs. The diarist's inference backend is `[brain]` (model, backend, max_cost_sats,
+/// the routstr fields) and its store is `[memory]` (relays, key_path, max_cost_sats) —
+/// reused verbatim, no nesting — so the daemon passes `cfg.brain`/`cfg.memory` straight
+/// through. This block adds only the loop cadence and the recall depth. Every field
+/// defaults so a bare `[diarist]` (or none, when `workload = "diarist"`) runs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiaristConfig {
+    /// Seconds the diarist sleeps between ticks (the ONE think+remember cadence). This
+    /// OVERRIDES `[brain].tick_secs` / `[memory].tick_secs` for the diarist workload
+    /// (which become unused — the diarist has a single loop, not two).
+    #[serde(default = "default_diarist_tick_secs")]
+    pub tick_secs: u64,
+    /// How many recent journal entries to RECALL (a free `Memory` LS + GET) into each
+    /// reflection prompt, so the diarist thinks WITH its recent past, not blind.
+    #[serde(default = "default_diarist_recall_count")]
+    pub recall_count: usize,
+}
+
+fn default_diarist_tick_secs() -> u64 {
+    60
+}
+fn default_diarist_recall_count() -> usize {
+    5
+}
+
+impl Default for DiaristConfig {
+    fn default() -> Self {
+        DiaristConfig {
+            tick_secs: default_diarist_tick_secs(),
+            recall_count: default_diarist_recall_count(),
+        }
+    }
+}
+
+/// The `[meter]` config block: the synthetic VM-rent burn rates, exposed so a deploy can
+/// tune always-on rent. `kirby run` ALWAYS meters CPU + memory time against the treasury
+/// (the unforgeable host bill), so even a SLEEPING VM drains continuously. At the default
+/// `mem_sats_per_mib_sec = 1` a 128 MiB VM burns ~128 sat/s, draining a ~3900-sat wallet
+/// to a rent-death in ~30s — before it journals anything, via the meter halt rather than
+/// the think-denial (the F4 finding). Lowering the memory rate (and shrinking the VM)
+/// makes think + write the dominant, visible drains, so the agent lives a satisfying
+/// while and the proximate death is the unaffordable THINK (the intended demo). Each
+/// field mirrors [`crate::meter::BurnRates`]; the defaults are byte-identical to its
+/// `Default`, so an absent `[meter]` block leaves every existing run unchanged.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeterRatesConfig {
+    /// Sats per microsecond of cgroup CPU time, as a fraction num/den (default 1/1000 =
+    /// 1 sat per millisecond of CPU).
+    #[serde(default = "default_cpu_sats_per_usec_num")]
+    pub cpu_sats_per_usec_num: u64,
+    #[serde(default = "default_cpu_sats_per_usec_den")]
+    pub cpu_sats_per_usec_den: u64,
+    /// Sats per MiB of resident memory per second (default 1). THE diarist rent dial —
+    /// lower this (e.g. to a small fraction via the num/den CPU pattern is not needed
+    /// here; the integer is the knob) so a sleeping VM does not rent-death.
+    #[serde(default = "default_mem_sats_per_mib_sec")]
+    pub mem_sats_per_mib_sec: u64,
+    /// Sats per egress byte, as a fraction num/den (default 1/1 = 1 sat per byte). Under
+    /// the default-deny lockdown egress is ~0, so this is normally a no-op.
+    #[serde(default = "default_egress_sats_per_byte_num")]
+    pub egress_sats_per_byte_num: u64,
+    #[serde(default = "default_egress_sats_per_byte_den")]
+    pub egress_sats_per_byte_den: u64,
+}
+
+fn default_cpu_sats_per_usec_num() -> u64 {
+    1
+}
+fn default_cpu_sats_per_usec_den() -> u64 {
+    1000
+}
+fn default_mem_sats_per_mib_sec() -> u64 {
+    1
+}
+fn default_egress_sats_per_byte_num() -> u64 {
+    1
+}
+fn default_egress_sats_per_byte_den() -> u64 {
+    1
+}
+
+impl Default for MeterRatesConfig {
+    fn default() -> Self {
+        MeterRatesConfig {
+            cpu_sats_per_usec_num: default_cpu_sats_per_usec_num(),
+            cpu_sats_per_usec_den: default_cpu_sats_per_usec_den(),
+            mem_sats_per_mib_sec: default_mem_sats_per_mib_sec(),
+            egress_sats_per_byte_num: default_egress_sats_per_byte_num(),
+            egress_sats_per_byte_den: default_egress_sats_per_byte_den(),
+        }
+    }
+}
+
 /// bootstrap (fund to born) or resume (restore from the latest checkpoint).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -556,9 +684,11 @@ impl KirbyConfig {
         }
         // The brain must be able to afford at least one think, or it dies before it
         // thinks once: a zero per-call cap is always DENIED_OVER_BUDGET, and a cap
-        // above the treasury is always DENIED_INSUFFICIENT_TREASURY (D-20). Checked
-        // only for the brain workload so non-brain configs are unaffected.
-        if self.workload == Workload::Brain {
+        // above the treasury is always DENIED_INSUFFICIENT_TREASURY (D-20). The DIARIST
+        // thinks too (its THINK is the same `Completion`, the life-gating act), and it
+        // reuses `[brain]`, so it gets the SAME guard — a diarist that cannot afford its
+        // first think is a config error caught at load, not a born-then-instantly-dead VM.
+        if matches!(self.workload, Workload::Brain | Workload::Diarist) {
             if self.brain.max_cost_sats == 0 {
                 anyhow::bail!(
                     "brain.max_cost_sats must be > 0 (a zero per-call cap means every think is DENIED_OVER_BUDGET)"
@@ -603,10 +733,14 @@ impl KirbyConfig {
         }
         // The durable-mind-state agent must be able to afford at least one WRITE, or it
         // can recall (reads are free) but never FORM a memory: a zero per-write ceiling is
-        // always DENIED_OVER_BUDGET. Checked only for the memory workload so other configs
-        // are unaffected. (No <= initial_sats check: reads stay free, so a broke memory
-        // agent still lives; the write cost is host-computed per op, not this ceiling.)
-        if self.workload == Workload::Memory && self.memory.max_cost_sats == 0 {
+        // always DENIED_OVER_BUDGET. The DIARIST also REMEMBERs through the Memory write
+        // and reuses `[memory]`, so it gets the SAME guard (F5: the diarist validation
+        // must apply BOTH the brain and the memory ceiling check, else every REMEMBER is
+        // DENIED_OVER_BUDGET — a config error). (No <= initial_sats check: reads stay
+        // free, so a broke agent still lives; the write cost is host-computed per op.)
+        if matches!(self.workload, Workload::Memory | Workload::Diarist)
+            && self.memory.max_cost_sats == 0
+        {
             anyhow::bail!(
                 "memory.max_cost_sats must be > 0 (a zero per-write ceiling means every write is DENIED_OVER_BUDGET)"
             );
@@ -1120,6 +1254,217 @@ mod tests {
         // Unparseable or non-http(s) schemes fail closed.
         assert!(!is_https_or_localhost("not a url"));
         assert!(!is_https_or_localhost("ftp://localhost/x"));
+    }
+
+    // ---- diarist: it REUSES [brain] + [memory] and adds a minimal [diarist] block; its
+    // validation applies BOTH the brain afford-a-think guard AND the memory afford-a-write
+    // guard (F5), and the [diarist] knobs default so a bare block runs. ----
+
+    /// A diarist config with no `[diarist]` block parses with the cadence/recall defaults,
+    /// resolves to the "diarist" genome workload, and submits a checkpoint (resume cursor).
+    #[test]
+    fn diarist_config_parses_with_defaults() {
+        let toml = r#"
+            workload = "diarist"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            max_cost_sats = 64
+            [memory]
+            max_cost_sats = 64
+        "#;
+        let cfg = KirbyConfig::from_toml_str(toml).expect("a valid diarist config must validate");
+        assert_eq!(cfg.workload, Workload::Diarist);
+        assert_eq!(cfg.workload.genome_workload(), "diarist");
+        assert!(
+            cfg.workload.submits_checkpoint(),
+            "the diarist persists its wseq cursor for resume continuity"
+        );
+        // The [diarist] block defaulted (none present).
+        assert_eq!(cfg.diarist.tick_secs, 60);
+        assert_eq!(cfg.diarist.recall_count, 5);
+    }
+
+    /// An explicit `[diarist]` block parses its two knobs.
+    #[test]
+    fn diarist_block_parses_explicit_knobs() {
+        let toml = r#"
+            workload = "diarist"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            max_cost_sats = 64
+            [memory]
+            max_cost_sats = 64
+            [diarist]
+            tick_secs = 90
+            recall_count = 8
+        "#;
+        let cfg = KirbyConfig::from_toml_str(toml).expect("a valid diarist config must validate");
+        assert_eq!(cfg.diarist.tick_secs, 90);
+        assert_eq!(cfg.diarist.recall_count, 8);
+    }
+
+    /// F5 (the brain half): a diarist whose brain cannot afford a think is rejected for THE
+    /// brain reason — the same guard the brain workload gets, now gated on Diarist too.
+    #[test]
+    fn diarist_zero_brain_cap_is_rejected() {
+        let toml = r#"
+            workload = "diarist"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            max_cost_sats = 0
+            [memory]
+            max_cost_sats = 64
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("brain.max_cost_sats must be > 0"),
+            "the diarist must inherit the brain afford-a-think guard, got: {err}"
+        );
+    }
+
+    /// F5 (the memory half): a diarist whose write ceiling is zero is rejected for THE
+    /// memory reason — without this, every REMEMBER would be DENIED_OVER_BUDGET (a config
+    /// error). This is the half the original spec's reused-Brain-only guard MISSED.
+    #[test]
+    fn diarist_zero_memory_cap_is_rejected() {
+        let toml = r#"
+            workload = "diarist"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            max_cost_sats = 64
+            [memory]
+            max_cost_sats = 0
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("memory.max_cost_sats must be > 0"),
+            "the diarist must ALSO inherit the memory afford-a-write guard (F5), got: {err}"
+        );
+    }
+
+    /// The diarist reuses `[brain]`, so a `routstr` diarist missing a routstr field is
+    /// rejected by the SAME real-mode guard the brain gets (proving it gates on Diarist).
+    #[test]
+    fn diarist_routstr_missing_node_url_is_rejected() {
+        let toml = r#"
+            workload = "diarist"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr"
+            max_cost_sats = 64
+            mint_url = "https://mint.example.com"
+            wallet_db_path = "/var/lib/kirby/diarist-wallet.sqlite"
+            [memory]
+            max_cost_sats = 64
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("brain.node_url must be set"),
+            "the diarist must inherit the routstr required-field guards, got: {err}"
+        );
+    }
+
+    /// The negative control: a well-formed diarist (affordable think AND write) validates,
+    /// proving the dual guard discriminates rather than rejecting the diarist wholesale.
+    #[test]
+    fn diarist_valid_config_is_accepted() {
+        let toml = r#"
+            workload = "diarist"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 5000
+            [brain]
+            max_cost_sats = 64
+            [memory]
+            max_cost_sats = 64
+        "#;
+        let cfg = KirbyConfig::from_toml_str(toml).expect("a valid diarist config must validate");
+        assert_eq!(cfg.workload, Workload::Diarist);
+        assert_eq!(cfg.brain.max_cost_sats, 64);
+        assert_eq!(cfg.memory.max_cost_sats, 64);
+    }
+
+    // ---- [meter]: the synthetic-rent dial (F4). Defaults are byte-identical to
+    // BurnRates::default so an absent block leaves every existing run unchanged; an
+    // explicit block lowers the memory rate so a sleeping VM does not rent-death. ----
+
+    /// An absent `[meter]` block yields the default rates (1 sat/ms CPU, 1 sat/MiB-s mem,
+    /// 1 sat/egress-byte) — byte-identical to `meter::BurnRates::default` (the From impl in
+    /// meter.rs is tested there field-by-field), so existing runs are unchanged.
+    #[test]
+    fn meter_defaults_match_burnrates() {
+        let m = MeterRatesConfig::default();
+        assert_eq!(m.cpu_sats_per_usec_num, 1);
+        assert_eq!(m.cpu_sats_per_usec_den, 1000);
+        assert_eq!(m.mem_sats_per_mib_sec, 1);
+        assert_eq!(m.egress_sats_per_byte_num, 1);
+        assert_eq!(m.egress_sats_per_byte_den, 1);
+        // A config with no [meter] block carries those defaults.
+        let cfg = KirbyConfig::from_toml_str(minimal_toml()).unwrap();
+        assert_eq!(cfg.meter, MeterRatesConfig::default());
+    }
+
+    /// An explicit `[meter]` block tunes the rates — the deploy lever that drops the memory
+    /// rent so think + write become the dominant drains (F4). Partial blocks default the
+    /// rest, so a deploy can set ONLY the memory rate.
+    #[test]
+    fn meter_block_tunes_memory_rent() {
+        let toml = r#"
+            workload = "diarist"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 5000
+            [brain]
+            max_cost_sats = 64
+            [memory]
+            max_cost_sats = 64
+            [meter]
+            mem_sats_per_mib_sec = 0
+        "#;
+        let cfg = KirbyConfig::from_toml_str(toml).expect("a tuned-meter diarist must validate");
+        // The deploy lowered the memory rent (here to 0 for an extreme demo); the untouched
+        // CPU/egress rates kept their defaults.
+        assert_eq!(cfg.meter.mem_sats_per_mib_sec, 0);
+        assert_eq!(cfg.meter.cpu_sats_per_usec_num, 1);
+        assert_eq!(cfg.meter.cpu_sats_per_usec_den, 1000);
     }
 
     #[test]
