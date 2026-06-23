@@ -38,6 +38,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // H2: the bundle digest (canonical encoding) + the agent-scoped persist/read-back,
 // in a submodule so the parallel-front chunks do not collide editing this file.
@@ -135,6 +136,34 @@ impl StateBundle {
     }
 }
 
+/// The raw Shamir share material, held as a secret newtype.
+///
+/// Serializes transparently as the underlying byte vector, so the holder-transport
+/// wire shape is identical to a bare `Vec<u8>`. But it zeroizes on drop and its `Debug`
+/// is redacted, so a stray `{:?}` on a [`Share`] can never dump share material. The
+/// bytes ARE sensitive: any [`SEAL_THRESHOLD`] of them reconstruct the master seed.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+#[serde(transparent)]
+pub struct ShareBytes(Vec<u8>);
+
+impl ShareBytes {
+    /// Wrap raw share bytes.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the raw share bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ShareBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ShareBytes([{} bytes redacted])", self.0.len())
+    }
+}
+
 /// A 2-of-3 Shamir share of the master seed (the wire format moved between holders).
 ///
 /// `seal_epoch` binds the share to a seal attempt: aborting a seal before the point
@@ -145,8 +174,8 @@ impl StateBundle {
 pub struct Share {
     /// The 1-based share index (`1..=SEAL_SHARES`).
     pub share_index: u8,
-    /// The raw Shamir share material.
-    pub share_bytes: Vec<u8>,
+    /// The raw Shamir share material (zeroizing; see [`ShareBytes`]).
+    pub share_bytes: ShareBytes,
     /// The seal epoch this share belongs to (an abort bumps it, invalidating prior shares).
     pub seal_epoch: u64,
     /// A commitment/checksum over the share for corrupt-share detection (hex).

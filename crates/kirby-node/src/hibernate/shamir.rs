@@ -41,15 +41,18 @@
 //!
 //! [`MasterSeed`] and [`Subkeys`] zeroize on drop and deliberately implement no
 //! `Debug` / `Display` / `Serialize`, so seed material can never be logged or
-//! serialized by accident. Transient reconstruction buffers are wrapped in
-//! [`Zeroizing`] and wiped as soon as the seed is rebuilt. Nothing in this module
-//! emits tracing for seed or share bytes.
+//! serialized by accident. Subkeys are HKDF-expanded DIRECTLY into the (zeroizing)
+//! [`Subkeys`] fields and the recovered seed is copied straight into [`MasterSeed`], so
+//! no staging buffer is left un-wiped on the stack; the reconstruction buffer is
+//! [`Zeroizing`]. The share payload rides in [`super::ShareBytes`] — zeroizing, with a
+//! redacted `Debug` — so a stray `{:?}` on a [`Share`] can't dump share material.
+//! Nothing in this module emits tracing for seed or share bytes.
 
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use super::{Share, SEAL_SHARES, SEAL_THRESHOLD};
+use super::{Share, ShareBytes, SEAL_SHARES, SEAL_THRESHOLD};
 
 /// The master-seed length in bytes: a 256-bit root secret (the thin slice's master
 /// seed == the node's secp256k1/BIP340 secret key width).
@@ -152,25 +155,22 @@ pub enum ShamirError {
 pub fn derive_subkeys(seed: &MasterSeed) -> Subkeys {
     let hk = Hkdf::<Sha256>::new(None, seed.expose_secret());
 
-    let mut identity_key = [0u8; IDENTITY_KEY_LEN];
+    // Expand directly into the (zeroizing) Subkeys fields — no separate staging arrays
+    // that, once moved into the struct, would leave un-wiped secret bytes on the stack.
+    let mut subkeys = Subkeys {
+        identity_key: [0u8; IDENTITY_KEY_LEN],
+        state_key: [0u8; STATE_KEY_LEN],
+        wallet_seed: [0u8; WALLET_SEED_LEN],
+    };
     // expand only fails when the output length exceeds 255*HashLen; our lengths are
     // small compile-time constants, so this is an invariant, not a runtime condition.
-    hk.expand(INFO_IDENTITY, &mut identity_key)
+    hk.expand(INFO_IDENTITY, &mut subkeys.identity_key)
         .expect("identity subkey length is valid");
-
-    let mut state_key = [0u8; STATE_KEY_LEN];
-    hk.expand(INFO_STATE, &mut state_key)
+    hk.expand(INFO_STATE, &mut subkeys.state_key)
         .expect("state subkey length is valid");
-
-    let mut wallet_seed = [0u8; WALLET_SEED_LEN];
-    hk.expand(INFO_WALLET, &mut wallet_seed)
+    hk.expand(INFO_WALLET, &mut subkeys.wallet_seed)
         .expect("wallet subkey length is valid");
-
-    Subkeys {
-        identity_key,
-        state_key,
-        wallet_seed,
-    }
+    subkeys
 }
 
 /// The corrupt-share commitment: `sha256(domain ‖ index ‖ epoch ‖ share_bytes)`,
@@ -189,7 +189,11 @@ pub fn share_commitment(share_index: u8, seal_epoch: u64, share_bytes: &[u8]) ->
 /// Recompute a share's commitment and check it matches the stored one. `Ok` means the
 /// share is self-consistent; `Err(CorruptShare)` means it was garbled or mismatched.
 pub fn verify_share(share: &Share) -> Result<(), ShamirError> {
-    let expected = share_commitment(share.share_index, share.seal_epoch, &share.share_bytes);
+    let expected = share_commitment(
+        share.share_index,
+        share.seal_epoch,
+        share.share_bytes.as_slice(),
+    );
     // Plain comparison is fine: the commitment is a PUBLIC value (carried in the
     // wake-request / watcher record), not a secret, so there is no timing oracle to
     // protect against — this only detects accidental garbling.
@@ -214,12 +218,12 @@ pub fn split_seed(seed: &MasterSeed, seal_epoch: u64) -> Vec<Share> {
     for sss in dealer.take(SEAL_SHARES as usize) {
         // blahaj serializes a share as [x, y_0, y_1, ...]; byte 0 is the x-coordinate
         // (the 1-based share index), the source of truth for reconstruction.
-        let share_bytes: Vec<u8> = (&sss).into();
-        let share_index = share_bytes[0];
-        let commitment = share_commitment(share_index, seal_epoch, &share_bytes);
+        let raw: Vec<u8> = (&sss).into();
+        let share_index = raw[0];
+        let commitment = share_commitment(share_index, seal_epoch, &raw);
         shares.push(Share {
             share_index,
-            share_bytes,
+            share_bytes: ShareBytes::new(raw),
             seal_epoch,
             commitment,
         });
@@ -231,9 +235,10 @@ pub fn split_seed(seed: &MasterSeed, seal_epoch: u64) -> Vec<Share> {
 /// Reconstruct the [`MasterSeed`] from `shares` (any [`SEAL_THRESHOLD`] suffice).
 ///
 /// Guards before reconstructing: at least threshold shares present, all from one seal
-/// epoch, and each self-consistent against its commitment. The recovered secret is
-/// held in a [`Zeroizing`] buffer and copied into the returned seed, so no plaintext
-/// copy lingers.
+/// epoch, each self-consistent against its commitment, each x-coordinate valid
+/// (`1..=SEAL_SHARES`) and matching its labeled index, and no two sharing a point. The
+/// recovered secret lives in a [`Zeroizing`] buffer and is copied straight into the
+/// returned seed, so no plaintext copy lingers.
 pub fn combine_shares(shares: &[Share]) -> Result<MasterSeed, ShamirError> {
     if shares.len() < SEAL_THRESHOLD as usize {
         return Err(ShamirError::NotEnoughShares(shares.len()));
@@ -247,11 +252,22 @@ pub fn combine_shares(shares: &[Share]) -> Result<MasterSeed, ShamirError> {
         }
         verify_share(share)?;
         // The reconstruction x-coordinate is byte 0 of the share (blahaj's wire
-        // layout). Guard the empty case and reject duplicate points up front.
+        // layout). Validate it before trusting it: a structurally-bad point (0, or
+        // outside 1..=SEAL_SHARES) is malformed, and a point that disagrees with the
+        // labeled share_index is a self-recommitted inconsistency verify_share CANNOT
+        // catch — the commitment binds the labeled index, not byte 0, so a forger can
+        // relabel the index and reconstruct at a different point. Reject all three.
         let point = *share
             .share_bytes
+            .as_slice()
             .first()
             .ok_or(ShamirError::MalformedShare)?;
+        if point == 0 || point > SEAL_SHARES {
+            return Err(ShamirError::MalformedShare);
+        }
+        if point != share.share_index {
+            return Err(ShamirError::CorruptShare(share.share_index));
+        }
         if !seen_points.insert(point) {
             return Err(ShamirError::DuplicateShareIndex(point));
         }
@@ -273,9 +289,11 @@ pub fn combine_shares(shares: &[Share]) -> Result<MasterSeed, ShamirError> {
     if secret.len() != MASTER_SEED_LEN {
         return Err(ShamirError::WrongSeedLen(secret.len()));
     }
-    let mut bytes = [0u8; MASTER_SEED_LEN];
-    bytes.copy_from_slice(&secret);
-    Ok(MasterSeed::from_bytes(bytes))
+    // Copy the recovered secret straight into the (zeroizing) MasterSeed field — no
+    // intermediate stack array that would be moved-from and left un-wiped.
+    let mut seed = MasterSeed([0u8; MASTER_SEED_LEN]);
+    seed.0.copy_from_slice(&secret);
+    Ok(seed)
 }
 
 #[cfg(test)]
@@ -341,8 +359,10 @@ mod tests {
         let shares = split_seed(&MasterSeed::from_bytes(pseudo_secret(3)), 1);
         let mut garbled = shares[0].clone();
         // flip a payload byte but leave the (now stale) commitment in place.
-        let last = garbled.share_bytes.len() - 1;
-        garbled.share_bytes[last] ^= 0xff;
+        let mut raw = garbled.share_bytes.as_slice().to_vec();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xff;
+        garbled.share_bytes = ShareBytes::new(raw);
         let subset = [garbled.clone(), shares[1].clone()];
         match combine_shares(&subset) {
             Err(ShamirError::CorruptShare(idx)) => assert_eq!(idx, garbled.share_index),
@@ -368,9 +388,35 @@ mod tests {
         // two copies of the same share = one distinct evaluation point.
         let dup = [shares[0].clone(), shares[0].clone()];
         match combine_shares(&dup) {
-            Err(ShamirError::DuplicateShareIndex(x)) => assert_eq!(x, shares[0].share_bytes[0]),
+            Err(ShamirError::DuplicateShareIndex(x)) => {
+                assert_eq!(x, shares[0].share_bytes.as_slice()[0])
+            }
             Err(e) => panic!("expected DuplicateShareIndex, got {e:?}"),
             Ok(_) => panic!("expected DuplicateShareIndex, but combine succeeded"),
+        }
+    }
+
+    #[test]
+    fn mismatched_x_coordinate_is_rejected() {
+        let shares = split_seed(&MasterSeed::from_bytes(pseudo_secret(13)), 1);
+        // Forge a share whose LABELED index disagrees with its byte-0 x-coord, and
+        // re-commit so verify_share (which binds the labeled index) still passes.
+        let mut forged = shares[0].clone();
+        let real_point = forged.share_bytes.as_slice()[0];
+        forged.share_index = real_point + 1; // a lie (real_point is 1 here, so still in range)
+        forged.commitment = share_commitment(
+            forged.share_index,
+            forged.seal_epoch,
+            forged.share_bytes.as_slice(),
+        );
+        // verify_share passes — the commitment matches the labeled index...
+        assert!(verify_share(&forged).is_ok());
+        // ...but combine catches that the labeled index != the reconstruction point.
+        let subset = [forged.clone(), shares[1].clone()];
+        match combine_shares(&subset) {
+            Err(ShamirError::CorruptShare(idx)) => assert_eq!(idx, forged.share_index),
+            Err(e) => panic!("expected CorruptShare, got {e:?}"),
+            Ok(_) => panic!("expected CorruptShare, but combine succeeded"),
         }
     }
 
