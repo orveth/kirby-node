@@ -175,6 +175,10 @@ pub mod boot;
 pub mod brokered_run;
 pub mod checkpoint;
 pub mod config;
+// EngramStore crypto/addressing/LWW (durable mind-state Chunk-2). Platform-agnostic
+// (host-side nostr-sdk + crypto), like `nerve`/`rail` -- NOT cfg-gated, so the
+// cross-platform `rail::EngramStore` can reference it on macOS too.
+pub mod engram;
 #[cfg(target_os = "linux")]
 pub mod egress_run;
 #[cfg(target_os = "linux")]

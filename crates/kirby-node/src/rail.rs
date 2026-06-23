@@ -31,6 +31,12 @@ use std::sync::{Arc, Mutex};
 
 use kirby_proto::capability_request::Act;
 use kirby_proto::{ChatMessage, Memory, MemoryOp, MemoryResult, WriteStatus};
+// The real EngramStore (Chunk-2) is a host-side nostr-sdk client over the nerve relay
+// set. `Event` here is the nostr event, NOT `kirby_proto::Event` (which rail.rs never
+// names) -- no conflict.
+use nostr_sdk::{Client, Event, Filter, Keys, Kind, Timestamp, ToBech32};
+
+use crate::engram::{EngramCrypto, EngramFrame, KIND_ENGRAM};
 
 /// The fixed allowlist sentinel for a [`Act::Completion`] (brain-stub R2). The
 /// allowlist step calls the free fn [`destination`] (it has no `[brain]`/
@@ -1461,5 +1467,372 @@ mod routstr_reconcile_tests {
                 assert!(cost <= cap, "reconcile_cost({cap},{change})={cost} exceeded the cap");
             }
         }
+    }
+}
+
+// ---- The real engram store (durable mind-state Chunk-2): NIP-AE over the nerve ----
+//
+// `EngramStore` is the production [`MemoryBackend`]: it swaps in for [`StubMemory`]
+// behind `Arc<dyn MemoryBackend>` when `[memory].relays` is configured (boot.rs);
+// `StubMemory` stays the test/dev default. It holds the node identity + a connected
+// nostr-sdk client to the N-relay set and performs the Memory act as real NIP-AE
+// engrams (design doc §16):
+//   - each engram is an addressable kind-30174 event; `d` = HMAC(K_dtag, slug) (the
+//     slug never appears in plaintext on a relay); content = NIP-44 self-encrypted
+//     (encrypt to the agent's OWN pubkey) so memory is private to the identity key
+//     (see [`crate::engram`]);
+//   - a WRITE publishes to N relays and succeeds at K-of-N acks. The write-time copy
+//     count IS the durability (design doc §16): there is NO ongoing rent and NO
+//     renewal -- the engram then PERSISTS on the relays it reached;
+//   - a READ unions the relay set, LWW-reconciles per d-tag (greatest created_at,
+//     tie -> lowest id), decrypts locally (the daemon holds the key), drops tombstones.
+//
+// The METERING contract is UNCHANGED from `StubMemory` (the gateway owns it, design
+// doc 11/12): `write_cost` is HOST-computed (G2); reads are free and bypass the ledger
+// (G3). This backend performs + reports the host cost; the gateway debits on the
+// Chunk-1 perform-then-debit flow.
+//
+// DOCUMENTED KNOWN GAP (design doc §16 -- accepted, bounded; closed by the shared
+// gateway-hardening chunk, NOT a Chunk-2 bug): the stored-but-never-paid DEATH-WINDOW.
+// A write can reach a relay (perform) and the agent can budget-die BEFORE the gateway
+// debit lands -- one engram stored without a debit, at death. It is BOUNDED (one write,
+// at the moment of death) and there is no leaked-storage growth (no rent). Exactly-once
+// across a crash (the reservation/outbox primitive) is gateway-hardening's, shared with
+// the brain F2 + routstr HIGH-2 paths; it is deliberately NOT built here.
+//
+// ALSO DEFERRED to gateway-hardening (design doc §16 F7), documented-not-silent:
+// BACKGROUND REPAIR -- restoring a write's copy-count back to N after a transient
+// relay miss (a publish that reached only some of the N relays). A write is already
+// K-of-N MAJORITY-durable without it, so this is a durability top-up, NOT a
+// correctness gap; the repair needs the lease-fenced-worker machinery (a single
+// fenced owner re-publishing, so concurrent daemons don't storm the relays) that is
+// gateway-hardening's -- NOT built here.
+//
+// The reservation primitive, ongoing retention rent, renewal, the
+// degrade->at-risk->expire ladder, and `MemoryAtRisk` are all OUT of Chunk-2 scope
+// (design doc §16): a write pays ONCE, the memory persists, a broke agent can still
+// READ (reads are free) but cannot WRITE -- "recall but can't record" falls out for
+// free with zero rent/ladder machinery.
+
+/// The relay read timeout: how long a GET/LS fetch waits for the relay-set union
+/// before reconciling what it has. Bounded so the daemon never hangs on a slow relay.
+const ENGRAM_READ_TIMEOUT_SECS: u64 = 4;
+
+/// The real NIP-AE engram store (design doc §16). Cheap to clone (an `Arc` over the
+/// nostr client + the committed-token cache + the logical clock).
+#[derive(Clone)]
+pub struct EngramStore {
+    /// Per-key crypto + addressing (self-ECDH root, d-tag HMAC, NIP-44 sealing).
+    crypto: EngramCrypto,
+    /// The connected nostr-sdk client to the N-relay set (an `Arc` so clones share
+    /// the one connection pool).
+    client: Arc<Client>,
+    /// The relay-set size (copy-count N): `write_cost` scales by it, and a write's
+    /// durability is the number of relays it reaches.
+    n: usize,
+    /// The K-of-N ack threshold a WRITE must reach to count as stored (default =
+    /// majority; configurable). `K <= N`.
+    k: usize,
+    /// Host storage-cost knob: a write costs `ceil((slug+value bytes) / bytes_per_sat)`
+    /// sats PER COPY, times `N` copies (min `N`). Deterministic + recomputable (G2).
+    bytes_per_sat: u64,
+    /// The per-write logical clock for event `created_at`: `max(now_secs, last + 1)`
+    /// so LWW orders writes in issue order even within one wall-clock second (design
+    /// doc §16 "simple monotonic-per-agent logical timestamp"). In-memory: it resets
+    /// on restart, but wall-clock `now` has advanced past any pre-restart value, so
+    /// monotonicity holds in practice. The persisted-grade clock is gateway-hardening's.
+    clock: Arc<AtomicU64>,
+    /// In-memory committed-token cache (write_token -> the first result). A re-perform
+    /// of a token within THIS daemon lifetime returns `AlreadyCommittedSameWseq` with
+    /// no re-publish (mirrors `StubMemory`'s G6 contract). NOT durable -- the durable
+    /// outbox is gateway-hardening's; across a restart this is empty and a re-publish is
+    /// absorbed by replaceable-LWW (same content, newer `created_at` wins). Reads bypass
+    /// it (free).
+    committed: Arc<Mutex<HashMap<String, MemoryResult>>>,
+    /// The relay read timeout (a fetch waits this long for the union).
+    read_timeout: Duration,
+}
+
+impl EngramStore {
+    /// Connect an engram store: derive the crypto from `keys`, build a nostr-sdk
+    /// client signed by them, add the N relays, and connect. `write_k` is the K-of-N
+    /// threshold (defaults to majority `floor(N/2)+1`, clamped to `[1, N]`).
+    ///
+    /// Returns an error if no relay is configured (a misconfigured EngramStore is a
+    /// boot bug, not a runtime Memory outcome) or the self-ECDH key derivation fails.
+    pub async fn connect(
+        keys: Keys,
+        relays: &[String],
+        write_k: Option<usize>,
+        bytes_per_sat: u64,
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        if relays.is_empty() {
+            anyhow::bail!("EngramStore requires at least one [memory].relays entry");
+        }
+        let crypto = EngramCrypto::new(keys.clone())?;
+        let client = Client::builder().signer(keys).build();
+        for url in relays {
+            client
+                .add_relay(url)
+                .await
+                .with_context(|| format!("add memory relay {url}"))?;
+        }
+        client.connect().await;
+        let n = relays.len();
+        // Default K = strict majority; a configured K is clamped into [1, N].
+        let k = write_k.unwrap_or(n / 2 + 1).clamp(1, n);
+        tracing::info!(
+            npub = %crypto.public_key().to_bech32().unwrap_or_default(),
+            n, k, "EngramStore connected to the nerve relay set (durable mind-state)"
+        );
+        Ok(EngramStore {
+            crypto,
+            client: Arc::new(client),
+            n,
+            k,
+            bytes_per_sat: bytes_per_sat.max(1),
+            clock: Arc::new(AtomicU64::new(0)),
+            committed: Arc::new(Mutex::new(HashMap::new())),
+            read_timeout: Duration::from_secs(ENGRAM_READ_TIMEOUT_SECS),
+        })
+    }
+
+    /// The next monotonic `created_at` (the logical clock): `max(now_secs, last + 1)`,
+    /// advanced atomically so concurrent writes never collide on a timestamp.
+    fn next_created_at(&self) -> Timestamp {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let secs = loop {
+            let last = self.clock.load(Ordering::SeqCst);
+            let next = now.max(last + 1);
+            if self
+                .clock
+                .compare_exchange(last, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break next;
+            }
+        };
+        Timestamp::from_secs(secs)
+    }
+
+    /// Fetch + LWW-reconcile the LIVE head frame for one slug across the relay set.
+    /// `None` means absent (no event) or tombstoned (the head is a RM). A fetch error
+    /// is [`MemoryError::Unreachable`] (the relay-set is down), which the gateway maps
+    /// to a debit-nothing receipt.
+    async fn read_head(&self, slug: &str) -> Result<Option<EngramFrame>, MemoryError> {
+        let filter = Filter::new()
+            .kind(Kind::from(KIND_ENGRAM))
+            .author(self.crypto.public_key())
+            .identifier(self.crypto.dtag(slug));
+        let events = self
+            .client
+            .fetch_events(filter, self.read_timeout)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, slug, "engram GET fetch failed; store unreachable");
+                MemoryError::Unreachable
+            })?;
+        let evs: Vec<Event> = events.into_iter().collect();
+        let Some(head) = crate::engram::lww_head(&evs) else {
+            return Ok(None);
+        };
+        let frame = self.crypto.decrypt(&head.content).map_err(|e| {
+            // A head we cannot decrypt is a foreign/corrupt event under our address; do
+            // not silently treat it as absent (that would mask data loss) -- surface it.
+            tracing::error!(error = %e, slug, "engram head failed to decrypt");
+            MemoryError::Unreachable
+        })?;
+        Ok(if frame.tombstone { None } else { Some(frame) })
+    }
+
+    /// Enumerate the live slugs: fetch every engram authored by this key, group by
+    /// d-tag, LWW-reconcile each group, decrypt, drop tombstones, and collect the
+    /// surviving slugs (sorted, so the result is stable). A frame that fails to decrypt
+    /// is skipped (a foreign event under our author) rather than aborting the whole LS.
+    async fn list_slugs(&self) -> Result<Vec<String>, MemoryError> {
+        let filter = Filter::new()
+            .kind(Kind::from(KIND_ENGRAM))
+            .author(self.crypto.public_key());
+        let events = self
+            .client
+            .fetch_events(filter, self.read_timeout)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "engram LS fetch failed; store unreachable");
+                MemoryError::Unreachable
+            })?;
+        let mut by_dtag: HashMap<String, Vec<Event>> = HashMap::new();
+        for ev in events.into_iter() {
+            if let Some(d) = crate::engram::event_dtag(&ev) {
+                by_dtag.entry(d).or_default().push(ev);
+            }
+        }
+        let mut slugs = Vec::new();
+        for group in by_dtag.values() {
+            if let Some(head) = crate::engram::lww_head(group) {
+                match self.crypto.decrypt(&head.content) {
+                    Ok(frame) if !frame.tombstone => slugs.push(frame.slug),
+                    Ok(_) => {} // a tombstone head: the slug is removed
+                    Err(e) => {
+                        tracing::warn!(error = %e, "engram LS skipping an undecryptable head")
+                    }
+                }
+            }
+        }
+        slugs.sort();
+        Ok(slugs)
+    }
+
+    /// Publish one engram frame to the relay set and require K-of-N acks. Builds the
+    /// event once with the next logical-clock `created_at`, signs it (the client's
+    /// signer), and broadcasts. Fewer than K acks (or a total send failure) is
+    /// [`MemoryError::Unreachable`] -- the write did not durably land, so the gateway
+    /// debits nothing.
+    async fn publish(&self, frame: &EngramFrame) -> Result<(), MemoryError> {
+        let created_at = self.next_created_at();
+        let builder = self.crypto.event_builder(frame, created_at).map_err(|e| {
+            tracing::error!(error = %e, "build engram event failed");
+            MemoryError::Unreachable
+        })?;
+        let output = self
+            .client
+            .send_event_builder(builder)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "engram publish failed on every relay");
+                MemoryError::Unreachable
+            })?;
+        let acks = output.success.len();
+        if acks < self.k {
+            tracing::warn!(
+                acks, k = self.k, n = self.n, failed = ?output.failed,
+                "engram write did not reach K-of-N relays; treating as unreachable (no debit)"
+            );
+            return Err(MemoryError::Unreachable);
+        }
+        tracing::debug!(acks, k = self.k, n = self.n, "engram write reached K-of-N");
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl MemoryBackend for EngramStore {
+    fn write_cost(&self, m: &Memory) -> u64 {
+        // Host-computed, ONE-TIME storage cost (design doc §16): the per-copy byte cost
+        // times the copy count N. Deterministic + recomputable; an RM (no value) still
+        // costs >= N (a tombstone is a write to every relay).
+        let bytes = (m.slug.len() + m.value.len()) as u64;
+        bytes.div_ceil(self.bytes_per_sat).max(1) * self.n as u64
+    }
+
+    async fn read(&self, m: &Memory) -> Result<MemoryResult, MemoryError> {
+        let op = MemoryOp::try_from(m.op).unwrap_or(MemoryOp::Unspecified);
+        match op {
+            MemoryOp::Get => {
+                if !is_valid_slug(&m.slug) {
+                    return Err(MemoryError::InvalidSlug(m.slug.clone()));
+                }
+                match self.read_head(&m.slug).await? {
+                    Some(frame) => Ok(MemoryResult {
+                        found: true,
+                        content_hash: content_hash(&frame.value),
+                        value: frame.value,
+                        slugs: Vec::new(),
+                        write_status: WriteStatus::Unspecified as i32,
+                    }),
+                    None => Ok(MemoryResult {
+                        found: false,
+                        value: Vec::new(),
+                        slugs: Vec::new(),
+                        content_hash: Vec::new(),
+                        write_status: WriteStatus::Unspecified as i32,
+                    }),
+                }
+            }
+            MemoryOp::Ls => {
+                let slugs = self.list_slugs().await?;
+                Ok(MemoryResult {
+                    found: !slugs.is_empty(),
+                    value: Vec::new(),
+                    slugs,
+                    content_hash: Vec::new(),
+                    write_status: WriteStatus::Unspecified as i32,
+                })
+            }
+            // read() serves only GET/LS; a write op here is a caller bug.
+            _ => Err(MemoryError::MalformedOp),
+        }
+    }
+
+    async fn write(&self, m: &Memory, write_token: &str) -> Result<MemoryWrite, MemoryError> {
+        let op = MemoryOp::try_from(m.op).unwrap_or(MemoryOp::Unspecified);
+        if !is_valid_slug(&m.slug) {
+            return Err(MemoryError::InvalidSlug(m.slug.clone()));
+        }
+
+        // G6: a re-perform of a token committed earlier in THIS lifetime is a replay --
+        // return the SAME result + AlreadyCommittedSameWseq (the gateway still debits the
+        // recomputable host cost exactly once). Across a restart the cache is empty; a
+        // re-publish is then absorbed by replaceable-LWW (same content, newer wins).
+        if let Some(prior) = self.committed.lock().unwrap().get(write_token).cloned() {
+            return Ok(MemoryWrite {
+                result: prior,
+                committed: WriteCommit::AlreadyCommittedSameWseq,
+            });
+        }
+
+        let result = match op {
+            MemoryOp::Set => {
+                if m.value.len() > MAX_MEMORY_VALUE_BYTES {
+                    return Err(MemoryError::TooLarge {
+                        got: m.value.len(),
+                        max: MAX_MEMORY_VALUE_BYTES,
+                    });
+                }
+                let frame = EngramFrame::live(m.slug.clone(), m.value.clone());
+                self.publish(&frame).await?;
+                MemoryResult {
+                    found: true,
+                    value: Vec::new(),
+                    slugs: Vec::new(),
+                    content_hash: content_hash(&m.value),
+                    write_status: WriteStatus::Stored as i32,
+                }
+            }
+            MemoryOp::Rm => {
+                // A pre-read sets `found`/`write_status` faithfully (did the slug exist
+                // before the tombstone?). The tombstone is then published regardless
+                // (idempotent: a RM of an absent slug still writes a tombstone head).
+                let existed = self.read_head(&m.slug).await?.is_some();
+                let frame = EngramFrame::tombstone(m.slug.clone());
+                self.publish(&frame).await?;
+                MemoryResult {
+                    found: existed,
+                    value: Vec::new(),
+                    slugs: Vec::new(),
+                    content_hash: Vec::new(),
+                    write_status: if existed {
+                        WriteStatus::Removed as i32
+                    } else {
+                        WriteStatus::AlreadyAbsent as i32
+                    },
+                }
+            }
+            // write() serves only SET/RM; a read op here is a caller bug.
+            _ => return Err(MemoryError::MalformedOp),
+        };
+
+        self.committed
+            .lock()
+            .unwrap()
+            .insert(write_token.to_string(), result.clone());
+        Ok(MemoryWrite {
+            result,
+            committed: WriteCommit::Stored,
+        })
     }
 }

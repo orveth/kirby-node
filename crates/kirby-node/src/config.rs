@@ -245,9 +245,13 @@ impl Workload {
             // The brain only thinks; it submits no app checkpoint (durable
             // mind-state is a named later chunk, not this stub).
             Workload::Brain => false,
-            // The Chunk-1 memory stub stores into an in-memory map only (the durable,
-            // portable engram store is Chunk-2); it submits no app checkpoint here.
-            Workload::Memory => false,
+            // Chunk-2: the memory workload checkpoint-persists its monotonic write-seq
+            // (`wseq`) so a restart does NOT reset it to 0 and false-dedupe a new write
+            // against the persistent ledger (the F1 bug on a durable store, design doc
+            // §16 fold #1). The genome submits a wseq blob; the daemon serves it back on
+            // resume (the run-agent restore path); the daemon's wseq_floor (R2-7) is the
+            // authoritative backstop.
+            Workload::Memory => true,
         }
     }
 }
@@ -391,10 +395,29 @@ pub struct MemoryConfig {
     /// Seconds the memory loop sleeps between scripted ops (the op cadence).
     #[serde(default = "default_memory_tick_secs")]
     pub tick_secs: u64,
-    /// The `StubMemory` cost knob: a write costs `ceil((slug+value bytes) / bytes_per_sat)`
-    /// sats (min 1), so the treasury visibly drains per write. Daemon-side only.
+    /// The storage-cost knob: a write costs `ceil((slug+value bytes) / bytes_per_sat)`
+    /// sats per copy (min 1), so the treasury visibly drains per write. `StubMemory`
+    /// charges that; `EngramStore` multiplies it by the copy-count N. Daemon-side only.
     #[serde(default = "default_memory_bytes_per_sat")]
     pub bytes_per_sat: u64,
+    /// The nerve relay set the real `EngramStore` (Chunk-2) writes engrams to (the
+    /// NIP-65 write relays). EMPTY (the default) selects the in-memory `StubMemory`
+    /// (test/dev); a NON-EMPTY set selects the real `EngramStore`. The set SIZE is the
+    /// copy-count N -- the write-time durability (design doc §16: no ongoing rent, so
+    /// durability is purely how many relays a write reaches). The first of the two
+    /// collapsed economics dials gudnuf tunes post-merge (own relay + >=1 durable).
+    #[serde(default)]
+    pub relays: Vec<String>,
+    /// The K-of-N ack threshold a WRITE must reach to count as stored (the second
+    /// economics dial, design doc §16). `None` => strict majority `floor(N/2)+1`.
+    #[serde(default)]
+    pub write_k: Option<usize>,
+    /// The identity keyfile the `EngramStore` signs + self-encrypts engrams with -- the
+    /// ONE key that roots identity/presence/memory (design doc §2; the same BIP340 key
+    /// the nerve uses). `None` => a default beside the treasury. Ignored when `relays`
+    /// is empty (`StubMemory` needs no key).
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
 }
 
 fn default_memory_max_cost_sats() -> u64 {
@@ -413,6 +436,11 @@ impl Default for MemoryConfig {
             max_cost_sats: default_memory_max_cost_sats(),
             tick_secs: default_memory_tick_secs(),
             bytes_per_sat: default_memory_bytes_per_sat(),
+            // Empty relay set => the in-memory StubMemory (test/dev default); the real
+            // EngramStore is opt-in via a configured `[memory].relays`.
+            relays: Vec::new(),
+            write_k: None,
+            key_path: None,
         }
     }
 }

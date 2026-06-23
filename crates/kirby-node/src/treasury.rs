@@ -88,6 +88,18 @@ pub struct PerformedRecord {
     pub completion: Vec<u8>,
     #[serde(default)]
     pub memory: Vec<u8>,
+    /// R2-4 (content-aware dedupe, defense-in-depth): a deterministic hash over the
+    /// EFFECTIVE request that produced this record (for a Memory WRITE: op+slug+value).
+    /// The gateway STEP-1 dedupe validates an incoming request's hash against this
+    /// before returning `DUPLICATE_IGNORED`, so a same-key replay carrying DIFFERENT
+    /// content -- a wseq desync / stale-checkpoint collision (the F1 bug class) -- is
+    /// REFUSED, not silently served the prior result. Empty for acts that compute no
+    /// hash (every non-Memory act today), which the validator treats as "skip".
+    /// `#[serde(default)]` + LAST field for the SAME back-compat reason as
+    /// `completion`/`memory`: an older row (no `request_hash`) deserializes with an
+    /// empty hash on resume, never a decode error.
+    #[serde(default)]
+    pub request_hash: Vec<u8>,
 }
 
 /// The daemon-owned treasury. Cheap to clone (an `Arc` over the sled handles),
@@ -173,6 +185,26 @@ impl Treasury {
         }
     }
 
+    /// The maximum numeric suffix among recorded ledger keys with `prefix` (e.g.
+    /// `"mem-write-"`), or `None` if none exist. The gateway seeds the wseq_floor boot
+    /// barrier from this (R2-7): on resume `wseq_floor = 1 + max(mem-write-* in ledger)`,
+    /// so a restarted genome whose checkpoint regressed cannot reuse an already-recorded
+    /// write-seq for a NEW write (the daemon is the wseq AUTHORITY -- a sub-floor fresh
+    /// write is refused). Memory READS bypass the ledger, so only WRITE keys appear here.
+    /// A key whose suffix is not a `u64` is ignored (a foreign key namespace).
+    pub fn max_idempotency_seq(&self, prefix: &str) -> Result<Option<u64>, TreasuryError> {
+        let mut max: Option<u64> = None;
+        for item in self.inner.ledger.scan_prefix(prefix.as_bytes()) {
+            let (key, _val) = item?;
+            if let Ok(suffix) = std::str::from_utf8(key.as_ref()) {
+                if let Some(n) = suffix.strip_prefix(prefix).and_then(|s| s.parse::<u64>().ok()) {
+                    max = Some(max.map_or(n, |m| m.max(n)));
+                }
+            }
+        }
+        Ok(max)
+    }
+
     /// Debit `amount_sats` of metered burn (CPU time, memory time, egress bytes)
     /// from the balance in one transaction, WITHOUT writing an idempotency-keyed
     /// ledger row (spec 3.3 metering, C-4). Metering is not idempotency-keyed:
@@ -242,6 +274,7 @@ impl Treasury {
         proof: Vec<u8>,
         completion: Vec<u8>,
         memory: Vec<u8>,
+        request_hash: Vec<u8>,
     ) -> Result<DebitOutcome, TreasuryError> {
         let key_bytes = key.as_bytes();
         let record_json = serde_json::to_vec(&PerformedRecord {
@@ -257,6 +290,10 @@ impl Treasury {
             // so a resume-replay returns the same structured result. Rides through the
             // re-decode below unchanged, exactly like `completion` (durable-mind-state).
             memory,
+            // The content hash of the effective request (R2-4): empty for acts that
+            // compute none. Persisted so STEP-1 can refuse a same-key, different-content
+            // replay. Rides through the re-decode below unchanged.
+            request_hash,
         })
         .map_err(|e| TreasuryError::Corrupt(format!("encode record: {e}")))?;
 

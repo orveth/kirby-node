@@ -77,11 +77,15 @@ openraft = { workspace = true }
 # it lean: presence needs only the core (custom Kind, EventBuilder, Filter, Keys,
 # subscriptions, NIP-19 bech32), none of the optional NIPs/tor (default = []). It
 # brings its own consistent secp256k1/tokio-tungstenite/reqwest, so it is NOT
-# coupled to cdk's transitive versions.
-nostr-sdk = { version = "0.44", default-features = false }
+# coupled to cdk's transitive versions. `nip44` is enabled for the durable
+# mind-state EngramStore (Chunk-2): engrams are NIP-44 self-encrypted (encrypt to
+# the node's OWN pubkey) so memory is private to the agent's key. This is the SAME
+# self-ECDH path cdk's NUT-27 wallet-backup already exercises in-tree, so the lib
+# supports self-pubkey ECDH (the F8 gate).
+nostr-sdk = { version = "0.44", default-features = false, features = ["nip44"] }
 # sha2 content-addresses app-checkpoint blobs for the portable Linux<->macOS
 # resume seam. The blob stays opaque to the daemon; the hash is only the stable
-# reference.
+# reference. It also backs the EngramStore's HMAC d-tag + HKDF key separation.
 sha2 = "0.10"
 # reqwest is the daemon-side HTTP client RoutstrBrain POSTs the OpenAI-compat
 # completion to (an outbound HTTPS call on the same host-network path as the C-6
@@ -96,6 +100,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # send can be reclaimed with revoke_send (R2-1, the same-wallet reclaim primitive).
 # Already in the tree transitively via cdk; declared direct so the seam can name it.
 uuid = "1"
+# hkdf + hmac back the EngramStore's NIP-AE key derivation (Chunk-2): the self-ECDH
+# root (the NIP-44 conversation key with the node's own pubkey) is HKDF-expanded into
+# a separate d-tag key (domain separation, codex C-low), and the per-slug `d` tag is
+# HMAC-SHA256(K_dtag, slug) so the slug never appears in plaintext on a relay. Pinned
+# to the RustCrypto 0.12 generation that pairs with sha2 0.10's digest 0.10 traits.
+hkdf = "0.12"
+hmac = "0.12"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = { version = "0.7.2", features = ["tonic012"] }

@@ -540,6 +540,10 @@ async fn memory_vm_boots_records_and_dies_when_broke() {
         max_cost_sats: 256, // a generous per-write ceiling (host cost stays well under it)
         tick_secs: 1,
         bytes_per_sat: 1,
+        // No relay set => the in-memory StubMemory (this real-VM e2e exercises the seam +
+        // the wseq checkpoint flip, not a live relay; the EngramStore round-trip is
+        // scripts/engram-store-test.sh).
+        ..MemoryConfig::default()
     };
 
     let boot = BootConfig {

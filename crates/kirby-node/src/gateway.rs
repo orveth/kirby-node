@@ -81,6 +81,15 @@ pub struct GatewayService {
     /// that fork is a treasury/ledger concern the gateway owns. `Arc<dyn MemoryBackend>`
     /// keeps the service cheap to clone (the serve path clones it per connection).
     memory: Option<Arc<dyn MemoryBackend>>,
+    /// The wseq_floor boot barrier (durable-mind-state Chunk-2, R2-7). The daemon is
+    /// the AUTHORITY on the Memory write-seq: a WRITE keyed `mem-write-{wseq}` with
+    /// `wseq < wseq_floor` (and not an exact-key replay, which STEP-1 already absorbed)
+    /// is a regressed/stale-checkpoint genome reusing an already-superseded seq for a
+    /// NEW write -- the F1 false-dedupe bug class -- and is REFUSED (debit 0). Seeded on
+    /// boot/resume to `1 + max(mem-write-* in the ledger)` (so it survives a restart via
+    /// the persisted treasury) and advanced past each committed write. Shared across the
+    /// service's clones (`Arc<AtomicU64>`); 0 when no memory backend is attached.
+    wseq_floor: Arc<AtomicU64>,
 }
 
 /// The lease fence attached to a gateway (spec 4.3): the node's lease handle plus
@@ -118,14 +127,32 @@ impl GatewayService {
             event_observer: None,
             lease_fence: None,
             memory: None,
+            wseq_floor: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Attach the durable-mind-state memory store (the Memory act backend). A memory-mode
-    /// gateway sets this (the `boot_and_observe` path injects a `StubMemory` for the
-    /// durable-mind-state workload); without it a Memory act fails closed. Mirrors the
-    /// brain's swap-ready seam: `StubMemory` now, `EngramStore` later, same call.
+    /// gateway sets this (the `boot_and_observe` path injects a `StubMemory`/`EngramStore`
+    /// for the durable-mind-state workload); without it a Memory act fails closed. Mirrors
+    /// the brain's swap-ready seam: `StubMemory` now, `EngramStore` later, same call.
+    ///
+    /// Seeds the wseq_floor boot barrier (R2-7) from the PERSISTED ledger:
+    /// `wseq_floor = 1 + max(mem-write-* recorded)`. On a fresh boot the ledger has no
+    /// memory writes so the floor is 1 (the genome's first write is `mem-write-1`); on a
+    /// RESUME it reflects the highest already-committed write-seq, so a restarted genome
+    /// whose checkpoint regressed cannot reuse a superseded seq for a new write. A scan
+    /// error is non-fatal (the barrier is defense-in-depth atop STEP-1 + R2-4): it logs
+    /// and leaves the floor at 0 (no barrier), never blocking boot.
     pub fn with_memory_backend(mut self, backend: Arc<dyn MemoryBackend>) -> Self {
+        let floor = match self.treasury.max_idempotency_seq(MEM_WRITE_KEY_PREFIX) {
+            Ok(max) => max.map_or(1, |m| m + 1),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to seed wseq_floor from the ledger; barrier disabled (STEP-1 + R2-4 still guard)");
+                0
+            }
+        };
+        self.wseq_floor.store(floor, Ordering::SeqCst);
+        tracing::info!(wseq_floor = floor, "durable-mind-state: wseq_floor boot barrier seeded (R2-7)");
         self.memory = Some(backend);
         self
     }
@@ -324,7 +351,28 @@ impl GatewayService {
         // safety, spec 4.2 idempotent-across-resume, gate G9). For a Completion the
         // stored `completion` rides back too (brain-stub R1), so a post-resume
         // re-issue gets the SAME assistant words, not just the proof.
+        //
+        // R2-4 (durable-mind-state Chunk-2, content-aware dedupe): a Memory act carries
+        // a deterministic hash over its EFFECTIVE request (op+slug+value). If a prior
+        // record under this same key has a DIFFERENT hash, the key was reused for
+        // different content -- a wseq desync / stale-checkpoint collision (the F1 bug
+        // class) -- so we REFUSE rather than silently serve the stale result. Empty on
+        // either side (an old pre-R2-4 row, or a non-memory act) => skip (back-compat).
+        let request_hash: Vec<u8> = match act {
+            Act::Memory(m) => memory_request_hash(m),
+            _ => Vec::new(),
+        };
         if let Some(prior) = self.treasury.lookup(&req.idempotency_key)? {
+            if !request_hash.is_empty()
+                && !prior.request_hash.is_empty()
+                && request_hash != prior.request_hash
+            {
+                tracing::error!(
+                    key = %req.idempotency_key,
+                    "idempotency key reused with a DIFFERENT memory request (wseq desync / stale checkpoint); refusing, debit 0 (R2-4)"
+                );
+                return Ok(denied(Outcome::Unspecified, self.balance()?));
+            }
             return Ok(receipt(
                 Outcome::DuplicateIgnored,
                 prior.cost_sats,
@@ -401,6 +449,8 @@ impl GatewayService {
             completion.clone(),
             // The generic path performs no Memory act (a Memory act forks to
             // `authorize_memory` before STEP3), so no memory result is persisted here.
+            Vec::new(),
+            // No content hash for a non-memory act (R2-4 is memory-specific).
             Vec::new(),
         )? {
             DebitOutcome::Debited {
@@ -498,6 +548,23 @@ impl GatewayService {
             };
         }
 
+        // wseq_floor boot barrier (R2-7, durable-mind-state Chunk-2): the daemon is the
+        // write-seq AUTHORITY. STEP-1 already absorbed an exact-key replay, so a write
+        // REACHING here is fresh. If its `mem-write-{wseq}` is BELOW the floor, the genome
+        // regressed (a stale checkpoint) and is reusing an already-superseded seq for new
+        // content -- refuse it (debit 0) before it can collide with the persistent ledger.
+        // (An unparseable key skips the barrier; STEP-1 + R2-4 still guard.)
+        if let Some(wseq) = parse_mem_write_seq(&req.idempotency_key) {
+            let floor = self.wseq_floor.load(Ordering::SeqCst);
+            if wseq < floor {
+                tracing::error!(
+                    key = %req.idempotency_key, wseq, floor,
+                    "Memory write-seq below the wseq_floor (regressed/stale-checkpoint genome); refusing, debit 0 (R2-7)"
+                );
+                return Ok(denied(Outcome::Unspecified, self.balance()?));
+            }
+        }
+
         // WRITE PATH (SET/RM): the HOST computes the cost (G2). `max_cost_sats` is a
         // CEILING -- a real cost above it is DENIED_OVER_BUDGET (the cost is NEVER clamped
         // down to the cap, which would silently under-charge the store). The act budget
@@ -539,18 +606,29 @@ impl GatewayService {
             proof.clone(),
             Vec::new(), // not a brain act -- no completion text
             memory_bytes,
+            // R2-4: persist the effective-request hash so a future same-key replay with
+            // DIFFERENT content is refused at STEP-1 (content-aware dedupe).
+            memory_request_hash(m),
         )? {
             DebitOutcome::Debited {
                 cost_sats,
                 remaining,
-            } => Ok(receipt(
-                Outcome::AuthorizedAndPerformed,
-                cost_sats,
-                remaining,
-                proof,
-                Vec::new(),
-                Some(result),
-            )),
+            } => {
+                // Advance the wseq_floor past this committed write (R2-7): the daemon's
+                // authoritative monotonic baseline only ever rises, so a later regressed
+                // genome is caught even without re-reading the ledger.
+                if let Some(wseq) = parse_mem_write_seq(&req.idempotency_key) {
+                    self.wseq_floor.fetch_max(wseq + 1, Ordering::SeqCst);
+                }
+                Ok(receipt(
+                    Outcome::AuthorizedAndPerformed,
+                    cost_sats,
+                    remaining,
+                    proof,
+                    Vec::new(),
+                    Some(result),
+                ))
+            }
             // A concurrent request performed this wseq first: return its stored receipt
             // (one debit, G6); the stored memory result rides back.
             DebitOutcome::Duplicate(prior) => Ok(receipt(
@@ -755,6 +833,33 @@ fn decode_memory(bytes: &[u8]) -> Option<MemoryResult> {
     } else {
         MemoryResult::decode(bytes).ok()
     }
+}
+
+/// The idempotency-key prefix the genome's Memory WRITE loop uses (`mem-write-{wseq}`).
+/// The wseq_floor barrier (R2-7) scans the ledger for this prefix and parses the seq.
+const MEM_WRITE_KEY_PREFIX: &str = "mem-write-";
+
+/// Parse the monotonic write-seq out of a `mem-write-{wseq}` idempotency key, or
+/// `None` if the key is not a Memory write key (the barrier then skips it). The genome
+/// keys every SET/RM this way (genome `memory_loop`), so real write traffic always parses.
+fn parse_mem_write_seq(key: &str) -> Option<u64> {
+    key.strip_prefix(MEM_WRITE_KEY_PREFIX)
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// A deterministic hash over the EFFECTIVE Memory request (R2-4, content-aware dedupe):
+/// the op + slug + value -- the fields that determine the performed store effect.
+/// `max_cost_sats` is a per-call CEILING, not content, so it is excluded (a retry may
+/// legitimately carry a different ceiling). Length-delimiting the slug makes the
+/// (slug, value) boundary unambiguous, so two distinct requests cannot collide.
+fn memory_request_hash(m: &Memory) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update((m.op as u32).to_be_bytes());
+    h.update((m.slug.len() as u64).to_be_bytes());
+    h.update(m.slug.as_bytes());
+    h.update(&m.value);
+    h.finalize().to_vec()
 }
 
 /// Map a host-side treasury fault to a gRPC internal error. Genome-driven

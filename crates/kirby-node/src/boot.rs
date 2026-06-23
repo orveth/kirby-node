@@ -30,8 +30,12 @@ use crate::config::BrainBackendKind;
 #[cfg(target_os = "linux")]
 use crate::firecracker::FirecrackerBackend;
 use crate::gateway::{GatewayService, Session};
+// NodeIdentity (the ONE key rooting identity/presence/memory) backs the real EngramStore
+// when a memory relay set is configured. `nerve` is cross-platform (host-side nostr-sdk).
+use crate::nerve::NodeIdentity;
 use crate::rail::{
-    BrainBackend, CdkEcash, CompositeRail, MockRail, Rail, RoutstrBrain, StubBrain, StubMemory,
+    BrainBackend, CdkEcash, CompositeRail, EngramStore, MemoryBackend, MockRail, Rail,
+    RoutstrBrain, StubBrain, StubMemory,
 };
 use crate::sandbox::{GatewayTransport, GuestImage, GuestSpec, SandboxBackend, SandboxInstance};
 use crate::treasury::Treasury;
@@ -341,11 +345,34 @@ pub async fn boot_and_observe_with_rail(
     if let Some(checkpoint) = config.restore_checkpoint.clone() {
         service = service.with_restore_checkpoint(checkpoint);
     }
-    // The durable-mind-state workload injects a StubMemory backend onto the gateway (the
+    // The durable-mind-state workload injects a memory backend onto the gateway (the
     // Memory act is performed here, not through the rail -- its metering forks, design doc
     // 11/12). `Some` only for `workload = memory`; otherwise a Memory act fails closed.
+    // An EMPTY relay set => the in-memory `StubMemory` (test/dev, Chunk-1 shape, all
+    // current tests); a configured relay set => the real NIP-AE `EngramStore` (Chunk-2),
+    // signing + self-encrypting engrams with the node identity key over the nerve.
     if let Some(mem) = &config.memory {
-        service = service.with_memory_backend(Arc::new(StubMemory::new(mem.bytes_per_sat)));
+        let backend: Arc<dyn MemoryBackend> = if mem.relays.is_empty() {
+            Arc::new(StubMemory::new(mem.bytes_per_sat))
+        } else {
+            // The identity keyfile (the ONE key rooting identity/presence/memory, design
+            // doc §2): the configured path, else a default beside this node's treasury.
+            let key_path = mem
+                .key_path
+                .clone()
+                .unwrap_or_else(|| treasury_path.with_extension("nostr.key"));
+            let identity = NodeIdentity::load_or_create(&key_path)?;
+            Arc::new(
+                EngramStore::connect(
+                    identity.keys().clone(),
+                    &mem.relays,
+                    mem.write_k,
+                    mem.bytes_per_sat,
+                )
+                .await?,
+            )
+        };
+        service = service.with_memory_backend(backend);
     }
 
     // Observe ReportEvents so we can await the genome's boot hello (G1).
