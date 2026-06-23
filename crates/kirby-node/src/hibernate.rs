@@ -52,6 +52,11 @@ pub mod wake;
 /// H1: Shamir secret-sharing of the master seed + domain-separated subkey derivation.
 pub mod shamir;
 
+/// H4a: the in-process share-holder + fencing lease — the durable [`WatcherRecord`]
+/// (barrier 2), the single-live-lease-per-`(npub, resume_seq)` fence (barrier 3), and
+/// condition-gated share release. The quorum primitive seal (H4b) + unseal (H5) drive.
+pub mod holder;
+
 /// The Shamir threshold for the thin slice: any `SEAL_THRESHOLD`-of-`SEAL_SHARES`
 /// shares reconstruct the master seed. 2-of-3 (survive losing one holder).
 pub const SEAL_THRESHOLD: u8 = 2;
