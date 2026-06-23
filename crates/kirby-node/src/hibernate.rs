@@ -62,6 +62,11 @@ pub mod holder;
 /// abort-and-stay-awake (bump `seal_epoch`) before the point of no return.
 pub mod seal;
 
+/// H5: the unseal ceremony + lease-gated reconstitution — fetch the wake-request, assemble
+/// a lease quorum, release + combine shares, derive subkeys, restore the bundle, and gate
+/// live authority (barrier 3) on the aggregated lease.
+pub mod unseal;
+
 /// The Shamir threshold for the thin slice: any `SEAL_THRESHOLD`-of-`SEAL_SHARES`
 /// shares reconstruct the master seed. 2-of-3 (survive losing one holder).
 pub const SEAL_THRESHOLD: u8 = 2;
