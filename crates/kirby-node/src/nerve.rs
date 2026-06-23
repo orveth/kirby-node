@@ -301,8 +301,13 @@ pub struct PresenceConfig {
 }
 
 /// Build a connected Nostr [`Client`] for `identity`, add `relay_url`, and connect.
-/// Shared by the presence task and the fleet read path.
-async fn connect_client(identity: &NodeIdentity, relay_url: &str) -> anyhow::Result<Client> {
+/// Shared by the presence task and the fleet read path, and reused by the hibernation
+/// wake-request publish path ([`crate::hibernate::wake`]) so it does not duplicate the
+/// relay-client construction.
+pub(crate) async fn connect_client(
+    identity: &NodeIdentity,
+    relay_url: &str,
+) -> anyhow::Result<Client> {
     let client = Client::builder().signer(identity.keys().clone()).build();
     client
         .add_relay(relay_url)
@@ -314,7 +319,8 @@ async fn connect_client(identity: &NodeIdentity, relay_url: &str) -> anyhow::Res
 
 /// Build a connected, read-only Nostr [`Client`] (a throwaway identity) for the
 /// fleet read path: it only queries, never publishes, so it needs no node identity.
-async fn connect_reader(relay_url: &str) -> anyhow::Result<Client> {
+/// Reused by the hibernation wake-request fetch path ([`crate::hibernate::wake`]).
+pub(crate) async fn connect_reader(relay_url: &str) -> anyhow::Result<Client> {
     let client = Client::builder().signer(Keys::generate()).build();
     client
         .add_relay(relay_url)

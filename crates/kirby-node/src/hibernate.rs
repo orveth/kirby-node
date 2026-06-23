@@ -43,6 +43,11 @@ use serde::{Deserialize, Serialize};
 // in a submodule so the parallel-front chunks do not collide editing this file.
 pub mod bundle;
 
+/// The wake-request Nostr event (chunk H3): wrap a [`WakeRequest`] as the content of
+/// an addressable Nostr event, sign + publish it via the slice-1 nerve relay client,
+/// and fetch it back by npub / `bundle_digest`.
+pub mod wake;
+
 /// The Shamir threshold for the thin slice: any `SEAL_THRESHOLD`-of-`SEAL_SHARES`
 /// shares reconstruct the master seed. 2-of-3 (survive losing one holder).
 pub const SEAL_THRESHOLD: u8 = 2;
