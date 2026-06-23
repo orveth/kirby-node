@@ -13,6 +13,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,6 +34,15 @@ pub enum NodeBehavior {
         reply: String,
         change_token: Option<String>,
     },
+    /// 200 with `reply`, but FIRST the mock REDEEMS the `X-Cashu` bearer it received via
+    /// `redeem` — consuming the brain's token at the mint the way a real Routstr node does —
+    /// and returns the change token the hook yields in the `X-Cashu` response header. This
+    /// proves node-CONSUMPTION (the sent token was real, spendable, and is now spent), not
+    /// just the brain's local cost bookkeeping.
+    Redeem {
+        reply: String,
+        redeem: RedeemHook,
+    },
     /// A non-2xx status (e.g. 402 payment rejected, 500 model error).
     Status(u16),
     /// 200 with a body that is NOT valid completion JSON (malformed / missing content).
@@ -39,6 +50,14 @@ pub enum NodeBehavior {
     /// Accept the connection but never respond (a black hole) — the client times out.
     Hang,
 }
+
+/// An async hook the round-trip mock invokes with the `X-Cashu` bearer token it received,
+/// so the mock REDEEMS (consumes) that token at the mint like a real Routstr node would,
+/// and returns the change token to hand back in the `X-Cashu` response header. Defined
+/// transport-only (`String` -> `String`): the cdk redeem logic lives in the layer test,
+/// keeping this module mint-free and dependency-light.
+pub type RedeemHook =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
 
 /// How the mock answers `POST /v1/wallet/refund` (the RIP-01 refund).
 #[derive(Clone)]
@@ -101,6 +120,20 @@ impl MockNode {
             NodeBehavior::Reply {
                 reply: reply.to_string(),
                 change_token: change_token.map(|s| s.to_string()),
+            },
+            RefundBehavior::None,
+        )
+        .await
+    }
+
+    /// Convenience: a node that REDEEMS the `X-Cashu` bearer it receives (proving
+    /// consumption at the mint) and returns the change token the hook yields. The
+    /// real-mint round-trip counterpart to [`MockNode::replying`].
+    pub async fn redeeming(reply: &str, redeem: RedeemHook) -> Self {
+        MockNode::start(
+            NodeBehavior::Redeem {
+                reply: reply.to_string(),
+                redeem,
             },
             RefundBehavior::None,
         )
@@ -191,6 +224,8 @@ async fn handle_conn(
         }
     }
 
+    // Keep a copy of the received bearer for the redeem path (the record moves it).
+    let x_cashu_received = x_cashu.clone();
     recorder.lock().unwrap().push(RecordedRequest {
         method,
         path: path.clone(),
@@ -228,6 +263,23 @@ async fn handle_conn(
             if let Some(ref tok) = change_token {
                 headers.push(("X-Cashu", tok));
             }
+            write_response(&mut stream, 200, "OK", &headers, body.as_bytes()).await;
+        }
+        NodeBehavior::Redeem { reply, redeem } => {
+            // Like a real Routstr node: REDEEM (consume) the X-Cashu bearer at the mint
+            // before replying, then hand back the change token the hook minted from it.
+            let bearer = x_cashu_received.unwrap_or_default();
+            let change_token = redeem(bearer).await;
+            let body = serde_json::json!({
+                "id": "mock-cmpl",
+                "object": "chat.completion",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": reply } }],
+            })
+            .to_string();
+            let headers: Vec<(&str, &str)> = vec![
+                ("Content-Type", "application/json"),
+                ("X-Cashu", &change_token),
+            ];
             write_response(&mut stream, 200, "OK", &headers, body.as_bytes()).await;
         }
         NodeBehavior::Status(code) => {

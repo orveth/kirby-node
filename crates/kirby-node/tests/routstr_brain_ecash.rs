@@ -10,12 +10,13 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use cdk::amount::Amount;
 use cdk::wallet::{ReceiveOptions, SendOptions};
 use common::mint_fixture::{FakeMint, TempDir};
-use common::{free_port, MockNode};
+use common::{free_port, MockNode, RedeemHook};
 use kirby_node::boot::assert_wallet_backs_counter;
 use kirby_node::mint_rig::{build_wallet, fund_wallet, open_persistent_wallet};
 use kirby_node::rail::{BrainBackend, CdkEcash, EcashProvider, RoutstrBrain};
@@ -40,20 +41,41 @@ async fn token_round_trip_debits_actual_and_wallet_delta_matches() {
     let w = build_wallet(&mint_url).await.expect("build brain wallet");
     fund_wallet(w.clone(), 1000).await.expect("fund brain wallet");
 
-    // A SECOND wallet mints the change token: it is a FOREIGN token to W (same mint), so
-    // W.receive(change) is the real foreign-redeem path (R2-1: change is `receive`, not revoke).
-    let w2 = build_wallet(&mint_url).await.expect("build change wallet");
-    fund_wallet(w2.clone(), 1000).await.expect("fund change wallet");
+    // The NODE's wallet (same mint, FOREIGN to W). The mock node REDEEMS the X-Cashu bearer
+    // it receives INTO this wallet — actually consuming the brain's token at the mint the
+    // way a real Routstr node does — then mints the change FROM it. This proves
+    // node-CONSUMPTION (the sent token was real, spendable, and is now spent), not just the
+    // brain's local cost bookkeeping; the change W redeems is the real foreign-redeem path
+    // (R2-1: change is `receive`, not revoke).
+    let node_wallet = build_wallet(&mint_url).await.expect("build node wallet");
     let change_amount = 50u64;
-    let prepared = w2
-        .prepare_send(Amount::from(change_amount), SendOptions::default())
-        .await
-        .expect("prepare change token");
-    let change_token = prepared.confirm(None).await.expect("confirm change").to_string();
-
-    let node = MockNode::replying("real-mint round trip", Some(&change_token)).await;
-
     let cap = 64u64;
+    let node_for_hook = node_wallet.clone();
+    let redeem: RedeemHook = Arc::new(move |bearer: String| {
+        let node = node_for_hook.clone();
+        Box::pin(async move {
+            // Consume the brain's bearer at the mint. A real mint enforces no-double-spend,
+            // so after this the brain's token is SPENT (unrevocable) — the consumption proof.
+            let received = node
+                .receive(&bearer, ReceiveOptions::default())
+                .await
+                .expect("the node redeems (consumes) the brain's X-Cashu bearer at the mint");
+            assert!(
+                u64::from(received) >= cap - FEE_BOUND,
+                "the node consumed ~the full cap-worth bearer, got {}",
+                u64::from(received)
+            );
+            // Hand back the change, minted from the just-consumed value.
+            let prepared = node
+                .prepare_send(Amount::from(change_amount), SendOptions::default())
+                .await
+                .expect("prepare change token");
+            prepared.confirm(None).await.expect("confirm change").to_string()
+        })
+    });
+
+    let node = MockNode::redeeming("real-mint round trip", redeem).await;
+
     let w_before = balance(&w).await;
     let brain = RoutstrBrain::new(
         node.url(),
@@ -88,6 +110,17 @@ async fn token_round_trip_debits_actual_and_wallet_delta_matches() {
     assert!(
         wallet_delta <= cap + FEE_BOUND,
         "wallet net spend {wallet_delta} exceeded cap {cap} + fee {FEE_BOUND}"
+    );
+
+    // Node-CONSUMPTION proof: the node wallet was actually PAID by consuming the bearer.
+    // It received the cap-worth (64) token and returned only the 50-sat change, so it nets
+    // ~cost (14). Had the mock merely done bookkeeping (discarded the bearer, as the old
+    // round-trip did), the node would hold ~0 — this is what separates real consumption
+    // from accounting.
+    let node_balance = balance(&node_wallet).await;
+    assert!(
+        node_balance >= cost.saturating_sub(FEE_BOUND),
+        "the node should hold ~the cost {cost} after consuming the bearer; node holds {node_balance}"
     );
 
     mint.shutdown().await;
