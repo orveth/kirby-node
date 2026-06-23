@@ -54,6 +54,36 @@ pub const KIND_KIRBY_LIFECYCLE: u16 = 9100;
 /// here in the shared contract crate so every node and the UI agree on one value.
 pub const KIND_KIRBY_AGENT_STATE: u16 = 31000;
 
+/// The Nostr event kind for a Kirby agent's WAKE-REQUEST (the hibernation
+/// commitment: an agent has sealed its state to sleep, and this is the public,
+/// signed record of how to wake it — the `wake_at` timer, the immutable
+/// `bundle_digest`, the genome `image_ref`, and the `seal` block naming the share
+/// holders + threshold). The JSON content shape is the `hibernate::WakeRequest`
+/// payload (`{ wake_at, bundle_digest, image_ref, seal, resume_seq, solvency_hint }`).
+///
+/// This is an ADDRESSABLE event kind (30000..40000, per NIP-01): keyed by a `d` tag
+/// set to the `agent_id`, the relay keeps only the LATEST event per
+/// `(pubkey, kind, d)`. ADDRESSABLE, not REPLACEABLE (10000..20000), for two reasons:
+///   1. **Discovery returns the current commitment, no stale pile-up.** A re-seal
+///      (a bumped `seal_epoch` / pushed-back `wake_at`) publishes a new addressable
+///      event that REPLACES the prior wake-request for that agent, so a waker always
+///      reads the live commitment — unlike a REGULAR/stored kind (e.g. 9100), which
+///      would accumulate every wake-request ever and force created_at de-duping.
+///   2. **Multi-agent-per-node stays open (the agent-scoped discipline).** A
+///      REPLACEABLE kind is keyed by `(pubkey, kind)` only, so a second agent on the
+///      same node (Move-2) would CLOBBER the first's wake-request. Keying on
+///      `d = agent_id` gives one wake-request PER AGENT — the same reasoning that
+///      made 31000 agent-state addressable.
+///
+/// The content JSON is the `WakeRequest` payload and the tags are `["d",<agent_id>]`
+/// (the addressable key), `["t","kirby"]`, `["a",<agent_id>]`, `["node",<node_id>]`
+/// (the unified vocabulary), plus `["x",<bundle_digest>]` — the indexable single-letter
+/// hash tag (NIP-94 convention: `x` = sha256) so a waker can `#x`-filter the relay to
+/// fetch a wake-request by its `bundle_digest`. It lives here in the shared contract
+/// crate so every node agrees on one value with no central registry (thin slice H3,
+/// `plans/build-spec-kirby-hibernation-thinslice.md`).
+pub const KIND_KIRBY_WAKE_REQUEST: u16 = 31001;
+
 pub mod gateway {
     //! Generated tonic types for `kirby.gateway.v1`.
     tonic::include_proto!("kirby.gateway.v1");
