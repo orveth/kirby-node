@@ -39,6 +39,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+// H2: the bundle digest (canonical encoding) + the agent-scoped persist/read-back,
+// in a submodule so the parallel-front chunks do not collide editing this file.
+pub mod bundle;
+
 /// The Shamir threshold for the thin slice: any `SEAL_THRESHOLD`-of-`SEAL_SHARES`
 /// shares reconstruct the master seed. 2-of-3 (survive losing one holder).
 pub const SEAL_THRESHOLD: u8 = 2;
@@ -115,9 +119,11 @@ impl StateBundle {
     /// bundle: a hash over the canonical serialization of all fields. The
     /// wake-request commits to it, and a tampered bundle fails the recomputed check.
     ///
-    /// H0 stub: H2 implements the digest (and the canonical serialization it hashes).
+    /// Implemented in [`bundle`] via a fixed-field, length-prefixed canonical
+    /// encoding decoupled from the storage format, so the same bundle always hashes
+    /// to the same digest regardless of field order or serialization whitespace.
     pub fn bundle_digest(&self) -> String {
-        todo!("H2: sha256 over the canonical serialization of the bundle fields")
+        bundle::compute_digest(self)
     }
 }
 
