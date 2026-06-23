@@ -463,17 +463,36 @@ fn default_initial_sats() -> u64 {
 }
 
 /// Whether `url` is safe to send the X-Cashu bearer token to in the clear: `https://`
-/// (TLS) always, or plain `http://` ONLY for a loopback host (a same-host node / tests).
-/// Any other plain-http host is refused (brain-routstr §3 MED-3).
+/// (TLS protects the bearer regardless of host) always, or plain `http://` ONLY when the
+/// TRUE host is loopback (a same-host node / tests). Any other plain-http host is refused
+/// (brain-routstr §3 MED-3).
+///
+/// The host is taken from a real URL parse, NOT a substring split. A naive
+/// `split([':', '/'])` reads `http://localhost:pw@evil.com/` as host "localhost" and would
+/// leak the cleartext bearer to evil.com (the userinfo bypass: `localhost:pw@` is userinfo,
+/// the real host is `evil.com`). `Url::host_str()` resolves the authority correctly
+/// (userinfo stripped, true host = evil.com → refused) and also accepts IPv6 loopback
+/// (`http://[::1]:7780`), which the old split mishandled. Unparseable or non-http(s) URLs
+/// fail closed (refused).
 fn is_https_or_localhost(url: &str) -> bool {
-    if url.starts_with("https://") {
-        return true;
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false; // unparseable → fail closed
+    };
+    match parsed.scheme() {
+        // TLS protects the bearer in transit regardless of host.
+        "https" => true,
+        // Plain http: the bearer crosses the wire in cleartext, so ONLY a real loopback
+        // host is acceptable. Strip any IPv6 brackets so "[::1]" and "::1" both match.
+        "http" => {
+            let host = parsed.host_str().unwrap_or("");
+            let host = host
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(host);
+            matches!(host, "localhost" | "127.0.0.1" | "::1")
+        }
+        _ => false,
     }
-    if let Some(rest) = url.strip_prefix("http://") {
-        let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
-        return matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]");
-    }
-    false
 }
 
 impl KirbyConfig {
@@ -1048,6 +1067,31 @@ mod tests {
         let cfg =
             KirbyConfig::from_toml_str(toml).expect("a loopback-http routstr brain must validate");
         assert_eq!(cfg.brain.node_url, "http://127.0.0.1:8181");
+    }
+
+    #[test]
+    fn is_https_or_localhost_resolves_true_host_not_userinfo() {
+        // PASS: TLS (any host), and a REAL loopback host over plain http.
+        assert!(is_https_or_localhost("https://api.routstr.com"));
+        assert!(is_https_or_localhost("http://localhost:7780"));
+        assert!(is_https_or_localhost("http://127.0.0.1:8181"));
+        // IPv6 loopback over plain http — the old substring split mishandled the brackets
+        // (it could never match), over-rejecting a legitimate same-host node.
+        assert!(is_https_or_localhost("http://[::1]:7780"));
+        assert!(is_https_or_localhost("http://[::1]"));
+
+        // REJECT (the userinfo bypass): the TRUE host is evil.com, so the cleartext X-Cashu
+        // bearer must NOT be sent. A naive split on ':'/'@' read these as "localhost" /
+        // "127.0.0.1" and PASSED them — leaking the bearer to evil.com over plaintext http.
+        assert!(!is_https_or_localhost("http://localhost:pw@evil.com/"));
+        assert!(!is_https_or_localhost("http://localhost:pw@evil.com"));
+        assert!(!is_https_or_localhost("http://127.0.0.1@evil.com"));
+        assert!(!is_https_or_localhost("http://localhost%2f@evil.com"));
+        // A plain non-loopback http host stays refused (the original MED-3 guard).
+        assert!(!is_https_or_localhost("http://api.routstr.com"));
+        // Unparseable or non-http(s) schemes fail closed.
+        assert!(!is_https_or_localhost("not a url"));
+        assert!(!is_https_or_localhost("ftp://localhost/x"));
     }
 
     #[test]
