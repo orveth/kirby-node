@@ -21,15 +21,29 @@
 //!    reconciles `expires_at` = MIN of the granted (most conservative liveness) and unions the
 //!    per-holder assents into the quorum proof.
 //! 4. **Release** ≥[`SEAL_THRESHOLD`] shares ([`Holder::release_share`], each holder handed
-//!    its OWN issued lease) → [`combine_shares`] (2 → master seed) → [`derive_subkeys`]
-//!    (identity / state / wallet).
+//!    its OWN issued lease), **bind each to the published seal** (commitment ∈
+//!    `wake.seal.commitments` and `seal_epoch == wake.seal.seal_epoch`), then [`combine_shares`]
+//!    (H1) → [`derive_subkeys`] (H1).
 //! 5. **Restore** the bundle the wake-request commits to ([`load_bundle`] with the
 //!    wake-request's `bundle_digest` — the digest MUST match, restore-consistency) and resume
 //!    at `resume_seq + 1`.
-//! 6. **Lease gates live authority** (barrier 3): the resumed [`LeasedRuntime`] hands out its
-//!    identity / state / wallet keys ONLY through [`LeasedRuntime::authority`], which refuses
-//!    once the aggregated lease has expired. The runtime renews before `expires_at`
+//! 6. **Lease gates live authority** (barrier 3): the resumed [`LeasedRuntime`] exposes its
+//!    identity / state / wallet keys ONLY inside [`LeasedRuntime::with_authority`], which
+//!    re-checks liveness on EVERY call and scopes the keys to the closure — so a stale handle
+//!    can never use them past `expires_at`. The runtime renews before `expires_at`
 //!    ([`LeasedRuntime::renew`]) or must self-stop ([`LeasedRuntime::must_self_stop`]).
+//!
+//! ## Binding the shares to the seal (integrity)
+//!
+//! A holder's own commitment only proves a share is internally consistent — NOT that it is one
+//! of THIS seal's shares. Tampered/stale holder state with a valid self-commitment would
+//! otherwise combine to a DIFFERENT seed (a wrong identity / wallet) while the bundle digest
+//! still passed. So before combining, each released share is bound to the PUBLISHED seal: its
+//! `commitment` must be one of `wake.seal.commitments` and its `seal_epoch` must equal
+//! `wake.seal.seal_epoch`. Set-membership (not a positional `commitments[i]`) is used so the
+//! check stays correct when a holder is skipped (open failure) and roster indices no longer
+//! line up — each share is still pinned to the published set, and the commitment's sha256
+//! binding makes membership ⟺ "exactly one of this seal's shares".
 //!
 //! ## Single shared `now`
 //!
@@ -38,20 +52,26 @@
 //! MIN equals each, and each holder's own lease matches its durable record at release time. The
 //! MIN-reconciliation is the GENERAL rule that stays correct when (Move-2) holders disagree.
 //!
-//! ## Holder lifecycle
+//! ## Holder lifecycle + the concurrency boundary
 //!
 //! Unseal OPENS the roster's holders, drives them, and drops them within the call — honoring
-//! H4a's single-live-handle invariant by construction (no two concurrent handles for an id from
-//! here). The fence still holds across separate attempts because each holder's `active_lease`
-//! is DURABLE: a second spawner opening the same ids reloads the first's live lease and is
-//! refused. A holder whose durable state cannot be opened is skipped (a 2-of-3 quorum is meant
-//! to survive a lost holder), so it simply does not count toward the quorum.
+//! H4a's single-live-handle invariant by construction. The fence holds across SEQUENTIAL
+//! attempts because each holder's `active_lease` is DURABLE: a later spawner opening the same
+//! ids reloads the earlier live lease and is refused. A holder whose durable state cannot be
+//! opened is skipped (a 2-of-3 quorum is meant to survive a lost holder), so it does not count.
+//!
+//! KNOWN GAP (inherited from H4a, not closed here): CONCURRENT spawners are NOT fenced. Two
+//! attempts that open the roster at the same instant each read `active_lease = None` and both
+//! persist a grant — a fork. The thin-slice round-trip is single-attempt, so it does not arise;
+//! concurrent / distributed unseal needs a per-holder file lock (H4a's documented Move-2
+//! hardening, the top flock item). Called out, not relied upon.
 //!
 //! ## Honest-actor scope
 //!
 //! Inherited from H4a: `lease_id` / `spawner_ephemeral_pubkey` are trusted strings (no schnorr
 //! proof-of-possession yet). The lease gates *authority*, not the in-process key bytes a buggy
-//! caller could read another way — it is the protocol fence, not a hardware boundary.
+//! caller could deliberately copy out of [`with_authority`](LeasedRuntime::with_authority) — it
+//! is the protocol fence, not a hardware boundary.
 //!
 //! ## Secret hygiene
 //!
@@ -91,9 +111,14 @@ pub enum UnsealError {
     /// The relay holds no wake-request for this agent.
     #[error("no wake-request on the relay for this agent")]
     NoWakeRequest,
-    /// The wake-request's declared threshold is not the protocol's [`SEAL_THRESHOLD`].
-    #[error("wake-request threshold does not match the protocol ({SEAL_THRESHOLD}-of-N)")]
-    WakeSealMismatch,
+    /// The wake-request's seal block is malformed (wrong threshold, roster/commitment count
+    /// mismatch, or a duplicate holder id). Carries a static reason.
+    #[error("malformed wake-request seal: {0}")]
+    MalformedSeal(&'static str),
+    /// A released share is not bound to the published seal — its commitment is not one of
+    /// `wake.seal.commitments`, or its `seal_epoch` differs. (Tampered / stale holder state.)
+    #[error("share {share_index} is not bound to the published seal (commitment/epoch mismatch)")]
+    ShareSealMismatch { share_index: u8 },
     /// Fewer than [`SEAL_THRESHOLD`] holders granted a lease for this seal — a competitor may
     /// hold the fence, holders are unavailable, or it is not yet `wake_at`.
     #[error("could not assemble a lease quorum: got {got} of {needed} required")]
@@ -115,9 +140,10 @@ pub enum UnsealError {
     Fetch(String),
 }
 
-/// The live-authority capability handed out by [`LeasedRuntime::authority`] ONLY while the
-/// aggregated lease is live. Holding one is the runtime's proof it may identity-sign,
-/// wallet-spend, or checkpoint (barrier 3) — the subkeys are reachable through nothing else.
+/// The live-authority capability exposed ONLY inside [`LeasedRuntime::with_authority`], whose
+/// closure re-checks the lease at use. Holding it (transiently, within the closure) is the
+/// runtime's proof it may identity-sign / wallet-spend / checkpoint (barrier 3); the subkeys are
+/// reachable through nothing else, and the borrow cannot escape the closure.
 pub struct Authority<'a> {
     subkeys: &'a Subkeys,
 }
@@ -140,11 +166,12 @@ impl Authority<'_> {
 /// A reconstituted, lease-gated agent runtime: the SAME identity + state the seal committed,
 /// holding the quorum's aggregated fencing [`Lease`].
 ///
-/// The derived [`Subkeys`] are PRIVATE and reachable only through [`authority`](Self::authority),
-/// which refuses once the lease has expired — so identity-sign / wallet-spend / checkpoint are
-/// structurally gated on a live lease (barrier 3). It also retains where its holders live
-/// (`treasury_dir` / `agent_id` / `holder_ids`) so [`renew`](Self::renew) can re-open the same
-/// roster. Not `Debug`: it holds secret subkeys.
+/// The derived [`Subkeys`] are PRIVATE and reachable only inside
+/// [`with_authority`](Self::with_authority), which re-checks the lease on every call — so
+/// identity-sign / wallet-spend / checkpoint are gated on a live lease at the moment of use
+/// (barrier 3), and no key reference can outlive that check. It also retains where its holders
+/// live (`treasury_dir` / `agent_id` / `holder_ids`) so [`renew`](Self::renew) can re-open the
+/// same roster. Not `Debug`: it holds secret subkeys.
 pub struct LeasedRuntime {
     npub: String,
     lease: Lease,
@@ -186,26 +213,45 @@ impl LeasedRuntime {
         !self.is_live(now)
     }
 
-    /// Barrier 3: the gate to live authority. Returns the capability to identity-sign /
-    /// wallet-spend / checkpoint ONLY while the aggregated lease is live; once it has expired
-    /// the runtime has no authority and the caller must self-stop.
-    pub fn authority(&self, now: u64) -> Result<Authority<'_>, UnsealError> {
+    /// Barrier 3: run `f` with live authority — the capability to identity-sign / wallet-spend /
+    /// checkpoint — ONLY if the aggregated lease is live at `now`, else [`UnsealError::LeaseExpired`]
+    /// (the caller must self-stop). The liveness is re-checked on EVERY call, and the
+    /// [`Authority`] (hence the key references) cannot escape the closure, so keys can never be
+    /// used past `expires_at`. (A caller that explicitly COPIES key bytes out owns that copy's
+    /// hygiene — the honest-actor boundary.)
+    pub fn with_authority<R>(
+        &self,
+        now: u64,
+        f: impl FnOnce(&Authority<'_>) -> R,
+    ) -> Result<R, UnsealError> {
         if !self.is_live(now) {
             return Err(UnsealError::LeaseExpired {
                 expires_at: self.lease.expires_at,
                 now,
             });
         }
-        Ok(Authority {
+        Ok(f(&Authority {
             subkeys: &self.subkeys,
-        })
+        }))
     }
 
     /// Renew before `expires_at` by re-opening the roster and re-gathering the quorum's assent
     /// for the SAME lease (same `lease_id` + spawner → the holders' renewal path extends
-    /// `expires_at`), then re-aggregating. On failure the old lease is kept (so a partial
-    /// failure does not widen authority) and the caller must self-stop once it lapses.
+    /// `expires_at`), then re-aggregating.
+    ///
+    /// An ALREADY-EXPIRED runtime is refused ([`UnsealError::LeaseExpired`]) BEFORE any holder is
+    /// contacted: once the lease has lapsed the runtime has no authority, and the holders' fence
+    /// slot is free — so a "renewal" would silently re-grant the same lease and resurrect dead
+    /// authority. A lapsed runtime must fully re-reconstitute (re-fence through the quorum), not
+    /// renew. On a gather failure the old lease is kept (a partial failure does not widen
+    /// authority) and the caller self-stops once it lapses.
     pub fn renew(&mut self, lease_ttl_secs: u64, now: u64) -> Result<(), UnsealError> {
+        if !self.is_live(now) {
+            return Err(UnsealError::LeaseExpired {
+                expires_at: self.lease.expires_at,
+                now,
+            });
+        }
         let req = UnsealRequest {
             npub: self.npub.clone(),
             lease_id: self.lease.lease_id.clone(),
@@ -300,10 +346,33 @@ fn aggregate_lease(leases: &[(usize, Lease)]) -> Lease {
     }
 }
 
+/// Validate the wake-request's seal block before trusting it to drive the ceremony: it must ask
+/// for the protocol threshold, pair each roster holder with a commitment, and name distinct
+/// holders (duplicates would double-count toward the quorum and open two handles to one id).
+fn validate_seal(wake: &WakeRequest) -> Result<(), UnsealError> {
+    if wake.seal.threshold != SEAL_THRESHOLD {
+        return Err(UnsealError::MalformedSeal(
+            "threshold does not match the protocol",
+        ));
+    }
+    if wake.seal.holder_pubkeys.len() != wake.seal.commitments.len() {
+        return Err(UnsealError::MalformedSeal(
+            "roster and commitment counts differ",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for id in &wake.seal.holder_pubkeys {
+        if !seen.insert(id.as_str()) {
+            return Err(UnsealError::MalformedSeal("duplicate holder id in roster"));
+        }
+    }
+    Ok(())
+}
+
 /// The synchronous reconstitution core (steps 2–6): given an already-fetched [`WakeRequest`],
-/// open the roster it names, drive the lease quorum, reconstruct the seed, restore the bundle,
-/// and return the lease-gated [`LeasedRuntime`]. Split out from the relay fetch so it is
-/// unit-testable without a live relay.
+/// open the roster it names, drive the lease quorum, reconstruct the seed (binding each share to
+/// the published seal), restore the bundle, and return the lease-gated [`LeasedRuntime`]. Split
+/// out from the relay fetch so it is unit-testable without a live relay.
 pub fn reconstitute(
     treasury_dir: &Path,
     agent_id: &str,
@@ -312,10 +381,7 @@ pub fn reconstitute(
     spawner: &SpawnerProposal,
     now: u64,
 ) -> Result<LeasedRuntime, UnsealError> {
-    // The wake-request must ask for the protocol's threshold policy.
-    if wake.seal.threshold != SEAL_THRESHOLD {
-        return Err(UnsealError::WakeSealMismatch);
-    }
+    validate_seal(wake)?;
     let needed = SEAL_THRESHOLD as usize;
 
     let req = UnsealRequest {
@@ -325,8 +391,8 @@ pub fn reconstitute(
         lease_ttl_secs: spawner.lease_ttl_secs,
     };
 
-    // (2) open the roster the seal stamped into the wake-request, then gather a lease quorum
-    // bound to this wake-request's seal, then (3) aggregate.
+    // (2) open the roster the seal stamped into the wake-request, gather a lease quorum bound to
+    // this wake-request's seal, then (3) aggregate.
     let mut holders = open_roster(treasury_dir, agent_id, &wake.seal.holder_pubkeys);
     let granted = gather_leases(
         &mut holders,
@@ -338,10 +404,19 @@ pub fn reconstitute(
     )?;
     let lease = aggregate_lease(&granted);
 
-    // (4) release `needed` shares (each holder handed its OWN lease) → combine → derive.
+    // (4) release `needed` shares (each holder handed its OWN lease), bind each to the PUBLISHED
+    // seal, then combine → derive.
     let mut shares: Vec<Share> = Vec::with_capacity(needed);
     for (idx, holder_lease) in granted.iter().take(needed) {
-        shares.push(holders[*idx].release_share(holder_lease, now)?);
+        let share = holders[*idx].release_share(holder_lease, now)?;
+        if share.seal_epoch != wake.seal.seal_epoch
+            || !wake.seal.commitments.contains(&share.commitment)
+        {
+            return Err(UnsealError::ShareSealMismatch {
+                share_index: share.share_index,
+            });
+        }
+        shares.push(share);
     }
     let seed = combine_shares(&shares)?;
     let subkeys = derive_subkeys(&seed);
@@ -419,8 +494,8 @@ mod tests {
 
     /// Seal-side fixture: split `seed_bytes` into SEAL_SHARES shares, persist a bundle, and seal
     /// each holder with its share. Returns the wake-request (its `seal.holder_pubkeys` IS the
-    /// roster unseal will open). Composes the H1/H2/H4a primitives exactly as the real seal
-    /// ceremony (H4b) will.
+    /// roster unseal will open, and `seal.commitments` the shares it will bind to). Composes the
+    /// H1/H2/H4a primitives exactly as the real seal ceremony (H4b) will.
     fn seal_fixture(
         dir: &Path,
         seed_bytes: [u8; 32],
@@ -487,7 +562,6 @@ mod tests {
         let seed_bytes = [42u8; 32];
         let wake = seal_fixture(&dir, seed_bytes, 5, 1_000, 1);
         let now = 1_000; // == wake_at
-                         // a fresh process reconstitutes, opening the roster from the wake-request itself.
         let rt = reconstitute(
             &dir,
             AGENT,
@@ -500,10 +574,12 @@ mod tests {
 
         // SAME identity: the gated subkeys match a fresh derivation from the original seed.
         let expected = derive_subkeys(&MasterSeed::from_bytes(seed_bytes));
-        let auth = rt.authority(now).expect("live authority");
-        assert_eq!(auth.identity_key(), &expected.identity_key);
-        assert_eq!(auth.state_key(), &expected.state_key);
-        assert_eq!(auth.wallet_seed(), &expected.wallet_seed);
+        rt.with_authority(now, |auth| {
+            assert_eq!(auth.identity_key(), &expected.identity_key);
+            assert_eq!(auth.state_key(), &expected.state_key);
+            assert_eq!(auth.wallet_seed(), &expected.wallet_seed);
+        })
+        .expect("live authority");
 
         // SAME state.
         assert_eq!(rt.npub(), NPUB);
@@ -567,19 +643,20 @@ mod tests {
             now,
         )
         .unwrap();
-        // expires_at = now + ttl = 1_100.
+        // expires_at = now + ttl = 1_100. Live inside the window: authority runs.
         assert!(rt.is_live(1_050));
-        assert!(rt.authority(1_050).is_ok());
-        // at/after expiry: dead, must self-stop, authority refused.
+        rt.with_authority(1_050, |_| ())
+            .expect("authority while live");
+        // at/after expiry: dead, must self-stop, and authority is refused at USE (re-checked).
         assert!(!rt.is_live(1_100));
         assert!(rt.must_self_stop(1_100));
-        match rt.authority(1_200) {
+        match rt.with_authority(1_200, |auth| auth.identity_key()[0]) {
             Err(UnsealError::LeaseExpired { expires_at, now }) => {
                 assert_eq!(expires_at, 1_100);
                 assert_eq!(now, 1_200);
             }
             Err(e) => panic!("expected LeaseExpired, got {e:?}"),
-            Ok(_) => panic!("expected LeaseExpired, but authority was granted"),
+            Ok(_) => panic!("expected LeaseExpired, but authority ran past expiry"),
         }
         cleanup(&dir);
     }
@@ -602,7 +679,33 @@ mod tests {
         rt.renew(100, 1_050).expect("renew");
         assert_eq!(rt.lease().expires_at, 1_150);
         // a time that would have been dead under the original lease is now live.
-        assert!(rt.authority(1_120).is_ok());
+        rt.with_authority(1_120, |_| ())
+            .expect("authority after renewal");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn renew_on_an_expired_runtime_is_refused() {
+        let dir = tempdir();
+        let wake = seal_fixture(&dir, [7u8; 32], 5, 1_000, 1);
+        let mut rt = reconstitute(
+            &dir,
+            AGENT,
+            NPUB,
+            &wake,
+            &proposal("lease-1", "spawner-A", 100),
+            1_000,
+        )
+        .unwrap();
+        // the lease has lapsed (expires_at 1_100): a dead runtime must NOT renew its way back.
+        match rt.renew(100, 1_200) {
+            Err(UnsealError::LeaseExpired { expires_at, now }) => {
+                assert_eq!(expires_at, 1_100);
+                assert_eq!(now, 1_200);
+            }
+            Err(e) => panic!("expected LeaseExpired, got {e:?}"),
+            Ok(()) => panic!("an expired runtime must not be allowed to renew"),
+        }
         cleanup(&dir);
     }
 
@@ -662,14 +765,68 @@ mod tests {
     }
 
     #[test]
+    fn a_share_not_bound_to_the_published_seal_is_rejected() {
+        let dir = tempdir();
+        let mut wake = seal_fixture(&dir, [2u8; 32], 5, 1_000, 1);
+        // The holders are sealed with valid, self-consistent shares, but the published seal no
+        // longer names their commitments (simulating tampered/stale holder state combining to a
+        // foreign seed). bundle_digest + resume_seq + threshold stay valid so the ceremony gets
+        // past the quorum and releases real shares, which must then fail the seal binding.
+        wake.seal.commitments = wake
+            .seal
+            .commitments
+            .iter()
+            .map(|_| "deadbeef".to_string())
+            .collect();
+        match reconstitute(
+            &dir,
+            AGENT,
+            NPUB,
+            &wake,
+            &proposal("lease-1", "spawner-A", 100),
+            1_000,
+        ) {
+            Err(UnsealError::ShareSealMismatch { .. }) => {}
+            Err(e) => panic!("expected ShareSealMismatch, got {e:?}"),
+            Ok(_) => panic!("expected a share-not-in-seal rejection"),
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
     fn a_wake_request_with_a_foreign_threshold_is_rejected() {
         let dir = tempdir();
         let mut wake = seal_fixture(&dir, [8u8; 32], 5, 1_000, 1);
         wake.seal.threshold = 3; // not the protocol's SEAL_THRESHOLD (2)
         match reconstitute(&dir, AGENT, NPUB, &wake, &proposal("l", "s", 100), 1_000) {
-            Err(UnsealError::WakeSealMismatch) => {}
-            Err(e) => panic!("expected WakeSealMismatch, got {e:?}"),
-            Ok(_) => panic!("expected WakeSealMismatch"),
+            Err(UnsealError::MalformedSeal(_)) => {}
+            Err(e) => panic!("expected MalformedSeal, got {e:?}"),
+            Ok(_) => panic!("expected MalformedSeal"),
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_duplicate_holder_in_the_roster_is_rejected() {
+        let dir = tempdir();
+        let mut wake = seal_fixture(&dir, [1u8; 32], 5, 1_000, 1);
+        // a duplicated holder id would double-count toward the quorum (and open two handles).
+        wake.seal.holder_pubkeys = vec![
+            "holder-0".to_string(),
+            "holder-0".to_string(),
+            "holder-1".to_string(),
+        ];
+        match reconstitute(
+            &dir,
+            AGENT,
+            NPUB,
+            &wake,
+            &proposal("lease-1", "spawner-A", 100),
+            1_000,
+        ) {
+            Err(UnsealError::MalformedSeal(_)) => {}
+            Err(e) => panic!("expected MalformedSeal, got {e:?}"),
+            Ok(_) => panic!("expected MalformedSeal for a duplicate roster"),
         }
         cleanup(&dir);
     }
