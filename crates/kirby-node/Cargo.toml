@@ -87,6 +87,22 @@ nostr-sdk = { version = "0.44", default-features = false, features = ["nip44"] }
 # resume seam. The blob stays opaque to the daemon; the hash is only the stable
 # reference. It also backs the EngramStore's HMAC d-tag + HKDF key separation.
 sha2 = "0.10"
+# blahaj is the Shamir secret-sharing backend for hibernation (H1): it splits the
+# master seed 2-of-3 so any two of three holders reconstruct it. It is the maintained,
+# RUSTSEC-recommended fix of the `sharks` crate (RUSTSEC-2024-0398: a biased coefficient
+# draw Cure53 found exploitable when the SAME secret is re-shared ~500-1500 times —
+# exactly hibernation's re-split-every-seal pattern). Textbook GF(256) byte-wise Shamir
+# (the right construction for a raw byte seed), no elliptic-curve machinery. Host-side
+# only (hibernation never crosses vsock); kept behind hibernate::shamir so the SSS
+# backend can be swapped without touching callers.
+blahaj = "0.6"
+# hex encodes share commitments as the lowercase-hex strings the H0 hibernate wire
+# types carry. Already in the graph transitively; pinned direct for the hibernate module.
+hex = "0.4"
+# zeroize (with the derive macros) wipes the master seed + derived subkeys on drop so no
+# plaintext secret lingers in freed memory (hibernation seed hygiene, H1). The
+# zeroize_derive feature provides #[derive(Zeroize, ZeroizeOnDrop)].
+zeroize = { version = "1", features = ["zeroize_derive"] }
 # reqwest is the daemon-side HTTP client RoutstrBrain POSTs the OpenAI-compat
 # completion to (an outbound HTTPS call on the same host-network path as the C-6
 # daemon->mint settle and the nerve relay websocket; the genome never makes it).

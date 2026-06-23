@@ -48,6 +48,9 @@ pub mod bundle;
 /// and fetch it back by npub / `bundle_digest`.
 pub mod wake;
 
+/// H1: Shamir secret-sharing of the master seed + domain-separated subkey derivation.
+pub mod shamir;
+
 /// The Shamir threshold for the thin slice: any `SEAL_THRESHOLD`-of-`SEAL_SHARES`
 /// shares reconstruct the master seed. 2-of-3 (survive losing one holder).
 pub const SEAL_THRESHOLD: u8 = 2;
