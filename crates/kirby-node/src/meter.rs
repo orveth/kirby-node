@@ -229,6 +229,11 @@ enum MeterSampleSource {
     Cgroup(CgroupMeterSource),
     #[cfg(target_os = "macos")]
     HostProcess(HostProcessMeterSource),
+    /// TEST-ONLY: a fixed in-memory sample source (no cgroup, no VZ host process), so the
+    /// metered-run loop — and the diarist's rent=0 FLOOR-HALT — are exercisable in CI without
+    /// a live VM. Never constructed in production (the variant is `cfg(test)`).
+    #[cfg(test)]
+    Mock(MockMeterSource),
 }
 
 #[cfg(target_os = "linux")]
@@ -247,6 +252,26 @@ struct HostProcessMeterSource {
 struct MeterSample {
     cpu_usec: u64,
     mem_bytes: u64,
+}
+
+/// TEST-ONLY sample source: reports a fixed cumulative CPU/mem every tick. With zero
+/// [`BurnRates`] the per-tick burn is 0, so the metered run moves ONLY as the treasury is
+/// drained elsewhere (the THINK/REMEMBER capability path) — exactly the diarist's rent=0
+/// economics, where the FLOOR-HALT is the death mechanism rather than synthetic rent.
+#[cfg(test)]
+struct MockMeterSource {
+    cpu_usec: u64,
+    mem_bytes: u64,
+}
+
+#[cfg(test)]
+impl MockMeterSource {
+    fn sample(&self) -> MeterSample {
+        MeterSample {
+            cpu_usec: self.cpu_usec,
+            mem_bytes: self.mem_bytes,
+        }
+    }
 }
 
 impl Meter {
@@ -371,6 +396,41 @@ impl Meter {
         })
     }
 
+    /// TEST-ONLY: build a [`Meter`] over a fixed mock sample source, bypassing the real
+    /// cgroup/VZ attach (which need a live VM). The mock reports `mock_cpu_usec` /
+    /// `mock_mem_bytes` each tick; pass zeros with zero `rates` for the diarist's rent=0 path,
+    /// where the treasury falls ONLY via THINK/REMEMBER spends and the FLOOR-HALT is the death
+    /// mechanism. This is what lets the rent=0 zombie-gone regression run in CI; the production
+    /// attach paths ([`Meter::attach`] / [`Meter::attach_host_process`]) are untouched.
+    #[cfg(test)]
+    pub(crate) fn attach_mock(
+        treasury: Treasury,
+        rates: BurnRates,
+        tick: Duration,
+        mock_cpu_usec: u64,
+        mock_mem_bytes: u64,
+    ) -> Self {
+        Meter {
+            source: MeterSampleSource::Mock(MockMeterSource {
+                cpu_usec: mock_cpu_usec,
+                mem_bytes: mock_mem_bytes,
+            }),
+            treasury,
+            rates,
+            tick,
+            // Disabled by default; the test arms it via set_halt_floor, exactly like the run.
+            halt_floor_sats: 0,
+            last_cpu_usec: 0,
+            #[cfg(target_os = "linux")]
+            egress: None,
+            #[cfg(target_os = "linux")]
+            last_egress_bytes: 0,
+            burned_sats: 0,
+            cpu_usec: 0,
+            ticks: 0,
+        }
+    }
+
     /// Set the FLOOR-HALT threshold (the diarist's death mechanism — see the field doc). The
     /// metered run sets this to the per-think D-20 cap (`brain.max_cost_sats`) for the diarist
     /// workload and leaves it `0` (disabled) for every other workload, so all existing metered
@@ -487,6 +547,8 @@ impl MeterSampleSource {
             MeterSampleSource::Cgroup(source) => source.sample(),
             #[cfg(target_os = "macos")]
             MeterSampleSource::HostProcess(source) => source.sample(),
+            #[cfg(test)]
+            MeterSampleSource::Mock(source) => Ok(source.sample()),
         }
     }
 }

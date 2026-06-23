@@ -535,7 +535,11 @@ async fn run_bootstrap(
     };
 
     let (death_reason, lifecycle_treasury) = match end_reason {
-        EndReason::BudgetExhausted => (DeathReason::Broke, 0),
+        // Report the REAL leftover the meter saw at halt, not a hardcoded 0. For a rent-driven
+        // death this is a sub-tick remainder (~0); for the diarist's FLOOR-HALT it is the
+        // sub-think leftover — it died because it could no longer GUARANTEE a think, with sats
+        // still in the till. Emitting the true balance is honesty for the death-beacon.
+        EndReason::BudgetExhausted => (DeathReason::Broke, outcome.remaining_at_halt),
         EndReason::Stopped => (DeathReason::Stopped, outcome.remaining_at_halt),
         EndReason::Resumed => unreachable!("bootstrap cannot end as resumed"),
     };
@@ -549,8 +553,8 @@ async fn run_bootstrap(
 
     // The terminal 31000 "dead" face, emitted once when the agent is gone (alongside
     // the 9100 died), AFTER which the node stops emitting agent-state. runway is null
-    // at death (no forward burn). Budget-death is treasury 0; a clean stop carries
-    // the leftover balance the meter reported.
+    // at death (no forward burn). Both deaths carry the real leftover the meter reported:
+    // ~0 for a rent-driven budget-death, the sub-think remainder for the diarist's floor-halt.
     emit_agent_state(
         identity,
         &run.config,

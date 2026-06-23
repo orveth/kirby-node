@@ -533,4 +533,160 @@ mod tests {
         // Exactly at the runway threshold counts as dying (<=).
         assert_eq!(e.phase(8_000, Some(30)), LIFECYCLE_DYING);
     }
+
+    /// THE rent=0 zombie-gone regression (the [HIGH] the 3-way review flagged), proving the
+    /// FLOOR-HALT is a LIVE death mechanism, not dead code. The existing G2 path bills DEFAULT
+    /// rent, so synthetic rent alone exhausts the budget in a tick and the floor-halt is never
+    /// the trigger there (G2 would pass with the floor removed). This drives the INTEGRATED
+    /// loop ([`tick_until_exhausted`]) over a mock meter source with the diarist's real deploy
+    /// economics: ZERO synthetic rent, and a treasury drained ONLY by THINK spends (the
+    /// capability ledger path — NOT metered rent) to a sub-think-floor balance.
+    ///
+    /// Two arms over the SAME drained state; only the floor differs:
+    ///   - floor ARMED (= brain.max_cost_sats): the run HALTS at `BudgetExhausted` within a
+    ///     tick, with a sub-floor leftover, NOT at the max_run ceiling — the daemon death.
+    ///   - floor DISABLED (the negative control): with rent=0 the meter never refuses a tick,
+    ///     so the run idles to the safety ceiling (`Stopped`) — the ZOMBIE the floor forecloses.
+    ///
+    /// This is the death-mechanism proof and it has TEETH: remove or break the floor-halt in
+    /// `tick_once` and the armed arm degrades to the zombie arm (returns `Stopped`), tripping
+    /// the armed arm's `panic!` and reddening the test.
+    #[tokio::test(start_paused = true)]
+    async fn rent_zero_diarist_halts_on_the_floor_and_zombies_without_it() {
+        use crate::meter::BurnRates;
+        use crate::treasury::Treasury;
+        // `DebitOutcome` is already in scope via `use super::*` (the module imports it).
+
+        // The diarist's deploy economics: ZERO synthetic rent (CPU, mem-time, and egress all
+        // bill 0), so the meter NEVER exhausts on its own — the treasury falls only as the
+        // genome THINKs/REMEMBERs through the gateway.
+        let zero_rent = BurnRates {
+            cpu_sats_per_usec_num: 0,
+            cpu_sats_per_usec_den: 1,
+            mem_sats_per_mib_sec: 0,
+            egress_sats_per_byte_num: 0,
+            egress_sats_per_byte_den: 1,
+        };
+        let floor: u64 = 64; // the per-think D-20 cap (brain.max_cost_sats)
+        let think_cost: u64 = 64; // a worst-case think costs the whole cap (actual <= cap, D-20)
+        let budget: u64 = 670; // a few thinks-worth, leaving a sub-think remainder when drained
+        let tick = Duration::from_millis(10);
+        // The safety ceiling: WITHOUT the floor a rent=0 run would tick here forever, so the
+        // control arm terminates (as Stopped) at this bound. Virtual time (start_paused) makes
+        // the tick count exact and the test instant.
+        let max_run = Duration::from_millis(200);
+        let ceiling_ticks = (max_run.as_millis() / tick.as_millis()) as u64;
+
+        // Drain a fresh treasury via THINK spends — the capability ledger path
+        // (`debit_and_record`), NOT metered rent — until it can no longer GUARANTEE the next
+        // think (remaining < floor). This is the diarist having thought until it is a
+        // sub-think-floor zombie candidate: still solvent, but unable to afford another thought.
+        let drained_treasury = || {
+            let t = Treasury::open_temporary(budget).expect("treasury opens");
+            let mut i = 0u64;
+            while t.remaining().expect("balance") >= floor {
+                match t
+                    .debit_and_record(
+                        &format!("think-{i}"),
+                        think_cost,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .expect("debit")
+                {
+                    DebitOutcome::Debited { .. } => {}
+                    DebitOutcome::Insufficient { remaining } => {
+                        panic!("a THINK drain spend was unexpectedly refused (remaining={remaining})")
+                    }
+                    DebitOutcome::Duplicate(_) => {
+                        panic!("a THINK drain spend hit a duplicate key (test bug: keys must be unique)")
+                    }
+                }
+                i += 1;
+            }
+            let remaining = t.remaining().expect("balance");
+            assert!(
+                remaining < floor,
+                "THINK spends drained below the per-think floor ({remaining} < {floor})"
+            );
+            assert!(
+                remaining > 0,
+                "but left a sub-think remainder, not exactly zero ({remaining}) — the zombie balance"
+            );
+            (t, remaining)
+        };
+
+        // --- ARM 1: floor ARMED (the diarist). The daemon HALTS the zombie candidate. ---
+        let (treasury, drained) = drained_treasury();
+        let mut meter = Meter::attach_mock(treasury, zero_rent, tick, 0, 0);
+        meter.set_halt_floor(floor);
+        let outcome = tick_until_exhausted(&mut meter, max_run, None)
+            .await
+            .expect("the meter loop runs");
+        match outcome {
+            MeterOutcome::BudgetExhausted {
+                remaining_at_halt,
+                burned_sats,
+                ticks,
+            } => {
+                assert_eq!(
+                    burned_sats, 0,
+                    "rent=0: the meter billed nothing (the drain was THINK spends, not rent)"
+                );
+                assert!(
+                    remaining_at_halt < floor,
+                    "halts with a sub-think leftover ({remaining_at_halt}): the next think is not guaranteed"
+                );
+                assert_eq!(
+                    remaining_at_halt, drained,
+                    "rent=0: the floor-halt moved no money — remaining == the THINK-drained balance"
+                );
+                assert!(
+                    ticks < ceiling_ticks,
+                    "the floor halted promptly ({ticks} ticks), NOT at the max_run ceiling \
+                     ({ceiling_ticks}) — this is a death, not a zombie"
+                );
+            }
+            other => panic!(
+                "FLOOR-HALT REGRESSION: a rent=0 diarist below the think-floor MUST halt at \
+                 BudgetExhausted, got {other:?}. The floor-halt is removed or broken — this is \
+                 the rent=0 zombie."
+            ),
+        }
+
+        // --- ARM 2: floor DISABLED (the negative control). The rent=0 run ZOMBIES. ---
+        // Identical drained state; ONLY the floor differs. With no floor the meter never
+        // refuses a tick (rent=0), so the run idles to the safety ceiling. This is the zombie
+        // the floor forecloses — and the proof ARM 1's halt came from the floor, not from rent.
+        let (treasury, drained) = drained_treasury();
+        let mut meter = Meter::attach_mock(treasury, zero_rent, tick, 0, 0);
+        meter.set_halt_floor(0);
+        let outcome = tick_until_exhausted(&mut meter, max_run, None)
+            .await
+            .expect("the meter loop runs");
+        match outcome {
+            MeterOutcome::Stopped {
+                remaining,
+                burned_sats,
+                ticks,
+            } => {
+                assert_eq!(burned_sats, 0, "rent=0: billed nothing");
+                assert_eq!(
+                    remaining, drained,
+                    "rent=0 + no floor: nothing moved the balance; it idled below the floor"
+                );
+                assert!(
+                    ticks >= ceiling_ticks - 1,
+                    "without the floor the run idled to the ceiling ({ticks} ~ {ceiling_ticks} \
+                     ticks) — the zombie the floor kills"
+                );
+            }
+            MeterOutcome::BudgetExhausted { .. } => panic!(
+                "the negative control is broken: a rent=0 run with NO floor must idle to the \
+                 ceiling (Stopped), not halt on a budget/floor"
+            ),
+        }
+    }
 }

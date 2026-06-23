@@ -745,6 +745,20 @@ impl KirbyConfig {
                 "memory.max_cost_sats must be > 0 (a zero per-write ceiling means every write is DENIED_OVER_BUDGET)"
             );
         }
+        // The diarist demo is BOOTSTRAP-ONLY. A diarist `resume` currently boots, confirms the
+        // checkpoint restore, and tears down WITHOUT entering the metered loop (run_agent::
+        // run_resume) — so the FLOOR-HALT death mechanism, which is armed only inside the
+        // metered run, never arms. A resumed diarist would be a deathless agent: it could fall
+        // below the per-think floor (unable to afford another thought) yet never be halted.
+        // Reject the combination cleanly at load rather than silently running that zombie.
+        // Metered-resume for the diarist is a follow-up; lifting this guard is part of it.
+        if self.workload == Workload::Diarist && self.mode == RunMode::Resume {
+            anyhow::bail!(
+                "workload = \"diarist\" does not support mode = \"resume\" yet: the diarist demo \
+                 is bootstrap-only (a resumed diarist skips the metered loop and never arms its \
+                 floor-halt death mechanism). Use mode = \"bootstrap\"; metered-resume is a follow-up."
+            );
+        }
         // A pinned backend must match the host. `auto` resolves to the native one,
         // so it never trips this. This is a RUNTIME check (cfg!), not a compile-time
         // hard fail, so the crate builds on both platforms.
@@ -1050,6 +1064,48 @@ mod tests {
         let cfg = KirbyConfig::from_toml_str(toml).expect("a valid brain config must validate");
         assert_eq!(cfg.workload, Workload::Brain);
         assert_eq!(cfg.brain.max_cost_sats, 64, "the brain block parsed");
+    }
+
+    /// The diarist demo is BOOTSTRAP-ONLY: a `diarist` + `resume` config is rejected cleanly at
+    /// load. A resumed diarist would skip the metered loop and never arm its floor-halt death
+    /// mechanism (a deathless agent), so the combination is refused until metered-resume lands.
+    /// The negative control: the SAME config with `bootstrap` validates — proving the guard
+    /// discriminates on the mode, not the diarist workload at large. Brain/memory/funding are
+    /// all valid here, so ONLY the bootstrap-only guard can be the failing check.
+    #[test]
+    fn diarist_resume_is_rejected_bootstrap_is_accepted() {
+        let toml = |mode: &str| {
+            format!(
+                r#"
+                workload = "diarist"
+                mode = "{mode}"
+                genome_image = {{ path = "/tmp/k/img" }}
+                [identity]
+                key_path = "/tmp/k/node.key"
+                [relay]
+                url = "ws://127.0.0.1:7777"
+                [funding]
+                initial_sats = 1000
+                [brain]
+                max_cost_sats = 64
+                [memory]
+                max_cost_sats = 8
+            "#
+            )
+        };
+
+        // diarist + resume => rejected for THE resume reason (bootstrap-only).
+        let err = KirbyConfig::from_toml_str(&toml("resume")).unwrap_err();
+        assert!(
+            err.to_string().contains("does not support mode = \"resume\""),
+            "expected the diarist bootstrap-only validation error, got: {err}"
+        );
+
+        // diarist + bootstrap => validates (the guard rejects only the unsupported mode).
+        let cfg = KirbyConfig::from_toml_str(&toml("bootstrap"))
+            .expect("a diarist bootstrap config must validate");
+        assert_eq!(cfg.workload, Workload::Diarist);
+        assert_eq!(cfg.mode, RunMode::Bootstrap);
     }
 
     // ---- brain-routstr: the `backend = "routstr"` validation guards (the real-mode
