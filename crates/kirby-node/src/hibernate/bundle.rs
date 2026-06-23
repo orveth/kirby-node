@@ -181,10 +181,12 @@ pub fn load_bundle(
     Ok(bundle)
 }
 
-/// Durable atomic write: write `bytes` to a sibling temp file at `0600`, fsync it,
-/// atomically rename it into place, then best-effort fsync the directory so the
-/// rename survives a crash. The directory fsync is tolerated to fail on platforms
-/// where a directory fd cannot be fsynced; the file fsync is mandatory.
+/// Durable atomic write: create a FRESH sibling temp file at `0600` (`O_EXCL` +
+/// random name, so a leftover temp is never reused with stale perms), write `bytes`,
+/// fsync it, atomically rename it into place, then fsync the directory so the rename
+/// itself is durable across a crash. BOTH fsyncs are mandatory — we deploy on
+/// Linux/Firecracker (and macOS), where a directory fd can be fsynced, and a failure
+/// here is a real durability loss, not something to swallow.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), BundleError> {
     let dir = path.parent().ok_or_else(|| BundleError::Io {
         op: "resolve-parent",
@@ -201,11 +203,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), BundleError> {
     })?;
 
     let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("bundle");
-    // pid in the temp name so a concurrent/leftover temp never collides.
-    let tmp = dir.join(format!(".{fname}.tmp.{}", std::process::id()));
+    // A random temp name + create_new (O_EXCL) so we NEVER reuse a leftover temp
+    // (e.g. from a crashed run after pid reuse) with its old, possibly-looser perms:
+    // the file is always freshly created at 0600 before any bearer-ecash byte lands.
+    let tmp = dir.join(format!(".{fname}.tmp.{:016x}", rand::random::<u64>()));
 
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -233,10 +237,19 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), BundleError> {
         path: path.to_path_buf(),
         source,
     })?;
-    // Best-effort: fsync the directory so the rename is durable across a crash.
-    if let Ok(dirf) = File::open(dir) {
-        let _ = dirf.sync_all();
-    }
+    // Mandatory: fsync the directory so the rename itself is durable across a crash.
+    // The file content is fsynced above, but the new directory entry is not durable
+    // until the directory is fsynced; a crash in that window would lose the rename.
+    let dirf = File::open(dir).map_err(|source| BundleError::Io {
+        op: "open-dir",
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    dirf.sync_all().map_err(|source| BundleError::Io {
+        op: "fsync-dir",
+        path: dir.to_path_buf(),
+        source,
+    })?;
     Ok(())
 }
 
@@ -387,6 +400,30 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "bundle holds bearer ecash; must be 0600, got {mode:o}");
+        cleanup(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_ignores_a_stale_loose_perm_temp_and_stays_0600() {
+        // Regression for the create_new + random-temp fix: a leftover, world-readable
+        // temp from a crashed run must NOT be reused (which would write ecash at its
+        // old perms). persist creates a fresh 0600 temp and lands a 0600 bundle.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir();
+        let hib = dir.join("hibernate-agent-0");
+        std::fs::create_dir_all(&hib).unwrap();
+        let stale = hib.join(".state-bundle.json.tmp.deadbeefdeadbeef");
+        std::fs::write(&stale, b"stale junk").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        persist_bundle(&dir, "agent-0", &sample_bundle()).unwrap();
+        let mode = std::fs::metadata(bundle_path(&dir, "agent-0"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "final bundle must be 0600 despite a stale loose-perm temp");
         cleanup(&dir);
     }
 
