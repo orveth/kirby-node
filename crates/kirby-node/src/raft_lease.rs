@@ -711,6 +711,19 @@ impl LeaseNode {
         agent_id: &str,
         node_id: LeaseNodeId,
     ) -> anyhow::Result<LeaseResponse> {
+        // A node only ever grants the lease to ITSELF (you grant to become the active
+        // holder). Granting to another node would let a non-leader hold the committed
+        // lease, which combined with the fence is a split-brain footgun; it would also
+        // permit a same-term reassignment to a different holder (two same-term grants to
+        // distinct nodes are impossible when grants are self-only, since one term has one
+        // leader). Reject a non-self grantee (Codex deep, S1 review). Raft additionally
+        // requires the caller be the current leader for the write to commit.
+        if node_id != self.id {
+            anyhow::bail!(
+                "lease node {}: refusing to grant agent {agent_id:?} lease to a different node {node_id} (grant-to-self only)",
+                self.id
+            );
+        }
         let resp = self
             .raft
             .client_write(LeaseRequest::Grant { agent_id: agent_id.to_string(), node_id })
@@ -928,6 +941,18 @@ impl LeaseHandle {
     /// holder of agent A and vice versa.
     pub async fn fence_for(&self, agent_id: &str, believed_term: u64) -> FenceVerdict {
         let lease = self.store.active_lease_for(agent_id).await;
+        // The live run/debit gate requires LEADERSHIP, identical to active_term_for: a
+        // node that still holds the committed lease but is NOT the current leader (it
+        // lost leadership, e.g. a partitioned-or-demoted old leader) must NOT act. This
+        // removes the asymmetry with active_term_for and shrinks the partition
+        // two-actives window to the leader step-down timeout (Codex deep, S1 review).
+        if !self.is_leader() {
+            return FenceVerdict::Fenced {
+                committed_term: lease.as_ref().map(|l| l.term).unwrap_or(0),
+                committed_holder: lease.as_ref().map(|l| l.node_id).unwrap_or(0),
+                believed_term,
+            };
+        }
         match lease {
             // The committed lease for this agent still names THIS node at a term >= what
             // it believes: it is genuinely still the active node for the agent.

@@ -779,6 +779,32 @@ impl KirbyConfig {
                 self.relay.url
             );
         }
+        // Tenant identifiers feed filesystem treasury paths (treasury_path_for_agent),
+        // host instance ids (jail / cgroup / TAP names), and lease-map keys, so they must
+        // be safe: non-empty, length-capped, and restricted to an identifier charset with
+        // no path separators or traversal. The empty string is reserved as the
+        // single-agent lease slot sentinel (raft_lease::DEFAULT_AGENT) and must never be a
+        // configured tenant id. An unvalidated id is a path-traversal / collision footgun
+        // at the new fleet entry points (Codex deep, S1 review).
+        for (label, value) in [("agent_id", &self.agent_id), ("node_id", &self.node_id)] {
+            if value.is_empty() {
+                anyhow::bail!("{label} must be non-empty");
+            }
+            if value.len() > 64 {
+                anyhow::bail!("{label} must be <= 64 chars (got {})", value.len());
+            }
+            if value == "." || value == ".." {
+                anyhow::bail!("{label} must not be a path component (got {value:?})");
+            }
+            if !value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                anyhow::bail!(
+                    "{label} must contain only ASCII alphanumerics, '-', '_', or '.' (got {value:?}); it feeds filesystem paths and host interface names"
+                );
+            }
+        }
         if self.funding.initial_sats == 0 {
             anyhow::bail!("funding.initial_sats must be > 0 (the agent needs a budget to live)");
         }
@@ -1018,6 +1044,29 @@ mod tests {
             cfg.genome_image,
             GenomeImage::Path(PathBuf::from("/tmp/kirby/genome-image"))
         );
+    }
+
+    #[test]
+    fn validate_rejects_unsafe_tenant_ids() {
+        // A valid minimal config validates.
+        let ok = KirbyConfig::from_toml_str(minimal_toml()).unwrap();
+        assert!(ok.validate().is_ok(), "the minimal config must validate");
+
+        // A path-traversal agent_id is rejected (it feeds treasury_path_for_agent +
+        // instance ids + lease keys).
+        let mut traversal = KirbyConfig::from_toml_str(minimal_toml()).unwrap();
+        traversal.agent_id = "../evil".to_string();
+        assert!(traversal.validate().is_err(), "a path-traversal agent_id must be rejected");
+
+        // The reserved empty sentinel (DEFAULT_AGENT) is not a valid configured id.
+        let mut empty = KirbyConfig::from_toml_str(minimal_toml()).unwrap();
+        empty.agent_id = String::new();
+        assert!(empty.validate().is_err(), "the empty agent_id must be rejected");
+
+        // A path separator in node_id is rejected too.
+        let mut bad_node = KirbyConfig::from_toml_str(minimal_toml()).unwrap();
+        bad_node.node_id = "a/b".to_string();
+        assert!(bad_node.validate().is_err(), "a node_id with a path separator must be rejected");
     }
 
     #[test]

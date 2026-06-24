@@ -208,3 +208,17 @@ async fn g_fence_live_per_agent_fenced_gateway_denies_and_debits_zero() {
         n.shutdown().await;
     }
 }
+
+// G-FENCE-LIVE leadership-gate note (Codex-S1 HIGH fix): `fence_for` was hardened to
+// require leadership in addition to holder+term, mirroring `active_term_for`, so a node
+// that still holds an agent's committed lease but has LOST LEADERSHIP is FENCED (it cannot
+// pass the live debit gate). The ONLY way a node loses leadership while staying alive and
+// still naming itself as the committed holder is a NETWORK PARTITION (openraft will not
+// demote a healthy leader on demand, and a quorum-less node cannot elect a successor, so
+// neither kill-the-others nor a forced election reproduces a demoted-but-alive holder
+// deterministically in this harness). A partitioned-alive old leader is explicitly OUT of
+// the crash-only MVP scope (see build-spec-kirby-failover-supervisor.md section 5); a full
+// e2e teeth for it needs the partition-simulation harness deferred to failover S5/S6. The
+// gate itself is verified by code-consistency with `active_term_for` (the established
+// active-node check, which the no_split_brain g8 tests exercise as leader+holder) and by
+// the no-regression of all existing lease tests after the fix.
