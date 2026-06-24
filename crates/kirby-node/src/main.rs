@@ -985,6 +985,7 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
         // subcommand (C-7, G6).
         snapshot_capable: false,
         restore_checkpoint: None,
+        lease_fence: None,
     };
 
     let (vm, outcome, _treasury, _events, _serve_guard) = boot::boot_and_observe(config).await?;
@@ -1083,6 +1084,7 @@ async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
+        lease_fence: None,
     };
 
     let config = metered_run::MeteredRunConfig {
@@ -1184,6 +1186,7 @@ async fn run_egress(args: EgressArgs) -> anyhow::Result<()> {
         lockdown_egress: true,
         snapshot_capable: false,
         restore_checkpoint: None,
+        lease_fence: None,
     };
 
     let config =
@@ -1296,6 +1299,7 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
+        lease_fence: None,
     };
 
     let config =
@@ -1404,6 +1408,7 @@ async fn run_app_checkpoint(args: AppCheckpointArgs) -> anyhow::Result<()> {
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
+        lease_fence: None,
     };
     let mut config = app_checkpoint_run::AppCheckpointRunConfig::new(boot_config);
     config.checkpoint_timeout = Duration::from_secs(args.checkpoint_secs);
@@ -1478,6 +1483,7 @@ async fn run_snapshot(args: SnapshotArgs) -> anyhow::Result<()> {
         lockdown_egress: false,
         snapshot_capable: true,
         restore_checkpoint: None,
+        lease_fence: None,
     };
 
     let mut config = snapshot_run::SnapshotRunConfig::new(boot_config);

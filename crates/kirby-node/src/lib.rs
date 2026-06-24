@@ -183,6 +183,7 @@ pub mod engram;
 pub mod egress_run;
 #[cfg(target_os = "linux")]
 pub mod firecracker;
+pub mod fleet;
 #[cfg(target_os = "linux")]
 pub mod full_loop_run;
 pub mod gateway;

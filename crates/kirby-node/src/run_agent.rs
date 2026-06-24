@@ -469,6 +469,7 @@ fn agent_boot_config(
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint,
+        lease_fence: None,
     })
 }
 
@@ -830,6 +831,7 @@ mod tests {
             },
             agent_id: "agent-0".to_string(),
             node_id: "node-1".to_string(),
+            fleet: Default::default(),
         }
     }
 

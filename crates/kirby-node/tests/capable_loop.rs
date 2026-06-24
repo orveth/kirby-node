@@ -476,6 +476,7 @@ async fn capable_vm_boots_plans_acts_verifies_and_dies_when_broke() {
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
+        lease_fence: None,
     };
 
     let config = MeteredRunConfig {

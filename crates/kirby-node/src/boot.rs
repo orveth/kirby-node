@@ -127,6 +127,14 @@ pub struct BootConfig {
     /// backend performs an ordinary cold boot, while the shared gateway tells the
     /// genome which logical state blob to rehydrate.
     pub restore_checkpoint: Option<CheckpointArtifact>,
+    /// The OPTIONAL per-agent lease fence for the LIVE run path (fleet-host S1, spec
+    /// 2.2). `None` is the single-agent default: the gateway is UNFENCED exactly as
+    /// before (a bare `kirby run` is byte-identical). `Some` is a fleet tenant: the
+    /// gateway built here attaches `with_lease_fence_for(handle, agent_id, vm_term)`, so
+    /// STEP 0 of `authorize_capability` denies + debits 0 unless this node holds the
+    /// agent's lease. This is where the previously-zero-caller fence becomes wired into a
+    /// real run (gate G-FENCE-LIVE): live money is fenced only because of this attach.
+    pub lease_fence: Option<crate::gateway::LeaseFence>,
 }
 
 /// The gateway event receiver the genome's `ReportEvent`s arrive on (diagnostic
@@ -301,6 +309,17 @@ fn treasury_path_for(node_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kirby-treasury-{node_id}"))
 }
 
+/// The per-AGENT treasury store path (fleet-host S0, spec 2.1): DB-per-agent, so each
+/// fleet tenant takes its OWN sled exclusive dir lock (boot.rs documents the lock at
+/// `boot_and_observe`) and there is ZERO cross-tenant contention. The single-agent
+/// default keeps using [`treasury_path_for`] (per node_id) verbatim, so a bare
+/// `kirby run` is unchanged; only a fleet supervisor reaches for this per-agent path.
+/// Agent-keyed TREES inside one sled were rejected (spec 2.1): they would re-serialize
+/// every tenant behind one lock, re-introducing the coupling DB-per-agent avoids.
+pub fn treasury_path_for_agent(agent_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("kirby-treasury-agent-{agent_id}"))
+}
+
 /// The §7.2 wallet<->counter reconcile decision (brain-routstr R2-3/R2-5): the wallet
 /// must back every sat the metabolism counter believes it has, so the gateway never
 /// authorizes a think the wallet can't fund. The invariant is `>=`, NEVER `==` (R2-3:
@@ -435,6 +454,17 @@ pub async fn boot_and_observe_with_rail(
             )
         };
         service = service.with_memory_backend(backend);
+    }
+
+    // Attach the PER-AGENT lease fence to the LIVE gateway (fleet-host S1, spec 2.2,
+    // gate G-FENCE-LIVE). This is the wiring that makes the proven-but-dead fence
+    // (gateway.rs: zero production callers before this) actually protect live money:
+    // when a fleet supervisor supplies a fence, STEP 0 of `authorize_capability` denies
+    // + debits 0 unless THIS node holds the tenant agent's committed lease at the
+    // started term. `None` (the single-agent default) leaves the gateway unfenced
+    // exactly as before, so a bare `kirby run` is byte-identical.
+    if let Some(fence) = config.lease_fence.clone() {
+        service = service.with_lease_fence_for(fence.handle, fence.agent_id, fence.vm_term);
     }
 
     // Observe ReportEvents so we can await the genome's boot hello (G1).

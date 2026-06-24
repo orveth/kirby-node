@@ -61,18 +61,32 @@ use tokio::sync::RwLock;
 /// A node id in the lease cluster. The three spike nodes are 1, 2, 3 (D-14).
 pub type LeaseNodeId = u64;
 
-/// The single replicated client write: grant the active lease to `node_id`. The
-/// state machine stamps the COMMITTING leader's term onto the lease when it applies
-/// this entry, so the lease's term is the Raft term at grant time (monotonic across
-/// the cluster, never lowered by a stale node). This is the only mutation a client
-/// can request; there is no "set term directly" path, which is what keeps the term
-/// authoritative and fenced.
+/// A tenant agent id, the key of the per-agent lease map (fleet-host S1). A `String`,
+/// matching the rest of the codebase (`agent_id` is a plain label, config.rs) and the
+/// allocator's [`crate::fleet::AgentId`]. The fleet host runs N agents in ONE lease
+/// cluster, each fenced independently, so the lease is keyed by agent, not global.
+pub type AgentId = String;
+
+/// The default agent slot for the SINGLE-AGENT path (fleet off). A bare `kirby run`
+/// grants/observes/fences against this one reserved slot, so the per-agent map degrades
+/// to exactly the old single-value behavior and every pre-fleet test/caller is unchanged
+/// (additive: the map has one entry under this key). Real fleet `agent_id` labels are
+/// non-empty, so they never collide with this sentinel.
+pub const DEFAULT_AGENT: &str = "";
+
+/// The single replicated client write: grant the active lease to `node_id` FOR a given
+/// `agent_id` (fleet-host S1: per-agent leases). The state machine stamps the COMMITTING
+/// leader's term onto THAT agent's lease entry when it applies this entry, so the lease's
+/// term is the Raft term at grant time (monotonic across the cluster, never lowered by a
+/// stale node). This is the only mutation a client can request; there is no "set term
+/// directly" path, which is what keeps the term authoritative and fenced. The
+/// single-agent path uses `agent_id = DEFAULT_AGENT`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LeaseRequest {
-    /// Grant the active lease to this node. Applied as a committed log entry; the
-    /// state machine records `active_lease = { node_id, term = <this entry's Raft
-    /// term> }`.
-    Grant { node_id: LeaseNodeId },
+    /// Grant the active lease for `agent_id` to `node_id`. Applied as a committed log
+    /// entry; the state machine records `active_leases[agent_id] = { node_id, term =
+    /// <this entry's Raft term> }`, touching ONLY that agent's entry.
+    Grant { agent_id: AgentId, node_id: LeaseNodeId },
 }
 
 /// The reply to a committed [`LeaseRequest`]: the lease as it stands AFTER applying
@@ -115,7 +129,9 @@ openraft::declare_raft_types!(
 struct LeaseSnapshotData {
     last_applied: Option<LogId<LeaseNodeId>>,
     membership: StoredMembership<LeaseNodeId, BasicNode>,
-    active_lease: Option<ActiveLease>,
+    /// The per-agent leases at snapshot time (fleet-host S1). Each agent's holder +
+    /// term is independent; the single-agent path stores one entry under DEFAULT_AGENT.
+    active_leases: BTreeMap<AgentId, ActiveLease>,
 }
 
 /// The in-memory Raft store: the log, the vote, and the applied state machine. The
@@ -138,8 +154,11 @@ struct StoreInner {
     last_applied: Option<LogId<LeaseNodeId>>,
     /// The last committed membership (Raft tracks this in the state machine).
     membership: StoredMembership<LeaseNodeId, BasicNode>,
-    /// THE replicated value: the active lease (spec 3.5).
-    active_lease: Option<ActiveLease>,
+    /// THE replicated value (fleet-host S1: per-agent): the active lease PER agent
+    /// (spec 3.5, 2.2). Across every committed term, for EACH agent at most one node
+    /// holds that agent's entry. The single-agent path stores exactly one entry under
+    /// DEFAULT_AGENT, so the old single-value invariant is the one-key case of this map.
+    active_leases: BTreeMap<AgentId, ActiveLease>,
     /// A snapshot, if one was built, plus its meta (for install/serve).
     snapshot: Option<(SnapshotMeta<LeaseNodeId, BasicNode>, Vec<u8>)>,
     /// A monotonically increasing snapshot index for naming.
@@ -152,26 +171,42 @@ impl LeaseStore {
         Self::default()
     }
 
-    /// The current committed active lease, read directly from the applied state
-    /// machine. This is the value the fence checks: a node holds the lease only if
-    /// this reports it as the holder at a term >= the term it believes.
+    /// The current committed active lease for the DEFAULT (single-agent) slot. The
+    /// pre-fleet single-agent API, preserved verbatim: it reads the DEFAULT_AGENT entry.
     pub async fn active_lease(&self) -> Option<ActiveLease> {
-        self.inner.read().await.active_lease
+        self.active_lease_for(DEFAULT_AGENT).await
     }
 
-    /// Record the authoritative committed lease this store learned from the cluster
-    /// (what a node observes as it CATCHES UP on rejoin: the leader's append-entries
-    /// carry the committed `active_lease`, and applying them lands the higher term
-    /// here). A revived stale node uses this to see the committed T+1 that superseded
-    /// its old belief, so the fence rejects it BECAUSE it sees the higher committed
-    /// term (not merely because it has no lease). The term only ever moves forward:
-    /// a stale value lower than what is already committed is ignored, mirroring the
-    /// Raft log applying in order.
+    /// The current committed active lease for `agent_id` (fleet-host S1), read directly
+    /// from the applied state machine. This is the value the per-agent fence checks: a
+    /// node holds THAT agent's lease only if this reports it as the holder at a term >=
+    /// the term it believes. Other agents' entries are untouched by this read.
+    pub async fn active_lease_for(&self, agent_id: &str) -> Option<ActiveLease> {
+        self.inner.read().await.active_leases.get(agent_id).copied()
+    }
+
+    /// Record the authoritative committed lease for the DEFAULT slot (single-agent API,
+    /// preserved). Delegates to the per-agent form keyed by DEFAULT_AGENT.
     pub async fn observe_committed_lease(&self, lease: ActiveLease) {
+        self.observe_committed_lease_for(DEFAULT_AGENT, lease).await;
+    }
+
+    /// Record the authoritative committed lease for `agent_id` this store learned from
+    /// the cluster (what a node observes as it CATCHES UP on rejoin: the leader's
+    /// append-entries carry the committed leases, and applying them lands the higher
+    /// term here). A revived stale node uses this to see the committed T+1 that
+    /// superseded its old belief FOR THAT AGENT, so the fence rejects it BECAUSE it sees
+    /// the higher committed term (not merely because it has no lease). The term only ever
+    /// moves forward PER agent: a stale value lower than what is already committed for
+    /// this agent is ignored, mirroring the Raft log applying in order; and only this
+    /// agent's entry is touched, never another agent's.
+    pub async fn observe_committed_lease_for(&self, agent_id: &str, lease: ActiveLease) {
         let mut inner = self.inner.write().await;
-        match inner.active_lease {
+        match inner.active_leases.get(agent_id) {
             Some(existing) if existing.term >= lease.term => {}
-            _ => inner.active_lease = Some(lease),
+            _ => {
+                inner.active_leases.insert(agent_id.to_string(), lease);
+            }
         }
     }
 }
@@ -191,26 +226,28 @@ fn apply_entry(inner: &mut StoreInner, entry: &Entry<LeaseTypeConfig>) -> LeaseR
             default_lease_response(inner)
         }
         EntryPayload::Normal(req) => match req {
-            LeaseRequest::Grant { node_id } => {
-                // Stamp the GRANTING entry's Raft term onto the lease. The term is
-                // the linearizable fence: a later grant at a higher term supersedes
-                // an earlier one, and a stale node believing an old term is fenced
-                // out because the committed term here is >= every committed grant.
+            LeaseRequest::Grant { agent_id, node_id } => {
+                // Stamp the GRANTING entry's Raft term onto THIS AGENT's lease entry
+                // ONLY (fleet-host S1, spec 2.2). The term is the linearizable fence:
+                // a later grant at a higher term supersedes an earlier one FOR THIS
+                // AGENT, and a stale node believing an old term is fenced out because
+                // the committed term in this agent's entry is >= every committed grant
+                // for it. No other agent's entry is read or written, so granting for
+                // agent A never perturbs agent B (G-LEASE-ISOLATION).
                 let lease = ActiveLease { node_id: *node_id, term: entry.log_id.leader_id.term };
-                inner.active_lease = Some(lease);
+                inner.active_leases.insert(agent_id.clone(), lease);
                 LeaseResponse { node_id: lease.node_id, term: lease.term }
             }
         },
     }
 }
 
-/// The lease response for a non-grant entry: the lease as it stands (or zero if
-/// none), so a blank/membership commit still returns a well-formed response.
-fn default_lease_response(inner: &StoreInner) -> LeaseResponse {
-    match inner.active_lease {
-        Some(l) => LeaseResponse { node_id: l.node_id, term: l.term },
-        None => LeaseResponse::default(),
-    }
+/// The lease response for a non-grant entry (a blank/membership commit): a well-formed
+/// default. Per-agent (fleet-host S1) there is no single global lease to echo, and a
+/// non-grant entry names no agent, so the zero response is correct (no caller consumes
+/// a blank/membership response as an agent's grant outcome).
+fn default_lease_response(_inner: &StoreInner) -> LeaseResponse {
+    LeaseResponse::default()
 }
 
 impl RaftLogStorage<LeaseTypeConfig> for LeaseStore {
@@ -341,7 +378,7 @@ impl RaftStateMachine<LeaseTypeConfig> for LeaseStore {
         let mut inner = self.inner.write().await;
         inner.last_applied = data.last_applied;
         inner.membership = data.membership;
-        inner.active_lease = data.active_lease;
+        inner.active_leases = data.active_leases;
         inner.snapshot = Some((meta.clone(), bytes));
         Ok(())
     }
@@ -363,7 +400,7 @@ impl RaftSnapshotBuilder<LeaseTypeConfig> for LeaseStore {
         let data = LeaseSnapshotData {
             last_applied: inner.last_applied,
             membership: inner.membership.clone(),
-            active_lease: inner.active_lease,
+            active_leases: inner.active_leases.clone(),
         };
         let bytes = serde_json::to_vec(&data).map_err(|e| StorageError::IO {
             source: StorageIOError::write_snapshot(None, &e),
@@ -656,18 +693,47 @@ impl LeaseNode {
         Ok(())
     }
 
-    /// Propose granting the active lease to `node_id` and wait for it to COMMIT
-    /// (linearizable). Only the leader can do this (a non-leader call returns a
-    /// ForwardToLeader-class error the caller can act on). On success the lease is
-    /// committed at the leader's current term and replicated to the majority, so
-    /// every node now agrees who is active. Returns the committed lease (node +
-    /// term).
+    /// Propose granting the DEFAULT-slot active lease to `node_id` (the single-agent
+    /// API, preserved verbatim) and wait for it to COMMIT. Delegates to
+    /// [`LeaseNode::grant_lease_for`] keyed by [`DEFAULT_AGENT`].
     pub async fn grant_lease(&self, node_id: LeaseNodeId) -> anyhow::Result<LeaseResponse> {
+        self.grant_lease_for(DEFAULT_AGENT, node_id).await
+    }
+
+    /// Propose granting `agent_id`'s active lease to `node_id` and wait for it to COMMIT
+    /// (linearizable, fleet-host S1). Only the leader can do this (a non-leader call
+    /// returns a ForwardToLeader-class error the caller can act on). On success that
+    /// agent's lease is committed at the leader's current term and replicated to the
+    /// majority, so every node now agrees who is active FOR THAT AGENT; no other agent's
+    /// lease is touched. Returns the committed lease (node + term) for this agent.
+    pub async fn grant_lease_for(
+        &self,
+        agent_id: &str,
+        node_id: LeaseNodeId,
+    ) -> anyhow::Result<LeaseResponse> {
+        // A node only ever grants the lease to ITSELF (you grant to become the active
+        // holder). Granting to another node would let a non-leader hold the committed
+        // lease, which combined with the fence is a split-brain footgun; it would also
+        // permit a same-term reassignment to a different holder (two same-term grants to
+        // distinct nodes are impossible when grants are self-only, since one term has one
+        // leader). Reject a non-self grantee (Codex deep, S1 review). Raft additionally
+        // requires the caller be the current leader for the write to commit.
+        if node_id != self.id {
+            anyhow::bail!(
+                "lease node {}: refusing to grant agent {agent_id:?} lease to a different node {node_id} (grant-to-self only)",
+                self.id
+            );
+        }
         let resp = self
             .raft
-            .client_write(LeaseRequest::Grant { node_id })
+            .client_write(LeaseRequest::Grant { agent_id: agent_id.to_string(), node_id })
             .await
-            .map_err(|e| anyhow::anyhow!("lease node {}: grant lease to {node_id}: {e}", self.id))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "lease node {}: grant lease for agent {agent_id:?} to {node_id}: {e}",
+                    self.id
+                )
+            })?;
         Ok(resp.data)
     }
 
@@ -805,20 +871,32 @@ impl LeaseHandle {
         self.id
     }
 
-    /// The committed active lease (who is active, at what term), read from the
-    /// applied state machine. None before any grant commits.
+    /// The committed active lease for the DEFAULT slot (single-agent API, preserved).
     pub async fn active_lease(&self) -> Option<ActiveLease> {
-        self.store.active_lease().await
+        self.active_lease_for(DEFAULT_AGENT).await
     }
 
-    /// Inform this node of the authoritative committed lease it learns as it CATCHES
-    /// UP on rejoin (the leader's append-entries carry the committed `active_lease`).
-    /// A revived stale node calls this so its fence check sees the higher committed
-    /// term T+1 that superseded its old belief, and is rejected BECAUSE it observed
-    /// the newer term, faithful to spec 4.3 ("sees the higher committed term"). Only
-    /// moves the term forward (a stale lower value is ignored).
+    /// The committed active lease for `agent_id` (fleet-host S1), read from the applied
+    /// state machine. None before any grant for that agent commits. Reads only this
+    /// agent's entry.
+    pub async fn active_lease_for(&self, agent_id: &str) -> Option<ActiveLease> {
+        self.store.active_lease_for(agent_id).await
+    }
+
+    /// Inform this node of the authoritative committed lease for the DEFAULT slot
+    /// (single-agent API, preserved). Delegates to the per-agent form.
     pub async fn catch_up_committed_lease(&self, lease: ActiveLease) {
-        self.store.observe_committed_lease(lease).await;
+        self.catch_up_committed_lease_for(DEFAULT_AGENT, lease).await;
+    }
+
+    /// Inform this node of the authoritative committed lease for `agent_id` it learns as
+    /// it CATCHES UP on rejoin (the leader's append-entries carry the committed leases).
+    /// A revived stale node calls this so its per-agent fence check sees the higher
+    /// committed term T+1 that superseded its old belief FOR THAT AGENT, and is rejected
+    /// BECAUSE it observed the newer term, faithful to spec 4.3. Only moves the term
+    /// forward per agent (a stale lower value is ignored); touches only this agent.
+    pub async fn catch_up_committed_lease_for(&self, agent_id: &str, lease: ActiveLease) {
+        self.store.observe_committed_lease_for(agent_id, lease).await;
     }
 
     /// Whether this node is the current Raft leader (necessary but not sufficient to
@@ -827,47 +905,68 @@ impl LeaseHandle {
         self.raft.metrics().borrow().current_leader == Some(self.id)
     }
 
-    /// THE ACTIVE-NODE CHECK (spec 3.5): this node may run the genome + debit the
-    /// treasury iff it is BOTH the Raft leader AND holds the committed `active_lease`
-    /// at the current term. Returns the term it is active at, or None if it is not
-    /// the active node (a non-leader, or the lease is held by someone else). The
-    /// run/restore path calls this before booting/restoring a VM; the debit path
-    /// calls it (via the fence) before any debit.
+    /// THE ACTIVE-NODE CHECK for the DEFAULT slot (single-agent API, preserved).
     pub async fn active_term(&self) -> Option<u64> {
+        self.active_term_for(DEFAULT_AGENT).await
+    }
+
+    /// THE ACTIVE-NODE CHECK for `agent_id` (spec 3.5, fleet-host S1): this node may run
+    /// and debit FOR THAT AGENT iff it is BOTH the Raft leader AND holds the agent's
+    /// committed lease at the current term. Returns the term it is active at for the
+    /// agent, or None (a non-leader, or the agent's lease is held by someone else, or
+    /// not granted). Other agents' entries do not affect this answer.
+    pub async fn active_term_for(&self, agent_id: &str) -> Option<u64> {
         if !self.is_leader() {
             return None;
         }
-        match self.store.active_lease().await {
+        match self.store.active_lease_for(agent_id).await {
             Some(l) if l.node_id == self.id => Some(l.term),
             _ => None,
         }
     }
 
-    /// A term-fence for a node that BELIEVES it is active at `believed_term` (e.g. a
-    /// revived stale node that was active before it was killed). It may run/debit
-    /// only if the CURRENTLY COMMITTED lease still names this node at a term >=
-    /// `believed_term`. A revived stale node believing the old term T sees the
-    /// higher committed term T+1 (the lease moved to another node) and is FENCED
-    /// OUT: this returns `Fenced`, so it does NOT run and does NOT debit (spec 4.3,
-    /// no double-execute). A node whose belief still matches the committed lease
-    /// passes.
+    /// A term-fence for the DEFAULT slot (single-agent API, preserved). Delegates to the
+    /// per-agent form keyed by DEFAULT_AGENT.
     pub async fn fence(&self, believed_term: u64) -> FenceVerdict {
-        let lease = self.store.active_lease().await;
+        self.fence_for(DEFAULT_AGENT, believed_term).await
+    }
+
+    /// A term-fence for `agent_id` for a node that BELIEVES it is active at
+    /// `believed_term` (fleet-host S1). It may run/debit FOR THAT AGENT only if the
+    /// CURRENTLY COMMITTED lease for the agent still names this node at a term >=
+    /// `believed_term`. A revived stale node believing the old term T sees the higher
+    /// committed term T+1 (the agent's lease moved) and is FENCED OUT: returns `Fenced`,
+    /// so it does NOT run and does NOT debit (spec 4.3, no double-execute). The fence
+    /// reads ONLY this agent's entry, so a grant moving agent B never un-fences a stale
+    /// holder of agent A and vice versa.
+    pub async fn fence_for(&self, agent_id: &str, believed_term: u64) -> FenceVerdict {
+        let lease = self.store.active_lease_for(agent_id).await;
+        // The live run/debit gate requires LEADERSHIP, identical to active_term_for: a
+        // node that still holds the committed lease but is NOT the current leader (it
+        // lost leadership, e.g. a partitioned-or-demoted old leader) must NOT act. This
+        // removes the asymmetry with active_term_for and shrinks the partition
+        // two-actives window to the leader step-down timeout (Codex deep, S1 review).
+        if !self.is_leader() {
+            return FenceVerdict::Fenced {
+                committed_term: lease.as_ref().map(|l| l.term).unwrap_or(0),
+                committed_holder: lease.as_ref().map(|l| l.node_id).unwrap_or(0),
+                believed_term,
+            };
+        }
         match lease {
-            // The committed lease still names THIS node at a term >= what it believes:
-            // it is genuinely still the active node, so it may proceed.
+            // The committed lease for this agent still names THIS node at a term >= what
+            // it believes: it is genuinely still the active node for the agent.
             Some(l) if l.node_id == self.id && l.term >= believed_term => {
                 FenceVerdict::Active { term: l.term }
             }
-            // The committed lease has moved on (a higher term, a different node): this
-            // node is stale and is fenced out. The committed term is the proof the
-            // lease was reassigned while this node was away.
+            // The agent's committed lease has moved on (a higher term, a different node):
+            // this node is stale for the agent and is fenced out.
             Some(l) => FenceVerdict::Fenced {
                 committed_term: l.term,
                 committed_holder: l.node_id,
                 believed_term,
             },
-            // No lease is committed at all: nothing authorizes this node to act.
+            // No lease is committed for this agent at all: nothing authorizes this node.
             None => FenceVerdict::Fenced {
                 committed_term: 0,
                 committed_holder: 0,
@@ -939,9 +1038,22 @@ pub struct ClusterBringUp {
 /// A correct cluster yields {} (between handoffs) or a single id (a settled active
 /// node), never two.
 pub async fn observe_active_nodes(handles: &[LeaseHandle]) -> BTreeSet<LeaseNodeId> {
+    observe_active_nodes_for(handles, DEFAULT_AGENT).await
+}
+
+/// The per-agent linearizability witness (fleet-host S1, gate G-LEASE-ISOLATION): the
+/// set of nodes that each believe they are the active node FOR `agent_id` (leader AND
+/// that agent's committed-lease-holder). The per-agent two-actives invariant is that
+/// this set NEVER has size > 1 for any single agent across observed term boundaries,
+/// mirroring the global G8 witness but scoped to one agent so other tenants are
+/// irrelevant to the answer.
+pub async fn observe_active_nodes_for(
+    handles: &[LeaseHandle],
+    agent_id: &str,
+) -> BTreeSet<LeaseNodeId> {
     let mut active = BTreeSet::new();
     for h in handles {
-        if h.active_term().await.is_some() {
+        if h.active_term_for(agent_id).await.is_some() {
             active.insert(h.id());
         }
     }
@@ -958,25 +1070,98 @@ mod tests {
     #[tokio::test]
     async fn grant_stamps_term_and_supersedes() {
         let store = LeaseStore::new();
-        // Apply a grant to node 2 at term 1, then a grant to node 3 at term 2.
+        // Apply a grant to node 2 at term 1, then a grant to node 3 at term 2 (both for
+        // the DEFAULT slot, the single-agent shape this test always exercised).
         let mut inner = store.inner.write().await;
         let e1 = Entry {
             log_id: LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),
-            payload: EntryPayload::Normal(LeaseRequest::Grant { node_id: 2 }),
+            payload: EntryPayload::Normal(LeaseRequest::Grant {
+                agent_id: DEFAULT_AGENT.to_string(),
+                node_id: 2,
+            }),
         };
         let r1 = apply_entry(&mut inner, &e1);
         assert_eq!(r1, LeaseResponse { node_id: 2, term: 1 });
-        assert_eq!(inner.active_lease, Some(ActiveLease { node_id: 2, term: 1 }));
+        assert_eq!(
+            inner.active_leases.get(DEFAULT_AGENT).copied(),
+            Some(ActiveLease { node_id: 2, term: 1 })
+        );
 
         let e2 = Entry {
             log_id: LogId::new(openraft::CommittedLeaderId::new(2, 0), 2),
-            payload: EntryPayload::Normal(LeaseRequest::Grant { node_id: 3 }),
+            payload: EntryPayload::Normal(LeaseRequest::Grant {
+                agent_id: DEFAULT_AGENT.to_string(),
+                node_id: 3,
+            }),
         };
         let r2 = apply_entry(&mut inner, &e2);
         assert_eq!(r2, LeaseResponse { node_id: 3, term: 2 });
         // The lease moved to node 3 at the higher term: node 2's old term (1) is now
         // superseded, which is exactly what fences a revived stale node 2.
-        assert_eq!(inner.active_lease, Some(ActiveLease { node_id: 3, term: 2 }));
+        assert_eq!(
+            inner.active_leases.get(DEFAULT_AGENT).copied(),
+            Some(ActiveLease { node_id: 3, term: 2 })
+        );
+    }
+
+    /// G-LEASE-ISOLATION (apply-level): granting agent A's lease stamps ONLY A's entry,
+    /// and a later grant for agent B leaves A's entry byte-identical (and vice versa).
+    /// TEETH: if apply touched B while granting A, A's entry would change here.
+    #[tokio::test]
+    async fn grant_for_one_agent_never_touches_another() {
+        let store = LeaseStore::new();
+        let mut inner = store.inner.write().await;
+        // Grant A -> node 2 @ term 1.
+        let ea = Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 0), 1),
+            payload: EntryPayload::Normal(LeaseRequest::Grant {
+                agent_id: "agent-a".to_string(),
+                node_id: 2,
+            }),
+        };
+        apply_entry(&mut inner, &ea);
+        let a_after_a = inner.active_leases.get("agent-a").copied();
+        assert_eq!(a_after_a, Some(ActiveLease { node_id: 2, term: 1 }));
+        assert!(!inner.active_leases.contains_key("agent-b"), "B must not exist yet");
+
+        // Grant B -> node 3 @ term 2. A's entry must be UNCHANGED.
+        let eb = Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(2, 0), 2),
+            payload: EntryPayload::Normal(LeaseRequest::Grant {
+                agent_id: "agent-b".to_string(),
+                node_id: 3,
+            }),
+        };
+        apply_entry(&mut inner, &eb);
+        assert_eq!(
+            inner.active_leases.get("agent-a").copied(),
+            a_after_a,
+            "granting B mutated A's lease entry (isolation violated)"
+        );
+        assert_eq!(
+            inner.active_leases.get("agent-b").copied(),
+            Some(ActiveLease { node_id: 3, term: 2 })
+        );
+
+        // Re-grant A at a higher term -> A advances, B unchanged.
+        let b_before = inner.active_leases.get("agent-b").copied();
+        let ea2 = Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(3, 0), 3),
+            payload: EntryPayload::Normal(LeaseRequest::Grant {
+                agent_id: "agent-a".to_string(),
+                node_id: 1,
+            }),
+        };
+        apply_entry(&mut inner, &ea2);
+        assert_eq!(
+            inner.active_leases.get("agent-a").copied(),
+            Some(ActiveLease { node_id: 1, term: 3 })
+        );
+        assert_eq!(
+            inner.active_leases.get("agent-b").copied(),
+            b_before,
+            "advancing A mutated B's lease entry (isolation violated)"
+        );
     }
 
     /// The fence verdict logic (without a live engine): a node that believes a term
@@ -987,7 +1172,9 @@ mod tests {
         let store = LeaseStore::new();
         {
             let mut inner = store.inner.write().await;
-            inner.active_lease = Some(ActiveLease { node_id: 2, term: 5 });
+            inner
+                .active_leases
+                .insert(DEFAULT_AGENT.to_string(), ActiveLease { node_id: 2, term: 5 });
         }
         // A handle for node 2 (the holder) with a stub raft is awkward to build here,
         // so test the verdict math against the store directly via a small helper that

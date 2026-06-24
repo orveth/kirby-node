@@ -569,6 +569,7 @@ async fn memory_vm_boots_records_and_dies_when_broke() {
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
+        lease_fence: None,
     };
 
     let config = MeteredRunConfig {
