@@ -134,6 +134,7 @@ async fn g5_brokered_ecash_settle_real_metered_no_vm_egress() {
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
+        lease_fence: None,
     };
 
     // A window long enough for the genome to issue the request and the daemon to

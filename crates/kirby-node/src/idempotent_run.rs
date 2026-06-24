@@ -115,6 +115,7 @@ impl IdempotentRunConfig {
             lockdown_egress: false,
             snapshot_capable: true,
             restore_checkpoint: None,
+            lease_fence: None,
         };
         Ok(Self::from_boot(boot))
     }

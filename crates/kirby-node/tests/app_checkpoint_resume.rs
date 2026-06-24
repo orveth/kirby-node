@@ -117,5 +117,6 @@ fn base_config(test: &str, guest_cid: u32, gateway_port: u32) -> Option<BootConf
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
+        lease_fence: None,
     })
 }

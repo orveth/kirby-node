@@ -70,6 +70,7 @@ async fn g6_snapshot_and_resume_on_node2() {
         lockdown_egress: false,
         snapshot_capable: true,
         restore_checkpoint: None,
+        lease_fence: None,
     };
 
     let config = SnapshotRunConfig::new(boot);

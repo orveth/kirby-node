@@ -79,6 +79,7 @@ fn boot_config(image: ImagePaths, node_id: &str, task: &str, cid: u32, port: u32
         lockdown_egress: false,
         snapshot_capable: true,
         restore_checkpoint: None,
+        lease_fence: None,
     }
 }
 

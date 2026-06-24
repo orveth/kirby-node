@@ -101,8 +101,13 @@ pub struct GatewayService {
 pub struct LeaseFence {
     /// The lease handle for THIS node (reads the committed lease + leadership).
     pub handle: LeaseHandle,
+    /// The agent_id this gateway serves (fleet-host S1): the fence reads only THIS
+    /// agent's per-agent lease entry, so a tenant is fenced on its OWN lease and a grant
+    /// for another tenant never un-fences or fences this one. The single-agent path uses
+    /// [`crate::raft_lease::DEFAULT_AGENT`].
+    pub agent_id: crate::raft_lease::AgentId,
     /// The term this VM/gateway was started under (the term the node believes it is
-    /// active at). The fence compares the CURRENT committed term to this.
+    /// active at FOR THIS AGENT). The fence compares the CURRENT committed term to this.
     pub vm_term: u64,
 }
 
@@ -186,8 +191,25 @@ impl GatewayService {
     /// committed term to it, so a revived stale node (started at the old term) fences
     /// out once the lease has moved to a higher term. Without this (C-3..C-8) the
     /// gateway is unfenced, exactly as before.
-    pub fn with_lease_fence(mut self, handle: LeaseHandle, vm_term: u64) -> Self {
-        self.lease_fence = Some(LeaseFence { handle, vm_term });
+    pub fn with_lease_fence(self, handle: LeaseHandle, vm_term: u64) -> Self {
+        // The single-agent path fences on the DEFAULT slot, so a bare run behaves
+        // exactly as the pre-fleet single-value fence did.
+        self.with_lease_fence_for(handle, crate::raft_lease::DEFAULT_AGENT.to_string(), vm_term)
+    }
+
+    /// Attach the PER-AGENT lease fence (fleet-host S1, spec 2.2): the gateway debits
+    /// only when THIS node holds `agent_id`'s active lease at the current committed term;
+    /// otherwise STEP 0 of `authorize_capability` returns `DENIED_NOT_ACTIVE_LEASE` and
+    /// debits 0. A fleet tenant attaches this with its own `agent_id`, so it is fenced on
+    /// its OWN lease and a grant moving another tenant's lease never affects it. `vm_term`
+    /// is the term the node held this agent's lease at when the VM started.
+    pub fn with_lease_fence_for(
+        mut self,
+        handle: LeaseHandle,
+        agent_id: crate::raft_lease::AgentId,
+        vm_term: u64,
+    ) -> Self {
+        self.lease_fence = Some(LeaseFence { handle, agent_id, vm_term });
         self
     }
 
@@ -320,7 +342,7 @@ impl GatewayService {
         // one node (the active lease-holder) ever debits, so there is no double-burn.
         // Without a lease attached (every gate before C-9) this is a no-op.
         if let Some(fence) = &self.lease_fence {
-            match fence.handle.fence(fence.vm_term).await {
+            match fence.handle.fence_for(&fence.agent_id, fence.vm_term).await {
                 FenceVerdict::Active { .. } => {}
                 FenceVerdict::Fenced {
                     committed_term,

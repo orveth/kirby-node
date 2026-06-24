@@ -55,6 +55,7 @@ async fn g1_genome_boots_and_completes_session_context_round_trip() {
         // G1 does not snapshot (no CPU template); snapshot is C-7 / G6.
         snapshot_capable: false,
         restore_checkpoint: None,
+        lease_fence: None,
     };
 
     let (vm, outcome, _treasury, _events, _serve_guard) = match boot::boot_and_observe(config).await

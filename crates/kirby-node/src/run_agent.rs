@@ -469,6 +469,7 @@ fn agent_boot_config(
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint,
+        lease_fence: None,
     })
 }
 
