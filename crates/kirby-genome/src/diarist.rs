@@ -34,7 +34,9 @@ use std::time::Duration;
 
 use kirby_proto::capability_request::Act;
 use kirby_proto::node_gateway_client::NodeGatewayClient;
-use kirby_proto::{CapabilityRequest, ChatMessage, Completion, Memory, MemoryOp, Outcome};
+use kirby_proto::{
+    CapabilityReceipt, CapabilityRequest, ChatMessage, Completion, Memory, MemoryOp, Outcome,
+};
 
 use super::{boot_log, idle_forever, redial, report_brokered};
 // REUSE the proven Chunk-2 checkpoint contract (the F2-critical resume surface): the diarist
@@ -67,22 +69,27 @@ not repeat earlier entries — build on them.";
 /// The diarist's runtime knobs, read from the kernel command line. It REUSES the brain knobs
 /// (model + per-think ceiling) and the memory knob (per-write ceiling), and adds its own
 /// cadence + recall depth; the brain/memory `tick_secs` are unused (the diarist has ONE loop).
-struct DiaristParams {
+///
+/// `pub(super)` so the CAPABLE workload reuses the EXACT same knob set (D-1, D-7): a slice-1
+/// capable agent rides the existing `kirby.brain_*`/`kirby.memory_*`/`kirby.diarist_*` cmdline
+/// knobs (no new daemon plumbing, charter "genome-side composition ONLY"); a dedicated
+/// `kirby.capable_*` namespace is a clean post-slice-1 addition.
+pub(super) struct DiaristParams {
     /// The model the THINK uses (cosmetic for the stub; load-bearing for RoutstrBrain).
-    model: String,
+    pub(super) model: String,
     /// The per-THINK budget ceiling (from `[brain].max_cost_sats`).
-    brain_max_cost: u64,
+    pub(super) brain_max_cost: u64,
     /// The per-REMEMBER budget ceiling (from `[memory].max_cost_sats`).
-    memory_max_cost: u64,
+    pub(super) memory_max_cost: u64,
     /// The one loop cadence (think + remember per tick).
-    tick: Duration,
+    pub(super) tick: Duration,
     /// How many recent journal entries to RECALL into each reflection prompt.
-    recall_count: usize,
+    pub(super) recall_count: usize,
 }
 
 /// Parse the diarist knobs from `/proc/cmdline`, falling back to the defaults for any absent
 /// or unparseable value (so a bare config still runs). Mirrors brain.rs/memory.rs.
-fn diarist_params_from_cmdline() -> DiaristParams {
+pub(super) fn diarist_params_from_cmdline() -> DiaristParams {
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let get = |key: &str| {
         cmdline
@@ -184,7 +191,11 @@ fn build_reflection_prompt(
 }
 
 /// What a THINK resolved to, for the loop's control flow.
-enum ThinkOutcome {
+///
+/// `pub(super)` so the CAPABLE workload reuses the SAME metabolism semantics (D-1): it maps a
+/// receipt through the shared [`classify_think`] and matches these variants verbatim, so the
+/// life-gating earn-or-die logic lives in ONE place, never duplicated across workloads.
+pub(super) enum ThinkOutcome {
     /// The reflection came back (PERFORMED, or a DUPLICATE_IGNORED resume-replay that returns
     /// the SAME persisted words). The agent keeps living; `cost`/`treasury_remaining` feed the
     /// next prompt's runway.
@@ -204,7 +215,7 @@ enum ThinkOutcome {
 /// What a REMEMBER (write) resolved to. The two DENIED reasons are SPLIT (F5): an over-budget
 /// write is a permanent CONFIG error (loud), an insufficient-treasury write is genuinely broke
 /// (a soft "can recall, can't record" skip). Neither is death — the THINK is the one death gate.
-enum RememberOutcome {
+pub(super) enum RememberOutcome {
     /// The reflection was recorded (PERFORMED or a DUPLICATE_IGNORED resume-replay).
     Recorded,
     /// DENIED_INSUFFICIENT_TREASURY: broke enough to think but not to record. Soft skip — a
@@ -344,6 +355,23 @@ pub(super) async fn diarist_loop(
     }
 }
 
+/// Classify a THINK receipt into a [`ThinkOutcome`], the shared life-gating metabolism (D-1).
+/// PURE (no IO, no logging) so BOTH the diarist's [`think`] and the capable loop map a receipt
+/// the SAME way, in ONE place: a PERFORMED or a DUPLICATE_IGNORED resume-replay (which carries
+/// the SAME persisted completion bytes, F2) is Performed; EITHER denial is Broke (earn-or-die
+/// applied to the mind, the one death gate, F4); anything else is a transient hiccup.
+pub(super) fn classify_think(receipt: &CapabilityReceipt) -> ThinkOutcome {
+    match Outcome::try_from(receipt.outcome).unwrap_or(Outcome::Unspecified) {
+        Outcome::AuthorizedAndPerformed | Outcome::DuplicateIgnored => ThinkOutcome::Performed {
+            reply: String::from_utf8_lossy(&receipt.completion).into_owned(),
+            cost_sats: receipt.cost_sats,
+            treasury_remaining: receipt.treasury_remaining,
+        },
+        Outcome::DeniedInsufficientTreasury | Outcome::DeniedOverBudget => ThinkOutcome::Broke,
+        _ => ThinkOutcome::Transient,
+    }
+}
+
 /// THINK: issue one `Completion` and classify the outcome. Keyed on the checkpointed `seq`
 /// (F2). A DUPLICATE_IGNORED replay (resume) returns the SAME persisted words, so it counts as
 /// Performed. On a dead channel it re-dials and reports a transient hiccup.
@@ -369,33 +397,16 @@ async fn think(
     match client.request_capability(request).await {
         Ok(resp) => {
             let receipt = resp.into_inner();
-            let outcome = Outcome::try_from(receipt.outcome).unwrap_or(Outcome::Unspecified);
-            match outcome {
-                // A DUPLICATE_IGNORED resume-replay carries the SAME completion bytes (the
-                // ledger persists them), so the diarist re-obtains the reflection it thought
-                // before a crash and records it — no new inference, no double debit (F2).
-                Outcome::AuthorizedAndPerformed | Outcome::DuplicateIgnored => {
-                    let reply = String::from_utf8_lossy(&receipt.completion).into_owned();
-                    ThinkOutcome::Performed {
-                        reply,
-                        cost_sats: receipt.cost_sats,
-                        treasury_remaining: receipt.treasury_remaining,
-                    }
-                }
-                // EARN-OR-DIE applied to the mind: BOTH denials end life on the THINK (mirrors
-                // brain.rs; validate() guarantees the first think is affordable, so an
-                // over-budget think is not expected on a valid config).
-                Outcome::DeniedInsufficientTreasury | Outcome::DeniedOverBudget => {
-                    ThinkOutcome::Broke
-                }
-                other => {
-                    boot_log(&format!(
-                        "diarist_think seq={seq} UNEXPECTED outcome={other:?} treasury_remaining={}",
-                        receipt.treasury_remaining
-                    ));
-                    ThinkOutcome::Transient
-                }
+            let outcome = classify_think(&receipt);
+            // The ONLY Ok-path Transient is an UNEXPECTED outcome; log it (classify_think is pure).
+            if matches!(outcome, ThinkOutcome::Transient) {
+                let proto_outcome = Outcome::try_from(receipt.outcome).unwrap_or(Outcome::Unspecified);
+                boot_log(&format!(
+                    "diarist_think seq={seq} UNEXPECTED outcome={proto_outcome:?} treasury_remaining={}",
+                    receipt.treasury_remaining
+                ));
             }
+            outcome
         }
         Err(status) => {
             boot_log(&format!(
@@ -406,6 +417,19 @@ async fn think(
             }
             ThinkOutcome::Transient
         }
+    }
+}
+
+/// Classify a REMEMBER (write) receipt into a [`RememberOutcome`], shared metabolism (D-1).
+/// PURE: the two DENIED reasons stay SPLIT (F5) so the caller treats over-budget as a LOUD
+/// config error and insufficient-treasury as a SOFT broke-skip, while a PERFORMED or a
+/// DUPLICATE_IGNORED replay is Recorded (exactly-once, F1). Shared by the diarist and capable.
+pub(super) fn classify_remember(receipt: &CapabilityReceipt) -> RememberOutcome {
+    match Outcome::try_from(receipt.outcome).unwrap_or(Outcome::Unspecified) {
+        Outcome::AuthorizedAndPerformed | Outcome::DuplicateIgnored => RememberOutcome::Recorded,
+        Outcome::DeniedOverBudget => RememberOutcome::ConfigError,
+        Outcome::DeniedInsufficientTreasury => RememberOutcome::Broke,
+        _ => RememberOutcome::Transient,
     }
 }
 
@@ -434,28 +458,28 @@ async fn remember(
     match client.request_capability(request).await {
         Ok(resp) => {
             let receipt = resp.into_inner();
-            let outcome = Outcome::try_from(receipt.outcome).unwrap_or(Outcome::Unspecified);
-            match outcome {
-                Outcome::AuthorizedAndPerformed | Outcome::DuplicateIgnored => {
+            let proto_outcome = Outcome::try_from(receipt.outcome).unwrap_or(Outcome::Unspecified);
+            let outcome = classify_remember(&receipt);
+            match &outcome {
+                RememberOutcome::Recorded => {
                     let detail = format!(
-                        "diarist_remember seq={seq} slug={slug} outcome={outcome:?} cost_sats={} treasury_remaining={}",
+                        "diarist_remember seq={seq} slug={slug} outcome={proto_outcome:?} cost_sats={} treasury_remaining={}",
                         receipt.cost_sats, receipt.treasury_remaining
                     );
                     report_brokered(client, "diarist_remember", &detail).await;
                     boot_log(&detail);
-                    RememberOutcome::Recorded
                 }
-                // F5 split: over-budget = config error (loud), insufficient = broke (soft).
-                Outcome::DeniedOverBudget => RememberOutcome::ConfigError,
-                Outcome::DeniedInsufficientTreasury => RememberOutcome::Broke,
-                other => {
+                RememberOutcome::Transient => {
                     boot_log(&format!(
-                        "diarist_remember seq={seq} slug={slug} UNEXPECTED outcome={other:?} treasury_remaining={}",
+                        "diarist_remember seq={seq} slug={slug} UNEXPECTED outcome={proto_outcome:?} treasury_remaining={}",
                         receipt.treasury_remaining
                     ));
-                    RememberOutcome::Transient
                 }
+                // F5 split: over-budget = config error (loud), insufficient = broke (soft). Both
+                // are returned for diarist_loop to handle (no log here, the loop logs them).
+                RememberOutcome::Broke | RememberOutcome::ConfigError => {}
             }
+            outcome
         }
         Err(status) => {
             boot_log(&format!(

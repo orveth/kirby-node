@@ -50,6 +50,7 @@
 //! set when it booted the VM.
 
 mod brain;
+mod capable;
 mod diarist;
 mod fingerprint;
 mod memory;
@@ -299,6 +300,15 @@ async fn run() {
             // tick, parking when the treasury can no longer cover a THINK so the daemon halts
             // the VM. It composes the Completion + Memory acts on one gateway (no new act).
             diarist::diarist_loop(client, port, &ctx).await;
+        }
+        Some("capable") => {
+            boot_log("workload=capable: the agentic kernel (slice 1): PLAN (think) -> ACT (one guarded mem/capable write) -> VERIFY (free read-back) -> learn; SELF-CORRECTION (a read-back mismatch is detected and fed into the next plan); death is the daemon halting the VM when a THINK is unaffordable (F4)");
+            // The capable loop never returns (PID 1): each tick it plans, acts on its OWN durable
+            // memory, VERIFIES the effect by reading it back, and feeds the verdict into the next
+            // plan, parking when a THINK is unaffordable so the daemon halts the VM. It composes
+            // the Completion + Memory acts on one gateway (no new daemon act), reusing the
+            // diarist's metabolism + checkpoint paths.
+            capable::capable_loop(client, port, &ctx).await;
         }
         _ => {
             boot_log("no burn workload: idling (the daemon meters/halts or tears down)");
