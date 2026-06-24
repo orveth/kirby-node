@@ -741,6 +741,11 @@ async fn run_fleet_supervisor_cmd(
     // the node's treasury dir alongside the per-tenant treasuries.
     let alloc_dir = config.identity.treasury_dir();
     std::fs::create_dir_all(&alloc_dir).ok();
+    // Take an EXCLUSIVE interprocess lock on the allocator dir BEFORE load_or_new, so a second
+    // concurrent `kirby fleet` fails fast instead of independently loading the same JSON state
+    // and double-allocating the same CID/port (the allocator file itself is unlocked). The
+    // guard is bound for the supervisor's lifetime; dropping it at process exit frees the lock.
+    let _alloc_lock = kirby_node::fleet::FleetAllocatorLock::acquire(&alloc_dir)?;
     let alloc_path = alloc_dir.join("fleet-allocator.json");
     let allocator = Allocator::load_or_new(&config.fleet, &alloc_path)?;
 
@@ -776,7 +781,15 @@ async fn run_fleet_supervisor_cmd(
             tracing::warn!(agent_id, "FLEET tenant EXITED (failover hook for S5/S6; S2 tracks only)");
         }
         if !dead.is_empty() && dead.len() == supervisor.tenant_count() {
-            tracing::info!("FLEET supervisor: all tenants have exited; shutting down");
+            // Before shutting down, REAP every exited tenant so the persisted allocator does
+            // not retain slots marked LIVE for dead CIDs/ports. Without this, a supervisor
+            // restart would reload those slots as live and never re-hand them (leaked across
+            // the restart).
+            let reaped = supervisor.reap_dead();
+            tracing::info!(
+                reaped = reaped.len(),
+                "FLEET supervisor: all tenants have exited; reaped dead allocator slots, shutting down"
+            );
             return Ok(());
         }
     }

@@ -171,18 +171,48 @@ impl FleetSupervisor {
 
     /// Launch every STATIC tenant declared in `[fleet]` (spec slice S2). For each tenant, in
     /// declaration order: allocate the resource triple, derive the per-agent treasury path,
-    /// grant the per-agent lease at the current term, and launch the child. On ANY per-tenant
-    /// failure (allocation exhausted, grant fails, launch fails) the tenant's allocation is
-    /// RELEASED so a partial failure leaks no slot, and the error is returned (the supervisor
-    /// does not silently host a partial fleet). Returns the records of the launched tenants.
+    /// grant the per-agent lease at the current term, and launch the child.
+    ///
+    /// ALL-OR-NOTHING: on ANY per-tenant failure (allocation exhausted, grant fails, launch
+    /// fails) every tenant ALREADY launched in this batch is KILLED and REAPED (its OS child
+    /// process is signalled + reaped and its allocator slot released) before the error is
+    /// returned. Dropping a `std::process::Child` does NOT kill the OS process, so an explicit
+    /// kill is required; without it a partial batch would leak orphaned children AND leak
+    /// allocator slots. The supervisor never silently hosts a partial fleet, and a failed batch
+    /// leaves it with no tracked tenants. Returns the records of the launched tenants on full
+    /// success.
     pub async fn launch_all(&mut self) -> anyhow::Result<Vec<TenantRecord>> {
         let tenants = self.base_config.fleet.tenants.clone();
         let mut records = Vec::with_capacity(tenants.len());
         for tenant in &tenants {
-            let record = self.launch_one(tenant).await?;
-            records.push(record);
+            match self.launch_one(tenant).await {
+                Ok(record) => records.push(record),
+                Err(e) => {
+                    // A mid-batch failure must not leak the tenants already launched in this
+                    // batch: kill their OS children (a dropped `Child` keeps running) and
+                    // release their allocator slots before surfacing the error.
+                    self.kill_and_reap_all();
+                    return Err(e);
+                }
+            }
         }
         Ok(records)
+    }
+
+    /// Kill + reap EVERY tracked tenant: signal each child dead, reap it (release its allocator
+    /// slot), and clear the live set. Used to roll back a partially-launched batch in
+    /// `launch_all` so a failed batch leaves no orphaned child process and no leaked allocator
+    /// slot. Idempotent on an empty set.
+    fn kill_and_reap_all(&mut self) {
+        let ids: Vec<AgentId> = self.tenants.keys().cloned().collect();
+        for id in ids {
+            if let Some(live) = self.tenants.remove(&id) {
+                // Kill the OS child first (a dropped `Child` does NOT terminate the process),
+                // then release the allocator slot so no CID/port is leaked.
+                live.process.kill();
+                self.allocator.release(&id);
+            }
+        }
     }
 
     /// Launch ONE tenant: allocate -> derive treasury path -> grant lease -> launch child ->
@@ -222,10 +252,13 @@ impl FleetSupervisor {
     ) -> anyhow::Result<TenantRecord> {
         // (2) Per-agent treasury path (DB-per-agent, spec 2.1): each tenant takes its OWN
         // sled exclusive dir lock, so opening tenant A's treasury never blocks on B's
-        // (G-TENANT-ISOLATION). The child's `kirby agent` keys its treasury off node_id, so
-        // the derived child config sets node_id = instance_id (distinct per tenant); we also
-        // surface the path here for the record + tests.
-        let treasury_path = crate::boot::treasury_path_for_agent(&tenant.agent_id);
+        // (G-TENANT-ISOLATION). The child's `kirby agent` keys its treasury off node_id, and
+        // the derived child config sets node_id = instance_id (distinct per tenant). The
+        // recorded path MUST be the path the child actually opens, so derive it from the
+        // child's node_id (= instance_id) via `treasury_path_for`, NOT from the agent_id via
+        // `treasury_path_for_agent` (a path the child never opens). Isolation still holds: the
+        // instance_id is distinct per tenant, so the per-tenant paths are distinct.
+        let treasury_path = crate::boot::treasury_path_for(&allocation.instance_id);
 
         // (3) Grant the per-agent lease to THIS node at the current term (S1). Touches only
         // this agent's entry, so granting tenant A never perturbs tenant B's lease.
@@ -313,6 +346,29 @@ impl FleetSupervisor {
         let live = self.tenants.remove(agent_id).expect("checked present");
         self.allocator.release(agent_id);
         Ok(live.record)
+    }
+
+    /// Reap EVERY exited tenant: for each tracked tenant whose child has died, drop its handle
+    /// and RELEASE its allocator slot, returning the reaped records. This is the supervisor's
+    /// shutdown/restart-safety cleanup: without it, the persisted allocator keeps a slot marked
+    /// LIVE for a dead CID/port, which would survive a supervisor restart and never be re-handed
+    /// (a leaked slot). Still-running tenants are left untouched. Idempotent (no dead tenants =>
+    /// empty result).
+    pub fn reap_dead(&mut self) -> Vec<TenantRecord> {
+        let dead: Vec<AgentId> = self
+            .tenants
+            .iter()
+            .filter(|(_, t)| !t.process.is_running())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut reaped = Vec::with_capacity(dead.len());
+        for id in dead {
+            if let Some(live) = self.tenants.remove(&id) {
+                self.allocator.release(&id);
+                reaped.push(live.record);
+            }
+        }
+        reaped
     }
 
     /// Kill a tracked tenant (force a death), for an operator stop or a test. Idempotent on
@@ -448,20 +504,35 @@ mod tests {
 
     /// A stub launcher: records every launch spec and hands back a controllable StubTenant.
     /// A shared `kill_switch` per agent lets a test force a tenant death deterministically.
+    /// `fail_on` names a tenant whose launch returns an error, modeling a mid-batch failure.
     #[derive(Default)]
     struct StubLauncher {
         launched: std::sync::Mutex<Vec<TenantLaunchSpec>>,
         switches: std::sync::Mutex<BTreeMap<AgentId, Arc<AtomicBool>>>,
+        fail_on: std::sync::Mutex<Option<AgentId>>,
     }
 
     impl StubLauncher {
         fn running_flag(&self, agent_id: &str) -> Arc<AtomicBool> {
             self.switches.lock().unwrap().get(agent_id).cloned().expect("agent launched")
         }
+
+        /// The running flag for an agent IF it was ever launched (so a test can prove a
+        /// rolled-back tenant's child was killed). `None` if it was never launched.
+        fn maybe_running_flag(&self, agent_id: &str) -> Option<Arc<AtomicBool>> {
+            self.switches.lock().unwrap().get(agent_id).cloned()
+        }
+
+        fn set_fail_on(&self, agent_id: &str) {
+            *self.fail_on.lock().unwrap() = Some(agent_id.to_string());
+        }
     }
 
     impl TenantLauncher for StubLauncher {
         fn launch(&self, spec: &TenantLaunchSpec) -> anyhow::Result<Box<dyn TenantProcess>> {
+            if self.fail_on.lock().unwrap().as_deref() == Some(spec.agent_id.as_str()) {
+                anyhow::bail!("stub launcher: forced launch failure for {:?}", spec.agent_id);
+            }
             let running = Arc::new(AtomicBool::new(true));
             self.switches.lock().unwrap().insert(spec.agent_id.clone(), running.clone());
             self.launched.lock().unwrap().push(spec.clone());
@@ -533,6 +604,15 @@ mod tests {
             assert!(ports.insert(r.allocation.gateway_port), "duplicate port across tenants");
             assert!(paths.insert(r.treasury_path.clone()), "two tenants share a treasury path");
             assert_eq!(r.allocation.instance_id, format!("kirby-{}", r.agent_id));
+            // G-TENANT-ISOLATION: the recorded treasury path MUST be the path the child
+            // actually opens. The child sets node_id = instance_id and opens
+            // `treasury_path_for(node_id)`, so the record must match that, NOT
+            // `treasury_path_for_agent(agent_id)` (a path no child ever opens).
+            assert_eq!(
+                r.treasury_path,
+                crate::boot::treasury_path_for(&r.allocation.instance_id),
+                "recorded treasury path must be the child's real (instance_id-derived) path"
+            );
         }
 
         // Each tenant got its OWN per-agent lease grant to this node (per-agent, S1).
@@ -616,6 +696,91 @@ mod tests {
         };
         sup2.launch_one(&tenant("alice", 1_000_000)).await.expect("relaunch after release");
         assert_eq!(sup2.tenant_count(), 1);
+    }
+
+    /// A MID-BATCH launch failure rolls back the WHOLE batch: every tenant already launched is
+    /// KILLED (its child terminated, not merely dropped) and REAPED (its allocator slot freed),
+    /// so the failed batch leaves no orphaned child and no leaked slot. TEETH: after the
+    /// failure the already-launched tenants' kill-switches read false (killed), nothing is
+    /// tracked, the allocator is empty, and every freed CID is reusable by a fresh batch.
+    #[tokio::test]
+    async fn mid_batch_launch_failure_kills_and_releases_already_launched_tenants() {
+        let cfg = base_config_with_tenants(vec![
+            tenant("alice", 1_000_000),
+            tenant("bob", 1_000_000),
+            tenant("carol", 1_000_000), // carol's launch fails, after alice + bob are up
+        ]);
+        let allocator = Allocator::new(&cfg.fleet);
+        let grantor = Arc::new(StubGrantor::default());
+        let launcher = Arc::new(StubLauncher::default());
+        launcher.set_fail_on("carol");
+        let mut sup = FleetSupervisor::new(1, cfg, allocator, grantor, launcher.clone());
+
+        let err = sup.launch_all().await.unwrap_err();
+        assert!(
+            err.to_string().contains("forced launch failure"),
+            "the mid-batch failure surfaces: {err}"
+        );
+
+        // The whole batch was rolled back: nothing is tracked.
+        assert_eq!(sup.tenant_count(), 0, "a failed batch must track no tenants");
+
+        // The already-launched tenants' OS children were KILLED (a dropped Child keeps
+        // running; the supervisor must signal them). Their kill-switches read false.
+        for id in ["alice", "bob"] {
+            let flag = launcher.maybe_running_flag(id).expect("alice/bob were launched");
+            assert!(
+                !flag.load(Ordering::SeqCst),
+                "{id}'s child must be killed on a rolled-back batch (no orphan)"
+            );
+        }
+        // carol's launch failed, so carol was never launched.
+        assert!(launcher.maybe_running_flag("carol").is_none(), "carol never launched");
+
+        // Their allocator slots were RELEASED: a fresh full batch succeeds (no leaked slot,
+        // and the freed CIDs are reusable).
+        let cfg2 = base_config_with_tenants(vec![tenant("alice", 1), tenant("bob", 1)]);
+        let allocator2 = Allocator::new(&cfg2.fleet);
+        let mut sup2 = FleetSupervisor::new(
+            1,
+            cfg2,
+            allocator2,
+            Arc::new(StubGrantor::default()),
+            Arc::new(StubLauncher::default()),
+        );
+        let records = sup2.launch_all().await.expect("a clean batch after a failed one");
+        assert_eq!(records.len(), 2);
+    }
+
+    /// `reap_dead` releases the allocator slot for EVERY exited tenant (the supervisor's
+    /// shutdown/restart-safety cleanup) and leaves running tenants alone. TEETH: after a
+    /// tenant dies and is reaped, its slot is reusable; a still-running tenant is untouched.
+    #[tokio::test]
+    async fn reap_dead_releases_exited_tenant_slots_only() {
+        let cfg = base_config_with_tenants(vec![tenant("alice", 1), tenant("bob", 1)]);
+        let allocator = Allocator::new(&cfg.fleet);
+        let launcher = Arc::new(StubLauncher::default());
+        let mut sup = FleetSupervisor::new(
+            1,
+            cfg,
+            allocator,
+            Arc::new(StubGrantor::default()),
+            launcher.clone(),
+        );
+        sup.launch_all().await.expect("launch all");
+
+        // alice dies; bob stays up.
+        launcher.running_flag("alice").store(false, Ordering::SeqCst);
+
+        let reaped = sup.reap_dead();
+        assert_eq!(reaped.len(), 1, "exactly the one dead tenant is reaped");
+        assert_eq!(reaped[0].agent_id, "alice");
+        assert_eq!(sup.tenant_count(), 1, "bob is still tracked");
+        assert_eq!(sup.tenant_status("bob"), Some(TenantStatus::Running), "bob untouched");
+        assert!(sup.tenant_status("alice").is_none(), "alice was reaped");
+
+        // A second reap with no dead tenants is a no-op.
+        assert!(sup.reap_dead().is_empty(), "no dead tenants => empty reap");
     }
 
     /// The real launcher derives a per-tenant child config that is DB-per-agent isolated: the

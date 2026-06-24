@@ -245,6 +245,49 @@ impl Allocator {
     }
 }
 
+/// An EXCLUSIVE interprocess lock over a fleet allocator directory, held for the lifetime of a
+/// supervisor process. The allocator state is a plain JSON file with no lock of its own, so two
+/// concurrent `kirby fleet` supervisors pointed at the same dir would independently
+/// `load_or_new` and allocate the SAME CID/port (double-allocation). This guard takes a sled
+/// exclusive dir lock (the SAME mechanism the per-node treasury uses, treasury.rs/boot.rs:
+/// sled `flock`s its dir on open) on a sibling `<alloc_dir>/.fleet-allocator-lock` directory.
+/// A second supervisor's `acquire` fails fast with a clear contention error rather than
+/// double-allocating. Bind it for the supervisor's lifetime; dropping it releases the lock.
+#[must_use = "dropping the FleetAllocatorLock releases the exclusive allocator lock; bind it for the supervisor's lifetime"]
+pub struct FleetAllocatorLock {
+    /// The open sled db whose `flock` IS the lock. Held only to keep the lock; never read.
+    _db: sled::Db,
+}
+
+impl FleetAllocatorLock {
+    /// The lock-dir name placed alongside the allocator JSON file inside the allocator dir.
+    const LOCK_DIR: &'static str = ".fleet-allocator-lock";
+
+    /// Take the exclusive lock on `alloc_dir`. Creates the lock dir if absent, then opens a
+    /// sled db over it (sled `flock`s the dir). Fails fast if another supervisor already holds
+    /// it (sled lock contention) so two `kirby fleet` processes can never double-allocate; any
+    /// other open error (a real I/O fault, corruption) is surfaced as-is.
+    pub fn acquire(alloc_dir: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(alloc_dir).map_err(|e| {
+            anyhow::anyhow!("create fleet allocator dir {}: {e}", alloc_dir.display())
+        })?;
+        let lock_path = alloc_dir.join(Self::LOCK_DIR);
+        let db = sled::open(&lock_path).map_err(|e| {
+            if e.to_string().contains("could not acquire lock") {
+                anyhow::anyhow!(
+                    "fleet supervisor: another `kirby fleet` already holds the allocator lock at \
+                     {} (refusing to start a second supervisor on the same allocator, which would \
+                     double-allocate CIDs/ports)",
+                    lock_path.display()
+                )
+            } else {
+                anyhow::anyhow!("open fleet allocator lock {}: {e}", lock_path.display())
+            }
+        })?;
+        Ok(FleetAllocatorLock { _db: db })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +381,38 @@ mod tests {
         let mut reloaded2 = Allocator::load_or_new(&cfg, &path).expect("reload 2");
         let cid_d = reloaded2.allocate("agent-d").expect("alloc d").guest_cid;
         assert_eq!(cid_d, cid_a, "a released CID should be reusable after a restart");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G-ALLOC-LOCK: the allocator dir takes an EXCLUSIVE interprocess lock, so two concurrent
+    /// supervisors can never both load + allocate against the same dir (double-allocation). A
+    /// second `acquire` while the first guard is held FAILS FAST; once the first guard drops,
+    /// a fresh acquire succeeds (the lock is released).
+    #[test]
+    fn allocator_dir_takes_an_exclusive_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "kirby-fleet-lock-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+
+        let first = FleetAllocatorLock::acquire(&dir).expect("first supervisor takes the lock");
+
+        // A second supervisor on the SAME dir is refused while the first holds the lock.
+        let msg = match FleetAllocatorLock::acquire(&dir) {
+            Ok(_) => panic!("a second supervisor must not acquire the held allocator lock"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("already holds the allocator lock"),
+            "the contention error must name the held lock: {msg}"
+        );
+
+        // Dropping the first guard releases the lock; a fresh acquire then succeeds.
+        drop(first);
+        let third = FleetAllocatorLock::acquire(&dir).expect("the lock is reusable after release");
+        drop(third);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
