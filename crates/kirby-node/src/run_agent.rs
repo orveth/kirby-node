@@ -830,6 +830,7 @@ mod tests {
             },
             agent_id: "agent-0".to_string(),
             node_id: "node-1".to_string(),
+            fleet: Default::default(),
         }
     }
 

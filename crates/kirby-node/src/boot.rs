@@ -301,6 +301,17 @@ fn treasury_path_for(node_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kirby-treasury-{node_id}"))
 }
 
+/// The per-AGENT treasury store path (fleet-host S0, spec 2.1): DB-per-agent, so each
+/// fleet tenant takes its OWN sled exclusive dir lock (boot.rs documents the lock at
+/// `boot_and_observe`) and there is ZERO cross-tenant contention. The single-agent
+/// default keeps using [`treasury_path_for`] (per node_id) verbatim, so a bare
+/// `kirby run` is unchanged; only a fleet supervisor reaches for this per-agent path.
+/// Agent-keyed TREES inside one sled were rejected (spec 2.1): they would re-serialize
+/// every tenant behind one lock, re-introducing the coupling DB-per-agent avoids.
+pub fn treasury_path_for_agent(agent_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("kirby-treasury-agent-{agent_id}"))
+}
+
 /// The §7.2 wallet<->counter reconcile decision (brain-routstr R2-3/R2-5): the wallet
 /// must back every sat the metabolism counter believes it has, so the gateway never
 /// authorizes a think the wallet can't fund. The invariant is `>=`, NEVER `==` (R2-3:

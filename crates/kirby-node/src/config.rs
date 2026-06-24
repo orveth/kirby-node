@@ -87,6 +87,65 @@ pub struct KirbyConfig {
     /// beacon's node_id). Defaults to [`default_node_id`].
     #[serde(default = "default_node_id")]
     pub node_id: String,
+    /// The OPTIONAL multi-tenant fleet-host block (fleet-host S0). Every field
+    /// defaults, so a bare config (or none) leaves a single-agent `kirby run`
+    /// byte-identical to its pre-fleet behavior: nothing reads `fleet` unless the
+    /// fleet supervisor is explicitly started (a later slice). This block only
+    /// carries the allocator base + the per-host tenant ceiling for now.
+    #[serde(default)]
+    pub fleet: FleetConfig,
+}
+
+/// The `[fleet]` config block (fleet-host S0): the knobs the fleet supervisor uses
+/// to host many tenants on one node. Every field defaults so an absent `[fleet]`
+/// block (the single-agent default) is unchanged. This block is INERT until a fleet
+/// supervisor is explicitly started; `Command::Run` / `kirby run` never read it.
+///
+/// `base_cid` seeds the monotonic CID allocator (one genome per guest CID,
+/// sandbox.rs:363-366); it starts HIGH because vsock reserves CIDs 0, 1, and 2.
+/// `max_tenants` is the per-host tenant ceiling (you cannot host what the host
+/// cannot fit): the allocator hands out at most this many distinct slots and then
+/// rejects on exhaustion. `gateway_port_base` seeds the per-tenant gateway vsock
+/// port (sandbox.rs:367-368), allocated alongside the CID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetConfig {
+    /// The base guest CID the allocator counts up from (tenant n gets `base_cid + n`).
+    /// Defaults to [`default_fleet_base_cid`] (well above the vsock-reserved 0..=2).
+    #[serde(default = "default_fleet_base_cid")]
+    pub base_cid: u32,
+    /// The per-host tenant ceiling. The allocator hands out at most this many slots
+    /// and rejects further requests as exhausted. Defaults to [`default_fleet_max_tenants`].
+    #[serde(default = "default_fleet_max_tenants")]
+    pub max_tenants: u32,
+    /// The base gateway vsock port the allocator counts up from (tenant n gets
+    /// `gateway_port_base + n`). Defaults to [`default_fleet_gateway_port_base`].
+    #[serde(default = "default_fleet_gateway_port_base")]
+    pub gateway_port_base: u32,
+}
+
+/// The base guest CID the fleet allocator counts up from. 100 is well above the
+/// vsock-reserved range (CIDs 0, 1, 2 are reserved by the vsock layer), so the first
+/// tenant's CID never collides with a reserved value.
+pub const fn default_fleet_base_cid() -> u32 {
+    100
+}
+/// The default per-host tenant ceiling.
+pub const fn default_fleet_max_tenants() -> u32 {
+    16
+}
+/// The base gateway vsock port the fleet allocator counts up from.
+pub const fn default_fleet_gateway_port_base() -> u32 {
+    9000
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        FleetConfig {
+            base_cid: default_fleet_base_cid(),
+            max_tenants: default_fleet_max_tenants(),
+            gateway_port_base: default_fleet_gateway_port_base(),
+        }
+    }
 }
 
 /// The node identity (Nostr key) and treasury directory.

@@ -79,6 +79,7 @@ fn bootstrap_config(test: &str, image_dir: PathBuf, funding_sats: u64) -> KirbyC
         },
         agent_id: format!("agent-{test}"),
         node_id: format!("node-{test}-{}", std::process::id()),
+        fleet: Default::default(),
     }
 }
 
