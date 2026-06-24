@@ -182,19 +182,22 @@ impl MeteredRunConfig {
     }
 }
 
-/// The FLOOR-HALT threshold for a run, derived from its boot config (the diarist's death
-/// mechanism). Covers BOTH bootstrap and resume (it reads `config.boot`, not the run mode).
+/// The FLOOR-HALT threshold for a run, derived from its boot config (the death mechanism for the
+/// think-gated diarist + capable loops). Covers BOTH bootstrap and resume (it reads `config.boot`,
+/// not the run mode).
 fn diarist_halt_floor(boot: &BootConfig) -> u64 {
     halt_floor_for(boot.workload.as_deref(), boot.brain.as_ref().map(|b| b.max_cost_sats))
 }
 
-/// Pure core of the floor derivation (unit-testable without a full `BootConfig`). ONLY the
-/// diarist (which runs at zero synthetic rent) gets a floor, equal to its per-think D-20 cap
-/// (`brain.max_cost_sats`): at or above the cap any think is affordable, so halting strictly
-/// below it is a real death (no premature kill) and forecloses the rent=0 zombie. Every other
-/// workload gets `0` (disabled) and keeps relying on synthetic rent for its halt — unchanged.
+/// Pure core of the floor derivation (unit-testable without a full `BootConfig`). The diarist AND
+/// the capable loop (both run at zero synthetic rent) get a floor, equal to the per-think D-20 cap
+/// (`brain.max_cost_sats`): at or above the cap any think is affordable, so halting strictly below
+/// it is a real death (no premature kill) and forecloses the rent=0 zombie where a think-gated
+/// agent parks below its cap yet is never halted (FIX-5: capable is now routable, so it needs the
+/// SAME death floor as the diarist). Every other workload gets `0` (disabled) and keeps relying on
+/// synthetic rent for its halt, unchanged.
 fn halt_floor_for(workload: Option<&str>, brain_max_cost_sats: Option<u64>) -> u64 {
-    if workload == Some("diarist") {
+    if matches!(workload, Some("diarist") | Some("capable")) {
         brain_max_cost_sats.unwrap_or(0)
     } else {
         0
@@ -479,18 +482,22 @@ mod tests {
         }
     }
 
-    /// The FLOOR-HALT derivation (the diarist's death mechanism): ONLY the diarist floors, at
-    /// its per-think D-20 cap; every other workload keeps a 0 floor (disabled, rent-driven).
+    /// The FLOOR-HALT derivation (the death mechanism for the think-gated demos): the diarist AND
+    /// the capable loop floor at their per-think D-20 cap; every other workload keeps a 0 floor
+    /// (disabled, rent-driven).
     #[test]
-    fn halt_floor_is_the_per_think_cap_for_the_diarist_zero_otherwise() {
+    fn halt_floor_is_the_per_think_cap_for_think_gated_workloads_zero_otherwise() {
         assert_eq!(halt_floor_for(Some("diarist"), Some(64)), 64, "the diarist floors at brain.max_cost_sats");
+        // FIX-5: capable is routable + think-gated + zero-rent, so it floors at its per-think cap too.
+        assert_eq!(halt_floor_for(Some("capable"), Some(64)), 64, "the capable loop floors at brain.max_cost_sats");
         // Every other workload keeps a 0 floor (disabled): synthetic rent drives their halt.
         assert_eq!(halt_floor_for(Some("brain"), Some(64)), 0);
         assert_eq!(halt_floor_for(Some("memory"), Some(64)), 0);
         assert_eq!(halt_floor_for(Some("burn"), Some(64)), 0);
         assert_eq!(halt_floor_for(None, Some(64)), 0, "an idle/unset workload is not floored");
-        // A diarist with no brain (validate() forbids it) floors at 0 rather than panicking.
+        // A think-gated workload with no brain (validate() forbids it) floors at 0, no panic.
         assert_eq!(halt_floor_for(Some("diarist"), None), 0);
+        assert_eq!(halt_floor_for(Some("capable"), None), 0);
     }
 
     #[test]
