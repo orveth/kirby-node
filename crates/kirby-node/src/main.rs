@@ -414,6 +414,25 @@ enum Command {
         #[arg(long, default_value = "kirby.toml")]
         config: std::path::PathBuf,
     },
+    /// Run the FLEET SUPERVISOR (fleet-host S2): host the N operator-declared tenants in
+    /// the config's `[fleet]` block as child `kirby agent` processes, each with its own
+    /// allocated CID / instance_id / gateway_port (the S0 allocator), its own per-agent
+    /// treasury (DB-per-agent), and its own per-agent Raft lease granted to this node (S1).
+    /// The supervisor then MONITORS child lifecycle (the dead-tenant detection is the
+    /// failover hook for S5/S6; S2 only tracks it). This is OFF by default: `Run` /
+    /// `kirby run` / `Agent` are byte-identical when the supervisor is not started, so a
+    /// single-agent node is unchanged (G-CLEAN). A config with NO `[[fleet.tenants]]`
+    /// entries hosts nothing.
+    Fleet {
+        /// Path to the `kirby run` config file (TOML); its `[fleet]` block declares the
+        /// tenants to host.
+        #[arg(long, default_value = "kirby.toml")]
+        config: std::path::PathBuf,
+        /// This node's lease id within the agents' cluster (the supervisor grants each
+        /// tenant's lease to this id). The MVP forms a single-node lease cluster.
+        #[arg(long, default_value_t = 1)]
+        node_id: u64,
+    },
     /// INTERNAL (not for direct use): the privileged eBPF egress-byte meter, run
     /// by the daemon through sudo (the D-7 path) because loading and attaching
     /// eBPF needs CAP_BPF the unprivileged daemon lacks. It loads the embedded TC
@@ -657,6 +676,10 @@ fn main() -> anyhow::Result<()> {
             init_tracing();
             run_agent_cmd(config)
         }
+        Command::Fleet { config, node_id } => {
+            init_tracing();
+            run_fleet_supervisor_cmd(config, node_id)
+        }
         Command::EbpfEgress { iface, tick_ms } => run_ebpf_egress(iface, tick_ms),
     }
 }
@@ -679,6 +702,83 @@ async fn run_agent_cmd(config_path: std::path::PathBuf) -> anyhow::Result<()> {
         Ok(())
     } else {
         std::process::exit(1);
+    }
+}
+
+/// The fleet supervisor entry (fleet-host S2): load the config, form a single-node lease
+/// cluster for this node, build the persisted allocator + the real process launcher, launch
+/// every static tenant, then MONITOR child lifecycle until killed. OFF unless `kirby fleet`
+/// is invoked, so the single-agent path is byte-identical (G-CLEAN).
+#[tokio::main]
+async fn run_fleet_supervisor_cmd(
+    config_path: std::path::PathBuf,
+    node_id: u64,
+) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use kirby_node::config::KirbyConfig;
+    use kirby_node::fleet::Allocator;
+    use kirby_node::fleet_supervisor::{FleetSupervisor, ProcessTenantLauncher};
+    use kirby_node::raft_lease::LeaseNode;
+
+    let config = KirbyConfig::load(&config_path)?;
+    tracing::info!(path = %config_path.display(), tenants = config.fleet.tenants.len(), "loaded fleet config");
+
+    // Form a single-node lease cluster for the supervisor (the agents' cluster). A real
+    // multi-node fleet adds peers here; the MVP is single-node so the supervisor is leader
+    // and can grant per-agent leases. A loopback port the OS picks.
+    let lease_node = LeaseNode::start(node_id, "127.0.0.1:0").await?;
+    lease_node
+        .initialize_cluster(&[(node_id, lease_node.addr().to_string())])
+        .await?;
+    lease_node
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("fleet supervisor: lease cluster did not elect a leader"))?;
+
+    // The persisted allocator: restart-safe CIDs (never re-hand a live CID). Stored under
+    // the node's treasury dir alongside the per-tenant treasuries.
+    let alloc_dir = config.identity.treasury_dir();
+    std::fs::create_dir_all(&alloc_dir).ok();
+    let alloc_path = alloc_dir.join("fleet-allocator.json");
+    let allocator = Allocator::load_or_new(&config.fleet, &alloc_path)?;
+
+    // The real launcher spawns each tenant as a child `kirby agent` (the existing
+    // single-agent path) with the allocated CID/port; derived per-tenant configs land under
+    // the node's config dir.
+    let binary = std::env::current_exe()?;
+    let config_dir = alloc_dir.join("fleet-tenant-configs");
+    let launcher = Arc::new(ProcessTenantLauncher::new(config.clone(), binary, config_dir));
+    let grantor = Arc::new(lease_node);
+
+    let mut supervisor = FleetSupervisor::new(node_id, config, allocator, grantor, launcher);
+    let records = supervisor.launch_all().await?;
+    for r in &records {
+        println!(
+            "FLEET tenant launched: agent_id={} cid={} port={} instance_id={} lease_term={} treasury={}",
+            r.agent_id,
+            r.allocation.guest_cid,
+            r.allocation.gateway_port,
+            r.allocation.instance_id,
+            r.lease_term,
+            r.treasury_path.display()
+        );
+    }
+    println!("FLEET supervisor: {} tenant(s) launched, monitoring lifecycle", records.len());
+
+    // Monitor: report dead tenants on a tick (the failover hook for S5/S6; S2 only tracks).
+    // Runs until killed; exits cleanly when all tenants have died (nothing left to host).
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let dead = supervisor.dead_tenants();
+        for agent_id in &dead {
+            tracing::warn!(agent_id, "FLEET tenant EXITED (failover hook for S5/S6; S2 tracks only)");
+        }
+        if !dead.is_empty() && dead.len() == supervisor.tenant_count() {
+            tracing::info!("FLEET supervisor: all tenants have exited; shutting down");
+            return Ok(());
+        }
     }
 }
 

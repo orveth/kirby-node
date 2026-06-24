@@ -184,6 +184,7 @@ pub mod egress_run;
 #[cfg(target_os = "linux")]
 pub mod firecracker;
 pub mod fleet;
+pub mod fleet_supervisor;
 #[cfg(target_os = "linux")]
 pub mod full_loop_run;
 pub mod gateway;

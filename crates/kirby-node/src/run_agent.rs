@@ -51,6 +51,13 @@ const DEFAULT_PORT: u32 = 5000;
 /// The default boot-hello timeout.
 const DEFAULT_HELLO_TIMEOUT: Duration = Duration::from_secs(40);
 
+/// Read a `u32` env var, returning `None` if unset or unparseable. Used ONLY by the
+/// fleet supervisor's per-tenant CID/port override (fleet-host S2); absent for every
+/// non-fleet run, so the single-agent path keeps its compile-time defaults.
+fn env_u32(name: &str) -> Option<u32> {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<u32>().ok())
+}
+
 /// The lifecycle event a run emits. `born` on a bootstrap boot, `died` on a
 /// budget-death or clean shutdown. Carried in the outcome so a test can assert the
 /// run reached the expected lifecycle milestone.
@@ -195,13 +202,21 @@ impl RunAgentConfig {
             .identity
             .treasury_dir()
             .join(format!("checkpoints-{}", config.agent_id));
+        // The fleet supervisor (fleet-host S2) launches each tenant as a `kirby agent`
+        // CHILD and must hand it the per-tenant CID/port the S0 allocator assigned, so N
+        // tenant VMs on one host stay distinct (one genome per CID, sandbox.rs:363-366).
+        // It passes them through these env vars; when UNSET (every non-fleet `kirby agent`
+        // and `kirby run`) the values are byte-identical to the pre-fleet DEFAULT_CID /
+        // DEFAULT_PORT, so the single-agent path is unchanged (G-CLEAN).
+        let guest_cid = env_u32("KIRBY_GUEST_CID").unwrap_or(DEFAULT_CID);
+        let gateway_port = env_u32("KIRBY_GATEWAY_PORT").unwrap_or(DEFAULT_PORT);
         Ok(RunAgentConfig {
             config,
             image_dir,
             meter_tick: DEFAULT_METER_TICK,
             max_run: DEFAULT_MAX_RUN,
-            guest_cid: DEFAULT_CID,
-            gateway_port: DEFAULT_PORT,
+            guest_cid,
+            gateway_port,
             vcpu_count: DEFAULT_VCPU,
             mem_size_mib: DEFAULT_MEM_MIB,
             hello_timeout: DEFAULT_HELLO_TIMEOUT,

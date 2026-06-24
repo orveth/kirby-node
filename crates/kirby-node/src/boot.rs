@@ -305,7 +305,7 @@ async fn build_nostr_actuator(
 
 /// The per-node treasury store path (the daemon-owned counter, D-9). A per-node temp
 /// store keeps two node processes distinct on one host.
-fn treasury_path_for(node_id: &str) -> PathBuf {
+pub(crate) fn treasury_path_for(node_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kirby-treasury-{node_id}"))
 }
 

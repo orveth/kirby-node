@@ -121,6 +121,66 @@ pub struct FleetConfig {
     /// `gateway_port_base + n`). Defaults to [`default_fleet_gateway_port_base`].
     #[serde(default = "default_fleet_gateway_port_base")]
     pub gateway_port_base: u32,
+    /// The STATIC, operator-declared tenants the fleet supervisor launches (fleet-host
+    /// S2). Empty by default, so an absent `[fleet]` block (or one with no `[[fleet.tenants]]`
+    /// entries) hosts NO tenants and a bare `kirby run` is unchanged. The spawn control-plane
+    /// (a later slice) adds tenants dynamically; S2 launches exactly this static set. Each
+    /// entry names one agent the supervisor allocates resources for, grants a per-agent lease
+    /// to, and launches as a child process.
+    #[serde(default)]
+    pub tenants: Vec<TenantConfig>,
+}
+
+/// One operator-declared fleet tenant (fleet-host S2): the static description of an agent
+/// the supervisor hosts. The supervisor turns this into an allocated resource triple (CID
+/// /instance_id/gateway_port), a per-agent treasury path, a per-agent lease grant, and a
+/// child `kirby agent` process. Only `agent_id` is required; the rest reuse the host's
+/// defaults so a teammate declares a tenant with one line. The `agent_id` is validated
+/// (non-empty, charset, length) the same as the top-level `agent_id`, because it feeds
+/// filesystem treasury paths + host interface names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantConfig {
+    /// The agent id for this tenant (the lease-map key, the treasury-path label, the
+    /// instance-id stem `kirby-<agent_id>`). Must be unique within the fleet and valid as
+    /// a path/interface component (validated like the top-level `agent_id`).
+    pub agent_id: String,
+    /// Initial treasury balance for this tenant (play-money), seeded on first creation of
+    /// the tenant's per-agent treasury. Defaults to [`default_tenant_initial_sats`].
+    #[serde(default = "default_tenant_initial_sats")]
+    pub initial_sats: u64,
+}
+
+/// The default per-tenant initial treasury balance (play-money for the fleet MVP).
+pub const fn default_tenant_initial_sats() -> u64 {
+    1_000_000
+}
+
+/// Validate an agent/node/tenant label that feeds filesystem treasury paths, host
+/// instance ids (jail / cgroup / TAP names), and lease-map keys: non-empty,
+/// length-capped, no path separators or traversal, identifier charset only. The empty
+/// string is reserved as the single-agent lease slot sentinel (raft_lease::DEFAULT_AGENT)
+/// and must never be a configured label. Shared by the top-level `agent_id`/`node_id` and
+/// every fleet tenant id (the new fleet entry points re-port this guard rather than
+/// trusting the input; Codex deep, S1 review).
+pub fn validate_agent_label(label: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{label} must be non-empty");
+    }
+    if value.len() > 64 {
+        anyhow::bail!("{label} must be <= 64 chars (got {})", value.len());
+    }
+    if value == "." || value == ".." {
+        anyhow::bail!("{label} must not be a path component (got {value:?})");
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        anyhow::bail!(
+            "{label} must contain only ASCII alphanumerics, '-', '_', or '.' (got {value:?}); it feeds filesystem paths and host interface names"
+        );
+    }
+    Ok(())
 }
 
 /// The base guest CID the fleet allocator counts up from. 100 is well above the
@@ -144,6 +204,7 @@ impl Default for FleetConfig {
             base_cid: default_fleet_base_cid(),
             max_tenants: default_fleet_max_tenants(),
             gateway_port_base: default_fleet_gateway_port_base(),
+            tenants: Vec::new(),
         }
     }
 }
@@ -787,23 +848,38 @@ impl KirbyConfig {
         // configured tenant id. An unvalidated id is a path-traversal / collision footgun
         // at the new fleet entry points (Codex deep, S1 review).
         for (label, value) in [("agent_id", &self.agent_id), ("node_id", &self.node_id)] {
-            if value.is_empty() {
-                anyhow::bail!("{label} must be non-empty");
-            }
-            if value.len() > 64 {
-                anyhow::bail!("{label} must be <= 64 chars (got {})", value.len());
-            }
-            if value == "." || value == ".." {
-                anyhow::bail!("{label} must not be a path component (got {value:?})");
-            }
-            if !value
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            {
+            validate_agent_label(label, value)?;
+        }
+        // Fleet tenants (fleet-host S2) feed the SAME treasury paths / instance ids / lease
+        // keys as the top-level agent_id, so each tenant id is validated identically, AND
+        // the tenant set must be free of duplicate agent_ids (a dup would collide on the
+        // treasury path, the lease entry, and the allocator's at-most-once-per-agent slot).
+        // The static set must also fit the per-host ceiling (max_tenants); a config that
+        // declares more tenants than the host can fit is rejected at load, not discovered
+        // mid-launch. These are new fleet entry points, so they re-port the agent_id guards
+        // rather than trusting the input (feedback_new_entry_point_needs_input_guards).
+        let mut seen = std::collections::BTreeSet::new();
+        for tenant in &self.fleet.tenants {
+            validate_agent_label("fleet.tenants.agent_id", &tenant.agent_id)?;
+            if !seen.insert(tenant.agent_id.as_str()) {
                 anyhow::bail!(
-                    "{label} must contain only ASCII alphanumerics, '-', '_', or '.' (got {value:?}); it feeds filesystem paths and host interface names"
+                    "fleet.tenants has a duplicate agent_id {:?}; each tenant must be unique (it keys the treasury path, the lease entry, and the resource slot)",
+                    tenant.agent_id
                 );
             }
+            if tenant.initial_sats == 0 {
+                anyhow::bail!(
+                    "fleet.tenants[{:?}].initial_sats must be > 0 (a tenant needs a budget to live)",
+                    tenant.agent_id
+                );
+            }
+        }
+        if (self.fleet.tenants.len() as u64) > self.fleet.max_tenants as u64 {
+            anyhow::bail!(
+                "fleet.tenants declares {} tenants but fleet.max_tenants is {} (the per-host ceiling); raise max_tenants or remove tenants",
+                self.fleet.tenants.len(),
+                self.fleet.max_tenants
+            );
         }
         if self.funding.initial_sats == 0 {
             anyhow::bail!("funding.initial_sats must be > 0 (the agent needs a budget to live)");

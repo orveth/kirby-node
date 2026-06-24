@@ -250,7 +250,7 @@ mod tests {
     use super::*;
 
     fn fleet(base_cid: u32, max_tenants: u32, port_base: u32) -> FleetConfig {
-        FleetConfig { base_cid, max_tenants, gateway_port_base: port_base }
+        FleetConfig { base_cid, max_tenants, gateway_port_base: port_base, tenants: Vec::new() }
     }
 
     /// G-ALLOC core: N tenants get DISTINCT CID/instance_id/gateway_port, and the CID
