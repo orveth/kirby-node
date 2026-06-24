@@ -112,6 +112,16 @@ pub fn act_max_sats(act: &Act) -> Option<u64> {
     }
 }
 
+/// The D-20 never-overspend clamp on a real rail's spend: the actual spend toward
+/// the mint may never exceed `cap_sats` (the gateway-checked estimate), regardless of
+/// the act's requested amount or the mint's reported melt. Pure so the clamp is
+/// fast-unit-testable WITHOUT a live mint; `CdkEcashRail::perform` calls it at BOTH
+/// clamp sites (pre-settle on the requested amount, post-settle on the melt's reported
+/// spend), so the test exercises the real code path, not a copy.
+pub fn clamp_spend(requested: u64, cap_sats: u64) -> u64 {
+    requested.min(cap_sats)
+}
+
 /// The outcome of a rail `perform`.
 pub enum RailOutcome {
     /// The act was performed; `actual_cost` is what to debit (already capped at
@@ -407,7 +417,7 @@ impl Rail for CdkEcashRail {
 
         // D-20: clamp the spend to the cap BEFORE settling, so the mint can never
         // debit past what the gateway's budget gate checked.
-        let spend = settle.amount.min(cap_sats);
+        let spend = clamp_spend(settle.amount, cap_sats);
         if spend == 0 {
             return RailOutcome::UpstreamFailed;
         }
@@ -420,7 +430,7 @@ impl Rail for CdkEcashRail {
                 // The actual cost is the melt's reported spend, clamped at the cap
                 // again (the melt should already be <= spend <= cap; the clamp is
                 // the never-overspend backstop D-20 requires post-perform).
-                let actual_cost = spent.min(cap_sats);
+                let actual_cost = clamp_spend(spent, cap_sats);
                 tracing::info!(
                     mint = %self.mint_id,
                     spent = actual_cost,
