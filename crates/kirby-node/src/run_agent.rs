@@ -413,6 +413,21 @@ fn agent_boot_config(
             Some(pin_diarist_memory_key(&cfg.memory, &cfg.identity)),
             Some(cfg.diarist),
         ),
+        Workload::Capable => (
+            // The capable loop is the both-acts workload (like the diarist): BOTH sentinels in
+            // the allowlist, and it carries brain + memory + diarist (the reused cadence/recall
+            // knobs), so boot_and_observe builds the Completion rail AND injects the Memory
+            // backend on ONE gateway. The fact EngramStore key is pinned to the node identity by
+            // construction, same as the diarist (capable facts are self-encrypted to the node,
+            // the F3 one-key invariant).
+            vec![
+                crate::rail::BRAIN_COMPLETION_DESTINATION.to_string(),
+                crate::rail::MEMORY_DESTINATION.to_string(),
+            ],
+            Some(cfg.brain.clone()),
+            Some(pin_diarist_memory_key(&cfg.memory, &cfg.identity)),
+            Some(cfg.diarist),
+        ),
         _ => (vec!["mint.test.local".to_string()], None, None, None),
     };
     Ok(BootConfig {

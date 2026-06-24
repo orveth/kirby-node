@@ -252,6 +252,18 @@ pub enum Workload {
     /// THINK is the life-gating act: when the treasury can no longer cover a think the
     /// genome parks and the daemon halts the VM (earn-or-die applied to the mind, F4).
     Diarist,
+    /// The CAPABLE workload (the agentic kernel, build-spec slice 1): the genome runs ONE
+    /// PLAN, ACT, VERIFY, learn iteration per tick. It is the diarist that learned to ACT and
+    /// then CHECK: it PLANs one decision (`Completion` via the brain, the life-gating act),
+    /// ACTs on its OWN durable memory (at most one `Memory` SET into `mem/capable/...`, guarded
+    /// genome-side), VERIFYs the effect (a free `Memory` GET read-back), and learns (feeds the
+    /// verified verdict into the next plan). The new muscle is SELF-CORRECTION: a read-back
+    /// mismatch is detected and surfaced for a retry. Like the diarist it is a genome-side
+    /// COMPOSITION of the two acts the daemon already performs and REUSES the `[brain]`,
+    /// `[memory]`, and `[diarist]` config (same allowlist, same cmdline knobs), so it needs no
+    /// new daemon act, rail, metering, crypto, or nerve code. THINK is the life-gating act
+    /// (earn-or-die, F4).
+    Capable,
 }
 
 impl Workload {
@@ -262,6 +274,7 @@ impl Workload {
             Workload::Brain => "brain",
             Workload::Memory => "memory",
             Workload::Diarist => "diarist",
+            Workload::Capable => "capable",
         }
     }
 
@@ -286,6 +299,10 @@ impl Workload {
             // F2 collision). The diarist drives BOTH its think and its write keys off
             // this one checkpointed `seq`.
             Workload::Diarist => true,
+            // The capable loop persists its monotonic `seq` through the SAME wseq-keyed Memory
+            // write (the ACT) exactly as the diarist/memory workloads do, so a restart continues
+            // PAST the last entry rather than re-issuing an old write/think key (F1/F2).
+            Workload::Capable => true,
         }
     }
 }
@@ -688,7 +705,7 @@ impl KirbyConfig {
         // thinks too (its THINK is the same `Completion`, the life-gating act), and it
         // reuses `[brain]`, so it gets the SAME guard — a diarist that cannot afford its
         // first think is a config error caught at load, not a born-then-instantly-dead VM.
-        if matches!(self.workload, Workload::Brain | Workload::Diarist) {
+        if matches!(self.workload, Workload::Brain | Workload::Diarist | Workload::Capable) {
             if self.brain.max_cost_sats == 0 {
                 anyhow::bail!(
                     "brain.max_cost_sats must be > 0 (a zero per-call cap means every think is DENIED_OVER_BUDGET)"
@@ -738,7 +755,7 @@ impl KirbyConfig {
         // must apply BOTH the brain and the memory ceiling check, else every REMEMBER is
         // DENIED_OVER_BUDGET — a config error). (No <= initial_sats check: reads stay
         // free, so a broke agent still lives; the write cost is host-computed per op.)
-        if matches!(self.workload, Workload::Memory | Workload::Diarist)
+        if matches!(self.workload, Workload::Memory | Workload::Diarist | Workload::Capable)
             && self.memory.max_cost_sats == 0
         {
             anyhow::bail!(
@@ -752,11 +769,15 @@ impl KirbyConfig {
         // below the per-think floor (unable to afford another thought) yet never be halted.
         // Reject the combination cleanly at load rather than silently running that zombie.
         // Metered-resume for the diarist is a follow-up; lifting this guard is part of it.
-        if self.workload == Workload::Diarist && self.mode == RunMode::Resume {
+        if matches!(self.workload, Workload::Diarist | Workload::Capable)
+            && self.mode == RunMode::Resume
+        {
             anyhow::bail!(
-                "workload = \"diarist\" does not support mode = \"resume\" yet: the diarist demo \
-                 is bootstrap-only (a resumed diarist skips the metered loop and never arms its \
-                 floor-halt death mechanism). Use mode = \"bootstrap\"; metered-resume is a follow-up."
+                "workload = \"{}\" does not support mode = \"resume\" yet: the diarist/capable \
+                 demos are bootstrap-only (a resumed agent skips the metered loop and never arms \
+                 its floor-halt death mechanism). Use mode = \"bootstrap\"; metered-resume is a \
+                 follow-up.",
+                self.workload.genome_workload()
             );
         }
         // A pinned backend must match the host. `auto` resolves to the native one,
@@ -1344,6 +1365,57 @@ mod tests {
         // The [diarist] block defaulted (none present).
         assert_eq!(cfg.diarist.tick_secs, 60);
         assert_eq!(cfg.diarist.recall_count, 5);
+    }
+
+    /// FIX-1 (config reachability): the daemon CONFIG path can boot the capable loop, not only
+    /// the test's cmdline knob. `workload = "capable"` round-trips to `Workload::Capable`, maps to
+    /// the "capable" genome workload, submits a checkpoint (the wseq resume cursor), reuses the
+    /// [brain] afford-a-think guard, and is bootstrap-only (resume rejected) exactly like the diarist.
+    #[test]
+    fn capable_config_round_trips_and_reuses_the_diarist_wiring() {
+        let toml = |mode: &str| {
+            format!(
+                r#"
+                workload = "capable"
+                mode = "{mode}"
+                genome_image = {{ path = "/tmp/k/img" }}
+                [identity]
+                key_path = "/tmp/k/node.key"
+                [relay]
+                url = "ws://127.0.0.1:7777"
+                [funding]
+                initial_sats = 1000
+                [brain]
+                max_cost_sats = 64
+                [memory]
+                max_cost_sats = 8
+            "#
+            )
+        };
+
+        // bootstrap: a valid capable config parses and resolves to the capable genome workload.
+        let cfg = KirbyConfig::from_toml_str(&toml("bootstrap"))
+            .expect("a valid capable config must validate");
+        assert_eq!(cfg.workload, Workload::Capable);
+        assert_eq!(cfg.workload.genome_workload(), "capable", "boots the capable genome arm");
+        assert!(
+            cfg.workload.submits_checkpoint(),
+            "the capable loop persists its wseq cursor for resume continuity"
+        );
+
+        // resume: bootstrap-only, rejected at load (same as the diarist).
+        let err = KirbyConfig::from_toml_str(&toml("resume")).unwrap_err();
+        assert!(
+            err.to_string().contains("does not support mode = \"resume\""),
+            "capable is bootstrap-only, got: {err}"
+        );
+
+        // reuse: the [brain] afford-a-think guard applies to capable too (it reuses [brain]).
+        let zero_brain = toml("bootstrap").replace("max_cost_sats = 64", "max_cost_sats = 0");
+        assert!(
+            KirbyConfig::from_toml_str(&zero_brain).is_err(),
+            "capable reuses the brain afford-a-think guard (max_cost_sats = 0 rejected)"
+        );
     }
 
     /// An explicit `[diarist]` block parses its two knobs.

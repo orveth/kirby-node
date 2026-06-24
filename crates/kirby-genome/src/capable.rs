@@ -69,6 +69,19 @@ const CAPABLE_NAMESPACE: &str = "mem/capable/";
 /// blindly forwarded to the daemon.
 const MAX_VALUE_BYTES: usize = 4096;
 
+/// The hard cap on a KEY/slug (D-4, FIX-4): a syntactically-valid but pathologically long
+/// `mem/capable/...` slug is rejected genome-side BEFORE dispatch/logging, never forwarded to the
+/// daemon for host-side denial.
+const MAX_KEY_BYTES: usize = 256;
+
+/// The hard cap on a KEY's path-segment count (a second bound on slug complexity).
+const MAX_KEY_SEGMENTS: usize = 16;
+
+/// The bounded, sanitized sample size for the intended/observed bytes echoed into the retry
+/// feedback (FIX-3): enough for the agent to see WHAT diverged, capped so the next prompt stays
+/// small and one-line.
+const FEEDBACK_SAMPLE_BYTES: usize = 256;
+
 /// The Steward's baked persona (v1, D-7, D-8). It IS the PLAN's system prompt: cosmetic for the
 /// stub brain (canned reply), load-bearing for the real RoutstrBrain. The persona name is a
 /// small cosmetic choice (continuity nod: "the Diarist that learned to act"); settle in review.
@@ -194,6 +207,18 @@ fn build_remember(key: Option<String>, value: Option<String>) -> Action {
     if key.is_empty() {
         return Action::Invalid { reason: "REMEMBER with an empty KEY".to_string() };
     }
+    // FIX-4: cap the KEY size + segment count BEFORE writable_key, so a pathologically long but
+    // syntactically-valid slug is a no-op + feedback, never dispatched/logged then host-denied.
+    if key.len() > MAX_KEY_BYTES {
+        return Action::Invalid {
+            reason: format!("KEY exceeds the {MAX_KEY_BYTES}-byte cap ({} bytes)", key.len()),
+        };
+    }
+    if key.split('/').count() > MAX_KEY_SEGMENTS {
+        return Action::Invalid {
+            reason: format!("KEY has too many path segments (> {MAX_KEY_SEGMENTS})"),
+        };
+    }
     let Some(value) = value else {
         return Action::Invalid { reason: "REMEMBER without a VALUE line".to_string() };
     };
@@ -295,19 +320,47 @@ pub(super) fn classify_verify(
 // PLAN prompt, so the loop reasons WITH the verified outcome of its last action.
 // ===========================================================================================
 
-/// The feedback line for a VERIFY verdict. The Mismatch/Unconfirmed lines SURFACE the failure
-/// (they say it FAILED and tell the agent to retry), which is the capability journaling lacks
-/// (K2: detected AND surfaced, never swallowed).
-fn verify_feedback(key: &str, verdict: VerifyOutcome) -> String {
+/// A bounded, sanitized one-line rendering of bytes for the retry feedback (FIX-3): truncated to
+/// `max` bytes (lossy UTF-8) with control chars (newlines included) replaced by spaces, so the
+/// echoed sample cannot inject a fake grammar line into the next PLAN prompt or blow up its size.
+fn summarize_bytes(bytes: &[u8], max: usize) -> String {
+    let truncated = bytes.len() > max;
+    let slice = &bytes[..bytes.len().min(max)];
+    let mut s: String = String::from_utf8_lossy(slice)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if truncated {
+        s.push_str("...");
+    }
+    s
+}
+
+/// The feedback line for a VERIFY verdict (the "learn" step). The Mismatch/Unconfirmed lines
+/// SURFACE the failure (say it FAILED/UNCONFIRMED, tell the agent to retry) AND, per FIX-3, carry
+/// a BOUNDED, sanitized sample of what the agent INTENDED and what the record actually HOLDS, so
+/// the next PLAN knows not just THAT it failed but WHAT to rewrite. The capability journaling
+/// lacks (K2: detected AND surfaced with a retry payload, never swallowed).
+fn verify_feedback(
+    key: &str,
+    verdict: VerifyOutcome,
+    intended: &[u8],
+    observed: Option<&[u8]>,
+) -> String {
     match verdict {
         VerifyOutcome::Confirmed => {
             format!("REMEMBER {key} was CONFIRMED (the stored value matches what you wrote).")
         }
         VerifyOutcome::Mismatch => format!(
-            "REMEMBER {key} FAILED: the stored value does NOT match what you wrote (mismatch). Rewrite it to correct the record."
+            "REMEMBER {key} FAILED: the stored value does NOT match what you wrote (mismatch). You wrote [{}] but the record holds [{}]. Rewrite it to correct the record.",
+            summarize_bytes(intended, FEEDBACK_SAMPLE_BYTES),
+            observed
+                .map(|o| summarize_bytes(o, FEEDBACK_SAMPLE_BYTES))
+                .unwrap_or_else(|| "<unreadable>".to_string())
         ),
         VerifyOutcome::Unconfirmed => format!(
-            "REMEMBER {key} is UNCONFIRMED: the value could not be read back (it may not have stored). Retry it."
+            "REMEMBER {key} is UNCONFIRMED: the value could not be read back (it may not have stored). You intended to write [{}]. Retry it.",
+            summarize_bytes(intended, FEEDBACK_SAMPLE_BYTES)
         ),
     }
 }
@@ -700,13 +753,15 @@ async fn execute_action<G: Gateway>(
                     let readback =
                         read_capable(gw, MemoryOp::Get, key, &capable_verify_key(key, seq)).await;
                     let verdict = classify_verify(value, readback.as_ref());
+                    // The observed bytes (the ground truth) for the retry feedback (FIX-3).
+                    let observed = readback.as_ref().filter(|r| r.found).map(|r| r.value.as_slice());
                     report(
                         gw,
                         "capable_verify",
                         &format!("seq={seq} key={key} verdict={verdict:?}"),
                     )
                     .await;
-                    (true, Some(verdict), verify_feedback(key, verdict))
+                    (true, Some(verdict), verify_feedback(key, verdict, value, observed))
                 }
                 RememberOutcome::Broke => {
                     // Soft skip (D-5): broke enough to think but not to record. NOT death.
@@ -739,6 +794,14 @@ async fn execute_action<G: Gateway>(
     }
 }
 
+/// Whether a tick outcome COMMITS its seq, advancing the loop's monotonic cursor (FIX-2). A
+/// `Transient` does NOT: the next tick reuses the SAME seq so a performed-but-unacked THINK
+/// (a lost response after a real debit) dedupes on its `capable-think-{seq}` key instead of
+/// double-charging a fresh key. `Lived`/`Dead` are terminal, so they commit.
+pub(super) fn tick_commits_seq(outcome: &TickOutcome) -> bool {
+    !matches!(outcome, TickOutcome::Transient)
+}
+
 /// The capable mission-loop (slice 1). PLAN -> ACT -> VERIFY -> learn -> sleep, forever. Never
 /// returns (PID 1): it parks on a THINK denial so the daemon halts the VM (death is the host
 /// halt, F4). Takes `client` by value (re-dialing internally on a transient), like the Diarist.
@@ -763,23 +826,29 @@ pub(super) async fn capable_loop(
     // The ONE monotonic seq (F1/F2), restored from the app checkpoint on resume so the next
     // think/write take a NEW seq, never a reset-to-0. A fresh boot starts at 0. Reuses the
     // diarist/memory KMEM1 contract verbatim (D-6).
-    let mut seq: u64 = restore_wseq(ctx);
-    if seq > 0 {
+    // `committed` is the last seq that ran to a TERMINAL outcome (Lived/Dead) or the restored
+    // checkpoint; each tick runs at `committed + 1`. A fresh boot starts at 0. On a Transient the
+    // committed seq is NOT advanced (FIX-2), so the retry reuses the SAME seq and the daemon
+    // dedupes a performed-but-unacked think rather than double-charging a fresh key.
+    let mut committed: u64 = restore_wseq(ctx);
+    if committed > 0 {
         boot_log(&format!(
-            "capable_loop RESUMED: seq restored to {seq} from the app checkpoint; the next think/write take seq > {seq}"
+            "capable_loop RESUMED: seq restored to {committed} from the app checkpoint; the next think/write take seq > {committed}"
         ));
     }
     // Submit the restored/fresh seq once up front (the resume cursor must exist even if the first
     // think is denied). Harmless on a fresh boot (seq 0); the daemon's wseq_floor backstops it.
-    submit_wseq_checkpoint(&mut client, seq).await;
+    submit_wseq_checkpoint(&mut client, committed).await;
 
     let mut last_treasury_remaining: u64 = ctx.budget_sats;
     let mut last_think_cost: u64 = 0;
     let mut last_feedback: Option<String> = None;
 
     loop {
-        seq += 1;
-        match capable_tick(
+        // Run this tick at the seq PAST the last committed one. On a Transient we do NOT commit,
+        // so the next loop reuses this exact seq (idempotent think retry, FIX-2).
+        let seq = committed + 1;
+        let outcome = capable_tick(
             &mut client,
             seq,
             &params,
@@ -788,8 +857,9 @@ pub(super) async fn capable_loop(
             last_feedback.as_deref(),
             &ctx.task_descriptor,
         )
-        .await
-        {
+        .await;
+        let commits = tick_commits_seq(&outcome);
+        match outcome {
             TickOutcome::Lived {
                 think_cost,
                 treasury_remaining,
@@ -832,15 +902,19 @@ pub(super) async fn capable_loop(
                 idle_forever().await;
             }
             TickOutcome::Transient => {
-                // A dead channel or unexpected outcome: re-dial and keep ticking (the think/write
-                // dedupe on the retry; the seq is not advanced).
+                // A dead channel or unexpected outcome: re-dial and keep ticking. The seq is NOT
+                // committed below, so the retry reuses `capable-think-{seq}` (idempotent, FIX-2).
                 boot_log(&format!(
-                    "capable_loop seq={seq}: transient hiccup; re-dialing the gateway"
+                    "capable_loop seq={seq}: transient hiccup; reusing seq on retry, re-dialing the gateway"
                 ));
                 if let Some(c) = redial(port).await {
                     client = c;
                 }
             }
+        }
+        // Advance the cursor only on a terminal outcome (FIX-2): a Transient keeps the seq.
+        if commits {
+            committed = seq;
         }
 
         tokio::time::sleep(params.tick).await;
@@ -1119,10 +1193,20 @@ mod tests {
 
     #[test]
     fn mismatch_feedback_surfaces_the_failure() {
-        let f = verify_feedback("mem/capable/x", VerifyOutcome::Mismatch);
+        let f = verify_feedback(
+            "mem/capable/x",
+            VerifyOutcome::Mismatch,
+            b"intended",
+            Some(b"observed"),
+        );
         assert!(f.contains("FAILED"), "the failure must be surfaced, not swallowed: {f}");
         assert!(f.to_lowercase().contains("mismatch"), "{f}");
-        let c = verify_feedback("mem/capable/x", VerifyOutcome::Confirmed);
+        let c = verify_feedback(
+            "mem/capable/x",
+            VerifyOutcome::Confirmed,
+            b"intended",
+            Some(b"intended"),
+        );
         assert!(c.contains("CONFIRMED"), "{c}");
     }
 
@@ -1316,5 +1400,157 @@ mod tests {
         assert!(user.contains("not yet measured"), "no runway estimate before the first think");
         assert!(user.contains("first plan"), "the first-plan feedback placeholder is present");
         assert!(!h[0].content.contains("mission"), "an empty mission is omitted");
+    }
+
+    // ---- FIX-4: the KEY is capped (oversized slug rejected genome-side, zero write) ----
+
+    #[test]
+    fn oversized_key_is_rejected() {
+        let big_key = format!("mem/capable/{}", "x".repeat(MAX_KEY_BYTES));
+        match parse_action(&format!("ACTION: REMEMBER\nKEY: {big_key}\nVALUE: y")) {
+            Action::Invalid { reason } => assert!(reason.contains("KEY"), "{reason}"),
+            other => panic!("expected Invalid for an oversized key, got {other:?}"),
+        }
+        let many_segments = format!("mem/capable/{}", "a/".repeat(MAX_KEY_SEGMENTS + 2));
+        assert!(
+            matches!(
+                parse_action(&format!("ACTION: REMEMBER\nKEY: {many_segments}\nVALUE: y")),
+                Action::Invalid { .. }
+            ),
+            "a key with too many path segments is rejected"
+        );
+        // A normal-length key is still accepted.
+        assert!(matches!(
+            parse_action("ACTION: REMEMBER\nKEY: mem/capable/relay-quiet\nVALUE: y"),
+            Action::Remember { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn tick_issues_no_write_for_an_oversized_key() {
+        let big_key = format!("mem/capable/{}", "x".repeat(MAX_KEY_BYTES + 10));
+        let mut gw = MockGateway::thinking(&format!("ACTION: REMEMBER\nKEY: {big_key}\nVALUE: y"));
+        let params = test_params();
+        match capable_tick(&mut gw, 1, &params, 1_000, 0, None, "").await {
+            TickOutcome::Lived { action, recorded_write, .. } => {
+                assert!(matches!(action, Action::Invalid { .. }), "oversized key -> Invalid");
+                assert!(!recorded_write);
+            }
+            other => panic!("expected Lived, got {other:?}"),
+        }
+        assert_eq!(
+            gw.set_requests(),
+            0,
+            "an oversized key issues ZERO writes (rejected before dispatch)"
+        );
+    }
+
+    // ---- FIX-3: the retry feedback carries intended + observed bytes (bounded, sanitized) ----
+
+    #[tokio::test]
+    async fn mismatch_feedback_carries_intended_and_observed_for_retry() {
+        let mut gw = MockGateway::thinking(
+            "ACTION: REMEMBER\nKEY: mem/capable/relay-quiet\nVALUE: quiet three ticks",
+        );
+        gw.corrupt_readback = Some(b"GARBLED-OBSERVED".to_vec());
+        let params = test_params();
+        let feedback = match capable_tick(&mut gw, 1, &params, 1_000, 0, None, "").await {
+            TickOutcome::Lived { verify: Some(VerifyOutcome::Mismatch), feedback, .. } => feedback,
+            other => panic!("expected a Mismatch Lived, got {other:?}"),
+        };
+        assert!(feedback.contains("quiet three ticks"), "intended value in feedback: {feedback}");
+        assert!(feedback.contains("GARBLED-OBSERVED"), "observed value in feedback: {feedback}");
+        // The next plan carries BOTH so the agent knows WHAT to rewrite, not just that it failed.
+        let next = build_plan_prompt(&[], 2, 995, 5, Some(&feedback), "");
+        assert!(
+            next[1].content.contains("quiet three ticks")
+                && next[1].content.contains("GARBLED-OBSERVED"),
+            "the next plan carries intended + observed: {}",
+            next[1].content
+        );
+    }
+
+    #[test]
+    fn summarize_bytes_bounds_and_sanitizes() {
+        // Bounded: a long value is truncated with an ellipsis.
+        let big = vec![b'x'; FEEDBACK_SAMPLE_BYTES + 50];
+        let s = summarize_bytes(&big, FEEDBACK_SAMPLE_BYTES);
+        assert!(s.ends_with("..."), "oversized samples are truncated: {s}");
+        // Sanitized: newlines (and other control chars) are stripped so the echoed sample cannot
+        // inject a fake grammar line into the next prompt.
+        let injected = b"line1\nACTION: REMEMBER\nKEY: core";
+        let s2 = summarize_bytes(injected, FEEDBACK_SAMPLE_BYTES);
+        assert!(!s2.contains('\n'), "newlines sanitized so the feedback stays one line: {s2}");
+    }
+
+    // ---- FIX-2: a Transient does NOT commit the seq (the retry reuses the think key) ----
+
+    fn lived_dummy() -> TickOutcome {
+        TickOutcome::Lived {
+            think_cost: 1,
+            treasury_remaining: 1,
+            recorded_write: false,
+            action: Action::Note,
+            verify: None,
+            feedback: String::new(),
+        }
+    }
+
+    #[test]
+    fn transient_does_not_commit_the_seq() {
+        assert!(!tick_commits_seq(&TickOutcome::Transient), "a Transient must NOT commit the seq");
+        assert!(tick_commits_seq(&TickOutcome::Dead), "Dead commits the seq");
+        assert!(tick_commits_seq(&lived_dummy()), "Lived commits the seq");
+        // Simulate the loop cursor across a Transient retry: the seq (and the think key) is reused.
+        let mut committed = 0u64;
+        let seq_first = committed + 1;
+        if tick_commits_seq(&TickOutcome::Transient) {
+            committed = seq_first;
+        }
+        let seq_retry = committed + 1;
+        assert_eq!(seq_first, seq_retry, "the Transient retry reuses the seq");
+        assert_eq!(
+            capable_think_key(seq_first),
+            capable_think_key(seq_retry),
+            "the think idempotency key is REUSED on retry (no double-charge)"
+        );
+        // A committed (Lived) tick then advances.
+        if tick_commits_seq(&lived_dummy()) {
+            committed = seq_retry;
+        }
+        assert_ne!(seq_retry, committed + 1, "after a committed tick the seq advances");
+    }
+
+    #[tokio::test]
+    async fn transient_think_reuses_the_idempotency_key_across_a_retry() {
+        let params = test_params();
+        // think_outcome = Unspecified -> classify_think -> Transient (the lost-response hazard).
+        let mut gw = MockGateway::thinking("ACTION: NOTE");
+        gw.think_outcome = Outcome::Unspecified as i32;
+        // tick 1 at seq=1 -> Transient -> committed stays 0.
+        let mut committed = 0u64;
+        let seq1 = committed + 1;
+        let out1 = capable_tick(&mut gw, seq1, &params, 1_000, 0, None, "").await;
+        assert!(matches!(out1, TickOutcome::Transient));
+        if tick_commits_seq(&out1) {
+            committed = seq1;
+        }
+        // tick 2 (the retry) at committed + 1 = 1 again.
+        let seq2 = committed + 1;
+        let out2 = capable_tick(&mut gw, seq2, &params, 1_000, 0, None, "").await;
+        assert!(matches!(out2, TickOutcome::Transient));
+        let think_keys: Vec<String> = gw
+            .requests
+            .iter()
+            .filter_map(|r| match &r.act {
+                Some(Act::Completion(_)) => Some(r.idempotency_key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            think_keys,
+            vec!["capable-think-1".to_string(), "capable-think-1".to_string()],
+            "the retry reuses the SAME think idempotency key (idempotent, no double-charge)"
+        );
     }
 }
