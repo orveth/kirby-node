@@ -29,7 +29,7 @@ use rand::TryRngCore;
 use tonic::{Request, Response, Status};
 
 use crate::checkpoint::{CheckpointArtifact, LatestCheckpoint};
-use crate::raft_lease::{FenceVerdict, LeaseHandle};
+use crate::raft_lease::{FenceVerdict, LeaseAuthority, LeaseHandle};
 use crate::rail::{self, MemoryBackend, MemoryWrite, Rail, RailOutcome};
 use crate::treasury::{DebitOutcome, Treasury, TreasuryError};
 
@@ -99,8 +99,12 @@ pub struct GatewayService {
 /// T, after the lease moved to T+1, fences out here and cannot debit.
 #[derive(Clone)]
 pub struct LeaseFence {
-    /// The lease handle for THIS node (reads the committed lease + leadership).
-    pub handle: LeaseHandle,
+    /// The lease authority for THIS node (reads the committed lease + leadership). Held
+    /// behind the [`LeaseAuthority`] TRAIT, not the concrete `LeaseHandle`, so a future
+    /// per-agent FROST-quorum lease impl drops in WITHOUT touching the gateway (the fleet
+    /// scaling seam). `Arc<dyn>` keeps the fence cheap to clone (the serve path clones it
+    /// per connection), mirroring the `Rail`/`MemoryBackend` seams.
+    pub handle: Arc<dyn LeaseAuthority>,
     /// The agent_id this gateway serves (fleet-host S1): the fence reads only THIS
     /// agent's per-agent lease entry, so a tenant is fenced on its OWN lease and a grant
     /// for another tenant never un-fences or fences this one. The single-agent path uses
@@ -197,6 +201,21 @@ impl GatewayService {
         self.with_lease_fence_for(handle, crate::raft_lease::DEFAULT_AGENT.to_string(), vm_term)
     }
 
+    /// Attach the lease fence from any [`LeaseAuthority`] (the trait seam, not the
+    /// concrete handle): a future per-agent FROST-quorum lease impl attaches here exactly
+    /// like the Raft `LeaseHandle` does, with no gateway change. The `LeaseHandle`-typed
+    /// constructors above are thin convenience wrappers that box into this; this is the
+    /// general entry point the supervisor (or a swapped impl) uses.
+    pub fn with_lease_authority(
+        mut self,
+        authority: Arc<dyn LeaseAuthority>,
+        agent_id: crate::raft_lease::AgentId,
+        vm_term: u64,
+    ) -> Self {
+        self.lease_fence = Some(LeaseFence { handle: authority, agent_id, vm_term });
+        self
+    }
+
     /// Attach the PER-AGENT lease fence (fleet-host S1, spec 2.2): the gateway debits
     /// only when THIS node holds `agent_id`'s active lease at the current committed term;
     /// otherwise STEP 0 of `authorize_capability` returns `DENIED_NOT_ACTIVE_LEASE` and
@@ -204,13 +223,14 @@ impl GatewayService {
     /// its OWN lease and a grant moving another tenant's lease never affects it. `vm_term`
     /// is the term the node held this agent's lease at when the VM started.
     pub fn with_lease_fence_for(
-        mut self,
+        self,
         handle: LeaseHandle,
         agent_id: crate::raft_lease::AgentId,
         vm_term: u64,
     ) -> Self {
-        self.lease_fence = Some(LeaseFence { handle, agent_id, vm_term });
-        self
+        // Box the concrete Raft handle into the trait seam; the fence stores only
+        // `Arc<dyn LeaseAuthority>`, so the debit path never depends on the concrete type.
+        self.with_lease_authority(Arc::new(handle), agent_id, vm_term)
     }
 
     /// Attach an observer that receives a copy of every genome `ReportEvent`.
@@ -353,7 +373,7 @@ impl GatewayService {
                         committed_term,
                         committed_holder,
                         believed_term,
-                        node = fence.handle.id(),
+                        node = fence.handle.node_id(),
                         "RequestCapability FENCED: this node does not hold the active lease at the current term; debiting 0 (no double-burn, gate G8)"
                     );
                     return Ok(denied(Outcome::DeniedNotActiveLease, self.balance()?));

@@ -854,6 +854,68 @@ async fn handle_rpc_conn(mut stream: TcpStream, raft: LeaseRaft) -> io::Result<(
     Ok(())
 }
 
+/// THE LEASE SEAM (fleet-host scaling seam): exactly what the gateway money-fence and
+/// the (future) fleet supervisor need from the lease, behind a trait so the concrete
+/// lease implementation can be swapped WITHOUT touching the gateway. Today the only
+/// impl is the single-global-Raft-cluster [`LeaseHandle`] (a tens-of-nodes design: one
+/// `BTreeMap<AgentId,ActiveLease>` linearized by one Raft group). Tomorrow a per-agent
+/// FROST-quorum-signed lease (each agent its own threshold-signed lease, no shared
+/// cluster) can implement the SAME three methods and drop in unchanged; the gateway
+/// fence (which holds a `dyn LeaseAuthority`) and the supervisor never learn which.
+///
+/// The trait is deliberately MINIMAL: it is the read-side the fence + supervisor use to
+/// answer "may THIS node act for `agent_id` right now?" and "what term is it active at?"
+/// It does NOT expose granting (that is impl-specific: a Raft `client_write` vs a FROST
+/// ceremony), so a caller behind the trait cannot mutate the lease, only read it. This
+/// keeps the seam read-only and the no-split-brain guarantee owned by the concrete impl.
+///
+/// Object-safe via `async_trait` (the gateway holds it as `Arc<dyn LeaseAuthority>`, like
+/// the `Rail`/`MemoryBackend` seams), and `Send + Sync` so it crosses the serve tasks.
+#[async_trait::async_trait]
+pub trait LeaseAuthority: Send + Sync {
+    /// This node's id (for evidence/logging on a fence-deny). Stable for the impl's life.
+    fn node_id(&self) -> LeaseNodeId;
+
+    /// The committed active lease for `agent_id`, or `None` if none is committed for it.
+    /// Reads ONLY this agent's entry, so it never reports another agent's holder.
+    async fn active_lease_for(&self, agent_id: &str) -> Option<ActiveLease>;
+
+    /// THE ACTIVE-NODE CHECK for `agent_id`: the term THIS node is active at for the
+    /// agent (it both is the authority's leader AND holds the agent's committed lease at
+    /// the current term), or `None` (not active for this agent). The supervisor uses this
+    /// to confirm a tenant it launched genuinely holds its agent's lease.
+    async fn active_term_for(&self, agent_id: &str) -> Option<u64>;
+
+    /// THE TERM-FENCE for `agent_id` for a node that BELIEVES it is active at
+    /// `believed_term`: `Active` only if the currently-committed lease for the agent still
+    /// names this node at a term >= `believed_term` (and this node still leads); otherwise
+    /// `Fenced`. This is the single check the gateway money-path gates every debit on.
+    async fn fence_for(&self, agent_id: &str, believed_term: u64) -> FenceVerdict;
+}
+
+/// The single-cluster Raft implementation of the lease seam: [`LeaseHandle`] already
+/// has these exact methods (this just exposes them through the trait), so the gateway
+/// fence and the supervisor depend on `LeaseAuthority`, not the concrete handle. A
+/// per-agent FROST-quorum lease impl drops in here later with zero gateway change.
+#[async_trait::async_trait]
+impl LeaseAuthority for LeaseHandle {
+    fn node_id(&self) -> LeaseNodeId {
+        self.id()
+    }
+
+    async fn active_lease_for(&self, agent_id: &str) -> Option<ActiveLease> {
+        LeaseHandle::active_lease_for(self, agent_id).await
+    }
+
+    async fn active_term_for(&self, agent_id: &str) -> Option<u64> {
+        LeaseHandle::active_term_for(self, agent_id).await
+    }
+
+    async fn fence_for(&self, agent_id: &str, believed_term: u64) -> FenceVerdict {
+        LeaseHandle::fence_for(self, agent_id, believed_term).await
+    }
+}
+
 /// A cheap-clone reader of the lease + leadership, handed to the run/restore path
 /// and the treasury-debit path so they can ASK "may I (this node) run/debit right
 /// now?" without owning the engine. The whole no-split-brain guarantee reduces to
