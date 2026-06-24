@@ -36,6 +36,171 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// One privileged command the lockdown runs: its argv plus an optional stdin
+/// payload (for `nft -f -`). The seam that lets tests CAPTURE exactly what the
+/// daemon would shell out to (so a test can assert the nft ruleset and that no
+/// `ip route` / IP-forwarding command is ever issued for the VM TAP) without any
+/// hardware or root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivilegedCommand {
+    /// The argv passed after the `sudo -n` prefix (e.g. `["ip", "tuntap", ...]`).
+    pub args: Vec<String>,
+    /// The stdin fed to the command, if any (the nft ruleset for `nft -f -`).
+    pub stdin: Option<String>,
+}
+
+/// The seam for running the privileged TAP/nftables steps. The real path
+/// ([`SudoRunner`]) shells out through the NOPASSWD sudo wrapper exactly as
+/// before; tests implement a capture runner that records every command (and its
+/// stdin) and asserts the ruleset + the absence of routing/forwarding commands.
+pub trait CommandRunner {
+    /// Run a privileged command (argv after `sudo -n`), optionally feeding `stdin`.
+    fn run(&self, args: &[&str], stdin: Option<&str>) -> anyhow::Result<()>;
+    /// Run a privileged command and capture its stdout (for reading the counter).
+    fn capture(&self, args: &[&str]) -> anyhow::Result<String>;
+    /// Run a privileged command discarding output and ignoring failure (teardown).
+    fn discard(&self, args: &[&str]);
+}
+
+/// The production [`CommandRunner`]: shells the privileged steps through the
+/// NOPASSWD sudo wrapper (the locked D-7 launch path). Behavior is byte-identical
+/// to the prior inline `Command::new(sudo_bin)` calls.
+pub struct SudoRunner {
+    sudo_bin: PathBuf,
+}
+
+impl SudoRunner {
+    pub fn new(sudo_bin: PathBuf) -> Self {
+        SudoRunner { sudo_bin }
+    }
+}
+
+impl CommandRunner for SudoRunner {
+    fn run(&self, args: &[&str], stdin: Option<&str>) -> anyhow::Result<()> {
+        match stdin {
+            None => {
+                let status = Command::new(&self.sudo_bin)
+                    .arg("-n")
+                    .args(args)
+                    .status()
+                    .map_err(|e| anyhow::anyhow!("spawn sudo {args:?}: {e}"))?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    anyhow::bail!("sudo {args:?} exited with {status}")
+                }
+            }
+            Some(stdin) => {
+                use std::io::Write;
+                use std::process::Stdio;
+                let mut child = Command::new(&self.sudo_bin)
+                    .arg("-n")
+                    .args(args)
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| anyhow::anyhow!("spawn sudo {args:?}: {e}"))?;
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("piped stdin")
+                    .write_all(stdin.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("write stdin to sudo {args:?}: {e}"))?;
+                let status = child
+                    .wait()
+                    .map_err(|e| anyhow::anyhow!("wait sudo {args:?}: {e}"))?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    anyhow::bail!("sudo {args:?} (stdin) exited with {status}")
+                }
+            }
+        }
+    }
+
+    fn capture(&self, args: &[&str]) -> anyhow::Result<String> {
+        let out = Command::new(&self.sudo_bin)
+            .arg("-n")
+            .args(args)
+            .output()
+            .map_err(|e| anyhow::anyhow!("spawn sudo {args:?}: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            anyhow::bail!(
+                "sudo {args:?} exited with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        }
+    }
+
+    fn discard(&self, args: &[&str]) {
+        use std::process::Stdio;
+        let _ = Command::new(&self.sudo_bin)
+            .arg("-n")
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Build the nftables default-deny egress ruleset for a TAP (spec 3.7, G4): a
+/// dedicated `netdev` table with a chain bound to THIS device's INGRESS hook
+/// (the VM-egress direction for a TAP), `policy drop`, and a named drop counter
+/// so the dropped egress is observable. Pure and side-effect-free so the exact
+/// ruleset can be asserted in a fast test (no nft, no root).
+pub fn egress_ruleset(table: &str, dev: &str) -> String {
+    format!(
+        "table netdev {table} {{\n\
+        \x20 counter dropped_egress {{ }}\n\
+        \x20 chain vm_egress {{\n\
+        \x20\x20 type filter hook ingress device \"{dev}\" priority filter; policy drop;\n\
+        \x20\x20 counter name dropped_egress\n\
+        \x20 }}\n\
+        }}\n",
+        table = table,
+        dev = dev,
+    )
+}
+
+/// Validate that an nft ruleset string actually enforces the G4 default-deny
+/// egress lockdown for `dev`: it must bind a `filter` chain to `dev`'s INGRESS
+/// hook (the VM-egress direction), default to `policy drop`, and carry the
+/// `dropped_egress` counter. Returns `Err` describing the FIRST missing
+/// invariant. A malformed ruleset (wrong hook, missing drop, wrong device, no
+/// counter) is rejected here, so a typo in [`egress_ruleset`] cannot pass CI.
+pub fn validate_egress_ruleset(ruleset: &str, dev: &str) -> Result<(), String> {
+    if !ruleset.contains("table netdev ") {
+        return Err("ruleset is not a `table netdev` (G4 uses a dedicated netdev table)".to_string());
+    }
+    // The hook must be the device's INGRESS hook (for a TAP the guest's egress is
+    // the host's ingress); an egress hook would only see host-to-guest traffic.
+    if !ruleset.contains("hook ingress") {
+        return Err("ruleset has no `hook ingress` (the VM-egress direction for a TAP)".to_string());
+    }
+    if ruleset.contains("hook egress") {
+        return Err("ruleset binds the EGRESS hook (only sees host-to-guest; the VM egress would NOT be filtered)".to_string());
+    }
+    // The hook must be bound to THIS device.
+    let dev_clause = format!("device \"{dev}\"");
+    if !ruleset.contains(&dev_clause) {
+        return Err(format!("ruleset does not bind the hook to device {dev:?} (clause {dev_clause:?} missing)"));
+    }
+    // Default-deny: the chain must declare `policy drop`.
+    if !ruleset.contains("policy drop") {
+        return Err("ruleset has no `policy drop` (default-deny is the whole point of G4)".to_string());
+    }
+    // The drop counter must exist (the observable G4 evidence).
+    if !ruleset.contains("counter dropped_egress") {
+        return Err("ruleset has no `dropped_egress` counter declaration".to_string());
+    }
+    if !ruleset.contains("counter name dropped_egress") {
+        return Err("ruleset never references the `dropped_egress` counter in the chain".to_string());
+    }
+    Ok(())
+}
+
 /// A per-VM TAP plus its nftables egress lockdown. Held by the VM lifecycle; on
 /// drop (or explicit teardown) the nftables table and the TAP are removed so a
 /// run leaves no host state behind.
@@ -44,9 +209,9 @@ pub struct VmTap {
     name: String,
     /// The dedicated nftables netdev table name for this TAP's egress lockdown.
     nft_table: String,
-    /// The sudo binary the daemon runs the privileged steps through (the locked
-    /// D-7 launch path; NOPASSWD via the NixOS wrapper).
-    sudo_bin: PathBuf,
+    /// The seam the privileged TAP/nftables steps run through (the production
+    /// [`SudoRunner`] shells out via the NOPASSWD sudo wrapper, the D-7 path).
+    runner: Box<dyn CommandRunner + Send + Sync>,
     /// Whether teardown already ran (so Drop does not double-tear-down).
     torn_down: bool,
 }
@@ -76,12 +241,25 @@ impl VmTap {
         gid: u32,
         sudo_bin: PathBuf,
     ) -> anyhow::Result<Self> {
+        Self::create_with_runner(short_id, uid, gid, Box::new(SudoRunner::new(sudo_bin)))
+    }
+
+    /// The seam-injected form of [`VmTap::create`]: identical to the real path but
+    /// runs every privileged step through `runner`. Production calls
+    /// [`VmTap::create`] (which injects the [`SudoRunner`]); tests inject a capture
+    /// runner to assert the exact argv + nft ruleset with no hardware or root.
+    pub fn create_with_runner(
+        short_id: &str,
+        uid: u32,
+        gid: u32,
+        runner: Box<dyn CommandRunner + Send + Sync>,
+    ) -> anyhow::Result<Self> {
         // A short, unique, interface-name-safe device name. Linux caps IFNAMSIZ
         // at 15 chars, so keep `kirby-tap-<id>` within that.
         let name = format!("kirby-tap-{}", short_tail(short_id, 5));
         let nft_table = format!("kirby_egress_{}", short_tail(short_id, 8));
 
-        let mut tap = VmTap { name, nft_table, sudo_bin, torn_down: false };
+        let mut tap = VmTap { name, nft_table, runner, torn_down: false };
 
         // A prior crashed run may have left the TAP or table; remove them first
         // so create is idempotent. Best-effort (absent is fine).
@@ -114,17 +292,7 @@ impl VmTap {
         // the VM's outbound is dropped and counted (the egress hook would only see
         // host-to-guest). This is our own table; it does not touch the host's
         // iptables-nft tables.
-        let ruleset = format!(
-            "table netdev {table} {{\n\
-            \x20 counter dropped_egress {{ }}\n\
-            \x20 chain vm_egress {{\n\
-            \x20\x20 type filter hook ingress device \"{dev}\" priority filter; policy drop;\n\
-            \x20\x20 counter name dropped_egress\n\
-            \x20 }}\n\
-            }}\n",
-            table = tap.nft_table,
-            dev = tap.name,
-        );
+        let ruleset = egress_ruleset(&tap.nft_table, &tap.name);
         tap.sudo_stdin(&["nft", "-f", "-"], &ruleset)
             .map_err(|e| anyhow::anyhow!("install nftables egress lockdown for {}: {e}", tap.name))?;
 
@@ -177,71 +345,22 @@ impl VmTap {
     /// Run a privileged command, discarding its output and ignoring failure (for
     /// idempotent teardown where the target may not exist).
     fn sudo_discard(&self, args: &[&str]) {
-        use std::process::Stdio;
-        let _ = Command::new(&self.sudo_bin)
-            .arg("-n")
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        self.runner.discard(args);
     }
 
     /// Run a privileged command through the sudo wrapper (NOPASSWD, the D-7 path).
     fn sudo(&self, args: &[&str]) -> anyhow::Result<()> {
-        let status = Command::new(&self.sudo_bin)
-            .arg("-n")
-            .args(args)
-            .status()
-            .map_err(|e| anyhow::anyhow!("spawn sudo {args:?}: {e}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            anyhow::bail!("sudo {args:?} exited with {status}")
-        }
+        self.runner.run(args, None)
     }
 
     /// Run a privileged command feeding `stdin` (for `nft -f -`).
     fn sudo_stdin(&self, args: &[&str], stdin: &str) -> anyhow::Result<()> {
-        use std::io::Write;
-        use std::process::Stdio;
-        let mut child = Command::new(&self.sudo_bin)
-            .arg("-n")
-            .args(args)
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("spawn sudo {args:?}: {e}"))?;
-        child
-            .stdin
-            .as_mut()
-            .expect("piped stdin")
-            .write_all(stdin.as_bytes())
-            .map_err(|e| anyhow::anyhow!("write stdin to sudo {args:?}: {e}"))?;
-        let status = child
-            .wait()
-            .map_err(|e| anyhow::anyhow!("wait sudo {args:?}: {e}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            anyhow::bail!("sudo {args:?} (stdin) exited with {status}")
-        }
+        self.runner.run(args, Some(stdin))
     }
 
     /// Run a privileged command and capture stdout.
     fn sudo_capture(&self, args: &[&str]) -> anyhow::Result<String> {
-        let out = Command::new(&self.sudo_bin)
-            .arg("-n")
-            .args(args)
-            .output()
-            .map_err(|e| anyhow::anyhow!("spawn sudo {args:?}: {e}"))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-        } else {
-            anyhow::bail!(
-                "sudo {args:?} exited with {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            )
-        }
+        self.runner.capture(args)
     }
 }
 
@@ -310,6 +429,13 @@ mod tests {
             parse_nft_counter(text),
             Some(NftDropCounter { packets: 0, bytes: 0 })
         );
+    }
+
+    #[test]
+    fn egress_ruleset_is_valid_for_its_device() {
+        let rs = egress_ruleset("kirby_egress_abcd1234", "kirby-tap-07480");
+        // The generated ruleset must pass its own validator.
+        validate_egress_ruleset(&rs, "kirby-tap-07480").expect("generated ruleset is valid");
     }
 
     #[test]

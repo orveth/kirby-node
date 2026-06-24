@@ -193,6 +193,15 @@ pub async fn run(config: AppCheckpointRunConfig) -> anyhow::Result<AppCheckpoint
     };
     let store_round_trip = loaded == checkpoint;
 
+    // RESTORE-side membrane (spec: no secret crosses the restore boundary either). The
+    // blob we are about to feed node 2 may have been tampered at rest, so re-validate the
+    // LOADED bytes before they reach `GetSessionContext`. A smuggled-secret marker fails
+    // closed here: node 2 never boots from it, so it loads/debits nothing.
+    if let Err(e) = validate_checkpoint_membrane(&loaded) {
+        node1.halt().await;
+        return Err(e);
+    }
+
     node1.halt().await;
     let node1_halted = true;
 
@@ -273,7 +282,15 @@ fn restore_detail_matches(event: &Event, artifact: &CheckpointArtifact) -> bool 
             .contains(&format!("blob_len={}", artifact.payload.len()))
 }
 
-fn validate_checkpoint_membrane(artifact: &CheckpointArtifact) -> anyhow::Result<()> {
+/// The checkpoint egress membrane (spec: no secret material crosses a logical-state
+/// checkpoint). It scans the OPAQUE payload bytes for forbidden secret markers and
+/// fails closed on any hit. It runs on BOTH sides of the handoff: on node 1's
+/// submitted checkpoint before it is stored, AND on the blob LOADED from the store
+/// before node 2 restores from it (the restore-side check catches a checkpoint that
+/// was tampered at rest, not only one a malicious node 1 submitted). The restore-side
+/// call gates node 2's boot, so a smuggled-secret blob never reaches `GetSessionContext`
+/// and node 2 loads/debits nothing from it.
+pub fn validate_checkpoint_membrane(artifact: &CheckpointArtifact) -> anyhow::Result<()> {
     let payload = String::from_utf8_lossy(&artifact.payload);
     let forbidden_markers = [
         "stale_nonce=",

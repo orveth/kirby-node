@@ -1,0 +1,29 @@
+# G10 reproducible + clean-cut gate (build-spec section 6 / gate G10).
+# Runs the full test suite and the clippy deny-warnings gate on every push and
+# pull request. The clippy gate is enforced HERE (not inside a #[test]) so the
+# test binary stays fast; tests/g10_reproducible.rs covers the pure-Rust G10
+# checks (em-dash scan + content-address determinism).
+#
+# NOTE: this workflow assumes a Nix-capable runner with the dev shell from
+# flake.nix. It needs gudnuf to confirm a CI runner (self-hosted or a
+# nix-installer action) is wired up before it will actually execute.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-and-clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: cargo test
+        run: nix develop --command cargo test
+
+      - name: cargo clippy (deny warnings)
+        run: nix develop --command cargo clippy -- -D warnings
