@@ -404,6 +404,18 @@ impl GatewayService {
             return self.authorize_memory(req, m).await;
         }
 
+        // FORK (outward actuator): an Actuate act diverges from the uniform STEP3/4/5 too, for two
+        // reasons. (1) Its host cost is KNOWN + FIXED (not unknown-capped like the brain), so it is
+        // gated against BOTH the per-act ceiling (max_cost_sats) AND budget_sats and DENIED when
+        // over either, NEVER clamped down (a hostile max_cost_sats can't free/under-charge a future
+        // variable-cost kind). (2) The act has a NETWORK side effect (a public publish), so the
+        // idempotency key must be RESERVED (recorded + debited) BEFORE the publish (record-then-
+        // publish), giving AT-MOST-ONCE on the outward effect even under a same-session retry /
+        // concurrent same-key. STEP0/1/2 already ran above.
+        if let Act::Actuate(a) = act {
+            return self.authorize_actuate(req, act, a).await;
+        }
+
         // STEP 3: budget gate. The estimate must be within BOTH the genome's
         // authorized budget for this act AND the treasury (D-9, never-overspend
         // checked before the act). A per-act max on the act itself
@@ -644,6 +656,101 @@ impl GatewayService {
             // invariant upstream broke. Surface a denial that debited nothing.
             DebitOutcome::Insufficient { remaining } => {
                 Ok(denied(Outcome::DeniedInsufficientTreasury, remaining))
+            }
+        }
+    }
+
+    /// The Actuate act's authorize path (the OUTWARD actuator), forked out of the uniform order for
+    /// its FIXED-cost budget gate + RECORD-THEN-PUBLISH ordering (a network side effect). STEP0
+    /// (lease), STEP1 (dedupe), STEP2 (allowlist) already ran in `authorize_capability`. Here, in
+    /// order:
+    ///   1. VALIDATE the outward payload (decode + kind-restrict + re-sanitize) BEFORE any debit,
+    ///      so a malformed payload is a FREE denial (debit 0) -- never reserved or charged.
+    ///   2. the host cost is the actuator's FIXED `estimate`; DENY if it exceeds the per-act ceiling
+    ///      (`max_cost_sats`) OR the authorized `budget_sats` OR the treasury -- NEVER clamping the
+    ///      host cost down (a hostile/zero ceiling cannot free- or under-charge a future
+    ///      variable-cost kind, the [MED] gate).
+    ///   3. RESERVE the idempotency key (record + debit the host cost) BEFORE the network publish,
+    ///      so a same-session retry / concurrent same-key dedupes at STEP1 and never republishes
+    ///      (AT-MOST-ONCE on the outward effect, the [HIGH] ordering). A `Duplicate` returns the
+    ///      stored receipt and publishes NOTHING; then `perform` publishes and the live receipt
+    ///      carries the event-id proof.
+    ///
+    /// DOCUMENTED RESIDUALS (bounded, fixed-cost, gateway-hardening fast-follows, symmetric to the
+    /// memory act's stored-but-unpaid window; a refund/release primitive is over-engineering for the
+    /// MVP -- the cardinal sin for a PUBLIC act is DOUBLE-publishing, which this prevents):
+    ///   (a) a relay-FAILED publish keeps the reserved fixed cost debited (the debit-only ledger has
+    ///       no refund); the genome advances to a new key and may post again.
+    ///   (b) a daemon CRASH in the narrow reserve->publish window can leave one paid-but-unpublished
+    ///       note (the reserved key dedupes a resume re-issue, so it is never republished).
+    async fn authorize_actuate(
+        &self,
+        req: &CapabilityRequest,
+        act: &Act,
+        a: &kirby_proto::Actuate,
+    ) -> Result<CapabilityReceipt, TreasuryError> {
+        let remaining = self.balance()?;
+        // 1. VALIDATE before any debit: a malformed outward payload is a FREE denial (debit 0).
+        if let Err(reason) = self.rail.validate_outward(act) {
+            tracing::warn!(
+                kind = %a.kind,
+                %reason,
+                "Actuate refused by the pre-publish guard (malformed payload); debiting nothing"
+            );
+            return Ok(denied(Outcome::UpstreamFailed, remaining));
+        }
+        // 2. FIXED host cost + ceiling gate (MED: deny over EITHER ceiling, NEVER clamp down).
+        let estimate = self.rail.estimate(act);
+        if estimate > a.max_cost_sats || estimate > req.budget_sats {
+            return Ok(denied(Outcome::DeniedOverBudget, remaining));
+        }
+        if estimate > remaining {
+            return Ok(denied(Outcome::DeniedInsufficientTreasury, remaining));
+        }
+        // 3. RESERVE (record + debit) BEFORE the publish (HIGH: record-then-publish). A concurrent
+        //    or same-session-retry same-key sees this reservation at STEP1/in-txn and dedupes ->
+        //    at-most-once publish. The reserved record carries an EMPTY proof (the event id is not
+        //    known until the publish below); a resume replay returns the note as already-published.
+        let (cost_sats, post_remaining) = match self.treasury.debit_and_record(
+            &req.idempotency_key,
+            estimate,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )? {
+            DebitOutcome::Debited { cost_sats, remaining } => (cost_sats, remaining),
+            // Already reserved/performed (concurrent or replay): return the stored receipt and
+            // publish NOTHING. This is the dedupe that makes the retry at-most-once.
+            DebitOutcome::Duplicate(prior) => {
+                return Ok(receipt(
+                    Outcome::DuplicateIgnored,
+                    prior.cost_sats,
+                    prior.treasury_remaining_after,
+                    prior.proof,
+                    prior.completion,
+                    None,
+                ));
+            }
+            // Defense-in-depth: the treasury gate above already refused, so this is unreachable
+            // unless an invariant broke. Debit nothing.
+            DebitOutcome::Insufficient { remaining } => {
+                return Ok(denied(Outcome::DeniedInsufficientTreasury, remaining));
+            }
+        };
+        // 4. PUBLISH (the network side effect). The actual spend is capped at the estimate (D-20);
+        //    for a fixed-cost actuator it equals `cost_sats` (the reserved amount).
+        match self.rail.perform(act, estimate).await {
+            RailOutcome::Performed { proof, .. } => {
+                // Published. The reserved record holds an empty proof; the LIVE receipt carries the
+                // real event id (a future finalize() could persist it for replay fidelity).
+                Ok(receipt(Outcome::AuthorizedAndPerformed, cost_sats, post_remaining, proof, Vec::new(), None))
+            }
+            RailOutcome::UpstreamFailed => {
+                // The publish failed AFTER the reserve+debit (residual (a)): the key STAYS recorded
+                // (a retry of THIS key dedupes -> never republishes) and the fixed cost STAYS
+                // debited (the debit-only ledger has no refund). The genome advances to a new key.
+                Ok(receipt(Outcome::UpstreamFailed, cost_sats, post_remaining, Vec::new(), Vec::new(), None))
             }
         }
     }

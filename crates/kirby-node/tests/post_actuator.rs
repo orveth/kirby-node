@@ -86,6 +86,15 @@ impl Actuator for RecordingActuator {
         }
     }
 
+    fn validate(&self, kind: &str, payload: &[u8]) -> Result<(), String> {
+        // The same pre-publish guard the real NostrActuator runs (the gateway calls this BEFORE it
+        // reserves/debits, so a malformed payload is a free denial).
+        if kind != ACTUATE_KIND_NOSTR_PUBLISH {
+            return Err(format!("unknown kind {kind:?}"));
+        }
+        validate_nostr_publish(payload).map(|_| ())
+    }
+
     async fn actuate(&self, kind: &str, payload: &[u8], cap_sats: u64) -> RailOutcome {
         self.dispatched.lock().unwrap().push((kind.to_string(), payload.to_vec(), cap_sats));
         if kind != ACTUATE_KIND_NOSTR_PUBLISH {
@@ -236,6 +245,30 @@ async fn allowlisted_post_dispatches_exactly_one_publish_with_the_payload() {
     assert_eq!(actuator.published(), vec![content.to_string()]);
 }
 
+// ---- HIGH: record-then-publish gives AT-MOST-ONCE on the outward effect (daemon dedupe) ----
+
+#[tokio::test]
+async fn daemon_dedupes_a_same_key_replay_publishing_at_most_once() {
+    // The [HIGH] record-then-publish exactly-once, daemon side: the gateway RESERVES (records +
+    // debits) the idempotency key BEFORE the publish, so re-issuing the SAME key (a same-session
+    // retry after a lost response, or a resume replay) reserves+publishes ONCE; the second call
+    // hits STEP1 dedupe -> DuplicateIgnored and publishes NOTHING. The recording sink is the proof:
+    // exactly ONE publish reached the actuator across BOTH calls (at-most-once on the outward act).
+    let (svc, actuator) = actuator_gateway(1_000, 1, true);
+    let req = post_req("capable-post-7", "a thought worth sharing once", 64);
+
+    let r1 = svc.authorize_capability(&req).await.unwrap();
+    assert_eq!(r1.outcome, Outcome::AuthorizedAndPerformed as i32, "the first issue publishes");
+
+    let r2 = svc.authorize_capability(&req).await.unwrap(); // the retry / replay: SAME key
+    assert_eq!(r2.outcome, Outcome::DuplicateIgnored as i32, "the same-key replay dedupes");
+
+    assert_eq!(actuator.dispatch_count(), 1, "the same key publishes AT MOST ONCE (one dispatch)");
+    assert_eq!(actuator.published(), vec!["a thought worth sharing once".to_string()]);
+    // The replay returns the stored receipt: one reserve, one debit, no second charge.
+    assert_eq!(r2.cost_sats, r1.cost_sats, "the replay returns the stored receipt (no second debit)");
+}
+
 // ---- P3: the DAEMON independently re-sanitizes + restricts the kind AT DISPATCH ----
 
 #[tokio::test]
@@ -256,16 +289,18 @@ async fn daemon_resanitizes_dirty_content_at_dispatch() {
 }
 
 #[tokio::test]
-async fn daemon_refuses_a_non_text_note_kind_at_dispatch() {
-    // The envelope kind is allowlisted (nostr.publish), so the gateway dispatches; but the INNER
-    // nostr kind is 2, which the daemon guard restricts (MVP: kind 1 only). The actuator refuses
-    // -> UpstreamFailed, nothing published, debit 0. (Dispatched, but guarded out at the daemon.)
+async fn daemon_refuses_a_non_text_note_kind_before_the_reserve() {
+    // The envelope kind is allowlisted (nostr.publish), so the gateway forks to authorize_actuate;
+    // but the INNER nostr kind is 2, which the daemon guard restricts (MVP: kind 1 only). The
+    // pre-publish guard (validate_outward) refuses it BEFORE the reserve -> UpstreamFailed, debit 0,
+    // and the actuator's publish (actuate) is NEVER reached (nothing reserved, dispatched, or
+    // published). A malformed payload is a FREE denial, never charged.
     let (svc, actuator) = actuator_gateway(1_000, 1, true);
     let r = svc.authorize_capability(&post_req_inner_kind("p1", 2, "metadata", 64)).await.unwrap();
     assert_eq!(r.outcome, Outcome::UpstreamFailed as i32, "a disallowed inner kind is refused");
-    assert_eq!(r.cost_sats, 0, "a guarded-out publish debits nothing");
-    assert_eq!(actuator.dispatch_count(), 1, "it reached the actuator (envelope kind allowlisted)");
-    assert!(actuator.published().is_empty(), "but the daemon refused it: NOTHING published");
+    assert_eq!(r.cost_sats, 0, "a malformed payload is refused BEFORE the reserve: debit 0");
+    assert_eq!(actuator.dispatch_count(), 0, "the publish was never dispatched (refused pre-reserve)");
+    assert!(actuator.published().is_empty(), "NOTHING published");
 }
 
 #[tokio::test]

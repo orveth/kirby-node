@@ -162,6 +162,16 @@ pub trait Rail: Send + Sync {
     /// capped actual cost and the rail receipt. MUST NOT spend more than
     /// `cap_sats` regardless of the rail's natural cost.
     async fn perform(&self, act: &Act, cap_sats: u64) -> RailOutcome;
+
+    /// Pre-perform validation for an OUTWARD act (the actuator path), run BEFORE the gateway
+    /// RESERVES/debits the idempotency key, so a malformed outward payload is a FREE denial (never
+    /// reserved or charged). Cheap + side-effect-free (decode + kind-restrict + re-sanitize). The
+    /// default is `Ok(())` for rails/acts with no outward validation (the brain, ecash, paid HTTP);
+    /// `CompositeRail` overrides it to delegate an `Act::Actuate` to its actuator. The actuator
+    /// re-runs the same guard inside `perform` before publishing (defense in depth).
+    fn validate_outward(&self, _act: &Act) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A deterministic mock rail for the C-3 gateway/treasury unit tests (the real
@@ -652,6 +662,19 @@ impl Rail for CompositeRail {
             }
         }
     }
+
+    /// Pre-publish validation for an `Act::Actuate`: delegate to the actuator's cheap, side-effect-
+    /// free guard so the gateway can refuse a malformed outward payload BEFORE it reserves/debits
+    /// (a free denial). No actuator => refuse (fail-closed). Non-Actuate acts pass (the default).
+    fn validate_outward(&self, act: &Act) -> Result<(), String> {
+        match act {
+            Act::Actuate(a) => match &self.actuator {
+                Some(actuator) => actuator.validate(&a.kind, &a.payload),
+                None => Err("CompositeRail has no actuator configured for an Actuate".to_string()),
+            },
+            _ => Ok(()),
+        }
+    }
 }
 
 // ---- The outward actuator (the agent's first voice): sign + publish via the nerve ----
@@ -682,6 +705,15 @@ pub fn validate_nostr_publish(payload: &[u8]) -> Result<String, String> {
             np.kind
         ));
     }
+    // MVP: `publish_note` composes a NO-TAG note, so a payload carrying tags would publish (and
+    // return a receipt for) a DIFFERENT event than requested. Reject non-empty tags until tag
+    // support is built AND plumbed through `publish_note` (so the signed event matches the request).
+    if !np.tags.is_empty() {
+        return Err(format!(
+            "nostr.publish refused: tags are not supported in the MVP (got {} tag(s)); the published event would not match the request",
+            np.tags.len()
+        ));
+    }
     kirby_proto::sanitize_note_for_publish(&np.content)
 }
 
@@ -696,6 +728,11 @@ pub trait Actuator: Send + Sync {
     /// write) so the agent cannot spam the world for free. A kind this actuator does not serve
     /// returns `u64::MAX`, so the gateway budget gate refuses it OVER_BUDGET (fail-closed).
     fn cost(&self, kind: &str) -> u64;
+    /// Validate the payload for `kind` WITHOUT performing the side effect (decode + kind-restrict +
+    /// re-sanitize). The gateway calls this BEFORE it reserves/debits the idempotency key, so a
+    /// malformed outward payload is a FREE denial (never charged). `Err(reason)` refuses; `Ok(())`
+    /// means it would publish. `actuate` re-runs the SAME guard before the network publish.
+    fn validate(&self, kind: &str, payload: &[u8]) -> Result<(), String>;
     /// Perform the actuate: RE-VALIDATE the payload (defense in depth), then do the outward act
     /// (sign + publish) and return the proof (the event id). Caps the actual spend at `cap_sats`
     /// (D-20). A bad payload / disallowed kind / publish failure returns `UpstreamFailed` (the act
@@ -772,6 +809,15 @@ impl Actuator for NostrActuator {
             // An unknown kind: refuse it OVER_BUDGET at the gate (fail-closed), never perform.
             u64::MAX
         }
+    }
+
+    fn validate(&self, kind: &str, payload: &[u8]) -> Result<(), String> {
+        if kind != kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH {
+            return Err(format!("unknown actuator kind {kind:?}"));
+        }
+        // The shared daemon-side guard (decode + kind=1-only + re-sanitize + re-cap). Discard the
+        // clean content here; `actuate` re-runs it to get the content to publish.
+        validate_nostr_publish(payload).map(|_| ())
     }
 
     async fn actuate(&self, kind: &str, payload: &[u8], cap_sats: u64) -> RailOutcome {

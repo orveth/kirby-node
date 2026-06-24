@@ -474,7 +474,10 @@ fn feedback_post_not_permitted() -> String {
 }
 
 fn feedback_post_transient() -> String {
-    "your POST hit a transient error and was not confirmed published; nothing was charged. You may retry it."
+    // No claim about charging: on an upstream failure the daemon may have reserved + debited the
+    // fixed publish cost before the relay rejected it (at-most-once: the note did not go out). The
+    // agent's runway self-corrects from the authoritative treasury_remaining on its next think.
+    "your POST could not be delivered (an upstream error) and was not confirmed published; you may post again."
         .to_string()
 }
 
@@ -816,100 +819,159 @@ pub(super) async fn capable_tick<G: Gateway>(
         ThinkOutcome::Performed { reply, cost_sats, treasury_remaining } => {
             // 3. PARSE the semi-trusted plan (the input-validation surface, D-4).
             let action = parse_action(&reply);
-            // 4. ACT (at most one guarded write) + 5. VERIFY (read-back) -> learn (feedback).
-            let (recorded_write, verify, feedback) = execute_action(gw, seq, &action, params).await;
-            TickOutcome::Lived {
-                think_cost: cost_sats,
-                treasury_remaining,
-                recorded_write,
-                action,
-                verify,
-                feedback,
+            // 4. ACT (at most one guarded act) + 5. VERIFY (read-back) -> learn (feedback).
+            match execute_action(gw, seq, &action, params).await {
+                ActionOutcome::Done { recorded_write, verify, feedback } => TickOutcome::Lived {
+                    think_cost: cost_sats,
+                    treasury_remaining,
+                    recorded_write,
+                    action,
+                    verify,
+                    feedback,
+                },
+                // A POST actuating-call TRANSPORT error: do NOT commit the seq (the think already
+                // happened + was charged; its retry dedupes on capable-think-{seq}). Reusing the
+                // seq makes the retry's publish reuse capable-post-{seq} -> daemon dedupe ->
+                // AT-MOST-ONCE publish. The loop re-dials and re-ticks this same seq.
+                ActionOutcome::Transient => TickOutcome::Transient,
             }
         }
     }
 }
 
-/// Dispatch a parsed action: NOTE/RECALL/Invalid are no-ops (NOTE issues NO write at all, D-4);
-/// a guarded REMEMBER issues exactly ONE `Memory` SET, then VERIFYs by reading it back. Returns
-/// `(recorded_write, verify_verdict, feedback_for_next_plan)`.
+/// What dispatching one parsed action resolved to. DONE is the normal case (the loop commits the
+/// seq and feeds the feedback into the NEXT plan). TRANSIENT is a POST actuating-call TRANSPORT
+/// error: the loop must NOT commit the seq, so the retry REUSES the post idempotency key and the
+/// daemon dedupes it (AT-MOST-ONCE publish), mirroring the THINK's transient handling. SCOPED to
+/// POST: a REMEMBER call-error stays a DONE no-op (an idempotent re-write to the same key is
+/// harmless), so its behavior is unchanged from the capable kernel.
+pub(super) enum ActionOutcome {
+    /// The action settled: `recorded_write` advances the resume cursor (a recorded write OR a
+    /// published post), `verify` is the read-back verdict (`None` for a post / no-op), `feedback`
+    /// feeds the next plan.
+    Done { recorded_write: bool, verify: Option<VerifyOutcome>, feedback: String },
+    /// A POST actuating-call TRANSPORT error: do NOT commit the seq, so the retry reuses
+    /// `capable-post-{seq}` and the daemon dedupes at STEP1 (at-most-once publish).
+    Transient,
+}
+
+/// Dispatch a parsed action: NOTE/RECALL/Invalid are no-ops (NOTE issues NO write at all, D-4); a
+/// guarded REMEMBER issues exactly ONE `Memory` SET then VERIFYs (read-back); a POST issues exactly
+/// ONE outward publish. Returns an [`ActionOutcome`]: DONE for every SETTLED outcome, or TRANSIENT
+/// for a POST actuating-call transport error (the at-most-once retry; scoped to POST).
 async fn execute_action<G: Gateway>(
     gw: &mut G,
     seq: u64,
     action: &Action,
     params: &DiaristParams,
-) -> (bool, Option<VerifyOutcome>, String) {
+) -> ActionOutcome {
     match action {
-        Action::Note => (false, None, feedback_note()),
-        Action::Recall => (false, None, feedback_recall()),
-        // POST: the ONE OUTWARD actuating act this tick (D-4), factored into its own helper.
+        Action::Note => {
+            ActionOutcome::Done { recorded_write: false, verify: None, feedback: feedback_note() }
+        }
+        Action::Recall => {
+            ActionOutcome::Done { recorded_write: false, verify: None, feedback: feedback_recall() }
+        }
+        // POST: the ONE OUTWARD actuating act this tick (D-4); the only action that can signal a
+        // TRANSIENT (the at-most-once retry).
         Action::Post { text } => execute_post(gw, seq, text, params).await,
         Action::Invalid { reason } => {
             boot_log(&format!(
                 "capable seq={seq}: plan malformed or guard-rejected, NO action taken ({reason})"
             ));
-            (false, None, feedback_invalid(reason))
+            ActionOutcome::Done {
+                recorded_write: false,
+                verify: None,
+                feedback: feedback_invalid(reason),
+            }
         }
-        Action::Remember { key, value } => {
-            // ACT: the ONE actuating write this tick (D-4). The slug is already guarded into the
-            // capable namespace by the parser, so no out-of-namespace SET can reach the daemon.
-            let set_req = build_memory_set_request(seq, key, value.clone(), params.memory_max_cost);
-            let receipt = match gw.call(set_req).await {
-                Ok(r) => r,
-                Err(status) => {
-                    boot_log(&format!(
-                        "capable_remember seq={seq} key={key}: RequestCapability errored ({status})"
-                    ));
-                    return (false, None, feedback_write_transient(key));
-                }
+        Action::Remember { key, value } => execute_remember(gw, seq, key, value, params).await,
+    }
+}
+
+/// Dispatch a guarded REMEMBER: issue exactly ONE `Memory` SET, then VERIFY by reading it back
+/// (D-3, the self-correction core, K2). Returns [`ActionOutcome::Done`] in EVERY branch: REMEMBER
+/// never signals a Transient because a call-error retry is an idempotent re-write to the same
+/// `mem-write-{seq}` key (harmless), so its behavior is UNCHANGED from the capable kernel.
+/// Extracted from [`execute_action`] only to keep the dispatch a clean per-action match.
+async fn execute_remember<G: Gateway>(
+    gw: &mut G,
+    seq: u64,
+    key: &str,
+    value: &[u8],
+    params: &DiaristParams,
+) -> ActionOutcome {
+    // ACT: the ONE actuating write this tick (D-4). The slug is already guarded into the capable
+    // namespace by the parser, so no out-of-namespace SET can reach the daemon.
+    let set_req = build_memory_set_request(seq, key, value.to_vec(), params.memory_max_cost);
+    let receipt = match gw.call(set_req).await {
+        Ok(r) => r,
+        Err(status) => {
+            boot_log(&format!(
+                "capable_remember seq={seq} key={key}: RequestCapability errored ({status})"
+            ));
+            return ActionOutcome::Done {
+                recorded_write: false,
+                verify: None,
+                feedback: feedback_write_transient(key),
             };
-            match classify_remember(&receipt) {
-                RememberOutcome::Recorded => {
-                    boot_log(&format!(
-                        "capable_remember seq={seq} key={key} RECORDED cost_sats={} treasury_remaining={}",
-                        receipt.cost_sats, receipt.treasury_remaining
-                    ));
-                    // VERIFY: a FREE GET read-back, compared to the intended bytes (D-3). This is
-                    // the detection half of self-correction (K2).
-                    let readback =
-                        read_capable(gw, MemoryOp::Get, key, &capable_verify_key(key, seq)).await;
-                    let verdict = classify_verify(value, readback.as_ref());
-                    // The observed bytes (the ground truth) for the retry feedback (FIX-3).
-                    let observed = readback.as_ref().filter(|r| r.found).map(|r| r.value.as_slice());
-                    report(
-                        gw,
-                        "capable_verify",
-                        &format!("seq={seq} key={key} verdict={verdict:?}"),
-                    )
-                    .await;
-                    (true, Some(verdict), verify_feedback(key, verdict, value, observed))
-                }
-                RememberOutcome::Broke => {
-                    // Soft skip (D-5): broke enough to think but not to record. NOT death.
-                    boot_log(&format!(
-                        "capable_remember seq={seq} key={key} DENIED_INSUFFICIENT_TREASURY (soft skip, not death)"
-                    ));
-                    (false, None, feedback_write_broke(key))
-                }
-                RememberOutcome::ConfigError => {
-                    // Loud config error (D-5): the ceiling is below the host write cost.
-                    report(
-                        gw,
-                        "capable_config_error",
-                        &format!(
-                            "seq={seq} key={key} REMEMBER DENIED_OVER_BUDGET: memory.max_cost_sats ({}) is below the host write cost; raise it",
-                            params.memory_max_cost
-                        ),
-                    )
-                    .await;
-                    (false, None, feedback_write_config_error(key, params.memory_max_cost))
-                }
-                RememberOutcome::Transient => {
-                    boot_log(&format!(
-                        "capable_remember seq={seq} key={key} UNEXPECTED outcome; transient"
-                    ));
-                    (false, None, feedback_write_transient(key))
-                }
+        }
+    };
+    match classify_remember(&receipt) {
+        RememberOutcome::Recorded => {
+            boot_log(&format!(
+                "capable_remember seq={seq} key={key} RECORDED cost_sats={} treasury_remaining={}",
+                receipt.cost_sats, receipt.treasury_remaining
+            ));
+            // VERIFY: a FREE GET read-back, compared to the intended bytes (D-3). This is the
+            // detection half of self-correction (K2).
+            let readback = read_capable(gw, MemoryOp::Get, key, &capable_verify_key(key, seq)).await;
+            let verdict = classify_verify(value, readback.as_ref());
+            // The observed bytes (the ground truth) for the retry feedback (FIX-3).
+            let observed = readback.as_ref().filter(|r| r.found).map(|r| r.value.as_slice());
+            report(gw, "capable_verify", &format!("seq={seq} key={key} verdict={verdict:?}")).await;
+            ActionOutcome::Done {
+                recorded_write: true,
+                verify: Some(verdict),
+                feedback: verify_feedback(key, verdict, value, observed),
+            }
+        }
+        RememberOutcome::Broke => {
+            // Soft skip (D-5): broke enough to think but not to record. NOT death.
+            boot_log(&format!(
+                "capable_remember seq={seq} key={key} DENIED_INSUFFICIENT_TREASURY (soft skip, not death)"
+            ));
+            ActionOutcome::Done {
+                recorded_write: false,
+                verify: None,
+                feedback: feedback_write_broke(key),
+            }
+        }
+        RememberOutcome::ConfigError => {
+            // Loud config error (D-5): the ceiling is below the host write cost.
+            report(
+                gw,
+                "capable_config_error",
+                &format!(
+                    "seq={seq} key={key} REMEMBER DENIED_OVER_BUDGET: memory.max_cost_sats ({}) is below the host write cost; raise it",
+                    params.memory_max_cost
+                ),
+            )
+            .await;
+            ActionOutcome::Done {
+                recorded_write: false,
+                verify: None,
+                feedback: feedback_write_config_error(key, params.memory_max_cost),
+            }
+        }
+        RememberOutcome::Transient => {
+            boot_log(&format!(
+                "capable_remember seq={seq} key={key} UNEXPECTED outcome; transient"
+            ));
+            ActionOutcome::Done {
+                recorded_write: false,
+                verify: None,
+                feedback: feedback_write_transient(key),
             }
         }
     }
@@ -917,28 +979,41 @@ async fn execute_action<G: Gateway>(
 
 /// Dispatch a POST: the ONE OUTWARD actuating act this tick (D-4). Issues EXACTLY ONE `Actuate`
 /// (`nostr.publish`) request via the isolated [`build_actuate_post_request`]; the DAEMON signs +
-/// publishes the kind:1 note (the genome NEVER publishes, egress lock). There is no read-back
-/// VERIFY (the egress-locked genome cannot read the relay), so `verify` is `None`; the daemon's
-/// receipt outcome + event-id proof IS the confirmation, surfaced into the feedback. Classifies
-/// the receipt: a performed/duplicate publish is RECORDED (advances the resume cursor: a post is
-/// a committed actuating act, and the loop never reuses its seq for a memory write, so advancing
-/// the monotonic wseq past it is safe); a broke publish is a SOFT SKIP (D-5: NOT death, the THINK
-/// stays the only death gate); an over-budget publish is a loud config error; a not-allowlisted /
-/// upstream / unexpected outcome did NOT publish and debited 0, so it is a non-committing retry.
-/// Reuses `params.memory_max_cost` as the genome's authorized ceiling (a post is a small metered
-/// act like a write; a dedicated knob is post-MVP), which the daemon's small fixed cost fits under.
+/// publishes the kind:1 note (the genome NEVER publishes, egress lock). No read-back VERIFY (the
+/// egress-locked genome cannot read the relay), so `verify` is `None`; the daemon's receipt outcome
+/// + event-id proof IS the confirmation, surfaced into the feedback.
+///
+/// The EXACTLY-ONCE seam: a TRANSPORT error on the publish call (`gw.call` `Err`) returns
+/// [`ActionOutcome::Transient`] so the loop does NOT commit the seq -- the retry REUSES
+/// `capable-post-{seq}`, which the daemon dedupes at STEP1 (the daemon reserves+records the key
+/// BEFORE the network publish), giving AT-MOST-ONCE publish in the lost-response / slow-relay
+/// window. Every SETTLED receipt is [`ActionOutcome::Done`]: a performed/duplicate publish is
+/// RECORDED (advances the resume cursor; safe because the loop never reuses its seq for a memory
+/// write); a broke publish is a SOFT SKIP (D-5: NOT death, the THINK stays the only death gate); an
+/// over-budget publish is a loud config error; a not-allowlisted publish is surfaced. An
+/// `UpstreamFailed` (the relay rejected the publish AFTER the daemon reserved+debited the fixed
+/// cost) settles to a no-op + retry: the agent advances to a NEW key and may post again, and the
+/// failed attempt's fixed cost stays debited (a bounded, documented at-most-once residual -- the
+/// daemon's debit-only ledger has no refund; symmetric to the memory act's stored-but-unpaid
+/// window). Reuses `params.memory_max_cost` as the genome's authorized ceiling (a post is a small
+/// metered act like a write; a dedicated knob is post-MVP), which the daemon's fixed cost fits under.
 async fn execute_post<G: Gateway>(
     gw: &mut G,
     seq: u64,
     text: &str,
     params: &DiaristParams,
-) -> (bool, Option<VerifyOutcome>, String) {
+) -> ActionOutcome {
     let req = build_actuate_post_request(seq, text, params.memory_max_cost);
     let receipt = match gw.call(req).await {
         Ok(r) => r,
         Err(status) => {
-            boot_log(&format!("capable_post seq={seq}: RequestCapability errored ({status})"));
-            return (false, None, feedback_post_transient());
+            // TRANSPORT error (lost response / dropped conn / slow-relay timeout): the daemon may
+            // have reserved + published. Do NOT commit the seq -> the retry reuses
+            // capable-post-{seq} -> the daemon dedupes at STEP1 -> AT-MOST-ONCE publish.
+            boot_log(&format!(
+                "capable_post seq={seq}: RequestCapability errored ({status}); transient, reusing the seq (at-most-once dedupe)"
+            ));
+            return ActionOutcome::Transient;
         }
     };
     match kirby_proto::Outcome::try_from(receipt.outcome).unwrap_or(kirby_proto::Outcome::Unspecified)
@@ -950,14 +1025,18 @@ async fn execute_post<G: Gateway>(
                 receipt.cost_sats, receipt.treasury_remaining
             ));
             report(gw, "capable_post", &format!("seq={seq} PUBLISHED event={event_id}")).await;
-            (true, None, feedback_post_published(&event_id))
+            ActionOutcome::Done {
+                recorded_write: true,
+                verify: None,
+                feedback: feedback_post_published(&event_id),
+            }
         }
         kirby_proto::Outcome::DeniedInsufficientTreasury => {
             // Soft skip (D-5): broke enough to think but not to post. NOT death.
             boot_log(&format!(
                 "capable_post seq={seq} DENIED_INSUFFICIENT_TREASURY (soft skip, not death)"
             ));
-            (false, None, feedback_post_broke())
+            ActionOutcome::Done { recorded_write: false, verify: None, feedback: feedback_post_broke() }
         }
         kirby_proto::Outcome::DeniedOverBudget => {
             // Loud config error (D-5): the authorized ceiling is below the host publish cost.
@@ -970,7 +1049,11 @@ async fn execute_post<G: Gateway>(
                 ),
             )
             .await;
-            (false, None, feedback_post_config_error(params.memory_max_cost))
+            ActionOutcome::Done {
+                recorded_write: false,
+                verify: None,
+                feedback: feedback_post_config_error(params.memory_max_cost),
+            }
         }
         kirby_proto::Outcome::DeniedNotAllowlisted => {
             // The workload lacks the nostr.publish token: posting is not permitted. Surfaced, NOT
@@ -979,16 +1062,26 @@ async fn execute_post<G: Gateway>(
             boot_log(&format!(
                 "capable_post seq={seq} DENIED_NOT_ALLOWLISTED: this workload may not publish"
             ));
-            (false, None, feedback_post_not_permitted())
+            ActionOutcome::Done {
+                recorded_write: false,
+                verify: None,
+                feedback: feedback_post_not_permitted(),
+            }
         }
         other => {
-            // UpstreamFailed (relay down / daemon-side guard rejection), Unspecified, or a lease
-            // fence: nothing published, nothing debited. Retry WITHOUT committing the seq (the
-            // post idempotency key is reused so a later success is not double-published).
+            // UpstreamFailed (the relay rejected the publish AFTER the daemon reserved+debited) /
+            // Unspecified / lease fence: the note did not publish. SETTLE (advance the seq) so the
+            // agent moves to a NEW key and may post again -- NOT a seq reuse (the reserved key is
+            // recorded, so reusing it would dedupe to a phantom "published"). The failed attempt's
+            // fixed cost stays debited (the bounded, documented at-most-once residual).
             boot_log(&format!(
-                "capable_post seq={seq} not published (outcome={other:?}); transient, will retry"
+                "capable_post seq={seq} not published (outcome={other:?}); advancing, may post again"
             ));
-            (false, None, feedback_post_transient())
+            ActionOutcome::Done {
+                recorded_write: false,
+                verify: None,
+                feedback: feedback_post_transient(),
+            }
         }
     }
 }
@@ -1163,6 +1256,9 @@ mod tests {
         // outcome + an event-id proof, so the genome tick can be driven without a real relay.
         actuate_outcome: i32,
         actuate_proof: Vec<u8>,
+        /// Force the Actuate gw.call to ERROR (a dropped/lost RPC), so a test can drive the
+        /// POST actuating-call transient path (the exactly-once retry).
+        actuate_errors: bool,
         /// Every Actuate request's decoded payload (the NostrPublish), so a test can assert the
         /// EXACT content + kind that reached the gateway (P2: one publish, sanitized content).
         published: Vec<NostrPublish>,
@@ -1210,6 +1306,11 @@ mod tests {
             req: CapabilityRequest,
         ) -> Result<CapabilityReceipt, tonic::Status> {
             self.requests.push(req.clone());
+            // Simulate a dropped/lost RPC on the Actuate call (the request is recorded above, so a
+            // test can assert the idempotency key, but the genome sees a transport error).
+            if self.actuate_errors && matches!(&req.act, Some(Act::Actuate(_))) {
+                return Err(tonic::Status::unavailable("simulated transient actuate failure"));
+            }
             let receipt = match req.act {
                 Some(Act::Completion(_)) => CapabilityReceipt {
                     outcome: self.think_outcome,
@@ -2003,5 +2104,52 @@ mod tests {
             "a denied THINK is the one death condition (F4), even when the plan would POST"
         );
         assert_eq!(gw.actuate_requests(), 0, "death happens BEFORE any outward publish");
+    }
+
+    // ---- exactly-once: a POST actuating-call error reuses capable-post-{seq} across a retry ----
+
+    #[tokio::test]
+    async fn post_call_error_reuses_the_idempotency_key_across_a_retry() {
+        // The exactly-once guarantee for the OUTWARD act (the proof keeper re-verifies). A POST
+        // whose gw.call ERRORS (a dropped/lost RPC) must be a TickOutcome::Transient -- NOT a
+        // committed Lived -- so the seq is NOT advanced and the retry REUSES capable-post-{seq}.
+        // The daemon then dedupes that key at STEP1 (DuplicateIgnored) instead of republishing a
+        // SECOND note under a fresh key. (Mirrors transient_think_reuses_the_idempotency_key.)
+        let params = test_params();
+        let mut gw = MockGateway::thinking("ACTION: POST\nTEXT: the relay has been quiet");
+        gw.actuate_errors = true; // the publish RPC drops (the think still succeeds)
+
+        // tick 1 at seq=1 -> the POST actuating-call errors -> Transient -> committed stays 0.
+        let mut committed = 0u64;
+        let seq1 = committed + 1;
+        let out1 = capable_tick(&mut gw, seq1, &params, 1_000, 0, None, "").await;
+        assert!(
+            matches!(out1, TickOutcome::Transient),
+            "a POST actuating-call error must be a Transient (so the seq is reused), got {out1:?}"
+        );
+        if tick_commits_seq(&out1) {
+            committed = seq1;
+        }
+
+        // tick 2 (the retry) at committed + 1 = 1 again.
+        let seq2 = committed + 1;
+        let out2 = capable_tick(&mut gw, seq2, &params, 1_000, 0, None, "").await;
+        assert!(matches!(out2, TickOutcome::Transient));
+
+        // The POST idempotency key is REUSED across the retry (so the daemon dedupes -> the note
+        // is published AT MOST ONCE, never a second note under capable-post-{seq+1}).
+        let post_keys: Vec<String> = gw
+            .requests
+            .iter()
+            .filter_map(|r| match &r.act {
+                Some(Act::Actuate(_)) => Some(r.idempotency_key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            post_keys,
+            vec!["capable-post-1".to_string(), "capable-post-1".to_string()],
+            "the retry REUSES the same post idempotency key (idempotent, at-most-once publish)"
+        );
     }
 }
