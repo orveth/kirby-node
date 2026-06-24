@@ -9,7 +9,8 @@
 //!  2. derives a per-agent treasury PATH (DB-per-agent, spec 2.1) so each tenant takes its
 //!     OWN sled exclusive dir lock and there is zero cross-tenant contention;
 //!  3. forms/joins the agent's per-agent lease and grants `{agent_id, self_node}` at the
-//!     current term (the per-agent fence the tenant's gateway is later fenced to, S1);
+//!     current term -- the lease-cluster SUBSTRATE the failover supervisor (S5/S6) needs
+//!     (the child does NOT yet enforce this; see KNOWN DEFERRAL below);
 //!  4. LAUNCHES the tenant as a CHILD process running the existing single-agent path
 //!     (`kirby agent --config <derived tenant config>`) with the allocated resources;
 //!  5. MONITORS child lifecycle (running / exited). The dead-tenant detection is the hook
@@ -21,9 +22,24 @@
 //! a test supplies a stub launcher. The real-VM end-to-end path is `KIRBY_GENOME_IMAGE`-gated.
 //!
 //! THE LEASE SEAM: the supervisor grants per-agent leases through a [`LeaseGrantor`] (a
-//! tiny trait over the Raft [`crate::raft_lease::LeaseNode`]), and the tenant's gateway is
-//! fenced through the [`crate::raft_lease::LeaseAuthority`] trait (commit 1). A future
+//! tiny trait over the Raft [`crate::raft_lease::LeaseNode`]); the gateway debit fence is
+//! read through the [`crate::raft_lease::LeaseAuthority`] trait (commit 1), so a future
 //! per-agent FROST-quorum lease drops in behind both without touching the supervisor.
+//!
+//! KNOWN DEFERRAL (S2, deliberate, in line with the roadmap): the supervisor GRANTS each
+//! tenant its per-agent lease, but the tenant CHILD PROCESS does NOT yet enforce it -- the
+//! child boots with no lease fence (`BootConfig.lease_fence = None`), because the lease
+//! lives in THIS supervisor process and the child is a separate process. Enforcing it would
+//! need a RemoteLeaseAuthority (the child querying this supervisor over IPC before each
+//! debit). That is intentionally NOT built here: the lease only becomes load-bearing when a
+//! SECOND node can contend for a tenant's agent (failover, S5/S6), and in S2 (single host,
+//! static config, no failover) nothing else runs a tenant's agent, so the unfenced child is
+//! not exploitable. Moreover the interim Raft lease is slated to be SUBSUMED by per-agent
+//! FROST quorum co-signing (S3) plus the per-agent-quorum-as-lease scaling model, where an
+//! agent's acts are gated at the SIGNING layer (a quorum co-sign), not a Raft fence in the
+//! child. So child-side lease enforcement is deferred to S5/S6 rather than invested in the
+//! interim mechanism now. S2 delivers multi-tenant RESOURCE isolation (own VM / CID /
+//! treasury per tenant), which IS enforced and tested.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
