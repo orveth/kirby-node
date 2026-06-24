@@ -62,6 +62,7 @@ async fn g4_raw_egress_denied_and_metered_about_zero() {
         brain: None,
         memory: None,
         diarist: None,
+        social: None,
         lockdown_egress: true,
         snapshot_capable: false,
         restore_checkpoint: None,

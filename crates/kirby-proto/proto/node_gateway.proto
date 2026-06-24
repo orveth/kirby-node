@@ -166,6 +166,39 @@ enum WriteStatus {
   ALREADY_COMMITTED = 4;
 }
 
+// The general OUTWARD actuator envelope (the agent's first voice to the world). ONE act
+// for MANY outward actions: `kind` selects the typed daemon handler AND is the per-kind
+// allowlist token (so a workload without that kind's token issues ZERO of it at the
+// gateway allowlist step); `payload` is opaque to the envelope (the handler decodes it as
+// its own type). The genome stays EGRESS-LOCKED and dep-free: it prost-encodes a typed
+// payload (e.g. NostrPublish) into `payload`, and the DAEMON decodes, RE-VALIDATES (the
+// handler is a NEW entry point, it never trusts genome input), signs with the host-held
+// node key, sends, and meters per kind on the generic estimate->budget->perform->debit
+// path. A new outward action = a new kind + handler + allowlist token, NO new proto act.
+message Actuate {
+  string kind          = 1;   // the actuator kind + per-kind allowlist token, e.g. "nostr.publish"
+  bytes  payload       = 2;   // kind-specific, prost-encoded by the genome, OPAQUE to the envelope
+  uint64 max_cost_sats = 3;   // the caller's per-act CEILING (metered like a write; daemon cost <= this)
+}
+
+// The payload for the "nostr.publish" actuator kind, prost-encoded into Actuate.payload so
+// the genome carries NO JSON. The DAEMON composes + SIGNS a nostr event {kind, content,
+// tags} with the NODE identity key and publishes it via the nerve relay path. Defense in
+// depth (the handler is a new entry point): the daemon RE-SANITIZES content, RE-CAPS it,
+// and RESTRICTS the publishable `kind` set (MVP: 1 only, a public text note), never
+// trusting the genome's own sanitize.
+message NostrPublish {
+  uint32 kind            = 1;   // the nostr event kind (MVP: MUST be 1, a public text note)
+  string content         = 2;   // the note text (re-sanitized + re-capped daemon-side)
+  repeated NostrTag tags = 3;   // optional event tags (MVP: empty)
+}
+
+// One nostr event tag: an ordered list of strings, e.g. ["e", "<id>"] or ["p", "<pubkey>"].
+// A nested message because protobuf has no repeated-of-repeated.
+message NostrTag {
+  repeated string elements = 1;
+}
+
 message CapabilityRequest {
   uint32 schema_version = 1;
   string idempotency_key = 2;  // genome-chosen; the daemon dedupes on it (replay safety across a resume)
@@ -175,6 +208,7 @@ message CapabilityRequest {
     PaidHttp    paid_http    = 5;
     Completion  completion   = 7;   // brain act -- field 7, NOT 6 (budget_sats holds 6; oneof + sibling fields share one number space)
     Memory      memory       = 8;   // memory act (durable mind-state) -- next free oneof field after completion=7
+    Actuate     actuate      = 9;   // outward actuator envelope (the agent's first outward voice) -- next free oneof field after memory=8
   }
   uint64 budget_sats = 6;      // max the genome authorizes for THIS act; must be <= remaining treasury
 }

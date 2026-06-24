@@ -565,6 +565,7 @@ async fn memory_vm_boots_records_and_dies_when_broke() {
         // memory knobs onto the genome's kernel cmdline.
         memory: Some(memory),
         diarist: None,
+        social: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

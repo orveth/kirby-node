@@ -30,11 +30,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kirby_proto::capability_request::Act;
-use kirby_proto::{ChatMessage, Memory, MemoryOp, MemoryResult, WriteStatus};
+use kirby_proto::{ChatMessage, Memory, MemoryOp, MemoryResult, NostrPublish, WriteStatus};
+// `prost::Message` (brought in unnamed) for `decode`: the daemon prost-decodes the opaque
+// `Actuate.payload` back into the typed `NostrPublish` (the genome encoded it the same way).
+use prost::Message as _;
 // The real EngramStore (Chunk-2) is a host-side nostr-sdk client over the nerve relay
 // set. `Event` here is the nostr event, NOT `kirby_proto::Event` (which rail.rs never
-// names) -- no conflict.
-use nostr_sdk::{Client, Event, Filter, Keys, Kind, Timestamp, ToBech32};
+// names) -- no conflict. `EventBuilder` builds the actuator's kind:1 note (the agent's voice).
+use nostr_sdk::{Client, Event, EventBuilder, Filter, Keys, Kind, Timestamp, ToBech32};
 
 use crate::engram::{EngramCrypto, EngramFrame, KIND_ENGRAM};
 
@@ -71,6 +74,11 @@ pub fn destination(act: &Act) -> String {
         // A Memory act has no endpoint field; its destination is the fixed sentinel
         // (durable-mind-state), allowlisted exactly in memory mode.
         Act::Memory(_) => MEMORY_DESTINATION.to_string(),
+        // An Actuate's destination IS its `kind` (e.g. "nostr.publish"): the allowlist gates
+        // PER-KIND, so a workload whose allowlist lacks this exact kind issues ZERO of it at the
+        // gateway allowlist step (DENIED_NOT_ALLOWLISTED, before perform). One envelope, many
+        // outward actions, each independently gated.
+        Act::Actuate(a) => a.kind.clone(),
     }
 }
 
@@ -109,6 +117,13 @@ pub fn act_max_sats(act: &Act) -> Option<u64> {
         // G2/G3). This value is the caller's write ceiling, returned for completeness;
         // the generic clamp-to-act-max path is never reached for memory.
         Act::Memory(m) => Some(m.max_cost_sats),
+        // None (like ecash): an Actuate's cost is a KNOWN fixed host cost (the actuator's
+        // `cost(kind)`), NOT an unknown-capped-at-the-ceiling cost like the brain. Returning None
+        // means the estimate is NOT clamped down to the caller's ceiling, so a true cost ABOVE
+        // the genome's authorized `budget_sats` is DENIED_OVER_BUDGET (surfaced as a loud config
+        // error), never silently clamped + undercharged. The per-act ceiling rides in
+        // `budget_sats` (the genome sets it = `Actuate.max_cost_sats`), which the gate enforces.
+        Act::Actuate(_) => None,
     }
 }
 
@@ -215,6 +230,10 @@ impl Rail for MockRail {
             // gateway performs memory through its own MemoryBackend path), so this arm
             // exists to satisfy the match; the value is the caller's write ceiling.
             Act::Memory(m) => m.max_cost_sats,
+            // Exhaustiveness only: an Actuate is intercepted by the CompositeRail (which holds the
+            // actuator) BEFORE it could reach this base rail, so this arm only satisfies the
+            // match; the value is the caller's declared ceiling.
+            Act::Actuate(a) => a.max_cost_sats,
         }
     }
 
@@ -383,6 +402,10 @@ impl Rail for CdkEcashRail {
             // gateway performs memory through its own MemoryBackend path), so this arm
             // exists to satisfy the match; the value is the caller's write ceiling.
             Act::Memory(m) => m.max_cost_sats,
+            // Exhaustiveness only: an Actuate is intercepted by the CompositeRail (which holds the
+            // actuator) BEFORE it could reach this base rail, so this arm only satisfies the
+            // match; the value is the caller's declared ceiling.
+            Act::Actuate(a) => a.max_cost_sats,
         }
     }
 
@@ -526,26 +549,38 @@ impl BrainBackend for StubBrain {
     }
 }
 
-/// A rail that routes the brain act to a [`BrainBackend`] and everything else to a
-/// base [`Rail`] (brain-stub F3). The base is the existing performer (the MockRail in
-/// the stub run, the CdkEcashRail later); the brain is the inference backend.
+/// A rail that routes the brain act to a [`BrainBackend`], the OUTWARD actuator act to an
+/// optional [`Actuator`], and everything else to a base [`Rail`] (brain-stub F3, extended for the
+/// POST actuator). The base is the existing performer (the MockRail in the stub run, the
+/// CdkEcashRail later); the brain is the inference backend; the actuator (when present) performs
+/// `Act::Actuate` (e.g. signs + publishes a nostr note via the nerve).
 ///
-/// FAIL-CLOSED MEMBRANE (brain-stub R3): in brain mode the gateway's allowlist holds
-/// ONLY [`BRAIN_COMPLETION_DESTINATION`], so a non-Completion act is denied at the
-/// gateway's allowlist step (`DENIED_NOT_ALLOWLISTED`) before `perform` is ever
-/// reached. As a defense-in-depth backstop, `perform` here ALSO refuses any
-/// non-Completion act (returns `UpstreamFailed`, performing nothing on the base rail):
-/// a buggy or hostile brain genome cannot smuggle an ecash settle through the brain
-/// rail even if the allowlist were misconfigured. "The brain only thinks."
+/// FAIL-CLOSED MEMBRANE (brain-stub R3, extended for Actuate): the gateway's allowlist holds ONLY
+/// the sentinels/kinds a workload may reach, so an unauthorized act is denied at the allowlist
+/// step (`DENIED_NOT_ALLOWLISTED`) before `perform`. As a defense-in-depth backstop, `perform`
+/// here ALSO refuses any act it has no backend for: a non-Completion/non-Actuate act, or an
+/// Actuate when `actuator` is `None`, returns `UpstreamFailed` (performing nothing, debiting
+/// nothing). "The brain only thinks; the actuator only acts on the kinds it is given."
 pub struct CompositeRail {
     base: Arc<dyn Rail>,
     brain: Arc<dyn BrainBackend>,
+    /// The outward actuator (the agent's voice). `None` for a workload with no outward acts (the
+    /// brain/memory/diarist workloads); `Some` only when a `social`-configured workload injects it
+    /// at boot. An `Act::Actuate` with `None` here is refused (fail-closed).
+    actuator: Option<Arc<dyn Actuator>>,
 }
 
 impl CompositeRail {
-    /// Build a composite rail over a base performer and a brain backend.
+    /// Build a composite rail over a base performer and a brain backend (no actuator).
     pub fn new(base: Arc<dyn Rail>, brain: Arc<dyn BrainBackend>) -> Self {
-        CompositeRail { base, brain }
+        CompositeRail { base, brain, actuator: None }
+    }
+
+    /// Attach an outward [`Actuator`] (the agent's voice): the rail then performs `Act::Actuate`
+    /// through it. Builder style so the existing `new` callers stay unchanged.
+    pub fn with_actuator(mut self, actuator: Arc<dyn Actuator>) -> Self {
+        self.actuator = Some(actuator);
+        self
     }
 }
 
@@ -557,6 +592,12 @@ impl Rail for CompositeRail {
             // cap IS the estimate (the gateway then enforces estimate <= budget <=
             // treasury, D-20, and perform caps the actual at it).
             Act::Completion(c) => c.max_cost_sats,
+            // The actuator's KNOWN fixed host cost for this kind (e.g. the publish cost). With no
+            // actuator, u64::MAX so the budget gate refuses it OVER_BUDGET (fail-closed) rather
+            // than estimating an outward act through the base rail.
+            Act::Actuate(a) => {
+                self.actuator.as_ref().map(|act| act.cost(&a.kind)).unwrap_or(u64::MAX)
+            }
             // Every other act estimates through the base rail unchanged.
             other => self.base.estimate(other),
         }
@@ -584,15 +625,186 @@ impl Rail for CompositeRail {
                     RailOutcome::UpstreamFailed
                 }
             },
-            // R3 fail-closed: the brain rail performs ONLY completions. A non-Completion
-            // act is refused here (the allowlist already denied it; this is the
-            // defense-in-depth backstop so a misconfigured allowlist still cannot route
-            // a spend through the brain rail). Debit nothing.
+            // The OUTWARD actuator act: route to the actuator, which decodes + RE-VALIDATES the
+            // payload (a NEW entry point: re-sanitize, re-cap, restrict the kind), then signs +
+            // publishes. With no actuator configured, refuse (fail-closed): nothing performed,
+            // nothing debited. The allowlist already gated the kind upstream; this is the backstop.
+            Act::Actuate(a) => match &self.actuator {
+                Some(actuator) => actuator.actuate(&a.kind, &a.payload, cap_sats).await,
+                None => {
+                    tracing::warn!(
+                        kind = %a.kind,
+                        "CompositeRail asked to perform an Actuate with no actuator configured; refusing (fail-closed)"
+                    );
+                    RailOutcome::UpstreamFailed
+                }
+            },
+            // R3 fail-closed: the brain rail performs ONLY completions (and the actuator handles
+            // Actuate above). Any OTHER act is refused here (the allowlist already denied it; this
+            // is the defense-in-depth backstop so a misconfigured allowlist still cannot route a
+            // spend through the brain rail). Debit nothing.
             other => {
                 tracing::warn!(
                     destination = %destination(other),
-                    "CompositeRail (brain mode) asked to perform a non-Completion act; refusing (the brain only thinks, R3)"
+                    "CompositeRail (brain mode) asked to perform a non-Completion/non-Actuate act; refusing (the brain only thinks, R3)"
                 );
+                RailOutcome::UpstreamFailed
+            }
+        }
+    }
+}
+
+// ---- The outward actuator (the agent's first voice): sign + publish via the nerve ----
+//
+// `Act::Actuate` is the GENERAL outward envelope; it rides the SAME generic gateway path as the
+// brain + ecash (estimate -> budget gate -> perform -> debit), so a publish is metered exactly
+// like any other act (no fork, unlike memory). The `Actuator` trait is the swap-ready seam
+// (mirrors `BrainBackend`): the `NostrActuator` impl holds the node identity key + a connected
+// nostr-sdk client and publishes a kind:1 note via the SAME key + relay path nerve.rs uses for
+// presence, so the note is followable as that agent's public feed. The genome NEVER publishes
+// (egress lock); it only REQUESTS the act over vsock and the daemon signs + sends.
+
+/// Decode + RE-VALIDATE a `nostr.publish` payload: the DAEMON-SIDE guard. The actuator is a NEW
+/// entry point, so it NEVER trusts that the genome sanitized; it independently (1) decodes the
+/// nested-prost [`NostrPublish`], (2) RESTRICTS the publishable nostr kind to
+/// [`kirby_proto::NOSTR_KIND_TEXT_NOTE`] (1, a public text note; MVP), and (3) RE-runs the SHARED
+/// [`kirby_proto::sanitize_note_for_publish`] guard on the content (strip control + the Unicode
+/// separators, collapse, non-empty, within `MAX_NOTE_BYTES`). Returns the CLEAN content to
+/// publish, or a reason to refuse. Pure (no network), so it is unit-tested directly. `pub` so the
+/// daemon-side guard teeth live alongside the dispatch teeth (the post-actuator integration test).
+pub fn validate_nostr_publish(payload: &[u8]) -> Result<String, String> {
+    let np = NostrPublish::decode(payload)
+        .map_err(|e| format!("nostr.publish payload failed to decode: {e}"))?;
+    if np.kind != kirby_proto::NOSTR_KIND_TEXT_NOTE as u32 {
+        return Err(format!(
+            "nostr.publish refused: only kind {} (a public text note) is allowed (MVP), got kind {}",
+            kirby_proto::NOSTR_KIND_TEXT_NOTE,
+            np.kind
+        ));
+    }
+    kirby_proto::sanitize_note_for_publish(&np.content)
+}
+
+/// The outward actuator the daemon performs an [`Act::Actuate`] through (the agent's voice).
+/// Mirrors the [`BrainBackend`]/[`MemoryBackend`] seam: the impl holds the host-only credential
+/// (here the node identity key + a connected nostr-sdk client), and the genome reaches it ONLY
+/// through the daemon. A `kind` this actuator does not serve is refused, so a misconfigured
+/// allowlist still cannot route an unknown outward act.
+#[async_trait::async_trait]
+pub trait Actuator: Send + Sync {
+    /// The HOST-computed cost (sats) of one actuate of `kind`: a small FIXED cost (like a memory
+    /// write) so the agent cannot spam the world for free. A kind this actuator does not serve
+    /// returns `u64::MAX`, so the gateway budget gate refuses it OVER_BUDGET (fail-closed).
+    fn cost(&self, kind: &str) -> u64;
+    /// Perform the actuate: RE-VALIDATE the payload (defense in depth), then do the outward act
+    /// (sign + publish) and return the proof (the event id). Caps the actual spend at `cap_sats`
+    /// (D-20). A bad payload / disallowed kind / publish failure returns `UpstreamFailed` (the act
+    /// did not happen, debit 0).
+    async fn actuate(&self, kind: &str, payload: &[u8], cap_sats: u64) -> RailOutcome;
+}
+
+/// The real outward actuator (`nostr.publish`): holds the node identity keys + a connected
+/// nostr-sdk client to the relay set + a small fixed publish cost. Cheap to clone (an `Arc` over
+/// the client). Built at boot from the SAME node identity + relay the presence beacon uses, so a
+/// published note is followable as that agent's public feed.
+#[derive(Clone)]
+pub struct NostrActuator {
+    keys: Keys,
+    client: Arc<Client>,
+    /// The fixed host cost (sats) of one publish: small + non-zero (clamped to >= 1) so a post is
+    /// never free, like a memory write. Configurable per deployment.
+    cost_sats: u64,
+}
+
+impl NostrActuator {
+    /// Connect an actuator: build a nostr-sdk client signed by `keys`, add the relays, and connect
+    /// (mirrors [`EngramStore::connect`]). Errors if no relay is configured (a misconfigured
+    /// actuator is a boot bug, not a runtime outcome).
+    pub async fn connect(keys: Keys, relays: &[String], cost_sats: u64) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        if relays.is_empty() {
+            anyhow::bail!("NostrActuator requires at least one relay (the agent's publish relay)");
+        }
+        let client = Client::builder().signer(keys.clone()).build();
+        for url in relays {
+            client
+                .add_relay(url)
+                .await
+                .with_context(|| format!("add actuator relay {url}"))?;
+        }
+        client.connect().await;
+        tracing::info!(
+            npub = %keys.public_key().to_bech32().unwrap_or_default(),
+            relays = relays.len(),
+            cost_sats = cost_sats.max(1),
+            "NostrActuator connected (the agent's outward voice)"
+        );
+        Ok(NostrActuator { keys, client: Arc::new(client), cost_sats: cost_sats.max(1) })
+    }
+
+    /// Compose, SIGN (with the node key), and publish a kind:1 note carrying `content` to the
+    /// relay set; return the event id hex (the receipt proof). `content` is ALREADY validated by
+    /// [`validate_nostr_publish`]. Reuses the nerve's `send_event_builder` publish path.
+    async fn publish_note(&self, content: &str) -> anyhow::Result<String> {
+        use anyhow::Context as _;
+        let builder = EventBuilder::new(Kind::from(kirby_proto::NOSTR_KIND_TEXT_NOTE), content);
+        let output = self
+            .client
+            .send_event_builder(builder)
+            .await
+            .context("publish kind:1 note to the relay set")?;
+        Ok(output.val.to_hex())
+    }
+
+    /// The node's public key (the npub the note is signed by). Exposed for the e2e to verify the
+    /// published note's author; the SIGNING key never leaves the daemon.
+    pub fn public_key(&self) -> nostr_sdk::PublicKey {
+        self.keys.public_key()
+    }
+}
+
+#[async_trait::async_trait]
+impl Actuator for NostrActuator {
+    fn cost(&self, kind: &str) -> u64 {
+        if kind == kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH {
+            self.cost_sats
+        } else {
+            // An unknown kind: refuse it OVER_BUDGET at the gate (fail-closed), never perform.
+            u64::MAX
+        }
+    }
+
+    async fn actuate(&self, kind: &str, payload: &[u8], cap_sats: u64) -> RailOutcome {
+        if kind != kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH {
+            tracing::warn!(kind, "NostrActuator asked for an unknown actuator kind; refusing");
+            return RailOutcome::UpstreamFailed;
+        }
+        // DEFENSE IN DEPTH (new entry point): decode + restrict the kind + RE-sanitize the content
+        // with the SAME shared rule, never trusting the genome did it. A rejection => refuse + 0.
+        let content = match validate_nostr_publish(payload) {
+            Ok(clean) => clean,
+            Err(reason) => {
+                tracing::warn!(%reason, "nostr.publish refused by the daemon-side guard");
+                return RailOutcome::UpstreamFailed;
+            }
+        };
+        // Sign + publish the kind:1 note (the daemon's own host networking; the VM sees no bytes).
+        match self.publish_note(&content).await {
+            Ok(event_id) => {
+                tracing::info!(
+                    event_id = %event_id,
+                    "published a kind:1 note (the agent's outward voice)"
+                );
+                // D-20: the fixed cost, capped at the gateway-checked estimate. proof = event id.
+                let actual_cost = self.cost_sats.min(cap_sats);
+                RailOutcome::Performed {
+                    actual_cost,
+                    proof: event_id.into_bytes(),
+                    completion: Vec::new(),
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "nostr.publish failed to reach the relay; debiting nothing");
                 RailOutcome::UpstreamFailed
             }
         }

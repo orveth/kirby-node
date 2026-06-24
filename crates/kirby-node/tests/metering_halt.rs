@@ -69,6 +69,7 @@ async fn g2_meters_and_halts_on_budget() {
         // G2 is vsock-only (CPU + memory metering); the egress meter and TAP are
         // C-5 (gate G4), exercised by the egress test.
         diarist: None,
+        social: None,
         lockdown_egress: false,
         // G2 does not snapshot; snapshot + resume is C-7 (gate G6).
         snapshot_capable: false,

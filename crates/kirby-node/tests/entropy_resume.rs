@@ -75,6 +75,7 @@ fn boot_config(image: ImagePaths, node_id: &str, task: &str, cid: u32, port: u32
         memory: None,
         // G7 is vsock-only (the egress lockdown is G4); keeps the move lean.
         diarist: None,
+        social: None,
         lockdown_egress: false,
         snapshot_capable: true,
         restore_checkpoint: None,

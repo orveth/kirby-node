@@ -472,6 +472,7 @@ async fn capable_vm_boots_plans_acts_verifies_and_dies_when_broke() {
         brain: Some(brain),
         memory: Some(memory),
         diarist: Some(diarist),
+        social: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

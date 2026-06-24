@@ -977,6 +977,7 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
         brain: None,
         memory: None,
         diarist: None,
+        social: None,
         // G1 is vsock-only (no TAP); the egress lockdown is the `egress`
         // subcommand (C-5, G4).
         lockdown_egress: false,
@@ -1076,6 +1077,7 @@ async fn run_meter(args: MeterArgs) -> anyhow::Result<()> {
         brain: None,
         memory: None,
         diarist: None,
+        social: None,
         // G2 meters CPU + memory; the egress meter rides with the TAP in the
         // `egress` subcommand (C-5, G4). Vsock-only here.
         lockdown_egress: false,
@@ -1178,6 +1180,7 @@ async fn run_egress(args: EgressArgs) -> anyhow::Result<()> {
         brain: None,
         memory: None,
         diarist: None,
+        social: None,
         lockdown_egress: true,
         snapshot_capable: false,
         restore_checkpoint: None,
@@ -1289,6 +1292,7 @@ async fn run_brokered(args: BrokeredArgs) -> anyhow::Result<()> {
         brain: None,
         memory: None,
         diarist: None,
+        social: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
@@ -1396,6 +1400,7 @@ async fn run_app_checkpoint(args: AppCheckpointArgs) -> anyhow::Result<()> {
         brain: None,
         memory: None,
         diarist: None,
+        social: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,
@@ -1467,6 +1472,7 @@ async fn run_snapshot(args: SnapshotArgs) -> anyhow::Result<()> {
         brain: None,
         memory: None,
         diarist: None,
+        social: None,
         // G6 is vsock-only (the egress lockdown is G4); the restore re-wires a
         // fresh TAP only if this is true. Vsock-only keeps the demo lean.
         lockdown_egress: false,

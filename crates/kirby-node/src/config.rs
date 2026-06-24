@@ -496,6 +496,30 @@ impl Default for MemoryConfig {
     }
 }
 
+/// The internally-derived config for the OUTWARD actuator (the agent's voice), built at boot for
+/// the `capable` workload. NOT a `kirby.toml` section in the MVP: the relay is the node's presence
+/// relay and the cost is a small default, so it is derived from `[relay]` + `[identity]` rather
+/// than configured (a dedicated `[social]` block is post-MVP). It selects + configures the
+/// `NostrActuator` (boot.rs) and is `None` for every workload with no outward act, so a
+/// Brain/Memory/Diarist gateway performs ZERO publishes.
+#[derive(Debug, Clone)]
+pub struct SocialConfig {
+    /// The relay(s) the daemon publishes the agent's notes to (defaults to the node's presence
+    /// relay, so a note is followable alongside its presence beacon).
+    pub relays: Vec<String>,
+    /// The node identity keyfile to SIGN published notes with -- the ONE key rooting
+    /// identity/presence/memory (design §2). Pinned to the node identity by construction
+    /// (run_agent), so a note is signed by the agent's own npub; an explicit path is honored.
+    pub key_path: Option<PathBuf>,
+    /// The fixed host cost (sats) of one publish: metered like a memory write so the agent cannot
+    /// spam the world for free (min 1).
+    pub cost_sats: u64,
+}
+
+/// The default fixed publish cost (sats): small + non-zero so a post costs the agent (no free
+/// spam) without dominating the think cost (which stays the death gate). Tunable post-MVP.
+pub const DEFAULT_POST_COST_SATS: u64 = 1;
+
 /// The `[diarist]` config block (the persistent journaler): the ONLY diarist-specific
 /// knobs. The diarist's inference backend is `[brain]` (model, backend, max_cost_sats,
 /// the routstr fields) and its store is `[memory]` (relays, key_path, max_cost_sats) —

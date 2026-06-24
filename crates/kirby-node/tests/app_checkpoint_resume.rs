@@ -113,6 +113,7 @@ fn base_config(test: &str, guest_cid: u32, gateway_port: u32) -> Option<BootConf
         brain: None,
         memory: None,
         diarist: None,
+        social: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

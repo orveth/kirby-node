@@ -8,6 +8,59 @@
 /// The current additive-only schema version for every gateway message.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// The actuator kind (and per-kind allowlist token) for a Nostr publish: the FIRST
+/// outward actuator (the agent's first voice to the world). The genome sets
+/// `Actuate.kind` to this; the daemon's `destination` returns it (so a workload whose
+/// allowlist lacks this token issues ZERO publishes at the gateway allowlist step); and
+/// the daemon's actuator handler dispatches on it. It lives here, in the shared contract
+/// crate, so the genome (which builds the request) and the daemon (which gates + performs
+/// it) agree on ONE value with no central registry.
+pub const ACTUATE_KIND_NOSTR_PUBLISH: &str = "nostr.publish";
+
+/// The only Nostr event kind the `nostr.publish` actuator may emit in the MVP: 1, a public
+/// text note (NIP-01). The daemon RESTRICTS the publishable kind to this (defense in depth,
+/// the handler is a new entry point); a payload naming any other kind is refused. A `u16`
+/// so the musl genome pays no weight; the daemon maps it to a `nostr` `Kind`.
+pub const NOSTR_KIND_TEXT_NOTE: u16 = 1;
+
+/// The hard byte cap on a single published note's text (the agent's public voice is one
+/// sane `kind:1` line). The GENOME sanitizes + caps to this before requesting a publish,
+/// and the DAEMON independently RE-CAPS to it (it never trusts the genome's cap; the
+/// handler is a new entry point). Shared here so the two bounds cannot drift. An over-cap
+/// note is REFUSED (a wasted think + feedback), never truncated (truncation could sever a
+/// multibyte char or silently post a half-thought).
+pub const MAX_NOTE_BYTES: usize = 512;
+
+/// Sanitize + validate model-generated note text into ONE safe public line: the SHARED
+/// publish-note guard. Both the GENOME (before it requests a publish) and the DAEMON (before it
+/// signs + sends, defense in depth as a NEW entry point) call this INDEPENDENTLY, so the two
+/// sides enforce the SAME rule with no drift while neither trusts the other did it. The rule:
+/// every control character AND the Unicode line/paragraph separators (U+2028 / U+2029, which
+/// render as line breaks but are NOT `char::is_control`) are mapped to a space, then whitespace
+/// runs are collapsed and the ends trimmed; the result must be non-empty and within
+/// [`MAX_NOTE_BYTES`]. An over-cap note is REFUSED (`Err`), never truncated (truncation could
+/// sever a multibyte char or post a half-thought). Returns the clean single-line note, or a
+/// human-readable reason. Total: any input either yields a clean line or a reason, never panics.
+pub fn sanitize_note_for_publish(raw: &str) -> Result<String, String> {
+    let spaced: String = raw
+        .chars()
+        .map(|c| if c.is_control() || c == '\u{2028}' || c == '\u{2029}' { ' ' } else { c })
+        .collect();
+    // `split_whitespace` drops the (now whitespace-only) runs and trims the ends; `join(" ")`
+    // re-joins with exactly one space. Non-whitespace content is preserved verbatim.
+    let clean = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.is_empty() {
+        return Err("note text is empty after stripping control characters and whitespace".into());
+    }
+    if clean.len() > MAX_NOTE_BYTES {
+        return Err(format!(
+            "note text exceeds the {MAX_NOTE_BYTES}-byte cap ({} bytes after sanitizing)",
+            clean.len()
+        ));
+    }
+    Ok(clean)
+}
+
 /// The Nostr event kind for a Kirby node's presence beacon (the "nerve" slice 1).
 ///
 /// This is the cross-node agreed constant: every node publishes its presence as a
@@ -90,3 +143,77 @@ pub mod gateway {
 }
 
 pub use gateway::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- the SHARED publish-note guard (P3-sanitize teeth, enforced by genome AND daemon) ----
+
+    #[test]
+    fn clean_note_passes_through_unchanged() {
+        assert_eq!(
+            sanitize_note_for_publish("the relay has been quiet for three ticks").unwrap(),
+            "the relay has been quiet for three ticks"
+        );
+    }
+
+    #[test]
+    fn control_chars_are_stripped() {
+        // NUL, bell, ESC, DEL: not whitespace, so they would survive a naive split_whitespace;
+        // the explicit is_control mapping turns them into spaces, then they collapse away.
+        let dirty = "hi\u{0}\u{7}there\u{1b}\u{7f}friend";
+        assert_eq!(sanitize_note_for_publish(dirty).unwrap(), "hi there friend");
+    }
+
+    #[test]
+    fn newlines_collapse_to_a_single_line() {
+        assert_eq!(
+            sanitize_note_for_publish("line one\nline two\r\nline three").unwrap(),
+            "line one line two line three"
+        );
+        assert!(!sanitize_note_for_publish("a\nb").unwrap().contains('\n'));
+    }
+
+    #[test]
+    fn unicode_line_separators_are_stripped() {
+        // FIX-6: U+2028 (LS) / U+2029 (PS) render as breaks but are NOT char::is_control. A note
+        // must not be able to smuggle a multi-line payload onto a relay through them.
+        let smuggle = "first\u{2028}second\u{2029}third";
+        let clean = sanitize_note_for_publish(smuggle).unwrap();
+        assert!(!clean.contains('\u{2028}') && !clean.contains('\u{2029}'));
+        assert_eq!(clean, "first second third");
+    }
+
+    #[test]
+    fn whitespace_runs_collapse_and_ends_trim() {
+        assert_eq!(
+            sanitize_note_for_publish("  hello\t\t  world   ").unwrap(),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn empty_or_blank_is_rejected() {
+        assert!(sanitize_note_for_publish("").is_err());
+        assert!(sanitize_note_for_publish("    \t\n  ").is_err());
+        assert!(sanitize_note_for_publish("\u{0}\u{2028}\r\n").is_err());
+    }
+
+    #[test]
+    fn over_cap_is_refused_and_the_boundary_is_accepted() {
+        let over = "x".repeat(MAX_NOTE_BYTES + 1);
+        assert!(sanitize_note_for_publish(&over).is_err());
+        // Exactly the cap is accepted (refused means strictly greater).
+        let at = "x".repeat(MAX_NOTE_BYTES);
+        assert_eq!(sanitize_note_for_publish(&at).unwrap().len(), MAX_NOTE_BYTES);
+    }
+
+    #[test]
+    fn multibyte_content_is_preserved_not_severed() {
+        // Non-ASCII letters + emoji are NOT control/whitespace, so they pass through intact; the
+        // cap is REFUSED not truncated, so a multibyte char is never sliced mid-sequence.
+        let note = "café ünïcode 🜂 sovereign";
+        assert_eq!(sanitize_note_for_publish(note).unwrap(), note);
+    }
+}

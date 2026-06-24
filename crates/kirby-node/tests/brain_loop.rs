@@ -367,6 +367,7 @@ async fn brain_vm_boots_thinks_and_dies_when_broke() {
         brain: Some(brain),
         memory: None,
         diarist: None,
+        social: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

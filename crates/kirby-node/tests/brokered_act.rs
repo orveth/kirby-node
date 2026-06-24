@@ -130,6 +130,7 @@ async fn g5_brokered_ecash_settle_real_metered_no_vm_egress() {
         memory: None,
         // BrokeredRunConfig chooses the backend-specific profile.
         diarist: None,
+        social: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

@@ -414,21 +414,38 @@ fn agent_boot_config(
             Some(cfg.diarist),
         ),
         Workload::Capable => (
-            // The capable loop is the both-acts workload (like the diarist): BOTH sentinels in
-            // the allowlist, and it carries brain + memory + diarist (the reused cadence/recall
-            // knobs), so boot_and_observe builds the Completion rail AND injects the Memory
-            // backend on ONE gateway. The fact EngramStore key is pinned to the node identity by
-            // construction, same as the diarist (capable facts are self-encrypted to the node,
-            // the F3 one-key invariant).
+            // The capable loop is the both-acts workload PLUS the outward voice: the brain +
+            // memory sentinels AND the nostr.publish actuator token in the allowlist, so
+            // boot_and_observe builds the Completion rail, injects the Memory backend, AND attaches
+            // the NostrActuator on ONE gateway. The actuator/EngramStore keys are pinned to the
+            // node identity by construction (capable facts are self-encrypted to the node, and a
+            // published note is signed by the node npub: the F3 one-key invariant). Per-kind
+            // gating: ONLY because nostr.publish is on this allowlist can a capable agent publish.
             vec![
                 crate::rail::BRAIN_COMPLETION_DESTINATION.to_string(),
                 crate::rail::MEMORY_DESTINATION.to_string(),
+                kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH.to_string(),
             ],
             Some(cfg.brain.clone()),
             Some(pin_diarist_memory_key(&cfg.memory, &cfg.identity)),
             Some(cfg.diarist),
         ),
         _ => (vec!["mint.test.local".to_string()], None, None, None),
+    };
+    // The outward actuator config (the agent's voice): ONLY the capable workload publishes (the
+    // first outward voice). Derived, not a toml section (MVP): the node's presence relay + the
+    // node identity key (pinned, so a note is signed by the agent's own npub, the F3 one-key
+    // invariant) + a small fixed cost. None for every other workload, so they publish nothing.
+    let social = match cfg.workload {
+        Workload::Capable => Some(crate::config::SocialConfig {
+            relays: vec![cfg.relay.url.clone()],
+            key_path: Some(NodeIdentity::resolve_key_path(
+                Some(&cfg.identity.key_path),
+                &cfg.identity.treasury_dir(),
+            )),
+            cost_sats: crate::config::DEFAULT_POST_COST_SATS,
+        }),
+        _ => None,
     };
     Ok(BootConfig {
         image,
@@ -446,6 +463,7 @@ fn agent_boot_config(
         brain,
         memory,
         diarist,
+        social,
         // Sovereign single-agent v0 is vsock-only (no TAP egress lockdown; that is
         // the C-5 lane). The membrane still holds structurally (no guest network).
         lockdown_egress: false,

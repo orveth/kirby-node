@@ -34,8 +34,8 @@ use crate::gateway::{GatewayService, Session};
 // when a memory relay set is configured. `nerve` is cross-platform (host-side nostr-sdk).
 use crate::nerve::NodeIdentity;
 use crate::rail::{
-    BrainBackend, CdkEcash, CompositeRail, EngramStore, MemoryBackend, MockRail, Rail,
-    RoutstrBrain, StubBrain, StubMemory,
+    Actuator, BrainBackend, CdkEcash, CompositeRail, EngramStore, MemoryBackend, MockRail,
+    NostrActuator, Rail, RoutstrBrain, StubBrain, StubMemory,
 };
 use crate::sandbox::{GatewayTransport, GuestImage, GuestSpec, SandboxBackend, SandboxInstance};
 use crate::treasury::Treasury;
@@ -107,6 +107,11 @@ pub struct BootConfig {
     /// carries the loop cadence + recall depth to the genome on the kernel command line
     /// (`kirby.diarist_*=`), the same way the brain/memory knobs travel. `None` otherwise.
     pub diarist: Option<crate::config::DiaristConfig>,
+    /// The outward-actuator config (the agent's voice). `Some` only for the `capable` workload:
+    /// `boot_and_observe` builds a `NostrActuator` from it (node identity key + the relay set) and
+    /// attaches it to the `CompositeRail` (`with_actuator`), so an `Act::Actuate` is signed +
+    /// published daemon-side. `None` for every other workload, so the rail performs ZERO publishes.
+    pub social: Option<crate::config::SocialConfig>,
     /// Wire a per-VM TAP into the VM and lock it down with nftables default-deny
     /// egress (C-5, spec 3.7, gate G4). When true, the VM gets a network interface
     /// it can ATTEMPT egress on, the host kernel drops that egress (counted), and
@@ -218,6 +223,13 @@ async fn open_treasury_retrying(
 pub async fn boot_and_observe(
     config: BootConfig,
 ) -> anyhow::Result<(Box<dyn SandboxInstance>, BootOutcome, Treasury, EventStream, ServeGuard)> {
+    // The outward actuator (the agent's voice): built once if the workload configured it (the
+    // capable workload, `config.social = Some`), then attached to the CompositeRail below. None
+    // for every other workload, so the rail performs ZERO publishes.
+    let actuator: Option<Arc<dyn Actuator>> = match &config.social {
+        Some(social) => Some(build_nostr_actuator(social).await?),
+        None => None,
+    };
     let rail: Arc<dyn Rail> = match &config.brain {
         // The REAL brain (brain-routstr): a CompositeRail whose brain is a RoutstrBrain
         // over a funded, persistent cdk wallet. Building it opens the wallet, recovers
@@ -227,16 +239,60 @@ pub async fn boot_and_observe(
         Some(brain) if brain.backend == BrainBackendKind::Routstr => {
             let treasury_remaining = peek_treasury_remaining(&config).await?;
             let brain_backend = build_routstr_brain(brain, treasury_remaining).await?;
-            Arc::new(CompositeRail::new(Arc::new(MockRail::new()), brain_backend))
+            Arc::new(attach_actuator(
+                CompositeRail::new(Arc::new(MockRail::new()), brain_backend),
+                actuator,
+            ))
         }
         // The stub brain (unchanged): deterministic, no network, no money.
-        Some(brain) => Arc::new(CompositeRail::new(
-            Arc::new(MockRail::new()),
-            Arc::new(StubBrain::new(brain.bytes_per_sat)),
+        Some(brain) => Arc::new(attach_actuator(
+            CompositeRail::new(
+                Arc::new(MockRail::new()),
+                Arc::new(StubBrain::new(brain.bytes_per_sat)),
+            ),
+            actuator,
         )),
-        None => Arc::new(MockRail::new()),
+        None => {
+            // No brain => a bare MockRail (no CompositeRail to hold the actuator). The capable
+            // workload always has a brain, so this only fires for a misconfig (social + no brain);
+            // the dropped actuator is harmless (a publish would be DENIED_NOT_ALLOWLISTED anyway).
+            if actuator.is_some() {
+                tracing::warn!(
+                    "a social actuator was configured but the workload has no brain (no CompositeRail to hold it); it is dropped"
+                );
+            }
+            Arc::new(MockRail::new())
+        }
     };
     boot_and_observe_with_rail(config, rail).await
+}
+
+/// Attach an optional outward [`Actuator`] to a [`CompositeRail`] (the agent's voice), returning
+/// the rail unchanged when there is none. Keeps the `boot_and_observe` brain match readable.
+fn attach_actuator(rail: CompositeRail, actuator: Option<Arc<dyn Actuator>>) -> CompositeRail {
+    match actuator {
+        Some(actuator) => rail.with_actuator(actuator),
+        None => rail,
+    }
+}
+
+/// Build the [`NostrActuator`] (the agent's outward voice) from the social config: load the node
+/// identity keyfile (the SAME key presence/memory use, so a published note is signed by the
+/// agent's own npub, the F3 one-key invariant) and connect a nostr-sdk client to the relay set.
+/// Mirrors `build_routstr_brain`'s shape (a backend built before the VM boots).
+async fn build_nostr_actuator(
+    social: &crate::config::SocialConfig,
+) -> anyhow::Result<Arc<dyn Actuator>> {
+    // The node identity keyfile is pinned to the node identity by run_agent (so a note is signed
+    // by the agent's own npub). A missing pin is a boot-wiring bug: fail loud, not a silent
+    // throwaway key (which would publish under an unfollowable ephemeral identity).
+    let key_path = social.key_path.clone().ok_or_else(|| {
+        anyhow::anyhow!("SocialConfig.key_path must be pinned to the node identity (boot-wiring bug)")
+    })?;
+    let identity = NodeIdentity::load_or_create(&key_path)?;
+    let actuator =
+        NostrActuator::connect(identity.keys().clone(), &social.relays, social.cost_sats).await?;
+    Ok(Arc::new(actuator))
 }
 
 /// The per-node treasury store path (the daemon-owned counter, D-9). A per-node temp

@@ -481,6 +481,7 @@ async fn diarist_vm_boots_recalls_thinks_remembers_and_dies_when_broke() {
         brain: Some(brain),
         memory: Some(memory),
         diarist: Some(diarist),
+        social: None,
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

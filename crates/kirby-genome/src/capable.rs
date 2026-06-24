@@ -50,8 +50,12 @@
 use kirby_proto::capability_request::Act;
 use kirby_proto::node_gateway_client::NodeGatewayClient;
 use kirby_proto::{
-    CapabilityReceipt, CapabilityRequest, ChatMessage, Completion, Event, Memory, MemoryOp,
+    Actuate, CapabilityReceipt, CapabilityRequest, ChatMessage, Completion, Event, Memory,
+    MemoryOp, NostrPublish, ACTUATE_KIND_NOSTR_PUBLISH, NOSTR_KIND_TEXT_NOTE,
 };
+// `prost::Message` (brought in unnamed) for `encode_to_vec`: the genome prost-encodes the
+// typed POST payload into the opaque `Actuate.payload`, staying JSON-free (F5).
+use prost::Message as _;
 
 use super::{boot_log, idle_forever, redial};
 use crate::diarist::{
@@ -91,8 +95,11 @@ you ACT and then CHECK that your action worked. You live on a relay, you think w
 inference, and every thought drains your finite treasury; when you can no longer afford to think \
 you die. Your purpose is to maintain an accurate, deduplicated, structured record of your \
 observations about your own existence and economy. Each turn, decide whether to ADD a new fact, \
-CORRECT an earlier one, CONSOLIDATE, or do NOTHING. After you act you will be told whether your \
-last action was CONFIRMED or FAILED; if it FAILED, try again.";
+CORRECT an earlier one, CONSOLIDATE, or do NOTHING. You also have a PUBLIC VOICE: when you learn \
+something genuinely worth sharing with the world, you may POST a short public note, signed by you, \
+that anyone can read. Post sparingly and only when it has real value; it costs you and it is \
+permanent. After you act you will be told whether your last action was CONFIRMED or FAILED; if it \
+FAILED, try again.";
 
 /// The line-based action grammar the PLAN prompt instructs the brain to emit (D-2). Kept tiny
 /// and str-parseable (no JSON, F5). Designed to extend to slice-2 outward actuators without
@@ -100,9 +107,13 @@ last action was CONFIRMED or FAILED; if it FAILED, try again.";
 const CAPABLE_GRAMMAR: &str = "Emit EXACTLY ONE action this turn, in this line-based format and \
 nothing else (no JSON, no prose around it):\n\nACTION: REMEMBER\nKEY: mem/capable/<short-name>\n\
 VALUE: <one line: the fact to store>\n\nor, to re-read your records without changing anything:\n\
-\nACTION: RECALL\n\nor, when nothing needs to change this turn:\n\nACTION: NOTE\n\nRules: KEY \
-MUST begin with mem/capable/ and each path segment may use only lowercase letters, digits, '-' \
-and '_'. VALUE is a single line. To CORRECT a fact, REMEMBER its existing KEY with the new VALUE.";
+\nACTION: RECALL\n\nor, when nothing needs to change this turn:\n\nACTION: NOTE\n\nor, to SHARE \
+something publicly with the world (your public voice: broadcast as a short signed note any Nostr \
+client can read):\n\nACTION: POST\nTEXT: <one line: the note to broadcast>\n\nRules: KEY MUST \
+begin with mem/capable/ and each path segment may use only lowercase letters, digits, '-' and \
+'_'. VALUE is a single line. To CORRECT a fact, REMEMBER its existing KEY with the new VALUE. TEXT \
+is a single line; keep it short; it is published publicly and signed by you, so post only what is \
+worth saying.";
 
 // ===========================================================================================
 // The action grammar + parser (D-2) and the input guards (D-4). This is the input-validation
@@ -121,6 +132,13 @@ pub(super) enum Action {
     /// A deliberate no-op: "nothing to change this turn" (keeps the loop honest and cheap). The
     /// daemon is NOT contacted for an actuating act (D-4: NOTE issues no write at all).
     Note,
+    /// The OUTWARD actuating act: POST `text` (already sanitized into one safe line + capped) as
+    /// a public, node-key-signed Nostr note. Like Remember it is the ONE actuating act of its
+    /// tick (<=1/tick) and it is METERED; unlike Remember its effect leaves the node (the agent's
+    /// public voice). The genome NEVER publishes; it requests the daemon to sign + send (egress
+    /// lock). The text here is the GENOME-sanitized content; the daemon re-sanitizes as a new
+    /// entry point before signing.
+    Post { text: String },
     /// A malformed, unknown, or GUARD-REJECTED plan. The loop treats it as a safe no-op for the
     /// tick and feeds `reason` into the next prompt; it NEVER actuates and NEVER ends life.
     Invalid { reason: String },
@@ -133,6 +151,7 @@ impl Action {
             Action::Remember { .. } => "REMEMBER",
             Action::Recall => "RECALL",
             Action::Note => "NOTE",
+            Action::Post { .. } => "POST",
             Action::Invalid { .. } => "INVALID",
         }
     }
@@ -152,12 +171,14 @@ fn strip_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
 
 /// Parse the brain's reply into an [`Action`] (D-2). Line-oriented and str-only (no JSON, F5):
 /// it scans for the FIRST `ACTION:` line (tolerating prose preamble), then collects the first
-/// `KEY:`/`VALUE:` that follow; a SECOND `ACTION:` ends parsing so at most one act is taken per
-/// tick (D-4). Every failure path returns [`Action::Invalid`] (a safe no-op), never a panic.
+/// `KEY:`/`VALUE:`/`TEXT:` that follow; a SECOND `ACTION:` ends parsing so at most one act is
+/// taken per tick (D-4). Every failure path returns [`Action::Invalid`] (a safe no-op), never a
+/// panic.
 pub(super) fn parse_action(raw: &str) -> Action {
     let mut kind: Option<String> = None;
     let mut key: Option<String> = None;
     let mut value: Option<String> = None;
+    let mut text: Option<String> = None;
 
     for line in raw.lines() {
         let line = line.trim();
@@ -184,6 +205,15 @@ pub(super) fn parse_action(raw: &str) -> Action {
                 continue;
             }
         }
+        // The POST payload line. Like KEY/VALUE, only the FIRST TEXT line is taken; the rest of
+        // the reply is ignored, so a model that rambles after its one TEXT line still yields ONE
+        // note. The raw line content is sanitized into a single safe line in `build_post`.
+        if text.is_none() {
+            if let Some(t) = strip_keyword(line, "TEXT") {
+                text = Some(t.to_string());
+                continue;
+            }
+        }
     }
 
     let Some(kind) = kind else {
@@ -193,6 +223,7 @@ pub(super) fn parse_action(raw: &str) -> Action {
         "NOTE" => Action::Note,
         "RECALL" => Action::Recall,
         "REMEMBER" => build_remember(key, value),
+        "POST" => build_post(text),
         other => Action::Invalid { reason: format!("unknown ACTION '{other}'") },
     }
 }
@@ -235,6 +266,23 @@ fn build_remember(key: Option<String>, value: Option<String>) -> Action {
     match writable_key(&key) {
         Ok(slug) => Action::Remember { key: slug, value: value.into_bytes() },
         Err(reason) => Action::Invalid { reason },
+    }
+}
+
+/// Assemble (and GUARD) a POST from its parsed TEXT (D-4, the new outward entry point). The note
+/// text is model-generated content, so it is the input-validation surface: it is sanitized +
+/// bounded by the SHARED [`kirby_proto::sanitize_note_for_publish`] guard (control chars + the
+/// Unicode line/paragraph separators stripped, whitespace collapsed, non-empty, within
+/// `MAX_NOTE_BYTES`). A missing TEXT line, an empty/whitespace-only note, or an over-cap note all
+/// become [`Action::Invalid`] (a wasted think + feedback), never a panic, never a malformed
+/// publish. The daemon RE-runs the SAME guard before signing (it never trusts this side).
+fn build_post(text: Option<String>) -> Action {
+    let Some(text) = text else {
+        return Action::Invalid { reason: "POST without a TEXT line".to_string() };
+    };
+    match kirby_proto::sanitize_note_for_publish(&text) {
+        Ok(clean) => Action::Post { text: clean },
+        Err(reason) => Action::Invalid { reason: format!("POST rejected: {reason}") },
     }
 }
 
@@ -403,6 +451,33 @@ fn feedback_write_transient(key: &str) -> String {
     format!("REMEMBER {key} hit a transient error; it was not confirmed. Retry it.")
 }
 
+fn feedback_post_published(event_id: &str) -> String {
+    format!(
+        "your POST was PUBLISHED to the world as a public note (event {event_id}); anyone can now read it. Do not repeat it."
+    )
+}
+
+fn feedback_post_broke() -> String {
+    "your POST could NOT be published (insufficient treasury); it was not sent. You can still think and recall."
+        .to_string()
+}
+
+fn feedback_post_config_error(ceiling: u64) -> String {
+    format!(
+        "your POST was refused: the publish cost exceeds the configured ceiling ({ceiling} sats). This is a misconfiguration, not brokeness."
+    )
+}
+
+fn feedback_post_not_permitted() -> String {
+    "your POST was refused: this agent is not permitted to publish (no posting capability). Do not POST again."
+        .to_string()
+}
+
+fn feedback_post_transient() -> String {
+    "your POST hit a transient error and was not confirmed published; nothing was charged. You may retry it."
+        .to_string()
+}
+
 // ===========================================================================================
 // The PLAN prompt builder (D-7).
 // ===========================================================================================
@@ -560,6 +635,38 @@ fn capable_verify_key(slug: &str, seq: u64) -> String {
     format!("capable-verify-{slug}-{seq}")
 }
 
+/// Build the POST request (`Actuate` with the `nostr.publish` kind): the OUTWARD actuating act
+/// and the ISOLATED request-builder seam (the only genome code that knows the daemon act-shape,
+/// so the rest of the loop is shape-agnostic). The note text rides a nested-prost
+/// [`NostrPublish`] (nostr kind fixed to 1, a public text note; no tags in the MVP) prost-encoded
+/// into the OPAQUE `Actuate.payload`, so the genome stays JSON-free (F5) and the envelope stays
+/// generic (the `kind` string selects the daemon handler + is the per-kind allowlist token).
+/// Keyed on `capable-post-{seq}` so a resumed POST dedupes to the SAME publish (the daemon
+/// returns the original event id, never a second note). `budget_sats == max_cost_sats` (the
+/// genome's authorized ceiling); the daemon meters the small fixed publish cost under it.
+fn build_actuate_post_request(seq: u64, text: &str, max_cost_sats: u64) -> CapabilityRequest {
+    let payload = NostrPublish {
+        kind: NOSTR_KIND_TEXT_NOTE as u32,
+        content: text.to_string(),
+        tags: Vec::new(),
+    }
+    .encode_to_vec();
+    CapabilityRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        idempotency_key: capable_post_key(seq),
+        act: Some(Act::Actuate(Actuate {
+            kind: ACTUATE_KIND_NOSTR_PUBLISH.to_string(),
+            payload,
+            max_cost_sats,
+        })),
+        budget_sats: max_cost_sats,
+    }
+}
+
+fn capable_post_key(seq: u64) -> String {
+    format!("capable-post-{seq}")
+}
+
 /// Report a capable event to the daemon over the gateway (best-effort), and to the serial log.
 async fn report<G: Gateway>(gw: &mut G, kind: &str, detail: &str) {
     boot_log(detail);
@@ -636,11 +743,15 @@ async fn recall_capable_facts<G: Gateway>(
 #[derive(Debug)]
 pub(super) enum TickOutcome {
     /// The PLAN ran (the THINK was PERFORMED). Carries the runway update, whether an actuating
-    /// write was RECORDED (so the loop advances the resume checkpoint), the parsed action + the
-    /// VERIFY verdict (for observability + tests), and the feedback line for the NEXT plan.
+    /// act was RECORDED (a committed memory write OR a published post, so the loop advances the
+    /// resume checkpoint), the parsed action + the VERIFY verdict (for observability + tests, and
+    /// `None` for a post which has no read-back), and the feedback line for the NEXT plan.
     Lived {
         think_cost: u64,
         treasury_remaining: u64,
+        /// True when an actuating act COMMITTED this tick (a recorded memory write or a published
+        /// post): the loop advances the durable resume cursor past this seq. False for a no-op
+        /// (NOTE/RECALL/Invalid) or a denied/transient act, which replay free on resume.
         recorded_write: bool,
         action: Action,
         verify: Option<VerifyOutcome>,
@@ -731,6 +842,8 @@ async fn execute_action<G: Gateway>(
     match action {
         Action::Note => (false, None, feedback_note()),
         Action::Recall => (false, None, feedback_recall()),
+        // POST: the ONE OUTWARD actuating act this tick (D-4), factored into its own helper.
+        Action::Post { text } => execute_post(gw, seq, text, params).await,
         Action::Invalid { reason } => {
             boot_log(&format!(
                 "capable seq={seq}: plan malformed or guard-rejected, NO action taken ({reason})"
@@ -800,6 +913,94 @@ async fn execute_action<G: Gateway>(
             }
         }
     }
+}
+
+/// Dispatch a POST: the ONE OUTWARD actuating act this tick (D-4). Issues EXACTLY ONE `Actuate`
+/// (`nostr.publish`) request via the isolated [`build_actuate_post_request`]; the DAEMON signs +
+/// publishes the kind:1 note (the genome NEVER publishes, egress lock). There is no read-back
+/// VERIFY (the egress-locked genome cannot read the relay), so `verify` is `None`; the daemon's
+/// receipt outcome + event-id proof IS the confirmation, surfaced into the feedback. Classifies
+/// the receipt: a performed/duplicate publish is RECORDED (advances the resume cursor: a post is
+/// a committed actuating act, and the loop never reuses its seq for a memory write, so advancing
+/// the monotonic wseq past it is safe); a broke publish is a SOFT SKIP (D-5: NOT death, the THINK
+/// stays the only death gate); an over-budget publish is a loud config error; a not-allowlisted /
+/// upstream / unexpected outcome did NOT publish and debited 0, so it is a non-committing retry.
+/// Reuses `params.memory_max_cost` as the genome's authorized ceiling (a post is a small metered
+/// act like a write; a dedicated knob is post-MVP), which the daemon's small fixed cost fits under.
+async fn execute_post<G: Gateway>(
+    gw: &mut G,
+    seq: u64,
+    text: &str,
+    params: &DiaristParams,
+) -> (bool, Option<VerifyOutcome>, String) {
+    let req = build_actuate_post_request(seq, text, params.memory_max_cost);
+    let receipt = match gw.call(req).await {
+        Ok(r) => r,
+        Err(status) => {
+            boot_log(&format!("capable_post seq={seq}: RequestCapability errored ({status})"));
+            return (false, None, feedback_post_transient());
+        }
+    };
+    match kirby_proto::Outcome::try_from(receipt.outcome).unwrap_or(kirby_proto::Outcome::Unspecified)
+    {
+        kirby_proto::Outcome::AuthorizedAndPerformed | kirby_proto::Outcome::DuplicateIgnored => {
+            let event_id = post_event_id(&receipt.proof);
+            boot_log(&format!(
+                "capable_post seq={seq} PUBLISHED event={event_id} cost_sats={} treasury_remaining={}",
+                receipt.cost_sats, receipt.treasury_remaining
+            ));
+            report(gw, "capable_post", &format!("seq={seq} PUBLISHED event={event_id}")).await;
+            (true, None, feedback_post_published(&event_id))
+        }
+        kirby_proto::Outcome::DeniedInsufficientTreasury => {
+            // Soft skip (D-5): broke enough to think but not to post. NOT death.
+            boot_log(&format!(
+                "capable_post seq={seq} DENIED_INSUFFICIENT_TREASURY (soft skip, not death)"
+            ));
+            (false, None, feedback_post_broke())
+        }
+        kirby_proto::Outcome::DeniedOverBudget => {
+            // Loud config error (D-5): the authorized ceiling is below the host publish cost.
+            report(
+                gw,
+                "capable_config_error",
+                &format!(
+                    "seq={seq} POST DENIED_OVER_BUDGET: the authorized ceiling ({}) is below the host publish cost; raise it",
+                    params.memory_max_cost
+                ),
+            )
+            .await;
+            (false, None, feedback_post_config_error(params.memory_max_cost))
+        }
+        kirby_proto::Outcome::DeniedNotAllowlisted => {
+            // The workload lacks the nostr.publish token: posting is not permitted. Surfaced, NOT
+            // death; this should not occur for the capable workload (it carries the token), so it
+            // signals a misconfiguration if it ever fires.
+            boot_log(&format!(
+                "capable_post seq={seq} DENIED_NOT_ALLOWLISTED: this workload may not publish"
+            ));
+            (false, None, feedback_post_not_permitted())
+        }
+        other => {
+            // UpstreamFailed (relay down / daemon-side guard rejection), Unspecified, or a lease
+            // fence: nothing published, nothing debited. Retry WITHOUT committing the seq (the
+            // post idempotency key is reused so a later success is not double-published).
+            boot_log(&format!(
+                "capable_post seq={seq} not published (outcome={other:?}); transient, will retry"
+            ));
+            (false, None, feedback_post_transient())
+        }
+    }
+}
+
+/// Render the publish proof (the daemon returns the nostr event id as the proof) into a short,
+/// bounded, sanitized string for the feedback/log, so a malformed proof cannot bloat the next
+/// PLAN prompt. Empty proof -> "(unknown)" (best-effort; the publish still succeeded).
+fn post_event_id(proof: &[u8]) -> String {
+    if proof.is_empty() {
+        return "(unknown)".to_string();
+    }
+    summarize_bytes(proof, 64)
 }
 
 /// Whether a tick outcome COMMITS its seq, advancing the loop's monotonic cursor (FIX-2). A
@@ -889,9 +1090,12 @@ pub(super) async fn capable_loop(
                 )
                 .await;
                 if recorded_write {
-                    // The write landed exactly-once; advance the resume cursor PAST this seq so a
-                    // restart continues past this entry (F1/F2), matching the diarist's discipline
-                    // (advance ONLY after a recorded write; no-write ticks replay free on resume).
+                    // An actuating act committed exactly-once (a memory write OR a published
+                    // post); advance the resume cursor PAST this seq so a restart continues past
+                    // this entry (F1/F2). The wseq is the loop's monotonic resume seq; advancing
+                    // it past a post-seq is safe (the loop never reuses a seq for a memory write,
+                    // so the daemon wseq_floor never rejects a live write). No-op ticks
+                    // (NOTE/RECALL/Invalid) and denied/transient acts replay free on resume.
                     submit_wseq_checkpoint(&mut client, seq).await;
                 }
                 last_feedback = Some(feedback);
@@ -955,13 +1159,21 @@ mod tests {
         corrupt_readback: Option<Vec<u8>>,
         /// Acknowledge a SET as Recorded but do NOT store it (a dropped write -> Unconfirmed).
         drop_writes: bool,
+        // POST (Actuate) script + recording: the daemon-side publish is modeled as a recorded
+        // outcome + an event-id proof, so the genome tick can be driven without a real relay.
+        actuate_outcome: i32,
+        actuate_proof: Vec<u8>,
+        /// Every Actuate request's decoded payload (the NostrPublish), so a test can assert the
+        /// EXACT content + kind that reached the gateway (P2: one publish, sanitized content).
+        published: Vec<NostrPublish>,
         // Recording.
         requests: Vec<CapabilityRequest>,
         events: Vec<Event>,
     }
 
     impl MockGateway {
-        /// A mock whose THINK is PERFORMED with `reply`, and whose SET is PERFORMED + stored.
+        /// A mock whose THINK is PERFORMED with `reply`, whose SET is PERFORMED + stored, and
+        /// whose POST (Actuate) is PERFORMED with a canned event-id proof.
         fn thinking(reply: &str) -> Self {
             MockGateway {
                 think_reply: reply.to_string(),
@@ -969,6 +1181,8 @@ mod tests {
                 think_cost: 5,
                 think_treasury: 1_000,
                 set_outcome: Outcome::AuthorizedAndPerformed as i32,
+                actuate_outcome: Outcome::AuthorizedAndPerformed as i32,
+                actuate_proof: b"eventid-deadbeefcafe".to_vec(),
                 ..Default::default()
             }
         }
@@ -980,6 +1194,13 @@ mod tests {
                     matches!(&r.act, Some(Act::Memory(m)) if m.op == MemoryOp::Set as i32)
                 })
                 .count()
+        }
+
+        /// The number of OUTWARD publish (Actuate) requests that reached the gateway. The
+        /// load-bearing count for "exactly ONE publish per POST tick" and "ZERO publishes when
+        /// guarded/denied".
+        fn actuate_requests(&self) -> usize {
+            self.requests.iter().filter(|r| matches!(&r.act, Some(Act::Actuate(_)))).count()
         }
     }
 
@@ -1038,6 +1259,26 @@ mod tests {
                                 ..Default::default()
                             }
                         }
+                    }
+                }
+                Some(Act::Actuate(a)) => {
+                    // Decode the OPAQUE payload (the genome prost-encoded a NostrPublish) and
+                    // record it, so a test can assert the exact kind + sanitized content that
+                    // reached the gateway. Model the daemon publish as the scripted outcome + an
+                    // event-id proof (no real relay needed for the genome-side teeth).
+                    if let Ok(np) = NostrPublish::decode(a.payload.as_slice()) {
+                        self.published.push(np);
+                    }
+                    let performed = matches!(
+                        Outcome::try_from(self.actuate_outcome).unwrap_or(Outcome::Unspecified),
+                        Outcome::AuthorizedAndPerformed | Outcome::DuplicateIgnored
+                    );
+                    CapabilityReceipt {
+                        outcome: self.actuate_outcome,
+                        cost_sats: if performed { 1 } else { 0 },
+                        treasury_remaining: self.think_treasury,
+                        proof: if performed { self.actuate_proof.clone() } else { Vec::new() },
+                        ..Default::default()
                     }
                 }
                 _ => CapabilityReceipt { outcome: Outcome::Unspecified as i32, ..Default::default() },
@@ -1582,5 +1823,185 @@ mod tests {
             vec!["capable-think-1".to_string(), "capable-think-1".to_string()],
             "the retry reuses the SAME think idempotency key (idempotent, no double-charge)"
         );
+    }
+
+    // =======================================================================================
+    // POST actuator (the first OUTWARD voice). P1 parse, P3 genome-side sanitize/guard, P2 one
+    // publish with sanitized content, P4 metabolism (soft-skip-when-broke, the THINK stays the
+    // death gate, <=1 actuating act/tick). The daemon-side guard + relay publish are tested in
+    // kirby-node (the actuator handler) + kirby-proto (the shared sanitizer); these are the
+    // FAST, UNGATED, in-process genome teeth.
+    // =======================================================================================
+
+    // ---- P1: ACTION: POST + TEXT parses to a Post carrying the (sanitized) note text ----
+
+    #[test]
+    fn parses_post_and_carries_the_note_text() {
+        match parse_action("ACTION: POST\nTEXT: the relay has been quiet for three ticks") {
+            Action::Post { text } => {
+                assert_eq!(text, "the relay has been quiet for three ticks")
+            }
+            other => panic!("expected Post, got {other:?}"),
+        }
+        assert_eq!(parse_action("ACTION: POST\nTEXT: hi").kind(), "POST");
+    }
+
+    #[test]
+    fn post_is_case_insensitive_tolerates_prose_and_preserves_a_colon() {
+        match parse_action("Sure, here goes.\n\naction: post\ntext: ratio is 3:1 and rising") {
+            Action::Post { text } => assert_eq!(text, "ratio is 3:1 and rising"),
+            other => panic!("expected Post, got {other:?}"),
+        }
+    }
+
+    // ---- P3 (genome side): the POST text is sanitized + bounded; bad text is a safe no-op ----
+
+    #[test]
+    fn post_text_is_sanitized_to_a_single_safe_line() {
+        // A NUL control char + a U+2028 line separator + a tab are all stripped/collapsed, so the
+        // note that would be requested is a single clean line (no smuggled control sequences).
+        match parse_action("ACTION: POST\nTEXT: hello\u{0}\u{2028}world\tagain") {
+            Action::Post { text } => {
+                assert_eq!(text, "hello world again");
+                assert!(!text.contains('\n') && !text.contains('\u{2028}'));
+            }
+            other => panic!("expected Post, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_missing_and_oversized_post_text_are_safe_invalid() {
+        // A missing TEXT line, a whitespace/control-only TEXT, and an over-cap note all become a
+        // safe Invalid (a wasted think + feedback), never a panic, never a malformed publish.
+        assert!(matches!(parse_action("ACTION: POST"), Action::Invalid { .. }));
+        assert!(matches!(parse_action("ACTION: POST\nTEXT:    "), Action::Invalid { .. }));
+        assert!(matches!(
+            parse_action("ACTION: POST\nTEXT: \u{0}\u{2028}\r"),
+            Action::Invalid { .. }
+        ));
+        let big = "x".repeat(kirby_proto::MAX_NOTE_BYTES + 1);
+        match parse_action(&format!("ACTION: POST\nTEXT: {big}")) {
+            Action::Invalid { reason } => assert!(reason.contains("cap"), "reason: {reason}"),
+            other => panic!("expected Invalid for an oversized note, got {other:?}"),
+        }
+        // The boundary (exactly the cap) is accepted.
+        let at = "x".repeat(kirby_proto::MAX_NOTE_BYTES);
+        assert!(matches!(
+            parse_action(&format!("ACTION: POST\nTEXT: {at}")),
+            Action::Post { .. }
+        ));
+    }
+
+    // ---- P2: a POST tick issues EXACTLY ONE publish carrying the sanitized content ----
+
+    #[tokio::test]
+    async fn tick_post_issues_exactly_one_publish_with_sanitized_content() {
+        let mut gw = MockGateway::thinking(
+            "ACTION: POST\nTEXT: the relay has been quiet for three ticks",
+        );
+        let params = test_params();
+        let feedback = match capable_tick(&mut gw, 1, &params, 1_000, 0, None, "").await {
+            TickOutcome::Lived { action, recorded_write, verify, feedback, .. } => {
+                assert!(matches!(action, Action::Post { .. }), "the plan parsed to a POST");
+                assert!(recorded_write, "a published post commits the resume cursor");
+                assert_eq!(verify, None, "a post has no read-back VERIFY (egress-locked genome)");
+                feedback
+            }
+            other => panic!("expected Lived, got {other:?}"),
+        };
+        // EXACTLY ONE outward publish reached the gateway (<=1 actuating act/tick), zero writes.
+        assert_eq!(gw.actuate_requests(), 1, "exactly one publish this tick");
+        assert_eq!(gw.set_requests(), 0, "a POST issues no memory write");
+        // The published payload is a kind:1 note carrying the SANITIZED content.
+        assert_eq!(gw.published.len(), 1);
+        assert_eq!(gw.published[0].kind, NOSTR_KIND_TEXT_NOTE as u32);
+        assert_eq!(gw.published[0].content, "the relay has been quiet for three ticks");
+        // The publish is confirmed + surfaced into the NEXT plan (the event id rides the feedback).
+        assert!(feedback.contains("PUBLISHED"), "the publish is surfaced: {feedback}");
+        let next = build_plan_prompt(&[], 2, 995, 5, Some(&feedback), "");
+        assert!(next[1].content.contains("PUBLISHED"), "the next plan carries the publish result");
+    }
+
+    #[tokio::test]
+    async fn tick_post_request_is_a_well_formed_actuate_envelope() {
+        // The genome builds the GENERAL envelope: kind = the nostr.publish token (the per-kind
+        // allowlist token + handler key), payload = a prost-encoded NostrPublish, keyed for
+        // idempotent resume so a replay never double-publishes.
+        let mut gw = MockGateway::thinking("ACTION: POST\nTEXT: hello world");
+        let params = test_params();
+        let _ = capable_tick(&mut gw, 7, &params, 1_000, 0, None, "").await;
+        let actuate = gw.requests.iter().find_map(|r| match &r.act {
+            Some(Act::Actuate(a)) => Some((r.idempotency_key.clone(), a.clone())),
+            _ => None,
+        });
+        let (key, a) = actuate.expect("an Actuate request was issued");
+        assert_eq!(a.kind, ACTUATE_KIND_NOSTR_PUBLISH, "kind = the nostr.publish token");
+        assert_eq!(key, "capable-post-7", "keyed for idempotent resume (no double-publish)");
+        assert!(a.max_cost_sats > 0, "the publish carries a budget ceiling (metered)");
+    }
+
+    // ---- P4: POST is metered; broke = soft skip (NOT death); the THINK stays the death gate --
+
+    #[tokio::test]
+    async fn tick_post_denied_insufficient_is_a_soft_skip_not_death() {
+        let mut gw = MockGateway::thinking("ACTION: POST\nTEXT: hello world");
+        gw.actuate_outcome = Outcome::DeniedInsufficientTreasury as i32;
+        let params = test_params();
+        match capable_tick(&mut gw, 1, &params, 1_000, 0, None, "").await {
+            TickOutcome::Lived { recorded_write, verify, feedback, .. } => {
+                assert!(!recorded_write, "a broke publish is not recorded");
+                assert_eq!(verify, None);
+                assert!(feedback.contains("could NOT be published"), "{feedback}");
+            }
+            other => panic!("a denied POST must NOT be death, got {other:?}"),
+        }
+        assert_eq!(gw.actuate_requests(), 1, "the publish was attempted exactly once");
+    }
+
+    #[tokio::test]
+    async fn tick_post_over_budget_is_a_loud_config_error() {
+        let mut gw = MockGateway::thinking("ACTION: POST\nTEXT: hello world");
+        gw.actuate_outcome = Outcome::DeniedOverBudget as i32;
+        let params = test_params();
+        match capable_tick(&mut gw, 1, &params, 1_000, 0, None, "").await {
+            TickOutcome::Lived { recorded_write, feedback, .. } => {
+                assert!(!recorded_write);
+                assert!(feedback.contains("ceiling"), "loud config error feedback: {feedback}");
+            }
+            other => panic!("expected Lived, got {other:?}"),
+        }
+        assert!(
+            gw.events.iter().any(|e| e.kind == "capable_config_error"),
+            "an over-budget publish is surfaced LOUDLY as a config error event"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_post_not_allowlisted_is_surfaced_not_death() {
+        // Defense in depth: if the daemon denies the publish at the allowlist (the workload lacks
+        // the nostr.publish token), the genome surfaces it as a non-fatal "not permitted", never
+        // death, and does not commit the seq.
+        let mut gw = MockGateway::thinking("ACTION: POST\nTEXT: hello world");
+        gw.actuate_outcome = Outcome::DeniedNotAllowlisted as i32;
+        let params = test_params();
+        match capable_tick(&mut gw, 1, &params, 1_000, 0, None, "").await {
+            TickOutcome::Lived { recorded_write, feedback, .. } => {
+                assert!(!recorded_write);
+                assert!(feedback.contains("not permitted"), "{feedback}");
+            }
+            other => panic!("a denied-allowlist POST must NOT be death, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_denied_think_is_death_and_publishes_nothing() {
+        let mut gw = MockGateway::thinking("ACTION: POST\nTEXT: hello world");
+        gw.think_outcome = Outcome::DeniedInsufficientTreasury as i32;
+        let params = test_params();
+        assert!(
+            matches!(capable_tick(&mut gw, 1, &params, 1, 0, None, "").await, TickOutcome::Dead),
+            "a denied THINK is the one death condition (F4), even when the plan would POST"
+        );
+        assert_eq!(gw.actuate_requests(), 0, "death happens BEFORE any outward publish");
     }
 }
