@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use kirby_node::gateway::{GatewayService, Session};
-use kirby_node::raft_lease::{ActiveLease, FenceVerdict, LeaseNode};
+use kirby_node::raft_lease::{bring_up_cluster, ActiveLease, FenceVerdict, LeaseNode};
 use kirby_node::rail::{self, MockRail};
 use kirby_node::treasury::Treasury;
 use kirby_proto::capability_request::Act;
@@ -129,16 +129,19 @@ async fn a_gateway_fences_debit_when_lease_moved_to_another_node() {
 /// request (a fence that denied unconditionally would also pass the test above).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gateway_allows_debit_when_node_holds_the_lease() {
-    let believed_term = 5u64;
-    let node = LeaseNode::start(7, "127.0.0.1:0").await.expect("start lease node");
+    // The node genuinely holds the committed lease AND is the Raft leader, which is the
+    // ONLY way a node is legitimately active (it granted itself the lease AS the leader).
+    // The fence now requires leadership in addition to holder+term (the S1 Codex
+    // hardening: a holder that lost leadership must be fenced), so this Active control
+    // uses a real single-node leader rather than a mock catch_up of a never-leader node.
+    let bring_up = bring_up_cluster(&[7]).await.expect("bring up single-node cluster");
+    let node = bring_up.nodes.into_iter().next().expect("the single node");
     let handle = node.handle();
-    // The committed lease names THIS node (7) at exactly its believed term: Active.
-    handle
-        .catch_up_committed_lease(ActiveLease { node_id: 7, term: believed_term })
-        .await;
+    let granted = node.grant_lease(7).await.expect("grant self the default-slot lease");
+    let believed_term = granted.term;
     assert!(
-        matches!(handle.fence(believed_term).await, FenceVerdict::Active { term: 5 }),
-        "the node holds the committed lease at its term: it must be Active"
+        matches!(handle.fence(believed_term).await, FenceVerdict::Active { term } if term == believed_term),
+        "the leader holds the committed lease at its term: it must be Active"
     );
 
     let treasury = Treasury::open_temporary(1_000_000).expect("open temporary treasury");
