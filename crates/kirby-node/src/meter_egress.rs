@@ -32,6 +32,26 @@ pub const EGRESS_BPF_OBJECT: &[u8] = include_bytes!(env!("KIRBY_EGRESS_BPF_OBJEC
 const EGRESS_MAP: &str = "EGRESS_BYTES";
 const EGRESS_PROG: &str = "kirby_egress";
 
+/// The TC attach direction for the egress meter (gate G4). It MUST be INGRESS:
+/// for a TAP the packets the GUEST transmits (the VM's egress) arrive at the host
+/// as the device's ingress, so the VM-egress bytes are counted on the ingress
+/// hook. Attaching the EGRESS hook would only see host-to-guest traffic and would
+/// silently meter ~0 for real VM egress (a leak the counter would not catch). A
+/// single source of truth so a fast test can assert the direction without a
+/// kernel, and `run_privileged_egress_meter` cannot drift from it.
+pub const EGRESS_METER_DIRECTION: EgressMeterDirection = EgressMeterDirection::Ingress;
+
+/// The direction the egress meter classifier attaches on the TAP. Mirrors the two
+/// `aya::programs::TcAttachType` variants that matter here, kernel-free so it is
+/// assertable in a fast test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressMeterDirection {
+    /// The host RX path: where a TAP sees the GUEST's transmitted (egress) bytes.
+    Ingress,
+    /// The host TX path: host-to-guest only (WRONG for metering VM egress).
+    Egress,
+}
+
 /// The stdout line prefix the privileged child prints the running byte total on.
 /// The daemon parses `EGRESS_BYTES <n>` lines to read the live counter.
 const EGRESS_LINE_PREFIX: &str = "EGRESS_BYTES ";
@@ -248,8 +268,15 @@ pub fn run_privileged_egress_meter(iface: &str, tick: Duration) -> anyhow::Resul
     program
         .load()
         .map_err(|e| anyhow::anyhow!("load classifier into the kernel: {e}"))?;
+    // The direction is the single source of truth EGRESS_METER_DIRECTION (G4): the
+    // TAP's INGRESS hook is the VM-egress direction; the egress hook would only see
+    // host-to-guest. Map the const to aya's attach type so the two cannot drift.
+    let attach_type = match EGRESS_METER_DIRECTION {
+        EgressMeterDirection::Ingress => TcAttachType::Ingress,
+        EgressMeterDirection::Egress => TcAttachType::Egress,
+    };
     program
-        .attach(iface, TcAttachType::Ingress)
+        .attach(iface, attach_type)
         .map_err(|e| anyhow::anyhow!("attach classifier to {iface} ingress (the VM-egress direction): {e}"))?;
 
     // Signal the parent we are attached (the daemon waits for this line).
