@@ -22,16 +22,23 @@ use kirby_proto::capability_request::Act;
 use kirby_proto::node_gateway_server::{NodeGateway, NodeGatewayServer};
 use kirby_proto::{
     Ack, CapabilityReceipt, CapabilityRequest, CheckpointBlob, EntropyNonce, EntropyRequest, Event,
-    Memory, MemoryOp, MemoryResult, Outcome, SessionContext, SessionRequest, WriteStatus,
+    InboundBatch, InboundKind, InboxRequest, Memory, MemoryOp, MemoryResult, Outcome,
+    SessionContext, SessionRequest, WriteStatus,
 };
 use prost::Message;
 use rand::TryRngCore;
 use tonic::{Request, Response, Status};
 
 use crate::checkpoint::{CheckpointArtifact, LatestCheckpoint};
+use crate::nerve::InboundQueue;
 use crate::raft_lease::{FenceVerdict, LeaseAuthority, LeaseHandle};
 use crate::rail::{self, MemoryBackend, MemoryWrite, Rail, RailOutcome};
 use crate::treasury::{DebitOutcome, Treasury, TreasuryError};
+
+/// The host ceiling on a `PollInbox` long-poll budget (1.2): the daemon CLAMPS the
+/// genome's `wait_ms` to this so a hostile value cannot pin a server task forever. 30s is
+/// generous for a tick-loop consumer that re-polls.
+const MAX_INBOX_WAIT_MS: u64 = 30_000;
 
 /// Non-secret session snapshot handed to the genome at boot (spec 3.1). Holds
 /// NO credentials: the task descriptor, the budget snapshot, and the allowlist
@@ -41,6 +48,12 @@ pub struct Session {
     pub task_descriptor: String,
     pub budget_sats: u64,
     pub allowlisted_destinations: Vec<String>,
+    /// The set of INBOUND kinds this VM is permitted to receive (earn-loop Component 1,
+    /// 1.4) -- the inbound mirror of `allowlisted_destinations`. `PollInbox` delivers
+    /// only `want_kinds INTERSECT allowlisted_inbound_kinds`: the genome can NARROW but
+    /// never widen what the session permits. Empty => inbound is DISABLED for this VM
+    /// (default-deny: a workload not configured for inbound receives nothing).
+    pub allowlisted_inbound_kinds: Vec<InboundKind>,
 }
 
 /// The gateway service for one VM/CID. Cheap to clone. It owns a `&Treasury`
@@ -90,6 +103,18 @@ pub struct GatewayService {
     /// the persisted treasury) and advanced past each committed write. Shared across the
     /// service's clones (`Arc<AtomicU64>`); 0 when no memory backend is attached.
     wseq_floor: Arc<AtomicU64>,
+    /// The OPTIONAL per-genome INBOUND queue (earn-loop Component 1, the daemon -> genome
+    /// inbox). `Some` for an inbound-enabled gateway (the nerve's `run_inbound` task feeds
+    /// the SAME `InboundQueue` handle, the gateway's `PollInbox` drains it); `None` for a
+    /// workload without inbound, where `PollInbox` returns an empty batch immediately
+    /// (default-deny: no queue, nothing to receive). An `InboundQueue` is itself
+    /// `Arc`-backed, so it stays cheap to clone with the service.
+    inbox: Option<InboundQueue>,
+    /// The set of INBOUND kinds this gateway is permitted to deliver, collected from the
+    /// session (1.4) -- the inbound mirror of `allowlist`. `PollInbox` intersects the
+    /// genome's `want_kinds` with this set; the genome can only NARROW. Empty => inbound
+    /// disabled.
+    allowlisted_inbound_kinds: Arc<Vec<InboundKind>>,
 }
 
 /// The lease fence attached to a gateway (spec 4.3): the node's lease handle plus
@@ -125,6 +150,7 @@ impl GatewayService {
             .iter()
             .cloned()
             .collect::<HashSet<_>>();
+        let allowlisted_inbound_kinds = Arc::new(session.allowlisted_inbound_kinds.clone());
         GatewayService {
             treasury,
             rail,
@@ -137,7 +163,27 @@ impl GatewayService {
             lease_fence: None,
             memory: None,
             wseq_floor: Arc::new(AtomicU64::new(0)),
+            inbox: None,
+            allowlisted_inbound_kinds,
         }
+    }
+
+    /// Attach the per-genome INBOUND queue (earn-loop Component 1): the gateway's `PollInbox`
+    /// now drains this `InboundQueue`, the SAME handle the nerve's `run_inbound` task feeds
+    /// (the daemon clones one queue, gives the task the producer side and the gateway the
+    /// consumer side). Without it `PollInbox` returns an empty batch immediately (a workload
+    /// with no inbox receives nothing -- default-deny). Mirrors `with_memory_backend`'s
+    /// optional-seam shape; the `InboundQueue` is `Arc`-backed so the service stays cheap to
+    /// clone (the serve path clones it per connection).
+    pub fn with_inbound_queue(mut self, queue: InboundQueue) -> Self {
+        self.inbox = Some(queue);
+        self
+    }
+
+    /// Clone the inbound queue handle (if any), so the daemon's `run_inbound` task can feed
+    /// the SAME queue this gateway drains. `None` when inbound is not attached.
+    pub fn inbound_queue(&self) -> Option<InboundQueue> {
+        self.inbox.clone()
     }
 
     /// Attach the durable-mind-state memory store (the Memory act backend). A memory-mode
@@ -938,6 +984,87 @@ impl NodeGateway for GatewayService {
         // error, mapped here at the boundary.
         let receipt = self.authorize_capability(&req).await.map_err(internal)?;
         Ok(Response::new(receipt))
+    }
+
+    /// The earn-loop INBOUND long-poll (Component 1, 1.1/1.2). The genome polls for the
+    /// typed, daemon-verified events the nerve's `run_inbound` task has queued. Semantics:
+    ///   * The delivered kinds = `want_kinds INTERSECT allowlisted_inbound_kinds`: the genome
+    ///     can only NARROW what the session permits (1.4). A `want_kind` NOT in the allowlist
+    ///     is silently ignored (not an error); an EMPTY effective set means deliver the full
+    ///     allowlisted set. If the session allowlists NOTHING, inbound is disabled (every poll
+    ///     returns empty) -- default-deny.
+    ///   * Only events with `inbox_seq > ack_seq` are returned (the monotonic cursor: never
+    ///     re-deliver, never skip; a redial + re-poll is exactly-once at the genome).
+    ///   * The daemon holds the request open up to `wait_ms`, CLAMPED to [`MAX_INBOX_WAIT_MS`]
+    ///     so a hostile value cannot pin a server task forever; it returns the instant >=1
+    ///     matching event is queued, else an EMPTY batch on the deadline (so the genome
+    ///     re-polls). `high_seq` is the max `inbox_seq` in the batch (the genome's next
+    ///     `ack_seq`); 0 on an empty batch (the cursor is unchanged).
+    ///
+    /// This is one more OUTBOUND call on the existing vsock: the genome gets a typed QUEUE,
+    /// never a socket, so the C-5 egress lockdown is untouched.
+    async fn poll_inbox(
+        &self,
+        request: Request<InboxRequest>,
+    ) -> Result<Response<InboundBatch>, Status> {
+        let req = request.into_inner();
+
+        // Resolve the effective want set: the genome's request INTERSECTED with the session
+        // allowlist. The genome can only narrow. Unknown/UNSPECIFIED want kinds and kinds not
+        // in the allowlist are silently dropped (default-deny). An empty effective set after
+        // intersection means "the full allowlisted set" ONLY when the genome asked for nothing;
+        // if it asked for kinds that are all disallowed, it gets nothing (it narrowed to empty).
+        let want: Vec<InboundKind> = if req.want_kinds.is_empty() {
+            // Default: the full allowlisted set.
+            (*self.allowlisted_inbound_kinds).clone()
+        } else {
+            req.want_kinds
+                .iter()
+                .filter_map(|k| InboundKind::try_from(*k).ok())
+                .filter(|k| *k != InboundKind::Unspecified)
+                .filter(|k| self.allowlisted_inbound_kinds.contains(k))
+                .collect()
+        };
+
+        // No queue attached, or the genome narrowed to the empty set: nothing to deliver.
+        // (Distinguish from "want all": `want` is empty here ONLY because the genome asked for
+        // kinds none of which are allowlisted, OR the session allowlists nothing AND the genome
+        // asked for all. Either way an empty `want` against an empty allowlist = deliver nothing,
+        // so we short-circuit when the allowlist is empty.)
+        let queue = match &self.inbox {
+            Some(q) if !self.allowlisted_inbound_kinds.is_empty() => q,
+            _ => {
+                return Ok(Response::new(InboundBatch {
+                    schema_version: kirby_proto::SCHEMA_VERSION,
+                    events: Vec::new(),
+                    high_seq: 0,
+                }));
+            }
+        };
+        // The genome explicitly asked only for disallowed kinds: it narrowed to empty, deliver
+        // nothing (do NOT fall back to the full set, which would WIDEN past its request).
+        if !req.want_kinds.is_empty() && want.is_empty() {
+            return Ok(Response::new(InboundBatch {
+                schema_version: kirby_proto::SCHEMA_VERSION,
+                events: Vec::new(),
+                high_seq: 0,
+            }));
+        }
+
+        let wait_ms = req.wait_ms.min(MAX_INBOX_WAIT_MS);
+        let events = queue
+            .poll(
+                req.ack_seq,
+                &want,
+                std::time::Duration::from_millis(wait_ms),
+            )
+            .await;
+        let high_seq = events.iter().map(|e| e.inbox_seq).max().unwrap_or(0);
+        Ok(Response::new(InboundBatch {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            events,
+            high_seq,
+        }))
     }
 }
 

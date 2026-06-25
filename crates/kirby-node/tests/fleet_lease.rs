@@ -139,6 +139,7 @@ async fn g_fence_live_per_agent_fenced_gateway_denies_and_debits_zero() {
         task_descriptor: "g-fence-live".to_string(),
         budget_sats: 1_000_000,
         allowlisted_destinations: vec!["mint.test.local".to_string()],
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let rail: Arc<dyn Rail> = Arc::new(MockRail::new());
 

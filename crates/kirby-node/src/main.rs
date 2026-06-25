@@ -671,6 +671,7 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
         task_descriptor: args.task,
         budget_sats: args.budget_sats,
         allowlisted_destinations: args.allow,
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let rail = Arc::new(rail::MockRail::new());
     let service = gateway::GatewayService::new(treasury, rail, session);

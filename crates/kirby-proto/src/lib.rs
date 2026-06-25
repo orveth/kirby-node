@@ -44,7 +44,13 @@ pub const MAX_NOTE_BYTES: usize = 512;
 pub fn sanitize_note_for_publish(raw: &str) -> Result<String, String> {
     let spaced: String = raw
         .chars()
-        .map(|c| if c.is_control() || c == '\u{2028}' || c == '\u{2029}' { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     // `split_whitespace` drops the (now whitespace-only) runs and trims the ends; `join(" ")`
     // re-joins with exactly one space. Non-whitespace content is preserved verbatim.
@@ -137,6 +143,18 @@ pub const KIND_KIRBY_AGENT_STATE: u16 = 31000;
 /// `plans/build-spec-kirby-hibernation-thinslice.md`).
 pub const KIND_KIRBY_WAKE_REQUEST: u16 = 31001;
 
+/// NIP-90 (Data Vending Machine) JOB REQUEST kind range, inclusive: a relay event whose
+/// kind falls in `[5000, 5999]` is a DVM job request -- the earn trigger (earn-loop
+/// Component 1, the inbound surface). The daemon maps any kind in this range to
+/// [`InboundKind::JobRequest`] in its fixed host-side allowlist table (`nerve.rs`); a
+/// kind OUTSIDE this range (and not another allowlisted kind) is dropped (default-deny).
+/// Job RESULTS are 6000-6999 and FEEDBACK is 7000 (the agent EMITS those via the
+/// actuator; it does not receive them), so only the request range maps inbound here.
+/// Shared in the contract crate so the host allowlist and any future genome-side
+/// classification agree on one range with no central registry.
+pub const NIP90_JOB_REQUEST_KIND_MIN: u16 = 5000;
+pub const NIP90_JOB_REQUEST_KIND_MAX: u16 = 5999;
+
 pub mod gateway {
     //! Generated tonic types for `kirby.gateway.v1`.
     tonic::include_proto!("kirby.gateway.v1");
@@ -206,7 +224,10 @@ mod tests {
         assert!(sanitize_note_for_publish(&over).is_err());
         // Exactly the cap is accepted (refused means strictly greater).
         let at = "x".repeat(MAX_NOTE_BYTES);
-        assert_eq!(sanitize_note_for_publish(&at).unwrap().len(), MAX_NOTE_BYTES);
+        assert_eq!(
+            sanitize_note_for_publish(&at).unwrap().len(),
+            MAX_NOTE_BYTES
+        );
     }
 
     #[test]

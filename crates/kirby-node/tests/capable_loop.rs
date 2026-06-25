@@ -65,6 +65,7 @@ fn capable_gateway(
             BRAIN_COMPLETION_DESTINATION.to_string(),
             MEMORY_DESTINATION.to_string(),
         ],
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let service =
         GatewayService::new(treasury, Arc::new(rail), session).with_memory_backend(Arc::new(backend));
