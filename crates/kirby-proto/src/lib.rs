@@ -181,6 +181,32 @@ pub const NIP90_JOB_REQUEST_KIND_MAX: u16 = 5999;
 /// weight; only the daemon (host-side) maps it to a `nostr` `Kind`.
 pub const KIND_KIRBY_LEASE: u16 = 31002;
 
+/// The Nostr event kind for a Kirby SPAWN REQUEST — the signed relay event that asks
+/// any node in the fleet to create (spawn) an agent. This is the control-plane trigger
+/// that lets a user/operator create an agent on a node they do not run, INCLUDING a node
+/// behind a LAN/NAT (the node makes only OUTBOUND relay connections: it subscribes to see
+/// the request, claims the agent via the relay-lease, and launches — no inbound port).
+///
+/// Unlike the other KIND_KIRBY_* events, a spawn request is NOT signed by the agent's
+/// quorum key Q — the agent does not exist yet. It is signed by the REQUESTER (the
+/// operator/creator key in the three-keys model); a node verifies that signature
+/// (the inbound trust boundary) and then runs the spawn through the authorization SEAM
+/// (the anti-spam / network-join gate, pops-ready) before it ever claims or launches.
+///
+/// This is an ADDRESSABLE event kind (30000..40000, per NIP-01): keyed by a `d` tag set
+/// to the `agent_id`, the relay keeps only the LATEST request per `(pubkey, kind, d)` —
+/// a re-issued request (bumped funding/config) REPLACES the prior one rather than piling
+/// up, and keying on `d = agent_id` keeps the per-agent discipline (one pending request
+/// per agent identity). Idempotency of the LAUNCH is enforced downstream by the
+/// relay-lease CLAIM (exactly one node launches a given agent_id), not by the relay's
+/// addressable de-dup.
+///
+/// The content JSON is `{ agent_id, genome_config, image_ref, funding, requester_pubkey }`,
+/// bounded + validated host-side (a NEW attacker-controlled entry point), and the tags are
+/// `["d",<agent_id>]`, `["t","kirby"]`, `["a",<agent_id>]`. It lives here in the shared
+/// contract crate so every node and the UI agree on one value with no central registry.
+pub const KIND_KIRBY_SPAWN_REQUEST: u16 = 31003;
+
 pub mod gateway {
     //! Generated tonic types for `kirby.gateway.v1`.
     tonic::include_proto!("kirby.gateway.v1");

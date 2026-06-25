@@ -140,6 +140,71 @@ pub struct FleetConfig {
     /// to, and launches as a child process.
     #[serde(default)]
     pub tenants: Vec<TenantConfig>,
+    /// The DYNAMIC spawn control-plane (#11): subscribe to signed `KIND_KIRBY_SPAWN_REQUEST`
+    /// events on the relay and spawn agents on demand (create an agent on this node from a
+    /// signed event, no node access required). OFF by default, so a fleet that only hosts its
+    /// static `tenants` is unchanged. See [`SpawnConfig`].
+    #[serde(default)]
+    pub spawn: SpawnConfig,
+}
+
+/// The spawn control-plane config (#11). When `enabled`, the fleet supervisor subscribes to
+/// `KIND_KIRBY_SPAWN_REQUEST` (31003) on the relay and, for each verified+authorized request,
+/// spawns the agent on this node. The authz fields are the MVP gate (pops deferred): only an
+/// operator pubkey in `operators` may spawn, bounded by a per-requester rate limit, and only a
+/// pre-staged `image_ref` in `image_allowlist` is accepted (default-deny). DISABLED by default
+/// so a node never becomes an open spawn trigger by accident.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpawnConfig {
+    /// Whether this node accepts relay spawn requests. Default false (a bare fleet hosts only
+    /// its static tenants; nothing subscribes to spawn requests unless explicitly enabled).
+    #[serde(default)]
+    pub enabled: bool,
+    /// The operator pubkeys (hex) allowed to spawn (the three-keys operator key). A signed
+    /// event whose signer is not in this set is rejected — a signature proves WHICH key, not
+    /// WHETHER it may spawn. EMPTY denies everyone (so `enabled` without operators is inert).
+    #[serde(default)]
+    pub operators: Vec<String>,
+    /// The pre-staged genome `image_ref`s this node will run (default-deny an unknown image).
+    /// Empty means no image is accepted (spawn nothing) — set it to the node's staged image.
+    #[serde(default)]
+    pub image_allowlist: Vec<String>,
+    /// Max spawns accepted per `rate_window_secs` per operator (anti-spam). Default 10.
+    #[serde(default = "default_spawn_max_per_window")]
+    pub max_per_window: u32,
+    /// The rate-limit window in seconds. Default 60.
+    #[serde(default = "default_spawn_rate_window_secs")]
+    pub rate_window_secs: u64,
+    /// The maximum declarative seed amount (sats) a single spawn may fund an agent with, so one
+    /// request cannot over-seed the host. Default 1_000_000 (the play-money tenant default).
+    #[serde(default = "default_spawn_max_seed_sats")]
+    pub max_seed_sats: u64,
+}
+
+/// Default anti-spam rate: 10 spawns per operator per window.
+pub const fn default_spawn_max_per_window() -> u32 {
+    10
+}
+/// Default rate-limit window: 60 seconds.
+pub const fn default_spawn_rate_window_secs() -> u64 {
+    60
+}
+/// Default per-spawn seed ceiling (the play-money tenant default).
+pub const fn default_spawn_max_seed_sats() -> u64 {
+    1_000_000
+}
+
+impl Default for SpawnConfig {
+    fn default() -> Self {
+        SpawnConfig {
+            enabled: false,
+            operators: Vec::new(),
+            image_allowlist: Vec::new(),
+            max_per_window: default_spawn_max_per_window(),
+            rate_window_secs: default_spawn_rate_window_secs(),
+            max_seed_sats: default_spawn_max_seed_sats(),
+        }
+    }
 }
 
 /// One operator-declared fleet tenant (fleet-host S2): the static description of an agent
@@ -216,6 +281,7 @@ impl Default for FleetConfig {
             max_tenants: default_fleet_max_tenants(),
             gateway_port_base: default_fleet_gateway_port_base(),
             tenants: Vec::new(),
+            spawn: SpawnConfig::default(),
         }
     }
 }

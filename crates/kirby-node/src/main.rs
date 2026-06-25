@@ -477,6 +477,12 @@ async fn run_fleet_supervisor_cmd(
     let config_dir = alloc_dir.join("fleet-tenant-configs");
     let launcher = Arc::new(ProcessTenantLauncher::new(config.clone(), binary, config_dir));
 
+    // Capture the spawn control-plane config + relay url BEFORE `config` is moved into the
+    // supervisor (the dynamic spawn-consumer, #11; off unless `[fleet.spawn] enabled = true`).
+    let spawn_cfg = config.fleet.spawn.clone();
+    let spawn_relay_url = config.relay.url.clone();
+    let spawn_max_tenants = config.fleet.max_tenants as usize;
+
     let mut supervisor = FleetSupervisor::new(node_id, config, allocator, grantor, launcher);
     let records = supervisor.launch_all().await?;
     for r in &records {
@@ -492,8 +498,23 @@ async fn run_fleet_supervisor_cmd(
     }
     println!("FLEET supervisor: {} tenant(s) launched, monitoring lifecycle", records.len());
 
-    // Monitor: report dead tenants on a tick (the failover hook for S5/S6; S2 only tracks).
-    // Runs until killed; exits cleanly when all tenants have died (nothing left to host).
+    // The DYNAMIC spawn control-plane (#11): if enabled, subscribe to signed
+    // KIND_KIRBY_SPAWN_REQUEST events on the relay and spawn agents on demand. A node behind a
+    // LAN/NAT makes only OUTBOUND connections here (subscribe + the lease/presence publish the
+    // launch triggers), so it can host spawned agents with no inbound port. OFF by default.
+    if spawn_cfg.enabled {
+        return run_spawn_control_plane(
+            supervisor,
+            spawn_cfg,
+            &spawn_relay_url,
+            spawn_max_tenants,
+            &alloc_dir,
+        )
+        .await;
+    }
+
+    // Monitor-only (no dynamic spawn): report dead tenants on a tick (the failover hook for
+    // S5/S6; S2 only tracks). Runs until killed; exits cleanly when all tenants have died.
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
         let dead = supervisor.dead_tenants();
@@ -511,6 +532,111 @@ async fn run_fleet_supervisor_cmd(
                 "FLEET supervisor: all tenants have exited; reaped dead allocator slots, shutting down"
             );
             return Ok(());
+        }
+    }
+}
+
+/// The dynamic spawn control-plane loop (#11): subscribe to `KIND_KIRBY_SPAWN_REQUEST` on the
+/// relay and feed each event to the [`kirby_node::spawn::SpawnConsumer`], which applies the
+/// full trust boundary (verify -> image-allowlist -> operator-authz + rate-limit -> funding ->
+/// capacity -> durable reserve) before claiming + launching through the supervisor. The relay
+/// subscription is the ONLY new I/O; all policy lives in the (unit-tested) consumer. Reaps dead
+/// tenants on a tick so a spawned-agent death frees capacity for the next spawn. Runs until
+/// killed (a spawn host is long-lived; it does NOT auto-exit when its static tenants die).
+async fn run_spawn_control_plane(
+    mut supervisor: kirby_node::fleet_supervisor::FleetSupervisor,
+    spawn_cfg: kirby_node::config::SpawnConfig,
+    relay_url: &str,
+    max_tenants: usize,
+    alloc_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use anyhow::Context as _;
+    use nostr_sdk::prelude::*;
+
+    use kirby_node::spawn::{
+        AllowlistAuthorizer, SeedFunder, SledSpawnLedger, SpawnConsumer, SpawnOutcome,
+    };
+    use kirby_proto::KIND_KIRBY_SPAWN_REQUEST;
+
+    // Build the consumer from config (MVP authz: operator allowlist + rate limit; pops later).
+    let operators: HashSet<String> = spawn_cfg.operators.iter().cloned().collect();
+    let images: HashSet<String> = spawn_cfg.image_allowlist.iter().cloned().collect();
+    if operators.is_empty() {
+        tracing::warn!(
+            "FLEET spawn: enabled with an EMPTY operator allowlist -- every spawn request will be \
+             rejected (a signed event is not authorization). Set [fleet.spawn] operators."
+        );
+    }
+    let authorizer = Arc::new(AllowlistAuthorizer::new(
+        operators,
+        spawn_cfg.max_per_window,
+        spawn_cfg.rate_window_secs,
+    ));
+    let funder = Arc::new(SeedFunder::new(spawn_cfg.max_seed_sats));
+    let ledger = Arc::new(
+        SledSpawnLedger::open(alloc_dir.join("spawn-ledger"))
+            .context("open the durable spawn ledger")?,
+    );
+    let consumer = SpawnConsumer::new(max_tenants, images, authorizer, funder, ledger);
+
+    // Subscribe to spawn requests on the relay (read-only: an ephemeral key signs nothing).
+    let client = Client::builder().signer(Keys::generate()).build();
+    client
+        .add_relay(relay_url)
+        .await
+        .with_context(|| format!("add fleet relay {relay_url} for spawn subscription"))?;
+    client.connect().await;
+    let filter = Filter::new().kind(Kind::from(KIND_KIRBY_SPAWN_REQUEST));
+    client
+        .subscribe(filter, None)
+        .await
+        .context("subscribe to KIND_KIRBY_SPAWN_REQUEST")?;
+    let mut notifications = client.notifications();
+    println!("FLEET spawn control-plane: listening for spawn requests on {relay_url}");
+
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                // Reap dead spawned tenants so their CID/port slots free up for new spawns.
+                let reaped = supervisor.reap_dead();
+                for r in &reaped {
+                    tracing::info!(agent_id = %r.agent_id, "FLEET spawn: reaped a dead tenant, slot freed");
+                }
+            }
+            notif = notifications.recv() => {
+                match notif {
+                    Ok(RelayPoolNotification::Event { event, .. }) => {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        match consumer.handle_event(&event, now, &mut supervisor).await {
+                            SpawnOutcome::Launched { agent_id, frost_npub, lease_term } => {
+                                println!(
+                                    "FLEET spawn: LAUNCHED agent_id={agent_id} npub={frost_npub} lease_term={lease_term}"
+                                );
+                            }
+                            other => {
+                                tracing::debug!(?other, "FLEET spawn: request not launched");
+                            }
+                        }
+                    }
+                    Ok(RelayPoolNotification::Shutdown) => {
+                        tracing::warn!("FLEET spawn: relay pool shut down, exiting control-plane");
+                        return Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "FLEET spawn: notifications lagged; some requests skipped");
+                    }
+                    Err(_) => return Ok(()),
+                }
+            }
         }
     }
 }
