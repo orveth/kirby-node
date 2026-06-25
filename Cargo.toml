@@ -13,10 +13,9 @@ edition = "2021"
 license = "MIT"
 rust-version = "1.90"
 
-# Pinned versions for the spike. Alpha and semi-stable libs (fctools, aya,
-# openraft) are pinned exactly because they churn (spec section 11). The
-# daemon-only deps live here; the genome crate keeps its own lean set so the
-# musl static build stays small.
+# Pinned versions for the spike. Alpha and semi-stable libs (fctools, aya) are
+# pinned exactly because they churn (spec section 11). The daemon-only deps live
+# here; the genome crate keeps its own lean set so the musl static build stays small.
 [workspace.dependencies]
 tokio = { version = "1.43", features = ["full"] }
 anyhow = "1.0"
@@ -33,14 +32,6 @@ tonic-build = "0.12"
 # live sovereign agent. default-features keep it lean; it is daemon/host-side only
 # (the genome crate never parses config), so it does not touch the musl build.
 toml = "0.8"
-
-# openraft drives the embedded lease + no-split-brain consensus (spec 3.5, 4.3,
-# D-4, D-17, gate G8). Pinned EXACTLY: openraft is pre-1.0 and churns (spec
-# section 11). The 0.9 line is the most stable, documented release (the storage-v2
-# RaftLogStorage/RaftStateMachine split + RaftNetwork over a custom transport). The
-# serde feature is required: the lease type config, the log entries, and the RPC
-# wire are all serialized over the loopback TCP transport (D-17).
-openraft = { version = "=0.9.21", features = ["serde", "storage-v2"] }
 
 # The CDK ecash stack for the C-6 brokered act (gate G5, D-16): the daemon's
 # real rail settles ecash on a LOCAL cdk-mintd fakewallet mint over host

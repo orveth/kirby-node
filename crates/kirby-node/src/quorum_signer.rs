@@ -59,8 +59,8 @@ use frost::{Identifier, SigningPackage};
 use kirby_custody::cosign_net::nip01_event_id;
 use kirby_custody::cosign_net::{nip01_event_id_with_tags, NostrEvent};
 use kirby_custody::guardian::{
-    self, CoSignRequest, RefuseReason, SignIntent, KIND_KIRBY_AGENT_STATE, KIND_KIRBY_LIFECYCLE,
-    KIND_KIRBY_PRESENCE,
+    self, CoSignRequest, RefuseReason, SignIntent, KIND_KIRBY_AGENT_STATE, KIND_KIRBY_LEASE,
+    KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE,
 };
 use kirby_custody::group_xonly_q;
 
@@ -331,8 +331,9 @@ impl QuorumSigner {
         // 1. RE-PORT THE GUARDS. kind-restrict to the voice + the three beacon kinds.
         if !is_signable_kind(kind) {
             anyhow::bail!(
-                "QuorumSigner refuses kind {kind}: only kind 1 (voice) and the Kirby beacons \
-                 {KIND_KIRBY_PRESENCE}/{KIND_KIRBY_LIFECYCLE}/{KIND_KIRBY_AGENT_STATE} are signable"
+                "QuorumSigner refuses kind {kind}: only kind 1 (voice), the Kirby beacons \
+                 {KIND_KIRBY_PRESENCE}/{KIND_KIRBY_LIFECYCLE}/{KIND_KIRBY_AGENT_STATE}, and the \
+                 cross-machine lease {KIND_KIRBY_LEASE} are signable"
             );
         }
         // The NOTE SANITIZER applies ONLY to kind:1 (free text). Beacons (JSON state) are
@@ -472,7 +473,7 @@ fn is_signable_kind(kind: u32) -> bool {
     kind == kirby_proto::NOSTR_KIND_TEXT_NOTE as u32
         || matches!(
             kind,
-            KIND_KIRBY_PRESENCE | KIND_KIRBY_LIFECYCLE | KIND_KIRBY_AGENT_STATE
+            KIND_KIRBY_PRESENCE | KIND_KIRBY_LIFECYCLE | KIND_KIRBY_AGENT_STATE | KIND_KIRBY_LEASE
         )
 }
 

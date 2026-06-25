@@ -2,13 +2,13 @@
 //! enforcement points that were HW/LIVE-only before this file. All run in a plain
 //! `cargo test` with NO genome image, NO KVM, NO root, NO network beyond loopback:
 //!
-//!  (a) GATEWAY LEASE FENCE (G8 STEP 0), mock-isolated: a `LeaseHandle` whose
-//!      committed lease names ANOTHER node at a higher term yields `FenceVerdict::
+//!  (a) GATEWAY LEASE FENCE (G8 STEP 0), mock-isolated: a relay-lease authority whose
+//!      latest observed lease names ANOTHER node at a higher term yields `FenceVerdict::
 //!      Fenced`; wired into the gateway debit path it must return
 //!      DENIED_NOT_ACTIVE_LEASE, cost 0, and perform NOTHING (the rail count stays
 //!      0). Complements `no_split_brain.rs::g8_gateway_debit_path_is_lease_fenced`
-//!      (which kills a real leader to advance the term); this isolates ONLY the
-//!      fence verdict -> gateway deny, with no election/handoff orchestration.
+//!      (which supersedes a real term to fence); this isolates ONLY the fence verdict ->
+//!      gateway deny, with no failover orchestration.
 //!  (b) D-20 REAL-RAIL CLAMP: the pure `rail::clamp_spend` (the exact fn
 //!      `CdkEcashRail::perform` calls at BOTH clamp sites) never returns more than
 //!      the cap, so the real melt can never overspend past the gateway-checked
@@ -21,16 +21,53 @@
 //!      wseq/idempotency_key -> DUPLICATE_IGNORED, no double-perform, debited once
 //!      total across the crash.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use kirby_custody::cosign_net::NostrEvent;
 use kirby_node::gateway::{GatewayService, Session};
-use kirby_node::raft_lease::{bring_up_cluster, ActiveLease, FenceVerdict, LeaseNode};
+use kirby_node::lease::{FenceVerdict, LeaseAuthority};
+use kirby_node::quorum_signer::{local_quorum_from_keyset, QuorumSigner};
 use kirby_node::rail::{self, MockRail};
+use kirby_node::relay_lease::RelayLeaseAuthority;
 use kirby_node::treasury::Treasury;
 use kirby_proto::capability_request::Act;
 use kirby_proto::{CapabilityRequest, Outcome, SettleEcash};
 
 const MINT: &str = "mint.test.local";
+
+/// The single-agent (DEFAULT) slot a bare run fences on.
+const AGENT: &str = "";
+
+/// A fresh real 2-of-3 trusted-dealer quorum (its FROST group key Q).
+fn quorum() -> Arc<QuorumSigner> {
+    let ks = kirby_custody::generate_dealer_keyset(2, 3).expect("2-of-3 dealer keygen");
+    Arc::new(local_quorum_from_keyset(&ks).expect("build co-located quorum signer"))
+}
+
+/// Sign a relay lease event for `AGENT` naming `holder` at `term`, issued now (fresh), under
+/// `q`. Used to fabricate the "lease moved to another node" supersede the fence observes.
+fn signed_lease(q: &QuorumSigner, holder: u64, term: u64) -> NostrEvent {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    q.sign_nostr_event_with_tags(
+        kirby_proto::KIND_KIRBY_LEASE as u32,
+        now,
+        &[
+            vec!["d".into(), AGENT.into()],
+            vec!["t".into(), "kirby".into()],
+            vec!["a".into(), AGENT.into()],
+            vec!["node".into(), holder.to_string()],
+        ],
+        &serde_json::to_string(&serde_json::json!({
+            "agent_id": AGENT, "holder_node_id": holder, "term": term, "issued_at": now,
+        }))
+        .unwrap(),
+    )
+    .expect("sign lease under Q")
+}
 
 /// A SettleEcash request on the allowlisted mint for `amount`, authorizing `budget`
 /// for the act, keyed by `key`.
@@ -58,38 +95,38 @@ fn test_session() -> Session {
 
 // ---- (a) gateway lease fence, mock-isolated -----------------------------------------
 
-/// (a) G8 STEP 0, mock-isolated: a single lease node whose committed lease has been
-/// caught up to ANOTHER holder at a HIGHER term is `Fenced` (it believes it is active
-/// at its own start term, but the committed lease moved on). Wired into the gateway as
-/// the debit fence, a RequestCapability must be DENIED_NOT_ACTIVE_LEASE, cost 0, and
-/// the rail must perform NOTHING. This isolates the fence verdict -> gateway deny path
-/// WITHOUT bringing up a 3-node cluster or killing a leader (that full handoff is
-/// covered by no_split_brain.rs); no genome image, no real election.
+/// (a) G8 STEP 0, mock-isolated: a relay-lease authority for node 7 whose latest observed
+/// lease names ANOTHER holder (node 2) at a HIGHER term is `Fenced` (it believes it is active
+/// at its own start term, but the lease moved on -- latest-term-wins). Wired into the gateway
+/// as the debit fence, a RequestCapability must be DENIED_NOT_ACTIVE_LEASE, cost 0, and the
+/// rail must perform NOTHING. This isolates the fence verdict -> gateway deny path WITHOUT any
+/// failover orchestration (that full handoff is covered by no_split_brain.rs); no genome image.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gateway_fences_debit_when_lease_moved_to_another_node() {
-    // The stale node believes it was active at term T (1); the committed lease has
-    // since moved to a DIFFERENT node (2) at the higher term T+1 (2). A revived stale
-    // node learns this committed lease as it catches up on rejoin.
+    // The stale node 7 believes it was active at term T (1); the latest lease has since moved
+    // to a DIFFERENT node (2) at the higher term T+1 (2). Node 7's authority observes that
+    // superseding lease (the relay delivered it), so its fence sees the higher term.
     let believed_term = 1u64;
-    let node = LeaseNode::start(7, "127.0.0.1:0").await.expect("start lease node");
-    let handle = node.handle();
-    handle
-        .catch_up_committed_lease(ActiveLease { node_id: 2, term: believed_term + 1 })
-        .await;
+    let q = quorum();
+    let mut expected = HashMap::new();
+    expected.insert(AGENT.to_string(), q.q_bytes());
+    let handle = RelayLeaseAuthority::new(7, None, expected);
+    let moved = signed_lease(&q, 2, believed_term + 1);
+    assert!(handle.observe(&moved).await, "node 7 observes the superseding lease");
 
-    // Sanity: the fence itself rejects this node at its believed term (the committed
-    // lease names node 2 @ T+1, not node 7).
-    let verdict = handle.fence(believed_term).await;
+    // Sanity: the fence itself rejects this node at its believed term (the latest lease names
+    // node 2 @ T+1, not node 7).
+    let verdict = handle.fence_for(AGENT, believed_term).await;
     assert!(
         matches!(
             verdict,
             FenceVerdict::Fenced { committed_term: 2, committed_holder: 2, believed_term: 1 }
         ),
-        "the stale node must be fenced by the higher committed term held by another node: {verdict:?}"
+        "the stale node must be fenced by the higher term held by another node: {verdict:?}"
     );
     assert!(!verdict.may_act(), "a fenced node must not act");
 
-    // Wire that fenced handle into the gateway debit path.
+    // Wire that fenced authority into the gateway debit path.
     let treasury = Treasury::open_temporary(1_000_000).expect("open temporary treasury");
     let start = treasury.remaining().unwrap();
     let rail = MockRail::new();
@@ -120,29 +157,24 @@ async fn a_gateway_fences_debit_when_lease_moved_to_another_node() {
         "the rail must NOT perform when the node is fenced (deny is BEFORE perform, STEP 0)"
     );
     assert!(receipt.proof.is_empty(), "no proof on a fenced denial");
-
-    node.shutdown().await;
 }
 
-/// (a, control): the SAME wiring, but the node genuinely holds the committed lease at
-/// its believed term, so the fence is `Active` and the gateway debits normally. This
-/// pins that the fence DENY above is the lease moving, not the fence rejecting every
-/// request (a fence that denied unconditionally would also pass the test above).
+/// (a, control): the SAME wiring, but the node genuinely holds the latest lease at its
+/// believed term, so the fence is `Active` and the gateway debits normally. This pins that
+/// the fence DENY above is the lease moving, not the fence rejecting every request (a fence
+/// that denied unconditionally would also pass the test above).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gateway_allows_debit_when_node_holds_the_lease() {
-    // The node genuinely holds the committed lease AND is the Raft leader, which is the
-    // ONLY way a node is legitimately active (it granted itself the lease AS the leader).
-    // The fence now requires leadership in addition to holder+term (the S1 Codex
-    // hardening: a holder that lost leadership must be fenced), so this Active control
-    // uses a real single-node leader rather than a mock catch_up of a never-leader node.
-    let bring_up = bring_up_cluster(&[7]).await.expect("bring up single-node cluster");
-    let node = bring_up.nodes.into_iter().next().expect("the single node");
-    let handle = node.handle();
-    let granted = node.grant_lease(7).await.expect("grant self the default-slot lease");
-    let believed_term = granted.term;
+    // Node 7 claims its OWN lease at term 1 and observes it -> it holds the latest term, so it
+    // is Active (the relay-native equivalent of being the legitimate active holder).
+    let q = quorum();
+    let handle = RelayLeaseAuthority::single_agent(7, AGENT, q.clone());
+    let lease = handle.claim(AGENT, 1).await.expect("node 7 signs its term-1 lease");
+    assert!(handle.observe(&lease).await, "node 7 observes its own lease");
+    let believed_term = 1u64;
     assert!(
-        matches!(handle.fence(believed_term).await, FenceVerdict::Active { term } if term == believed_term),
-        "the leader holds the committed lease at its term: it must be Active"
+        matches!(handle.fence_for(AGENT, believed_term).await, FenceVerdict::Active { term } if term == believed_term),
+        "the node holds the latest lease at its term: it must be Active"
     );
 
     let treasury = Treasury::open_temporary(1_000_000).expect("open temporary treasury");
@@ -163,8 +195,6 @@ async fn a_gateway_allows_debit_when_node_holds_the_lease() {
     assert_eq!(receipt.cost_sats, 300, "the active node debited the act cost");
     assert_eq!(gateway.treasury_remaining().unwrap(), 1_000_000 - 300);
     assert_eq!(rail_handle.perform_count(), 1, "the active node performed exactly once");
-
-    node.shutdown().await;
 }
 
 // ---- (b) D-20 real-rail clamp (no mint) ---------------------------------------------

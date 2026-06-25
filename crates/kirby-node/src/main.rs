@@ -4,7 +4,7 @@
 //! library modules (the host-prereqs gate, the persisted treasury, the vsock
 //! NodeGateway). One Tokio process per node. The VM-boot loop that drives a
 //! genome to connect is C-2; the meters (C-4), egress (C-5), real rail (C-6),
-//! and openraft lease (C-9) land in later chunks.
+//! and the relay-native lease (#9) land in later chunks.
 
 use std::time::Duration;
 
@@ -438,25 +438,25 @@ async fn run_fleet_supervisor_cmd(
     use std::sync::Arc;
     use std::time::Duration;
 
+    use anyhow::Context as _;
     use kirby_node::config::KirbyConfig;
     use kirby_node::fleet::Allocator;
     use kirby_node::fleet_supervisor::{FleetSupervisor, ProcessTenantLauncher};
-    use kirby_node::raft_lease::LeaseNode;
+    use kirby_node::relay_lease::{RelayLeaseGrantor, RelayLeasePublisher};
 
     let config = KirbyConfig::load(&config_path)?;
     tracing::info!(path = %config_path.display(), tenants = config.fleet.tenants.len(), "loaded fleet config");
 
-    // Form a single-node lease cluster for the supervisor (the agents' cluster). A real
-    // multi-node fleet adds peers here; the MVP is single-node so the supervisor is leader
-    // and can grant per-agent leases. A loopback port the OS picks.
-    let lease_node = LeaseNode::start(node_id, "127.0.0.1:0").await?;
-    lease_node
-        .initialize_cluster(&[(node_id, lease_node.addr().to_string())])
-        .await?;
-    lease_node
-        .wait_for_leader(Duration::from_secs(10))
-        .await
-        .ok_or_else(|| anyhow::anyhow!("fleet supervisor: lease cluster did not elect a leader"))?;
+    // The relay-native lease grantor (#9): the supervisor CLAIMS each tenant's per-agent lease
+    // by FROST-signing a Lease event (under the tenant's OWN quorum Q, loaded from the keystore
+    // it provisions) and publishing it to the SAME fleet relay the nerve uses. No loopback Raft
+    // cluster -- the relay does the NAT traversal, so this is the cross-machine failover floor.
+    let publisher = std::sync::Arc::new(
+        RelayLeasePublisher::connect(&config.relay.url)
+            .await
+            .context("connect the relay-lease publisher to the fleet relay")?,
+    );
+    let grantor = std::sync::Arc::new(RelayLeaseGrantor::new(node_id, publisher));
 
     // The persisted allocator: restart-safe CIDs (never re-hand a live CID). Stored under
     // the node's treasury dir alongside the per-tenant treasuries.
@@ -476,7 +476,6 @@ async fn run_fleet_supervisor_cmd(
     let binary = std::env::current_exe()?;
     let config_dir = alloc_dir.join("fleet-tenant-configs");
     let launcher = Arc::new(ProcessTenantLauncher::new(config.clone(), binary, config_dir));
-    let grantor = Arc::new(lease_node);
 
     let mut supervisor = FleetSupervisor::new(node_id, config, allocator, grantor, launcher);
     let records = supervisor.launch_all().await?;

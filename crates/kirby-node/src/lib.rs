@@ -99,30 +99,25 @@
 //!   the VMGenID generation BUMPS on restore (node 2's gateway `bump_generation`, the
 //!   hook C-8 uses). The single persisted treasury continues across the move (D-9).
 //!
-//! C-9 adds the openraft lease + no-split-brain consensus (spec 3.5, 4.3, D-4,
-//! D-14, D-17, red-team gate 1, gate G8): the consensus keystone.
-//! - [`raft_lease`]: the embedded openraft cluster (3 nodes, D-14), the single
-//!   replicated state-machine value `active_lease { node_id, term }`, the openraft
-//!   transport over plain loopback TCP (D-17, no iroh), and the
-//!   [`raft_lease::LeaseHandle`] the fence rides on. Only the node that is BOTH the
-//!   Raft leader AND holds the lease at the current committed term may run + debit;
-//!   a revived stale node believing an old term is term-fenced
-//!   ([`raft_lease::FenceVerdict::Fenced`]).
-//! - [`gateway::GatewayService`] gained an OPTIONAL [`raft_lease::LeaseHandle`]: when
-//!   a lease is attached, `RequestCapability` checks "do I hold the lease at the
-//!   current term?" BEFORE any treasury debit (the fence wired into the debit path);
-//!   a non-active or fenced node returns a DENIED receipt and debits 0. Without a
-//!   lease attached (C-3..C-8) the gateway behaves exactly as before, so no prior
-//!   gate regresses.
-//! - [`nosplitbrain_run`]: the G8 3-node harness. It brings up a 3-node lease
-//!   cluster on loopback, kills the active node, asserts the 2-of-3 majority elects a
-//!   new leader and commits `active_lease{node2, T+1}` (survive-one-loss, D-14),
-//!   has node 2 RESTORE the killed node's snapshot (the C-7 path) and continue, then
-//!   revives the stale node and asserts it REFUSES to run/debit (fenced), with the
-//!   money-path invariant (at-most-one-node-debits) and the linearizability witness
-//!   (no two actives per committed term). The pure-Raft mechanics run WITHOUT the
-//!   genome image (fast); the handoff-restores-the-VM part needs the image and SKIPS
-//!   cleanly when `KIRBY_GENOME_IMAGE` is unset.
+//! C-9 / #9 add the lease + no-split-brain fence (build-spec
+//! `build-spec-kirby-failover-relay-lease-20260625.md`, gate G8 / F9): the consensus
+//! keystone. The loopback Raft cluster was CUT (it was same-host only; plain-TCP Raft
+//! cannot form across NAT); the ACTIVE lease is now relay-native + FROST-signed, so it works
+//! across LAN/NAT by riding the SAME relay the nerve already uses.
+//! - [`lease`]: the transport-free SEAM -- the [`lease::LeaseAuthority`] trait the gateway
+//!   money-fence reads, plus the shared value types (`ActiveLease` / `FenceVerdict` /
+//!   `LeaseNodeId`). A node ACTS for an agent only while it holds the latest non-stale term;
+//!   a node on a stale term is term-fenced ([`lease::FenceVerdict::Fenced`]).
+//! - [`relay_lease`]: the ACTIVE relay-native FROST-signed lease impl. A claim FROST-signs a
+//!   `Lease { agent_id, holder_node_id, term, issued_at }` event under the agent's quorum Q
+//!   and publishes it to the relay (latest-term-wins); a failover claims `term + 1`. The
+//!   fleet supervisor claims an agent's lease on launch via the
+//!   [`relay_lease::RelayLeaseGrantor`].
+//! - [`gateway::GatewayService`] has an OPTIONAL lease fence: when one is attached,
+//!   `RequestCapability` checks "do I hold the lease at the current term?" BEFORE any treasury
+//!   debit (the fence wired into the debit path); a non-active or fenced node returns a DENIED
+//!   receipt and debits 0. Without a lease attached the gateway behaves exactly as before, so
+//!   no prior gate regresses.
 //!
 //! The lease GATES the run + debit; it does NOT change what the run/debit does. The
 //! agnostic core (gateway authorize-order, treasury economics, rail, genome) is
@@ -211,6 +206,9 @@ pub mod gateway;
 // WakeRequest + the agent-scoped path helper. Platform-agnostic host-side serde
 // types (no genome/trait/sudo surface), like `nerve`/`engram` -- NOT cfg-gated.
 pub mod hibernate;
+// The lease SEAM + shared value types (the no-split-brain fence). Transport-free, so NOT
+// cfg-gated; the relay-native impl lives in `relay_lease`.
+pub mod lease;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod meter;
 #[cfg(target_os = "linux")]
@@ -221,11 +219,9 @@ pub mod mint_rig;
 pub mod nerve;
 #[cfg(target_os = "linux")]
 pub mod network;
-#[cfg(target_os = "linux")]
-pub mod nosplitbrain_run;
 pub mod prereqs;
-pub mod raft_lease;
 pub mod rail;
+pub mod relay_lease;
 pub mod run_agent;
 pub mod sandbox;
 #[cfg(target_os = "linux")]

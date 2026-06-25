@@ -21,24 +21,22 @@
 //! processes (non-gated). [`ProcessTenantLauncher`] is the real impl (spawns `kirby agent`);
 //! a test supplies a stub launcher. The real-VM end-to-end path is `KIRBY_GENOME_IMAGE`-gated.
 //!
-//! THE LEASE SEAM: the supervisor grants per-agent leases through a [`LeaseGrantor`] (a
-//! tiny trait over the Raft [`crate::raft_lease::LeaseNode`]); the gateway debit fence is
-//! read through the [`crate::raft_lease::LeaseAuthority`] trait (commit 1), so a future
-//! per-agent FROST-quorum lease drops in behind both without touching the supervisor.
+//! THE LEASE SEAM: the supervisor CLAIMS per-agent leases through a [`LeaseGrantor`] (a tiny
+//! write-side trait; the relay-native impl FROST-signs a lease and publishes it to the relay,
+//! [`crate::relay_lease::RelayLeaseGrantor`]); the gateway debit fence is read through the
+//! [`crate::lease::LeaseAuthority`] trait, so the relay-native lease drops in behind both
+//! without touching the supervisor.
 //!
-//! KNOWN DEFERRAL (S2, deliberate, in line with the roadmap): the supervisor GRANTS each
-//! tenant its per-agent lease, but the tenant CHILD PROCESS does NOT yet enforce it -- the
-//! child boots with no lease fence (`BootConfig.lease_fence = None`), because the lease
-//! lives in THIS supervisor process and the child is a separate process. Enforcing it would
-//! need a RemoteLeaseAuthority (the child querying this supervisor over IPC before each
-//! debit). That is intentionally NOT built here: the lease only becomes load-bearing when a
-//! SECOND node can contend for a tenant's agent (failover, S5/S6), and in S2 (single host,
-//! static config, no failover) nothing else runs a tenant's agent, so the unfenced child is
-//! not exploitable. Moreover the interim Raft lease is slated to be SUBSUMED by per-agent
-//! FROST quorum co-signing (S3) plus the per-agent-quorum-as-lease scaling model, where an
-//! agent's acts are gated at the SIGNING layer (a quorum co-sign), not a Raft fence in the
-//! child. So child-side lease enforcement is deferred to S5/S6 rather than invested in the
-//! interim mechanism now. S2 delivers multi-tenant RESOURCE isolation (own VM / CID /
+//! KNOWN DEFERRAL (S2, deliberate, in line with the roadmap): the supervisor CLAIMS each
+//! tenant its per-agent lease (term 1 on launch), but the tenant CHILD PROCESS does NOT yet
+//! enforce it -- the child boots with no lease fence (`BootConfig.lease_fence = None`),
+//! because the lease lives in THIS supervisor process and the child is a separate process.
+//! Enforcing it would need a RemoteLeaseAuthority (the child querying this supervisor over IPC
+//! before each debit). That is intentionally NOT built here: the lease only becomes
+//! load-bearing when a SECOND node can contend for a tenant's agent (failover, S5/S6), and in
+//! S2 (single host, static config, no failover) nothing else runs a tenant's agent, so the
+//! unfenced child is not exploitable. The failover-detection loop that claims `term + 1` on a
+//! takeover is a later chunk. S2 delivers multi-tenant RESOURCE isolation (own VM / CID /
 //! treasury per tenant), which IS enforced and tested.
 
 use std::collections::BTreeMap;
@@ -47,7 +45,7 @@ use std::sync::Arc;
 
 use crate::config::{KirbyConfig, TenantConfig};
 use crate::fleet::{AgentId, AllocError, Allocator, TenantAllocation};
-use crate::raft_lease::{LeaseNodeId, LeaseResponse};
+use crate::lease::{LeaseNodeId, LeaseResponse};
 
 /// What a launched tenant's resources + grant came out to (the supervisor's record of
 /// one live tenant). Returned per tenant from [`FleetSupervisor::launch_all`] so a test
@@ -118,24 +116,28 @@ pub trait TenantLauncher: Send + Sync {
     fn launch(&self, spec: &TenantLaunchSpec) -> anyhow::Result<Box<dyn TenantProcess>>;
 }
 
-/// The lease-grant seam: grant `{agent_id, self_node}` for a tenant and return the committed
-/// term. Implemented over the Raft [`crate::raft_lease::LeaseNode`] (the supervisor is a
-/// voter/leader in the agents' cluster); a per-agent FROST-quorum lease impl drops in here
-/// later. Async because a real grant awaits a Raft commit. Kept SEPARATE from
-/// [`crate::raft_lease::LeaseAuthority`] (the read-only fence seam) because granting is
-/// impl-specific and write-side, while the fence is read-only.
+/// The lease-grant (CLAIM) seam: claim `{agent_id, self_node}` for a tenant and return the
+/// claimed lease (node + term). Implemented over the relay-native FROST-signed lease
+/// ([`crate::relay_lease::RelayLeaseGrantor`]): the supervisor holds the tenant's quorum, so a
+/// claim FROST-signs a lease and publishes it to the relay. Async because a real claim awaits
+/// the publish. Kept SEPARATE from [`crate::lease::LeaseAuthority`] (the read-only fence seam)
+/// because claiming is impl-specific and write-side, while the fence is read-only.
 #[async_trait::async_trait]
 pub trait LeaseGrantor: Send + Sync {
-    /// Grant `agent_id`'s lease to this node and return the committed lease (node + term).
-    /// Only touches this agent's lease entry (per-agent isolation, S1).
-    async fn grant_for(&self, agent_id: &str, node_id: LeaseNodeId) -> anyhow::Result<LeaseResponse>;
-}
-
-#[async_trait::async_trait]
-impl LeaseGrantor for crate::raft_lease::LeaseNode {
-    async fn grant_for(&self, agent_id: &str, node_id: LeaseNodeId) -> anyhow::Result<LeaseResponse> {
-        self.grant_lease_for(agent_id, node_id).await
-    }
+    /// Claim `agent_id`'s lease for this node and return the claimed lease (node + term).
+    /// Only touches this agent's lease entry (per-agent isolation, S1). The MVP claims at
+    /// term 1 on launch; a failover takeover (a later chunk) claims `term + 1`.
+    ///
+    /// `keystore_dir` is the tenant's just-provisioned per-agent FROST keystore: the
+    /// relay-native grantor loads the agent's quorum Q from it to FROST-SIGN the lease (F9-2 --
+    /// a node can only claim a lease for an agent whose quorum it holds). A stub grantor (the
+    /// tests) ignores it.
+    async fn grant_for(
+        &self,
+        agent_id: &str,
+        node_id: LeaseNodeId,
+        keystore_dir: &std::path::Path,
+    ) -> anyhow::Result<LeaseResponse>;
 }
 
 /// The fleet supervisor itself (fleet-host S2). Owns the resource allocator, the base config
@@ -311,7 +313,7 @@ impl FleetSupervisor {
         // this agent's entry, so granting tenant A never perturbs tenant B's lease.
         let granted = self
             .grantor
-            .grant_for(&tenant.agent_id, self.node_id)
+            .grant_for(&tenant.agent_id, self.node_id, &keystore_dir)
             .await
             .map_err(|e| anyhow::anyhow!("fleet supervisor: grant lease for tenant {:?}: {e}", tenant.agent_id))?;
 
@@ -619,7 +621,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LeaseGrantor for StubGrantor {
-        async fn grant_for(&self, agent_id: &str, node_id: LeaseNodeId) -> anyhow::Result<LeaseResponse> {
+        async fn grant_for(
+            &self,
+            agent_id: &str,
+            node_id: LeaseNodeId,
+            _keystore_dir: &std::path::Path,
+        ) -> anyhow::Result<LeaseResponse> {
             self.grants.lock().unwrap().push((agent_id.to_string(), node_id));
             let term = self.next_term.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(LeaseResponse { node_id, term })
@@ -814,7 +821,12 @@ mod tests {
         struct FailingGrantor;
         #[async_trait::async_trait]
         impl LeaseGrantor for FailingGrantor {
-            async fn grant_for(&self, _agent_id: &str, _node_id: LeaseNodeId) -> anyhow::Result<LeaseResponse> {
+            async fn grant_for(
+                &self,
+                _agent_id: &str,
+                _node_id: LeaseNodeId,
+                _keystore_dir: &std::path::Path,
+            ) -> anyhow::Result<LeaseResponse> {
                 anyhow::bail!("grant refused (not leader)")
             }
         }

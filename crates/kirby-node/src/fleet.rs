@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::FleetConfig;
 
 /// A tenant agent id (the `agent_id` label, config.rs). A `String` for now, matching
-/// the rest of the codebase; the per-agent lease uses the same alias (raft_lease.rs).
+/// the rest of the codebase; the per-agent lease uses the same alias (lease.rs).
 pub type AgentId = String;
 
 /// One tenant's allocated resource triple: its guest CID, its host-side instance id

@@ -58,16 +58,29 @@ pub const KIND_KIRBY_PRESENCE: u32 = 10100;
 pub const KIND_KIRBY_LIFECYCLE: u32 = 9100;
 /// The Kirby AGENT-STATE kind (31000): the ADDRESSABLE live "Kirby face".
 pub const KIND_KIRBY_AGENT_STATE: u32 = 31000;
+/// The Kirby cross-machine LEASE kind (31002): the ADDRESSABLE relay-native failover
+/// claim. MUST match `kirby_proto::KIND_KIRBY_LEASE` (custody cannot import kirby_proto,
+/// so this is a hand-maintained mirror like the beacon kinds above). Like the beacons it
+/// carries machine-generated JSON (`{ agent_id, holder_node_id, term, issued_at }`), so it
+/// is signed VERBATIM (the note sanitizer is kind:1-only) and the membrane's real gate is
+/// the id-over-content-and-tags equality check.
+pub const KIND_KIRBY_LEASE: u32 = 31002;
 
 /// S3e: is `kind` one a guardian will authorize? The agent's PUBLIC Nostr output is its
-/// voice (kind:1) PLUS its three public beacons (presence/lifecycle/agent-state) -- all
-/// signed by the same group key Q ("Q signs everything", gudnuf's decision A). Any other
-/// kind (and the future BitcoinSpend intent) needs its own reconstruction + policy and is
-/// refused as `BadKind` until added.
+/// voice (kind:1) PLUS its three public beacons (presence/lifecycle/agent-state) PLUS its
+/// cross-machine lease (31002) -- all signed by the same group key Q ("Q signs everything",
+/// gudnuf's decision A). The lease rides the SAME membrane: a node cannot get the quorum to
+/// co-sign a lease for an agent whose shares it does not hold. Any other kind (and the
+/// future BitcoinSpend intent) needs its own reconstruction + policy and is refused as
+/// `BadKind` until added.
 fn is_authorizable_kind(kind: u32) -> bool {
     matches!(
         kind,
-        NOSTR_TEXT_NOTE_KIND | KIND_KIRBY_PRESENCE | KIND_KIRBY_LIFECYCLE | KIND_KIRBY_AGENT_STATE
+        NOSTR_TEXT_NOTE_KIND
+            | KIND_KIRBY_PRESENCE
+            | KIND_KIRBY_LIFECYCLE
+            | KIND_KIRBY_AGENT_STATE
+            | KIND_KIRBY_LEASE
     )
 }
 

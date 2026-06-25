@@ -17,7 +17,7 @@ rust-version.workspace = true
 # memory.current to bill the treasury) and libc (the cgroup-based VMM kill for
 # the budget-death halt). The eBPF egress-byte meter (aya) is DEFERRED to C-5:
 # it rides with the per-VM TAP, which does not exist yet. The nftables egress
-# (C-5), the real rail (C-6), and the openraft lease (C-9) add their deps in
+# (C-5), the real rail (C-6), and the loopback-Raft lease (C-9) add their deps in
 # those chunks, to keep each tree clippy-clean with no unused crates.
 [dependencies]
 kirby-proto = { path = "../kirby-proto" }
@@ -81,15 +81,10 @@ futures = "0.3"
 cdk = { workspace = true }
 cdk-sqlite = { workspace = true }
 cdk-fake-wallet = { workspace = true }
-# openraft is the embedded Raft under the lease + no-split-brain (spec 3.5, 4.3,
-# D-4, D-17, gate G8): each node runs an openraft engine, the single replicated
-# value is active_lease{node_id, term}, and the inter-node transport is openraft
-# over plain loopback TCP (no iroh). Only the leader+lease-holder runs+debits; a
-# revived stale node is term-fenced. Pinned exactly (pre-1.0, churns, spec section
-# 11). It is daemon-side; nothing openraft crosses vsock or touches the genome.
-openraft = { workspace = true }
-# bincode is unused; the loopback RPC wire uses serde_json (already a dep) for the
-# Raft RPCs, keeping the transport dependency-light.
+# The lease + no-split-brain fence (#9, gate G8 / F9) is now relay-native + FROST-signed
+# (`relay_lease`): a Lease event is published to the SAME Nostr relay the nerve uses, so it
+# works across LAN/NAT. The loopback Raft cluster was CUT (it was same-host only). The
+# crypto rides the existing quorum_signer + nostr-sdk client; no new transport dependency.
 # nostr-sdk is the host-side Nostr client for the "nerve" presence/discovery layer
 # (slice 1): the daemon publishes a replaceable presence beacon and subscribes to
 # the fleet over a relay (an outbound websocket, the same host-network path as the

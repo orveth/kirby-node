@@ -22,9 +22,10 @@ use kirby_node::boot::treasury_path_for_agent;
 use kirby_node::config::{KirbyConfig, TenantConfig};
 use kirby_node::fleet::Allocator;
 use kirby_node::fleet_supervisor::{
-    FleetSupervisor, LeaseGrantor, TenantLauncher, TenantLaunchSpec, TenantProcess, TenantStatus,
+    FleetSupervisor, TenantLauncher, TenantLaunchSpec, TenantProcess, TenantStatus,
 };
-use kirby_node::raft_lease::{bring_up_cluster, LeaseNode, LeaseNodeId, LeaseResponse};
+use kirby_custody::cosign_net::NostrEvent;
+use kirby_node::relay_lease::{LeasePublisher, RelayLeaseGrantor};
 use kirby_node::treasury::{DebitOutcome, Treasury};
 
 // ---- stub launcher (no VM, no process) ----------------------------------------------
@@ -54,16 +55,25 @@ impl TenantLauncher for StubLauncher {
     }
 }
 
-// A grantor that forwards to a real LeaseNode but is held behind the trait (proving the
-// supervisor depends on the seam, not the concrete node).
-struct NodeGrantor {
-    node: Arc<LeaseNode>,
+// A capturing relay-lease publisher: records every published lease event (the wire the
+// RelayLeaseGrantor publishes a FROST-signed claim to), so a test can assert which agent's
+// lease was claimed and verify it under the agent's own Q (no live relay).
+#[derive(Default)]
+struct CapturingPublisher {
+    published: std::sync::Mutex<Vec<NostrEvent>>,
 }
 #[async_trait::async_trait]
-impl LeaseGrantor for NodeGrantor {
-    async fn grant_for(&self, agent_id: &str, node_id: LeaseNodeId) -> anyhow::Result<LeaseResponse> {
-        self.node.grant_lease_for(agent_id, node_id).await
+impl LeasePublisher for CapturingPublisher {
+    async fn publish_lease(&self, event: &NostrEvent) -> anyhow::Result<()> {
+        self.published.lock().unwrap().push(event.clone());
+        Ok(())
     }
+}
+
+/// Parse a published lease event's content `agent_id`.
+fn lease_agent(event: &NostrEvent) -> String {
+    let v: serde_json::Value = serde_json::from_str(&event.content).expect("lease content json");
+    v["agent_id"].as_str().expect("agent_id").to_string()
 }
 
 fn base_config(tenants: Vec<TenantConfig>) -> KirbyConfig {
@@ -152,50 +162,57 @@ fn g_tenant_isolation_db_per_agent_treasuries_are_independent() {
     let _ = std::fs::remove_dir_all(&path_b);
 }
 
-/// G-TENANT-ISOLATION (supervisor over a REAL 3-node lease cluster): the supervisor allocates
-/// a distinct resource triple per tenant, grants EACH its own per-agent lease (committed on a
-/// real Raft cluster), and the grant for one tenant never touches another's lease entry. This
-/// is the per-agent independence the fleet relies on, exercised through the real grant path.
+/// G-TENANT-ISOLATION (supervisor over the REAL relay-lease grantor): the supervisor allocates
+/// a distinct resource triple per tenant, CLAIMS EACH its own per-agent lease (FROST-signed
+/// under the tenant's OWN quorum Q, loaded from the keystore the supervisor provisions, and
+/// published to the relay), and the claim for one tenant names ONLY that agent. This is the
+/// per-agent independence the fleet relies on, exercised through the real claim path (no live
+/// relay -- a capturing publisher records each signed lease, verified under the agent's Q).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn g_tenant_isolation_supervisor_grants_each_tenant_its_own_lease() {
-    let bring_up = bring_up_cluster(&[1, 2, 3]).await.expect("bring up 3-node cluster");
-    let leader = bring_up.leader;
-    let mut nodes = bring_up.nodes;
-    // Take the leader node out to hand to the grantor; keep the others for lease reads.
-    let leader_idx = nodes.iter().position(|n| n.id() == leader).unwrap();
-    let leader_node = Arc::new(nodes.remove(leader_idx));
-    let read_handles: Vec<_> = nodes.iter().map(|n| n.handle()).collect();
-    let leader_handle = leader_node.handle();
+    // Pin the durable state root so the per-agent FROST keystores the supervisor provisions
+    // (and the RelayLeaseGrantor loads each tenant's Q from) land in a unique temp dir.
+    let test_root = std::env::temp_dir().join(format!("kirby-fleet-s2-claim-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&test_root);
+    std::fs::create_dir_all(&test_root).unwrap();
+    std::env::set_var(kirby_node::boot::STATE_ROOT_ENV, &test_root);
 
+    let node_id = 1u64;
     let cfg = base_config(vec![tenant("alice", 400_000), tenant("bob", 600_000)]);
     let allocator = Allocator::new(&cfg.fleet);
-    let grantor = Arc::new(NodeGrantor { node: leader_node.clone() });
+    let publisher = Arc::new(CapturingPublisher::default());
+    let grantor = Arc::new(RelayLeaseGrantor::new(node_id, publisher.clone()));
     let launcher = Arc::new(StubLauncher::default());
-    let mut sup = FleetSupervisor::new(leader, cfg, allocator, grantor, launcher.clone());
+    let mut sup = FleetSupervisor::new(node_id, cfg, allocator, grantor, launcher.clone());
 
-    let records = sup.launch_all().await.expect("launch tenants on the real cluster");
+    let records = sup.launch_all().await.expect("launch tenants through the relay-lease grantor");
     assert_eq!(records.len(), 2);
 
-    // Each tenant's lease is committed for the leader, at its own term, and the two are
-    // INDEPENDENT entries (granting bob never touched alice's committed lease).
-    let alice_lease = leader_handle.active_lease_for("alice").await.expect("alice's lease committed");
-    let bob_lease = leader_handle.active_lease_for("bob").await.expect("bob's lease committed");
-    assert_eq!(alice_lease.node_id, leader);
-    assert_eq!(bob_lease.node_id, leader);
-    // Re-read alice on a SURVIVOR follower (replicated): unchanged by bob's grant.
-    for h in &read_handles {
-        if let Some(a) = h.active_lease_for("alice").await {
-            assert_eq!(a.node_id, leader, "alice's replicated lease names the leader");
-        }
+    // Each tenant's lease was CLAIMED at term 1 for this node, and the two claims are
+    // INDEPENDENT (one lease per agent; claiming bob never produced a lease for alice).
+    let published = publisher.published.lock().unwrap().clone();
+    assert_eq!(published.len(), 2, "one published lease per tenant");
+    let agents: std::collections::BTreeSet<String> = published.iter().map(lease_agent).collect();
+    assert_eq!(
+        agents,
+        ["alice".to_string(), "bob".to_string()].into_iter().collect(),
+        "each tenant got its OWN per-agent lease (no cross-tenant lease)"
+    );
+    // Each published lease is a VALID FROST signature (the supervisor signed under the tenant's
+    // provisioned Q): re-materialize + verify via nostr-sdk.
+    for ev in &published {
+        use nostr_sdk::JsonUtil as _;
+        let json = serde_json::to_string(ev).unwrap();
+        let owned = nostr_sdk::Event::from_json(&json).expect("parse signed lease");
+        owned.verify().expect("each tenant's lease verifies under its own Q");
     }
-
     // The records carry distinct resources + treasury paths (no cross-tenant collision).
     assert_ne!(records[0].allocation.guest_cid, records[1].allocation.guest_cid);
     assert_ne!(records[0].allocation.gateway_port, records[1].allocation.gateway_port);
     assert_ne!(records[0].treasury_path, records[1].treasury_path);
-    // The record's lease term matches what is committed for that agent.
+    // The MVP claims term 1 on launch.
     let alice_rec = sup.tenant_record("alice").unwrap();
-    assert_eq!(alice_rec.lease_term, alice_lease.term, "the record's term matches the committed lease");
+    assert_eq!(alice_rec.lease_term, 1, "the MVP claims term 1 on first launch");
 
     // Both tenants RUNNING; killing one leaves the other undisturbed (crash isolation at the
     // supervisor-tracking level; VM-level isolation is the gated gate below).
@@ -205,16 +222,8 @@ async fn g_tenant_isolation_supervisor_grants_each_tenant_its_own_lease() {
     assert_eq!(sup.tenant_status("alice"), Some(TenantStatus::Exited));
     assert_eq!(sup.tenant_status("bob"), Some(TenantStatus::Running), "bob undisturbed by alice's death");
 
-    // Drop the supervisor (and its grantor) so the only remaining strong ref to the leader
-    // node is `leader_node`, then shut it and the followers down.
     drop(sup);
-    match Arc::try_unwrap(leader_node) {
-        Ok(node) => node.shutdown().await,
-        Err(_) => panic!("leader node still has outstanding refs after dropping the supervisor"),
-    }
-    for n in nodes {
-        n.shutdown().await;
-    }
+    let _ = std::fs::remove_dir_all(&test_root);
 }
 
 /// G-N-TENANTS (VM-gated): N genome VMs run concurrently on one host via the REAL process

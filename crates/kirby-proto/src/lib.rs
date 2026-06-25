@@ -155,6 +155,32 @@ pub const KIND_KIRBY_WAKE_REQUEST: u16 = 31001;
 pub const NIP90_JOB_REQUEST_KIND_MIN: u16 = 5000;
 pub const NIP90_JOB_REQUEST_KIND_MAX: u16 = 5999;
 
+/// The Nostr event kind for a Kirby agent's CROSS-MACHINE LEASE (the NAT-friendly,
+/// relay-native failover claim that supersedes the loopback Raft lease for
+/// cross-machine fleets).
+///
+/// A lease names which node is the active holder of an agent at a given monotonic
+/// `term`. A node ACTS for the agent only if it holds the LATEST observed `term`;
+/// failover claims `term + 1` (a monotonic fencing token). The lease is FROST-signed
+/// by the agent's OWN quorum key Q -- a node cannot forge a claim for an agent whose
+/// shares it does not hold, so failover authority is tied to the agent's own quorum,
+/// NOT to node identity.
+///
+/// This is an ADDRESSABLE event kind (30000..40000, per NIP-01): keyed by a `d` tag
+/// set to the `agent_id`, the relay keeps only the LATEST event per `(pubkey, kind, d)`.
+/// ADDRESSABLE for the same reasons 31000/31001 are: a re-publish (a heartbeat refresh,
+/// or a failover `term + 1`) REPLACES the prior lease for that agent rather than piling
+/// up, and keying on `d = agent_id` keeps multi-agent-per-node open (a second agent's
+/// lease cannot clobber the first's). Latest-wins is by the monotonic `term` in the
+/// content, NOT by `created_at`, so an observer never moves a term backward.
+///
+/// The content JSON is `{ agent_id, holder_node_id, term, issued_at }` and the tags are
+/// `["d",<agent_id>]`, `["t","kirby"]`, `["a",<agent_id>]`, `["node",<node_id>]`, per the
+/// unified event-kinds vocabulary. It lives here, in the shared contract crate, so every
+/// node agrees on one value with no central registry. A `u16` so the musl genome pays no
+/// weight; only the daemon (host-side) maps it to a `nostr` `Kind`.
+pub const KIND_KIRBY_LEASE: u16 = 31002;
+
 pub mod gateway {
     //! Generated tonic types for `kirby.gateway.v1`.
     tonic::include_proto!("kirby.gateway.v1");
