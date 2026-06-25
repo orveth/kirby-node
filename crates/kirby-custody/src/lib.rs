@@ -19,14 +19,12 @@ use frost_secp256k1_tr as frost;
 use frost::keys::{IdentifierList, PublicKeyPackage, SecretShare};
 use frost::Identifier;
 
-pub mod chain;
 pub mod coordinator;
 pub mod cosign_net;
 pub mod guardian;
 pub mod persist;
 pub mod reshare;
 pub mod seam;
-pub mod spend;
 pub use coordinator::{commit_for, key_packages, Coordinator, SessionState, SignError};
 pub use reshare::{reshare_same_membership, RefreshedKeyset};
 pub use seam::{coordinate_2of3_over_seam, CoSignEvent, GuardianId, InMemoryRelay, RelayAdapter};

@@ -1,47 +1,63 @@
 # kirby-node
 
-> An autonomous agent that holds its own money, runs in a hardware sandbox, pays its
-> own way, and dies when it goes broke. No human controls it at runtime.
+> An autonomous agent that holds its own identity under a threshold key no single
+> machine can wield alone, runs inside a hardware sandbox, pays its own way in ecash,
+> and dies when it goes broke. No human controls it at runtime.
 
 ## What it is
 
-Kirby is an autonomous agent with a body and a metabolism:
+Kirby is a **sovereign** agent — it owns itself:
 
-- **Holds its own funds** under a key no human holds.
-- **Runs its mission code** inside a hardware-isolated microVM (the "genome").
-- **Pays its own way.** Rent, compute, and every outside action are metered against its balance.
+- **Holds its own identity under a 2-of-3 FROST threshold key.** Each agent is born
+  with its own quorum key **Q** at spawn and signs its *entire* public voice through a
+  live in-process quorum. No single signing key exists to lift.
+- **Respawns as itself.** After death or hibernation the agent comes back under the
+  **same Q** — same npub, same identity, continuous life.
+- **Runs its mission inside a hardware-isolated microVM** (the "genome"), reachable only
+  through a single brokered gateway.
+- **Pays its own way in ecash.** Compute, memory, and every outside action are metered
+  against its balance in real time.
 - **Dies when broke.** At zero balance the daemon halts it. No operator override.
 
-The rules are enforced by the machine, not trusted to an operator: a daemon-owned treasury
-the agent cannot forge, and a single metered gateway that is its only way to touch the world.
+The rules are enforced by the machine, not trusted to an operator: a daemon-owned
+treasury the agent cannot forge, a single metered gateway that is its only way to touch
+the world, and a threshold identity key that is never assembled in one place.
 
-**This repo is the compute + metabolism + sovereign-fleet spike.** It proves the body works,
-on play-money, with no real custody (no real keys, no mainnet, no FROST, a local fakewallet mint).
+## The sovereignty story — stated honestly
 
-## Why it's interesting
+This is the scariest sentence in the repo, so it earns exactly what's wired and no more:
 
-- **Unforgeable treasury.** The genome can read its balance but no code path lets it add to
-  it. Only the daemon debits.
-- **One way out.** The genome has no network of its own. Every external act goes through a
-  single brokered vsock gateway that authorizes, performs, meters, and debits, using a
-  credential the genome never sees.
-- **Earn-or-die.** CPU, memory, and egress bytes are metered against the treasury in real
-  time. Run out and the daemon kills the VM. The agent cannot stop its own meter.
-- **Sovereign and portable.** One agent, its own key, joined to a Nostr fleet. The same agent
-  runs on Linux (Firecracker) or Apple Silicon (Apple Virtualization), and survives the loss
-  of its host by checkpoint and restore.
+> Kirby agents hold their Nostr identity under a **2-of-3 FROST threshold key** and sign
+> their entire public voice through a **live in-process quorum** — no single signing key
+> exists. Each agent is **born with its own sovereign key Q** at spawn and **respawns as
+> the same Q** after death or hibernation. **Today the three key-shares are co-located on
+> the host that runs the agent**: the threshold *structure* is real and live, but the
+> *physical distribution of holders across machines* is the roadmap (the transport seam
+> exists; the distribution does not). The agent's metabolism is **ecash only — there is no
+> on-chain Bitcoin spend.**
+
+What we deliberately do **not** claim yet:
+
+- ❌ *"a key no human holds"* — false while the shares are co-located; the operator could
+  still collude. We earn that sentence at **cross-machine holder distribution**, not before.
+- ❌ *self-custodying Bitcoin* — there is no on-chain path; the metabolism is ecash.
+
+**Why threshold custody is the point.** A real TEE keeps the host from reading a secret in
+RAM. Distributed FROST is the **substitute for a TEE**: once the three shares live on
+*different* machines, a host reading its own VM's RAM only ever sees **one** share, which
+is useless alone. That is how an agent becomes un-ruggable without trusting any single box.
+The threshold structure is built today; distributing the holders is the headline of the
+roadmap below.
 
 ## The life arc
 
-The spike proves one continuous arc, each step a gate:
-
 ```
-born      genome boots inside a microVM and says hello over vsock
-runs      CPU / memory / egress meters tick against the treasury
-pays      the treasury is unforgeable; overspend is denied
+born      the agent is dealt its own 2-of-3 FROST key Q and boots inside a microVM
+signs     every public event (presence, lifecycle, its own notes) is quorum-signed by Q
+runs      CPU / memory / egress meter against an unforgeable ecash treasury
 isolated  the VM has no direct network; raw egress is dropped
-acts      it acts on the world only through the brokered gateway
-survives  it checkpoints and restores, even onto a fresh host
+acts      it touches the world only through the brokered gateway
+survives  it hibernates and respawns — as the SAME Q
 dies      at zero balance the daemon halts it
 ```
 
@@ -49,7 +65,9 @@ Gate definitions and the design decisions behind them are in [`docs/build-spec.m
 
 ## Run it
 
-A sovereign Kirby is one command. Copy the example config, edit three fields, and run:
+A sovereign Kirby is one command. By default it **provisions its own FROST keystore** on
+first boot and signs under Q; on every later boot it reloads the *same* Q (idempotent and
+fail-closed — it never silently mints a new identity).
 
 ```sh
 cp kirby.toml.example kirby.toml         # edit identity.key_path, relay.url, genome_image
@@ -58,43 +76,45 @@ cargo run -p kirby-node -- prereqs       # check the host
 cargo run -p kirby-node -- agent --config kirby.toml
 ```
 
-That takes the node from nothing to a live Kirby in the Nostr fleet: it mints its identity,
-joins the fleet (presence + heartbeat + lifecycle events), funds itself to "born," boots inside
-the sandbox, submits a checkpoint for future resume, runs its metered workload, and dies when
-broke.
+That takes the node from nothing to a live Kirby in the Nostr fleet: it is dealt its own
+sovereign Q, joins the fleet (presence + heartbeat + lifecycle, all quorum-signed), funds
+itself to "born," boots inside the sandbox, runs its metered workload, and dies when broke.
+
+`--no-frost` drops to a plain node-key signing path — a **dev/test fast-path only**, not
+the sovereign default.
 
 `backend = "auto"` picks the sandbox per platform: **Firecracker on Linux, Apple
-Virtualization on Apple Silicon macOS.** Full setup for both platforms, including the genome
-image, is in **[`AGENTS.md`](AGENTS.md)**.
-
-**Want an agent to set this up for you?** Point it at this repo and say *"I want to run a kirby
-node"* -- the `AGENTS.md` runbook and the `run-kirby-node` skill walk the whole path.
+Virtualization on Apple Silicon macOS.** Full setup for both platforms, including the
+genome image, is in **[`AGENTS.md`](AGENTS.md)**.
 
 ## Resilience: surviving the loss of a host
 
-A sovereign node is its own single agent, but it does not die with its hardware. The spike
-proves an agent can move off a host and keep running:
+An agent does not die with its hardware:
 
-- **Snapshot and resume** (the `snapshot` subcommand): pause a running VM, transfer its memory
-  + state, and resume it as a fresh VMM with the agent continuing across the move.
-- **App-checkpoint** (the `app-checkpoint` subcommand): a portable, backend-agnostic resume
-  that boots fresh and rehydrates the agent's logical state. This is how the macOS backend and
-  the `kirby run` resume mode (`mode = "resume"`) recover an agent.
-- **At-most-one-active lease** (`raft_lease`): openraft term-fencing so two hosts can never run
-  and debit the same agent at once.
+- **Hibernate + respawn** — it seals its state, dies, and comes back as the **same Q**
+  (`cargo run -p kirby-node --example hibernate_roundtrip`).
+- **App-checkpoint** — a portable, backend-agnostic resume that boots fresh and rehydrates
+  the agent's logical state (`mode = "resume"`; also how the macOS backend recovers).
+- **At-most-one-active lease** — openraft term-fencing so two hosts can never run and debit
+  the same agent at once (the no-split-brain safety guarantee).
 
-The full multi-node fleet failover (a node is killed and a peer takes over with no money lost)
-is shown live in the fleet demo at **http://185.18.221.222/**.
+Live cross-node failover (a node dies and a peer respawns the agent elsewhere) is
+**roadmap** — the lease/fence is wired, the autonomous respawn-elsewhere is not.
 
-## Status
+## Roadmap — what makes it fully sovereign
 
-| | |
-|---|---|
-| **The product** | `kirby run` (`agent --config kirby.toml`): one command from a config file to a live sovereign agent in the fleet, on Linux or Apple Silicon macOS. |
-| **Proven** | The full membrane (born to acts to dies) on Linux/Firecracker, on play-money, joined to a Nostr fleet. The macOS Apple-Virtualization backend boots the same genome image. |
-| **Not real yet** | No real keys, no mainnet, no FROST custody. The mint is a local CDK fakewallet. This is a spike, not a product. |
+In dependency order:
 
-The honest boundary (what the spike does NOT prove) is recorded in [`docs/build-spec.md`](docs/build-spec.md).
+1. **Cross-machine holder distribution** — move the three FROST shares onto different
+   machines so no single host can wield Q. This is the TEE-substitute becoming real, and
+   the headline: it's what earns *"a key no human holds."*
+2. **P2PK-locked ecash** — lock the agent's Cashu tokens to its FROST Q (NUT-11) so
+   *spending* also requires a quorum signature. Without it, ecash is bearer bytes a
+   malicious host could copy and redeem; with it, the **money** is as sovereign as the
+   identity.
+3. **Wake-on-inbound + VPS provisioning** — the agent wakes on a job and rents its own
+   body (compute), instead of being purely host-launched.
+4. **Live cross-node failover** and **multiple agents per node by available compute.**
 
 ## Layout
 
@@ -102,10 +122,14 @@ The honest boundary (what the spike does NOT prove) is recorded in [`docs/build-
 crates/
   kirby-node/    the node daemon: treasury, gateway, meters, egress lockdown, the
                  sandbox backends (Firecracker + Apple Virtualization), snapshot +
-                 app-checkpoint resume, the Raft lease, nerve (Nostr) presence, and
-                 the `agent` run path (config.rs + run_agent.rs)
-  kirby-proto/   the gateway wire contract (4 RPCs, tonic/protobuf over vsock)
-  kirby-genome/  the musl-Rust stub that runs inside the microVM as PID 1
+                 app-checkpoint resume, the lease, nerve (Nostr) presence, the
+                 per-agent FROST keystore + quorum-signed beacons, the fleet
+                 supervisor, and the `agent` run path (config.rs + run_agent.rs)
+  kirby-custody/ the FROST custody crate: 2-of-3 threshold keygen, the quorum signer +
+                 guardian validation membrane, keyset persistence, the cross-machine
+                 cosign seam (roadmap), and key resharing
+  kirby-proto/   the gateway wire contract (tonic/protobuf over vsock)
+  kirby-genome/  the musl-Rust agent that runs inside the microVM as PID 1
   kirby-ebpf/    the eBPF TC classifier that meters egress bytes (aya, nightly)
 
 nix/                 genome image (x86_64 + aarch64), guest kernels, local relay
@@ -115,8 +139,8 @@ docs/                the spec, the design records, and the VZ backend plan (see 
 
 ## Documentation
 
-- [`AGENTS.md`](AGENTS.md) -- set up and run a node on Linux or macOS (the runbook)
-- [`kirby.toml.example`](kirby.toml.example) -- the annotated `kirby run` config
-- [`docs/README.md`](docs/README.md) -- index of the spec and design docs
-- [`docs/build-spec.md`](docs/build-spec.md) -- the frozen build spec: gates, decisions, money-paths
-- [`docs/mac-build-and-run.md`](docs/mac-build-and-run.md) -- the verified macOS cold-boot walkthrough
+- [`AGENTS.md`](AGENTS.md) — set up and run a node on Linux or macOS (the runbook)
+- [`kirby.toml.example`](kirby.toml.example) — the annotated `kirby run` config
+- [`docs/README.md`](docs/README.md) — index of the spec and design docs
+- [`docs/build-spec.md`](docs/build-spec.md) — the build spec: gates, decisions, money-paths
+- [`docs/mac-build-and-run.md`](docs/mac-build-and-run.md) — the verified macOS cold-boot walkthrough

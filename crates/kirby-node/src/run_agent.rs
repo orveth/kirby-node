@@ -188,6 +188,10 @@ pub struct RunAgentConfig {
     pub hello_timeout: Duration,
     /// The checkpoint store dir for resume mode (defaults under the treasury dir).
     pub checkpoint_dir: PathBuf,
+    /// `--no-frost` escape hatch: when set, the single-node path SKIPS the FROST-by-default
+    /// auto-provision and keeps the legacy node-key dev signer. Default `false` (FROST is the
+    /// default boot path). The fleet path is unaffected (it always sets `frost_keystore_dir`).
+    pub no_frost: bool,
 }
 
 impl RunAgentConfig {
@@ -221,6 +225,10 @@ impl RunAgentConfig {
             mem_size_mib: DEFAULT_MEM_MIB,
             hello_timeout: DEFAULT_HELLO_TIMEOUT,
             checkpoint_dir,
+            // FROST is the DEFAULT single-node boot path; `--no-frost` flips this true (set by
+            // the CLI after construction). Defaulting false here keeps every other constructor +
+            // the fleet path on the FROST/sovereign-Q default.
+            no_frost: false,
         })
     }
 
@@ -513,7 +521,7 @@ fn agent_boot_config(
 /// config/identity/lifecycle-shape logic, and the integration tests (G-run-1..3)
 /// drive this with `KIRBY_GENOME_IMAGE` set.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub async fn run(run: RunAgentConfig) -> anyhow::Result<RunAgentOutcome> {
+pub async fn run(mut run: RunAgentConfig) -> anyhow::Result<RunAgentOutcome> {
     // 1. Resolve the backend (auto by platform unless pinned; validated already).
     let backend = run.backend();
     let mode = run.config.mode;
@@ -528,6 +536,39 @@ pub async fn run(run: RunAgentConfig) -> anyhow::Result<RunAgentOutcome> {
 
     // 2. Load-or-mint the node identity (the stable fleet npub).
     let identity = load_identity(&run.config)?;
+
+    // 2b. FROST-BY-DEFAULT (single-node sovereign quorum): a bare `kirby agent` (no fleet
+    // supervisor to provision a keystore) now auto-provisions — or idempotently RELOADS — its
+    // OWN per-agent 2-of-3 FROST keystore and signs under its sovereign quorum key Q by DEFAULT.
+    // The fleet path already sets `identity.frost_keystore_dir`; only the single-node path
+    // arrives here with it `None`. `--no-frost` (run.no_frost) keeps the legacy node-key dev path.
+    //
+    // SAFETY: `provision_keyset_at` is idempotent + fail-closed (FIX 1): if the identity anchor
+    // (`group_pubkeys.json`) already exists it RELOADS the same Q and validates all 3 shares,
+    // NEVER regenerating; only a truly-empty keystore generates. So calling it on EVERY boot is
+    // safe — first spawn provisions, every later boot reloads the same Q (G-IDENTITY-PERSISTS).
+    //
+    // The keystore is keyed by the SAME id the single-node treasury is keyed by (`node_id`, via
+    // `boot::treasury_path_for`), so `keystore-<node_id>` sits beside `treasury-<node_id>` under
+    // the same durable state_root and is stable across reboots. Setting
+    // `identity.frost_keystore_dir = Some(..)` then routes both `beacon_signer` and the
+    // `SocialConfig` construction down the existing FROST branch unchanged ("Q signs everything").
+    if run.config.identity.frost_keystore_dir.is_none() && !run.no_frost {
+        use anyhow::Context as _;
+        let keystore_dir =
+            crate::keyset_provisioning::keystore_dir_for(&run.config.node_id);
+        crate::keyset_provisioning::provision_keyset_at(&keystore_dir).with_context(|| {
+            format!(
+                "FROST-by-default: provision-or-reload the single-node per-agent 2-of-3 keystore \
+                 at {} (keyed by node_id {}; idempotent/fail-closed — first spawn mints the \
+                 sovereign Q, every later boot reloads the SAME Q). Use --no-frost for the legacy \
+                 node-key dev path.",
+                keystore_dir.display(),
+                run.config.node_id
+            )
+        })?;
+        run.config.identity.frost_keystore_dir = Some(keystore_dir);
+    }
 
     // S3e: resolve the ONE signer for ALL public Nostr output (voice + the three
     // beacons). For a FROST tenant this is the sovereign quorum key Q (the SAME keystore

@@ -230,6 +230,12 @@ enum Command {
         /// Path to the `kirby run` config file (TOML, e.g. `kirby.toml`).
         #[arg(long, default_value = "kirby.toml")]
         config: std::path::PathBuf,
+        /// Escape hatch to the legacy node-key dev signer. By DEFAULT a single-node agent
+        /// auto-provisions (or idempotently reloads) its own per-agent 2-of-3 FROST keystore
+        /// and signs under its sovereign quorum key Q. `--no-frost` skips that and keeps the
+        /// plain node-key path. (The fleet path always provisions FROST regardless.)
+        #[arg(long)]
+        no_frost: bool,
     },
     /// Run the FLEET SUPERVISOR (fleet-host S2): host the N operator-declared tenants in
     /// the config's `[fleet]` block as child `kirby agent` processes, each with its own
@@ -385,9 +391,9 @@ fn main() -> anyhow::Result<()> {
                 restore_secs,
             })
         }
-        Command::Agent { config } => {
+        Command::Agent { config, no_frost } => {
             init_tracing();
-            run_agent_cmd(config)
+            run_agent_cmd(config, no_frost)
         }
         Command::Fleet { config, node_id } => {
             init_tracing();
@@ -402,13 +408,15 @@ fn main() -> anyhow::Result<()> {
 /// evidence line. Exits non-zero if the agent never reached Running so the keeper's
 /// harness run fails loudly on a broken boot.
 #[tokio::main]
-async fn run_agent_cmd(config_path: std::path::PathBuf) -> anyhow::Result<()> {
+async fn run_agent_cmd(config_path: std::path::PathBuf, no_frost: bool) -> anyhow::Result<()> {
     use kirby_node::config::KirbyConfig;
     use kirby_node::run_agent::{self, RunAgentConfig};
 
     let config = KirbyConfig::load(&config_path)?;
     tracing::info!(path = %config_path.display(), "loaded kirby run config");
-    let run = RunAgentConfig::from_config(config)?;
+    let mut run = RunAgentConfig::from_config(config)?;
+    // FROST is the single-node default; `--no-frost` keeps the legacy node-key dev path.
+    run.no_frost = no_frost;
     let outcome = run_agent::run(run).await?;
     println!("{}", run_agent::evidence_line(&outcome));
     if outcome.reached_running {

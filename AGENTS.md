@@ -10,11 +10,16 @@ Nostr fleet.
 
 ## First, set expectations
 
-- This is a **play-money spike**, not a product. No real keys, no mainnet, no FROST. The
-  brokered-act mint is a local CDK fakewallet. Nothing here moves real value.
+- **Sovereign by default.** `kirby run` provisions the agent its own 2-of-3 **FROST**
+  threshold key **Q** on first boot and signs its entire public voice through a live
+  in-process quorum; on restart it reloads the *same* Q (idempotent, fail-closed). **Today
+  the three shares are co-located on this host** — the threshold *structure* is real, but
+  cross-machine holder distribution is the roadmap, so don't claim "a key no human holds"
+  yet. `--no-frost` is a dev/test fast-path (plain node key), not the default.
+- **ecash metabolism, no on-chain.** The brokered-act mint is a local CDK fakewallet; the
+  agent thinks, acts, and dies against ecash. There is **no on-chain Bitcoin path**.
 - **The run path is one command:** `kirby-node agent --config kirby.toml` (a.k.a. `kirby run`).
-  It runs a single **sovereign** agent joined to a Nostr fleet. It is NOT the Raft cluster
-  (that is a resilience showcase, see the bottom of this file).
+  It runs a single **sovereign** agent joined to a Nostr fleet.
 - It runs on **Linux** (Firecracker backend) and **Apple Silicon macOS** (Apple Virtualization
   backend). `backend = "auto"` in the config picks the right one per platform.
 
@@ -23,7 +28,9 @@ Nostr fleet.
 From a config file to a live agent, composing pieces that already exist:
 
 1. Load and validate the config; resolve the backend by platform (unless pinned).
-2. Load or mint the node's Nostr identity (same npub across restarts).
+2. Provision (first boot) or idempotently reload (restart) the agent's own 2-of-3 FROST
+   keystore and derive its sovereign **Q + npub** — the same Q across restarts. (`--no-frost`
+   falls back to a plain node key.)
 3. Join the fleet: presence + heartbeat + a `9100` lifecycle event.
 4. `mode = "bootstrap"`: fund the treasury to "born". `mode = "resume"`: restore the agent from
    its latest app-checkpoint instead.
@@ -107,9 +114,10 @@ Verify it is alive: it publishes presence to the relay and emits a `9100` born e
 fleet with `cargo run -p kirby-node -- presence --relay-url <url>` (or `nerve-events`). Start a
 local relay for testing with `nix run .#relay` (defaults to `127.0.0.1:7777`).
 
-To see the gates individually, each has a demo subcommand (`--help`): `boot` (G1), `meter`
-(G2), `egress` (G4), `brokered` (G5, needs a running fakewallet mint via `--mint-url`),
-`snapshot` (G6), `app-checkpoint`.
+The surviving subcommands are `prereqs`, `agent` (the run path), `boot`, `app-checkpoint`,
+and `fleet` (the multi-tenant supervisor); run `--help` for each. The standalone per-gate
+demo subcommands have been removed — the invariants they proved now live in the integration
+test suite (`cargo test --workspace`).
 
 ## macOS specifics
 
@@ -135,26 +143,32 @@ walkthrough on an M-series Mac.
 | `KIRBY_CPU_TEMPLATE` | CPU template for snapshot/resume normalization. Load-bearing for any cross-CPU or two-host move. |
 | `KIRBY_EBPF_CARGO` | Absolute path to the nightly cargo that builds the eBPF subtree. Set by the dev shell. |
 
-## Resilience showcase (not the run path)
+## Resilience
 
-`kirby run` is one sovereign node. The spike separately proves an agent survives the loss of its
-host: `snapshot`/resume and `app-checkpoint` move a running agent to a fresh boot, and the Raft
-lease (`raft_lease`) fences a term so two hosts never run the same agent at once. The full
-multi-node fleet failover (kill a node, a peer takes over, no money lost) is shown live at
-**http://185.18.221.222/**. The networked multi-node cluster itself is a separate line of work,
-not part of the `kirby run` path.
+`kirby run` is one sovereign node that does not die with its hardware:
 
-## What this spike does NOT prove
+- **Hibernate + respawn** rehydrate the agent under the **same Q** (`cargo run -p kirby-node
+  --example hibernate_roundtrip`); `app-checkpoint` (`mode = "resume"`) is the portable,
+  backend-agnostic resume the macOS backend also uses.
+- The lease fences a term so two hosts never run + debit the same agent at once (no
+  split-brain).
 
-Be honest about the boundary when reporting:
+Live cross-node failover (a node dies, a peer respawns the agent elsewhere) is **roadmap** —
+the lease/fence is wired, the autonomous respawn-elsewhere is not.
 
-- No real custody: no real keys, no mainnet, no FROST. Play-money fakewallet mint only.
-- The everyday run path is one sovereign node; networked multi-node failover is a showcase, not
-  a runnable part of this command.
-- No production hardening.
+## The honest boundary (what is NOT wired yet)
+
+Be honest about this when reporting:
+
+- **Threshold custody is structural, not yet distributed.** Q is a real 2-of-3 FROST key and
+  signs everything, but the three shares are **co-located on the host** today — an operator
+  could still collude. Cross-machine holder distribution (the TEE-substitute) is the roadmap;
+  until then, do not claim "a key no human holds."
+- **ecash only.** The mint is a local CDK fakewallet; there is no on-chain Bitcoin spend.
+- **No live cross-node failover** — the lease/fence is wired, autonomous respawn-elsewhere is not.
+- **No production hardening.**
 - A known caveat: the genome's vsock request timeout is short (safe for a local fakewallet
-  settle, which is fast); a real non-local Lightning melt could exceed it. Revisit before any
-  non-local mint.
+  settle); a real non-local Lightning melt could exceed it. Revisit before any non-local mint.
 
 ## Where to read more
 

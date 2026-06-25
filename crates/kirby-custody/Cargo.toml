@@ -16,10 +16,9 @@ frost-secp256k1-tr = { version = "3.0.0", features = ["serde"] }
 bitcoin = "0.32"
 # CSPRNG for the trusted dealer (rand_core 0.6 compatible with frost-core).
 rand = "0.8"
-# C-3 spend path: a real Rust HTTP client for esplora (fetch/broadcast/confirm)
-# and the faucet, JSON for the esplora responses + keyset persistence, hex for
-# the frost serializations.
-ureq = "2"
+# JSON for keyset persistence + the opaque CoSignEvent payloads, hex for the frost
+# serializations. (The on-chain esplora client/`ureq` was removed with chain.rs/spend.rs:
+# on-chain custody is out of scope — ecash-only.)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
