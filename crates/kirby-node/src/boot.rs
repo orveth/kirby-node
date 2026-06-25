@@ -291,9 +291,30 @@ fn attach_actuator(rail: CompositeRail, actuator: Option<Arc<dyn Actuator>>) -> 
 async fn build_nostr_actuator(
     social: &crate::config::SocialConfig,
 ) -> anyhow::Result<Arc<dyn Actuator>> {
-    // The node identity keyfile is pinned to the node identity by run_agent (so a note is signed
-    // by the agent's own npub). A missing pin is a boot-wiring bug: fail loud, not a silent
-    // throwaway key (which would publish under an unfollowable ephemeral identity).
+    // S3d FROST-TENANT BRANCH: when a per-agent keystore dir is configured, the agent's voice is
+    // its SOVEREIGN 2-of-3 quorum (Q SIGNS EVERYTHING), NOT a node-local key. Load the
+    // `QuorumSigner` from the provisioned keystore and build a FROST-mode actuator, so
+    // `publish_note` signs via the PERSISTENT Q (the keystore's Q across restarts), the aggregate
+    // is published as a pre-signed event. A FROST tenant has no node-local signing key, so
+    // `key_path` is intentionally NOT consulted on this branch.
+    if let Some(keystore_dir) = social.frost_keystore_dir.as_deref() {
+        use anyhow::Context as _;
+        let quorum = crate::keyset_provisioning::load_quorum_signer_at(keystore_dir)
+            .with_context(|| {
+                format!(
+                    "load per-agent FROST quorum signer from keystore {} (S3d)",
+                    keystore_dir.display()
+                )
+            })?;
+        let actuator =
+            NostrActuator::connect_frost(Arc::new(quorum), &social.relays, social.cost_sats).await?;
+        return Ok(Arc::new(actuator));
+    }
+
+    // SINGLE-KEY PATH (byte-identical, G-CLEAN): the node identity keyfile is pinned to the node
+    // identity by run_agent (so a note is signed by the agent's own npub). A missing pin is a
+    // boot-wiring bug: fail loud, not a silent throwaway key (which would publish under an
+    // unfollowable ephemeral identity).
     let key_path = social.key_path.clone().ok_or_else(|| {
         anyhow::anyhow!("SocialConfig.key_path must be pinned to the node identity (boot-wiring bug)")
     })?;

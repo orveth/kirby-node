@@ -196,6 +196,13 @@ pub mod frost_identity;
 // every holder. Platform-agnostic host-side type (like `frost_identity`), so NOT
 // cfg-gated.
 pub mod quorum_signer;
+// S3d per-agent FROST keyset provisioning at spawn. Connects `frost_identity` (the
+// PUBLIC Q) + `quorum_signer` (the SECRET 2-of-3 signer) into the spawn path: a fleet
+// tenant is born with its OWN durable FROST group key Q (trusted-dealer keygen by the
+// supervisor, 0600 holder shares at rest, idempotent reload across restart). Wired into
+// the supervisor's launch path; the single-key `kirby run` path never reaches it.
+// Platform-agnostic host-side type (like `quorum_signer`), so NOT cfg-gated.
+pub mod keyset_provisioning;
 pub mod fleet_supervisor;
 #[cfg(target_os = "linux")]
 pub mod full_loop_run;

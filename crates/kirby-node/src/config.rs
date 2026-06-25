@@ -634,6 +634,13 @@ pub struct SocialConfig {
     /// The fixed host cost (sats) of one publish: metered like a memory write so the agent cannot
     /// spam the world for free (min 1).
     pub cost_sats: u64,
+    /// S3d: when `Some`, this agent is a FROST tenant -- its voice is signed by the per-agent
+    /// 2-of-3 quorum loaded from this keystore dir (its sovereign Q), NOT a node-local single key.
+    /// `build_nostr_actuator` loads a `QuorumSigner` from here and builds a FROST-mode actuator
+    /// (`NostrActuator::connect_frost`). `None` (the default for every non-fleet `kirby run`) keeps
+    /// the byte-identical single-key path: `key_path` is loaded and the actuator signs with it.
+    /// A FROST tenant has NO node-local signing key, so `key_path` is unused when this is `Some`.
+    pub frost_keystore_dir: Option<PathBuf>,
 }
 
 /// The default fixed publish cost (sats): small + non-zero so a post costs the agent (no free

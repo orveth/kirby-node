@@ -62,6 +62,13 @@ pub struct TenantRecord {
     pub treasury_path: PathBuf,
     /// The lease term the supervisor granted `{agent_id, self_node}` at.
     pub lease_term: u64,
+    /// The tenant's per-agent FROST keystore dir (S3d): where its 3 holder shares +
+    /// group pubkeys live (0600), beside its treasury. Keyed by `instance_id`.
+    pub keystore_dir: PathBuf,
+    /// The tenant's SOVEREIGN identity (S3d): the npub of its per-agent FROST group key Q.
+    /// Durable across restarts (idempotent provisioning yields the same Q). For a FROST
+    /// tenant, Q signs everything; this is the followable public identity.
+    pub frost_npub: String,
 }
 
 /// The launch description the supervisor hands a [`TenantLauncher`]: everything the child
@@ -276,6 +283,25 @@ impl FleetSupervisor {
         // instance_id is distinct per tenant, so the per-tenant paths are distinct.
         let treasury_path = crate::boot::treasury_path_for(&allocation.instance_id);
 
+        // (2b) PROVISION THE PER-AGENT FROST KEYSET (S3d). The supervisor is the trusted
+        // dealer: on FIRST spawn it generates the tenant's OWN 2-of-3 group key Q, splits it,
+        // writes all 3 holder shares (0600) + the group pubkeys beside the treasury (keyed by
+        // the SAME instance_id), and the transient share material is zeroized after persisting.
+        // IDEMPOTENT: on a restart (the keystore already exists) it RELOADS the SAME Q -- the
+        // agent's sovereign identity is durable across restarts (it dies and comes back as
+        // itself). Q SIGNS EVERYTHING for a FROST tenant. Keyed by instance_id so each tenant's
+        // keystore is distinct (the same isolation the treasury path has). This runs AFTER
+        // allocation (so instance_id exists) and BEFORE launch (so the agent is born with Q).
+        let keystore_dir = crate::keyset_provisioning::keystore_dir_for(&allocation.instance_id);
+        let frost_identity = crate::keyset_provisioning::provision_keyset_at(&keystore_dir)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "fleet supervisor: provision FROST keyset for tenant {:?}: {e}",
+                    tenant.agent_id
+                )
+            })?;
+        let frost_npub = frost_identity.npub();
+
         // (3) Grant the per-agent lease to THIS node at the current term (S1). Touches only
         // this agent's entry, so granting tenant A never perturbs tenant B's lease.
         let granted = self
@@ -304,6 +330,8 @@ impl FleetSupervisor {
             allocation: allocation.clone(),
             treasury_path,
             lease_term: granted.term,
+            keystore_dir,
+            frost_npub,
         };
         self.tenants.insert(
             tenant.agent_id.clone(),
@@ -658,6 +686,66 @@ mod tests {
             assert_eq!(sup.tenant_status(id), Some(TenantStatus::Running));
         }
         assert!(sup.dead_tenants().is_empty());
+    }
+
+    /// S3d at the SUPERVISOR level: launching a tenant PROVISIONS its per-agent FROST keystore
+    /// (the supervisor is the dealer) and records its sovereign Q-npub. TEETH: after launch the
+    /// keystore dir holds the group pubkeys + 3 holder shares (so the agent is born with Q), the
+    /// record carries a real npub, and re-provisioning the SAME instance_id (a restart) yields
+    /// the SAME npub (idempotent, no regeneration). Distinct tenants get DISTINCT keystores +
+    /// distinct sovereign Qs.
+    #[tokio::test]
+    async fn supervisor_provisions_per_agent_frost_keyset_at_spawn() {
+        // Unique agent ids per test run so the instance-keyed keystore dirs do not collide with
+        // other tests/runs sharing the temp dir.
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let a_id = format!("s3d-alice-{suffix}");
+        let b_id = format!("s3d-bob-{suffix}");
+        let cfg = base_config_with_tenants(vec![tenant(&a_id, 500_000), tenant(&b_id, 700_000)]);
+        let allocator = Allocator::new(&cfg.fleet);
+        let grantor = Arc::new(StubGrantor::default());
+        let launcher = Arc::new(StubLauncher::default());
+        let mut sup = FleetSupervisor::new(1, cfg, allocator, grantor, launcher);
+
+        let records = sup.launch_all().await.expect("launch all");
+        assert_eq!(records.len(), 2);
+
+        let mut npubs = std::collections::BTreeSet::new();
+        let mut keystores = std::collections::BTreeSet::new();
+        for r in &records {
+            // Each tenant was born with a real FROST identity (Q-npub).
+            assert!(r.frost_npub.starts_with("npub1"), "tenant must have a sovereign npub, got {}", r.frost_npub);
+            assert!(npubs.insert(r.frost_npub.clone()), "two tenants share a sovereign Q (must be distinct)");
+            assert!(keystores.insert(r.keystore_dir.clone()), "two tenants share a keystore dir");
+
+            // The keystore is provisioned: group pubkeys + 3 holder shares exist beside the treasury.
+            assert!(r.keystore_dir.join("group_pubkeys.json").is_file(), "group pubkeys must be written at spawn");
+            for idx in 1..=3 {
+                assert!(
+                    r.keystore_dir.join(format!("share_{idx}.json")).is_file(),
+                    "holder share_{idx} must be written at spawn"
+                );
+            }
+            // The keystore sits beside the treasury (same instance_id key).
+            assert_eq!(
+                r.keystore_dir,
+                crate::keyset_provisioning::keystore_dir_for(&r.allocation.instance_id),
+                "keystore dir must be keyed by instance_id (beside the treasury)"
+            );
+        }
+
+        // IDEMPOTENT across restart: re-provisioning the SAME instance_id yields the SAME npub
+        // (the supervisor's restart path reloads, never regenerates).
+        for r in &records {
+            let reload = crate::keyset_provisioning::provision_keyset_at(&r.keystore_dir)
+                .expect("reload existing keystore (restart)");
+            assert_eq!(reload.npub(), r.frost_npub, "restart must reload the SAME sovereign Q (no regen)");
+        }
+
+        // Cleanup the temp keystores.
+        for r in &records {
+            let _ = std::fs::remove_dir_all(&r.keystore_dir);
+        }
     }
 
     /// Killing ONE tenant does not disturb another: the killed tenant reports EXITED and is

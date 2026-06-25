@@ -459,6 +459,11 @@ fn agent_boot_config(
                 &cfg.identity.treasury_dir(),
             )),
             cost_sats: crate::config::DEFAULT_POST_COST_SATS,
+            // Single-key path by default: a bare `kirby run` signs notes with its node key. A
+            // FROST tenant (S3d) sets this to its provisioned keystore dir so its voice signs via
+            // its sovereign 2-of-3 Q (see `build_nostr_actuator`'s FROST branch); `None` here keeps
+            // the byte-identical single-key path (G-CLEAN).
+            frost_keystore_dir: None,
         }),
         _ => None,
     };
