@@ -73,7 +73,13 @@ fn g_clean_explicit_fleet_block_matches_default_and_perturbs_nothing() {
 /// integration contract.
 #[test]
 fn g_alloc_distinct_triples_and_exhaustion() {
-    let fleet = FleetConfig { base_cid: 100, max_tenants: 3, gateway_port_base: 9000, tenants: Vec::new() };
+    let fleet = FleetConfig {
+        base_cid: 100,
+        max_tenants: 3,
+        gateway_port_base: 9000,
+        tenants: Vec::new(),
+        spawn: Default::default(),
+    };
     let mut alloc = Allocator::new(&fleet);
 
     let mut cids = std::collections::BTreeSet::new();
