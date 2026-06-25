@@ -664,10 +664,18 @@ mod tests {
     /// grant (per-agent independence).
     #[tokio::test]
     async fn launches_n_tenants_with_distinct_resources_and_per_agent_grants() {
+        // Unique-per-run ids: launch_all provisions REAL FROST keystores keyed by instance_id
+        // under the SHARED test state_root, so FIXED ids would collide/race with sibling fleet
+        // tests that also launch "alice"/"bob"/"carol" in parallel (the rug-proof anchor guard
+        // then sees a half-written keystore and fails). Unique ids isolate this run's keystores.
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let a = format!("ln-alice-{suffix}");
+        let b = format!("ln-bob-{suffix}");
+        let c = format!("ln-carol-{suffix}");
         let cfg = base_config_with_tenants(vec![
-            tenant("alice", 500_000),
-            tenant("bob", 700_000),
-            tenant("carol", 900_000),
+            tenant(&a, 500_000),
+            tenant(&b, 700_000),
+            tenant(&c, 900_000),
         ]);
         let allocator = Allocator::new(&cfg.fleet);
         let grantor = Arc::new(StubGrantor::default());
@@ -704,20 +712,25 @@ mod tests {
         assert_eq!(grants.len(), 3, "one grant per tenant");
         for (agent_id, node_id) in &grants {
             assert_eq!(*node_id, 1, "the supervisor grants each tenant's lease to itself");
-            assert!(["alice", "bob", "carol"].contains(&agent_id.as_str()));
+            assert!([a.as_str(), b.as_str(), c.as_str()].contains(&agent_id.as_str()));
         }
 
         // The launcher saw each tenant's allocated CID/port + initial_sats.
         let launched = launcher.launched.lock().unwrap().clone();
         assert_eq!(launched.len(), 3);
-        let alice = launched.iter().find(|s| s.agent_id == "alice").unwrap();
+        let alice = launched.iter().find(|s| s.agent_id == a).unwrap();
         assert_eq!(alice.initial_sats, 500_000);
 
         // All three report RUNNING; none dead yet.
-        for id in ["alice", "bob", "carol"] {
+        for id in [&a, &b, &c] {
             assert_eq!(sup.tenant_status(id), Some(TenantStatus::Running));
         }
         assert!(sup.dead_tenants().is_empty());
+
+        // Tidy the real keystores this test provisioned.
+        for r in &records {
+            let _ = std::fs::remove_dir_all(&r.keystore_dir);
+        }
     }
 
     /// S3d at the SUPERVISOR level: launching a tenant PROVISIONS its per-agent FROST keystore
@@ -789,7 +802,12 @@ mod tests {
     /// gated G-N-TENANTS gate).
     #[tokio::test]
     async fn killing_one_tenant_does_not_disturb_another() {
-        let cfg = base_config_with_tenants(vec![tenant("alice", 1_000_000), tenant("bob", 1_000_000)]);
+        // Unique-per-run ids: launch_all provisions REAL keystores under the SHARED test
+        // state_root, so fixed ids race sibling fleet tests (see launches_n_tenants).
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let a = format!("ko-alice-{suffix}");
+        let b = format!("ko-bob-{suffix}");
+        let cfg = base_config_with_tenants(vec![tenant(&a, 1_000_000), tenant(&b, 1_000_000)]);
         let allocator = Allocator::new(&cfg.fleet);
         let grantor = Arc::new(StubGrantor::default());
         let launcher = Arc::new(StubLauncher::default());
@@ -797,20 +815,25 @@ mod tests {
         sup.launch_all().await.expect("launch all");
 
         // Kill alice via the launcher's switch (modeling a child crash).
-        launcher.running_flag("alice").store(false, Ordering::SeqCst);
+        launcher.running_flag(&a).store(false, Ordering::SeqCst);
 
-        assert_eq!(sup.tenant_status("alice"), Some(TenantStatus::Exited), "alice must read EXITED");
-        assert_eq!(sup.tenant_status("bob"), Some(TenantStatus::Running), "bob must be undisturbed by alice's death");
-        assert_eq!(sup.dead_tenants(), vec!["alice".to_string()], "only alice is dead");
+        assert_eq!(sup.tenant_status(&a), Some(TenantStatus::Exited), "alice must read EXITED");
+        assert_eq!(sup.tenant_status(&b), Some(TenantStatus::Running), "bob must be undisturbed by alice's death");
+        assert_eq!(sup.dead_tenants(), vec![a.clone()], "only alice is dead");
 
         // Reaping the dead tenant frees its slot (and only its slot); bob is untouched.
-        let reaped = sup.reap("alice").expect("reap dead alice");
-        assert_eq!(reaped.agent_id, "alice");
+        let reaped = sup.reap(&a).expect("reap dead alice");
+        assert_eq!(reaped.agent_id, a);
         assert_eq!(sup.tenant_count(), 1);
-        assert_eq!(sup.tenant_status("bob"), Some(TenantStatus::Running));
+        assert_eq!(sup.tenant_status(&b), Some(TenantStatus::Running));
         // Refusing to reap a live tenant.
-        let err = sup.reap("bob").unwrap_err();
+        let err = sup.reap(&b).unwrap_err();
         assert!(err.to_string().contains("still RUNNING"));
+
+        // Tidy the real keystores this test provisioned.
+        for id in [&a, &b] {
+            let _ = std::fs::remove_dir_all(crate::keyset_provisioning::keystore_dir_for(&format!("kirby-{id}")));
+        }
     }
 
     /// A launch that fails partway (the grantor errors) RELEASES the tenant's allocation, so
@@ -830,12 +853,19 @@ mod tests {
                 anyhow::bail!("grant refused (not leader)")
             }
         }
-        let cfg = base_config_with_tenants(vec![tenant("alice", 1_000_000)]);
+        // Unique-per-run id: launch_one provisions a REAL keystore for the tenant under the
+        // SHARED test state_root BEFORE the grant step. A FIXED id ("alice") collides with the
+        // sibling fleet tests that also launch "alice" in parallel — the rug-proof anchor guard
+        // then sees a half-written keystore and the relaunch fails ("missing/corrupt holder
+        // share"). A unique id isolates this run's keystore. (This was the recurring CI flake.)
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let a = format!("fl-alice-{suffix}");
+        let cfg = base_config_with_tenants(vec![tenant(&a, 1_000_000)]);
         let allocator = Allocator::new(&cfg.fleet);
         let launcher = Arc::new(StubLauncher::default());
         let mut sup = FleetSupervisor::new(1, cfg, allocator, Arc::new(FailingGrantor), launcher.clone());
 
-        let err = sup.launch_one(&tenant("alice", 1_000_000)).await.unwrap_err();
+        let err = sup.launch_one(&tenant(&a, 1_000_000)).await.unwrap_err();
         assert!(err.to_string().contains("grant lease"), "the grant failure surfaces: {err}");
         // The allocation was released: nothing is tracked, and nothing was launched.
         assert_eq!(sup.tenant_count(), 0);
@@ -846,8 +876,11 @@ mod tests {
             let allocator = Allocator::new(&cfg.fleet);
             FleetSupervisor::new(1, cfg, allocator, Arc::new(StubGrantor::default()), launcher.clone())
         };
-        sup2.launch_one(&tenant("alice", 1_000_000)).await.expect("relaunch after release");
+        sup2.launch_one(&tenant(&a, 1_000_000)).await.expect("relaunch after release");
         assert_eq!(sup2.tenant_count(), 1);
+
+        // Tidy the real keystore this test provisioned.
+        let _ = std::fs::remove_dir_all(crate::keyset_provisioning::keystore_dir_for(&format!("kirby-{a}")));
     }
 
     /// A MID-BATCH launch failure rolls back the WHOLE batch: every tenant already launched is
@@ -925,7 +958,12 @@ mod tests {
     /// tenant dies and is reaped, its slot is reusable; a still-running tenant is untouched.
     #[tokio::test]
     async fn reap_dead_releases_exited_tenant_slots_only() {
-        let cfg = base_config_with_tenants(vec![tenant("alice", 1), tenant("bob", 1)]);
+        // Unique-per-run ids: launch_all provisions REAL keystores under the SHARED test
+        // state_root, so fixed ids race sibling fleet tests (see launches_n_tenants).
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let a = format!("rd-alice-{suffix}");
+        let b = format!("rd-bob-{suffix}");
+        let cfg = base_config_with_tenants(vec![tenant(&a, 1), tenant(&b, 1)]);
         let allocator = Allocator::new(&cfg.fleet);
         let launcher = Arc::new(StubLauncher::default());
         let mut sup = FleetSupervisor::new(
@@ -938,17 +976,22 @@ mod tests {
         sup.launch_all().await.expect("launch all");
 
         // alice dies; bob stays up.
-        launcher.running_flag("alice").store(false, Ordering::SeqCst);
+        launcher.running_flag(&a).store(false, Ordering::SeqCst);
 
         let reaped = sup.reap_dead();
         assert_eq!(reaped.len(), 1, "exactly the one dead tenant is reaped");
-        assert_eq!(reaped[0].agent_id, "alice");
+        assert_eq!(reaped[0].agent_id, a);
         assert_eq!(sup.tenant_count(), 1, "bob is still tracked");
-        assert_eq!(sup.tenant_status("bob"), Some(TenantStatus::Running), "bob untouched");
-        assert!(sup.tenant_status("alice").is_none(), "alice was reaped");
+        assert_eq!(sup.tenant_status(&b), Some(TenantStatus::Running), "bob untouched");
+        assert!(sup.tenant_status(&a).is_none(), "alice was reaped");
 
         // A second reap with no dead tenants is a no-op.
         assert!(sup.reap_dead().is_empty(), "no dead tenants => empty reap");
+
+        // Tidy the real keystores this test provisioned.
+        for id in [&a, &b] {
+            let _ = std::fs::remove_dir_all(crate::keyset_provisioning::keystore_dir_for(&format!("kirby-{id}")));
+        }
     }
 
     /// The real launcher derives a per-tenant child config that is DB-per-agent isolated: the
