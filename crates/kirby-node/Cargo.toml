@@ -21,6 +21,27 @@ rust-version.workspace = true
 # those chunks, to keep each tree clippy-clean with no unused crates.
 [dependencies]
 kirby-proto = { path = "../kirby-proto" }
+# kirby-custody (S3a graft): the canonical FROST 2-of-3 taproot custody crate, a
+# LOCAL sibling repo (no github remote). PATH dep -- NOT vendored -- so the custody
+# source stays single-source-of-truth (vendoring-vs-path is a separate keeper
+# decision). It supplies generate_dealer_keyset / group_xonly_q / key_packages /
+# taproot_address and cosign_net::{npub_encode, nip01_event_id, NostrEvent}. This
+# slice only DERIVES a per-agent FROST identity (FrostIdentity); it changes NO
+# signing path. The crate resolves bitcoin 0.32 + secp256k1 0.29 + rand_core 0.6,
+# which the node already has in-tree (via nostr-sdk/cdk), so no version bump.
+kirby-custody = { path = "../../../kirby-custody" }
+# bitcoin (S3a graft): only to name the XOnlyPublicKey type FrostIdentity::q_xonly
+# returns (custody hands back the 32-byte x-only serialization). Pinned to the 0.32
+# line custody/the node already resolve in-tree -- adds no new version, no new
+# secp256k1. Host-side identity helper only; never crosses vsock, never in the genome.
+bitcoin = "0.32"
+# frost-secp256k1-tr (S3a graft): only to NAME the FROST PublicKeyPackage type in
+# FrostIdentity's signatures (custody owns all the keygen/signing; this crate just
+# loads + derives an identity from a group public key package). Pinned to the SAME
+# 3.0 line custody uses, with the `serde` feature so the package serializes/persists
+# identically to custody's keyset persistence. Host-side identity only; not in the
+# genome, never crosses vsock, no signing here.
+frost-secp256k1-tr = { version = "3.0.0", features = ["serde"] }
 tokio.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

@@ -184,6 +184,11 @@ pub mod egress_run;
 #[cfg(target_os = "linux")]
 pub mod firecracker;
 pub mod fleet;
+// FROST per-agent identity (S3a graft). Loads a per-agent FROST PublicKeyPackage
+// from a keystore and derives the group taproot key Q + npub. NOT wired into any
+// signing path; fleet-tenant-only, behind the custody graft. Platform-agnostic
+// host-side type (like `nerve`), so NOT cfg-gated.
+pub mod frost_identity;
 pub mod fleet_supervisor;
 #[cfg(target_os = "linux")]
 pub mod full_loop_run;
