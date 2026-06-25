@@ -98,12 +98,32 @@ pub fn recv_frame(stream: &mut TcpStream) -> Result<WireEvent, String> {
 /// x-only group key Q in lowercase hex. tags is the empty array for a plain kind:1
 /// note. Returns the 32-byte id (this is the FROST `message`).
 pub fn nip01_event_id(pubkey_hex: &str, created_at: u64, kind: u32, content: &str) -> [u8; 32] {
+    // The empty-tags case (a plain kind:1 note). Delegates to the tag-aware form so
+    // there is exactly ONE serialization implementation: empty tags must serialize as
+    // `[]`, which `nip01_event_id_with_tags` produces for an empty slice.
+    let empty_tags: Vec<Vec<String>> = Vec::new();
+    nip01_event_id_with_tags(pubkey_hex, created_at, kind, &empty_tags, content)
+}
+
+/// Compute the NIP-01 event id WITH tags: sha256 of the compact JSON array
+/// `[0, pubkey_hex, created_at, kind, tags, content]` where `tags` is the event's tag
+/// array (each tag a `["name", "value", ...]` string array). This is the general form
+/// the Kirby beacons (presence 10100 / lifecycle 9100 / agent-state 31000) need, since
+/// those events carry tags that are part of the signed id. `nip01_event_id` is the
+/// empty-tags special case (a plain kind:1 note). Returns the 32-byte id (the FROST
+/// `message`).
+pub fn nip01_event_id_with_tags(
+    pubkey_hex: &str,
+    created_at: u64,
+    kind: u32,
+    tags: &[Vec<String>],
+    content: &str,
+) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     // NIP-01 serialization: a compact (no-whitespace) UTF-8 JSON array. serde_json's
-    // to_string already emits compact JSON, and it escapes the content string exactly
-    // as NIP-01 requires (it is JSON-string escaping). tags = [] (no tags).
-    let empty_tags: Vec<Vec<String>> = Vec::new();
-    let arr = serde_json::json!([0, pubkey_hex, created_at, kind, empty_tags, content]);
+    // to_string already emits compact JSON, and it escapes the strings exactly as
+    // NIP-01 requires (it is JSON-string escaping).
+    let arr = serde_json::json!([0, pubkey_hex, created_at, kind, tags, content]);
     let serialized = serde_json::to_string(&arr).expect("serialize NIP-01 array");
     let mut hasher = Sha256::new();
     hasher.update(serialized.as_bytes());

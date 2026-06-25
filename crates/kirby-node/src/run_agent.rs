@@ -238,6 +238,36 @@ fn load_identity(config: &KirbyConfig) -> anyhow::Result<NodeIdentity> {
     NodeIdentity::load_or_create(&key_path)
 }
 
+/// S3e: build the agent's [`BeaconSigner`] -- the ONE key all its PUBLIC Nostr output
+/// (voice + presence + lifecycle + agent-state) is signed under.
+///
+/// For a FROST tenant (`identity.frost_keystore_dir` is `Some`, set by the supervisor's
+/// `derive_tenant_config`) the beacons sign under the SAME 2-of-3 quorum key Q the
+/// actuator's voice uses -- loaded from the SAME per-agent keystore via the SAME
+/// `load_quorum_signer_at` the actuator (`build_nostr_actuator`) uses, so there is ONE
+/// signer = the agent's identity for ALL its Nostr output ("Q signs everything"). For a
+/// bare `kirby run`/`kirby agent` (`None`) it is the node key -- byte-identical to the
+/// pre-S3e beacon path (G-CLEAN).
+fn beacon_signer(
+    config: &KirbyConfig,
+    identity: &NodeIdentity,
+) -> anyhow::Result<crate::nerve::BeaconSigner> {
+    match config.identity.frost_keystore_dir.as_deref() {
+        Some(keystore_dir) => {
+            use anyhow::Context as _;
+            let quorum = crate::keyset_provisioning::load_quorum_signer_at(keystore_dir)
+                .with_context(|| {
+                    format!(
+                        "load per-agent FROST quorum signer from keystore {} for the beacons (S3e)",
+                        keystore_dir.display()
+                    )
+                })?;
+            Ok(crate::nerve::BeaconSigner::Frost(std::sync::Arc::new(quorum)))
+        }
+        None => Ok(crate::nerve::BeaconSigner::NodeKey(identity.clone())),
+    }
+}
+
 /// Build the [`PresenceConfig`] for this node from the config.
 fn presence_config(config: &KirbyConfig) -> PresenceConfig {
     PresenceConfig {
@@ -256,11 +286,12 @@ struct PresenceTask {
 }
 
 /// Start the presence + heartbeat task (the fleet-join step), returning the handle
-/// so the run stops it cleanly at the end.
-fn start_presence(identity: &NodeIdentity, config: &KirbyConfig) -> PresenceTask {
+/// so the run stops it cleanly at the end. Beacons sign under `signer` (the node key,
+/// or the FROST quorum key Q for a FROST tenant).
+fn start_presence(signer: crate::nerve::BeaconSigner, config: &KirbyConfig) -> PresenceTask {
     let cfg = presence_config(config);
     let (shutdown, rx) = tokio::sync::oneshot::channel();
-    let handle = tokio::spawn(nerve::run_presence(identity.clone(), cfg, rx));
+    let handle = tokio::spawn(nerve::run_presence(signer, cfg, rx));
     PresenceTask { shutdown, handle }
 }
 
@@ -279,12 +310,12 @@ async fn stop_presence(task: PresenceTask) {
 /// runway on the presence cadence; the `backend` is the resolved sandbox label. Used
 /// by the metered (bootstrap) loop; resume emits its state directly (no meter loop).
 fn agent_state_emitter(
-    identity: &NodeIdentity,
+    signer: crate::nerve::BeaconSigner,
     config: &KirbyConfig,
     backend: ResolvedBackend,
 ) -> crate::metered_run::AgentStateEmitter {
     crate::metered_run::AgentStateEmitter {
-        identity: identity.clone(),
+        signer,
         relay_url: config.relay.url.clone(),
         agent_id: config.agent_id.clone(),
         node_id: config.node_id.clone(),
@@ -299,7 +330,7 @@ fn agent_state_emitter(
 /// "dead" at budget-death, and the running state on the resume path. `runway_secs` is
 /// `None` (null) when no burn rate applies (resume; the final dead state).
 async fn emit_agent_state(
-    identity: &NodeIdentity,
+    signer: &crate::nerve::BeaconSigner,
     config: &KirbyConfig,
     backend: ResolvedBackend,
     treasury_sats: u64,
@@ -314,7 +345,7 @@ async fn emit_agent_state(
         backend.label(),
     );
     if let Err(e) =
-        nerve::publish_agent_state(identity, &config.relay.url, &config.node_id, &content).await
+        nerve::publish_agent_state(signer, &config.relay.url, &config.node_id, &content).await
     {
         tracing::warn!(error = %e, lifecycle, "failed to publish 31000 agent-state");
     }
@@ -325,7 +356,7 @@ async fn emit_agent_state(
 /// milestone log, not a correctness dependency, so a transient relay hiccup must
 /// not abort an otherwise-live agent.
 async fn emit_lifecycle(
-    identity: &NodeIdentity,
+    signer: &crate::nerve::BeaconSigner,
     config: &KirbyConfig,
     which: Lifecycle,
     treasury_sats: u64,
@@ -335,7 +366,7 @@ async fn emit_lifecycle(
         Lifecycle::Died(reason) => ("died", reason.as_str()),
     };
     match nerve::publish_lifecycle(
-        identity,
+        signer,
         &config.relay.url,
         &config.agent_id,
         &config.node_id,
@@ -519,16 +550,24 @@ pub async fn run(run: RunAgentConfig) -> anyhow::Result<RunAgentOutcome> {
 
     // 2. Load-or-mint the node identity (the stable fleet npub).
     let identity = load_identity(&run.config)?;
-    let npub = identity.npub();
-    tracing::info!(npub = %npub, "node identity ready");
 
-    // 3. Join the fleet: presence + heartbeat to the relay.
-    let presence = start_presence(&identity, &run.config);
+    // S3e: resolve the ONE signer for ALL public Nostr output (voice + the three
+    // beacons). For a FROST tenant this is the sovereign quorum key Q (the SAME keystore
+    // the actuator loads); otherwise the node key. Build it ONCE and thread it through
+    // presence + lifecycle + agent-state, so every public event is signed under the
+    // agent's identity Q ("Q signs everything").
+    let signer = beacon_signer(&run.config, &identity)?;
+    // The agent's PUBLIC identity npub: Q for a FROST tenant, the node key otherwise.
+    let npub = signer.npub();
+    tracing::info!(npub = %npub, frost = matches!(signer, crate::nerve::BeaconSigner::Frost(_)), "agent identity ready (beacons + voice sign under this key)");
+
+    // 3. Join the fleet: presence + heartbeat to the relay (signed by `signer`).
+    let presence = start_presence(signer.clone(), &run.config);
 
     // 4-7. Drive the mode-specific path. Always stop presence at the end.
     let result = match mode {
-        RunMode::Bootstrap => run_bootstrap(&run, &identity, backend, npub.clone()).await,
-        RunMode::Resume => run_resume(&run, &identity, backend, npub.clone()).await,
+        RunMode::Bootstrap => run_bootstrap(&run, &signer, backend, npub.clone()).await,
+        RunMode::Resume => run_resume(&run, &signer, backend, npub.clone()).await,
     };
     stop_presence(presence).await;
     result
@@ -540,7 +579,7 @@ pub async fn run(run: RunAgentConfig) -> anyhow::Result<RunAgentOutcome> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn run_bootstrap(
     run: &RunAgentConfig,
-    identity: &NodeIdentity,
+    signer: &crate::nerve::BeaconSigner,
     backend: ResolvedBackend,
     npub: String,
 ) -> anyhow::Result<RunAgentOutcome> {
@@ -550,7 +589,7 @@ async fn run_bootstrap(
 
     // 4. Fund to born: the treasury is seeded at boot with initial_sats; emit the
     // 9100 born (reason "funded") at this funding milestone.
-    let born_emitted = emit_lifecycle(identity, &run.config, Lifecycle::Born, funding).await;
+    let born_emitted = emit_lifecycle(signer, &run.config, Lifecycle::Born, funding).await;
 
     // 5-7. Boot the agent, run the v0 metered workload, persist the checkpoint it
     // submits, and halt on exhaustion. The metered run boots the agent through the
@@ -563,7 +602,7 @@ async fn run_bootstrap(
         max_run: run.max_run,
         // Emit the live 31000 "Kirby face" on the presence cadence during the run,
         // sourcing the live treasury + burn rate from the meter loop.
-        agent_state: Some(agent_state_emitter(identity, &run.config, backend)),
+        agent_state: Some(agent_state_emitter(signer.clone(), &run.config, backend)),
         // The synthetic VM-rent rates from the `[meter]` block (F4): the deploy tunes the
         // memory rent down so an always-on diarist VM does not rent-death before it thinks.
         rates: crate::meter::BurnRates::from(&run.config.meter),
@@ -602,7 +641,7 @@ async fn run_bootstrap(
         EndReason::Resumed => unreachable!("bootstrap cannot end as resumed"),
     };
     let died_emitted = emit_lifecycle(
-        identity,
+        signer,
         &run.config,
         Lifecycle::Died(death_reason),
         lifecycle_treasury,
@@ -614,7 +653,7 @@ async fn run_bootstrap(
     // at death (no forward burn). Both deaths carry the real leftover the meter reported:
     // ~0 for a rent-driven budget-death, the sub-think remainder for the diarist's floor-halt.
     emit_agent_state(
-        identity,
+        signer,
         &run.config,
         backend,
         lifecycle_treasury,
@@ -645,7 +684,7 @@ async fn run_bootstrap(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn run_resume(
     run: &RunAgentConfig,
-    identity: &NodeIdentity,
+    signer: &crate::nerve::BeaconSigner,
     backend: ResolvedBackend,
     npub: String,
 ) -> anyhow::Result<RunAgentOutcome> {
@@ -677,7 +716,7 @@ async fn run_resume(
     // on resume, which the seed does not refill), best-effort.
     let treasury_sats = treasury.remaining().unwrap_or(run.config.funding.initial_sats);
     emit_agent_state(
-        identity,
+        signer,
         &run.config,
         backend,
         treasury_sats,
@@ -694,13 +733,13 @@ async fn run_resume(
     // The terminal 31000 "dead" face, emitted once as the resume demonstration run
     // tears the agent down (alongside the 9100 died below), after which the node
     // stops emitting agent-state.
-    emit_agent_state(identity, &run.config, backend, treasury_sats, None, "dead").await;
+    emit_agent_state(signer, &run.config, backend, treasury_sats, None, "dead").await;
 
     // A resume run ends as "continue", not a budget-death, so it emits died only on
     // its own clean shutdown here (the agent is being torn down at the end of this
     // demonstration run).
     let died_emitted = emit_lifecycle(
-        identity,
+        signer,
         &run.config,
         Lifecycle::Died(DeathReason::Stopped),
         run.config.funding.initial_sats,

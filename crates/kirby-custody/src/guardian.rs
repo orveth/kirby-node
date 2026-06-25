@@ -42,13 +42,34 @@ use frost_secp256k1_tr as frost;
 use frost::keys::PublicKeyPackage;
 use frost::{Identifier, SigningPackage};
 
+#[cfg(test)]
 use crate::cosign_net::nip01_event_id;
+use crate::cosign_net::nip01_event_id_with_tags;
 use crate::group_xonly_q;
 
-/// The Nostr "short text note" kind. The only kind this membrane will let a guardian
-/// sign in S3b. Other kinds (and the future BitcoinSpend intent) need their own
-/// reconstruction + policy and are refused as `BadKind` until added.
+/// The Nostr "short text note" kind (the agent's free-text voice). The ONLY kind whose
+/// content runs through the note content-policy (`content_is_clean`); the beacon kinds
+/// carry machine-generated JSON state, not free text, so that policy does not apply.
 pub const NOSTR_TEXT_NOTE_KIND: u32 = 1;
+
+/// The Kirby PRESENCE beacon kind (10100): a REPLACEABLE liveness heartbeat.
+pub const KIND_KIRBY_PRESENCE: u32 = 10100;
+/// The Kirby LIFECYCLE event kind (9100): the signed born/died log.
+pub const KIND_KIRBY_LIFECYCLE: u32 = 9100;
+/// The Kirby AGENT-STATE kind (31000): the ADDRESSABLE live "Kirby face".
+pub const KIND_KIRBY_AGENT_STATE: u32 = 31000;
+
+/// S3e: is `kind` one a guardian will authorize? The agent's PUBLIC Nostr output is its
+/// voice (kind:1) PLUS its three public beacons (presence/lifecycle/agent-state) -- all
+/// signed by the same group key Q ("Q signs everything", gudnuf's decision A). Any other
+/// kind (and the future BitcoinSpend intent) needs its own reconstruction + policy and is
+/// refused as `BadKind` until added.
+fn is_authorizable_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        NOSTR_TEXT_NOTE_KIND | KIND_KIRBY_PRESENCE | KIND_KIRBY_LIFECYCLE | KIND_KIRBY_AGENT_STATE
+    )
+}
 
 /// Maximum content length (bytes, UTF-8) a guardian will co-sign for a kind:1 note.
 ///
@@ -80,12 +101,20 @@ pub struct CoSignRequest {
 /// The typed intent a guardian can independently reconstruct into a signed message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignIntent {
-    /// A Nostr event. In S3b only `kind == NOSTR_TEXT_NOTE_KIND` (1) is accepted; the
-    /// guardian recomputes the NIP-01 event id under its own Q and requires the package
-    /// message to equal it.
+    /// A Nostr event. S3e accepts the agent's voice (kind:1) AND its three public
+    /// beacons (10100 presence / 9100 lifecycle / 31000 agent-state); the guardian
+    /// recomputes the NIP-01 event id under its OWN Q -- over `kind`, `created_at`,
+    /// `tags`, and `content` -- and requires the package message to equal it. `tags` is
+    /// part of the signed id, so a beacon's tags are reconstructed and equality-checked
+    /// exactly like its content. The note content-policy (`content_is_clean`) applies
+    /// ONLY to kind:1; beacon JSON is signed verbatim (never run through the note
+    /// sanitizer).
     NostrEvent {
         kind: u32,
         created_at: u64,
+        /// The event's tag array (each tag a `["name","value",...]`). Empty for a plain
+        /// kind:1 note; populated for the beacons.
+        tags: Vec<Vec<String>>,
         content: String,
     },
     // FUTURE (not implemented in S3b): a `BitcoinSpend` variant carrying the typed spend
@@ -113,7 +142,8 @@ pub enum RefuseReason {
     /// A signer identifier appears more than once across the request/package (would reuse
     /// a single-use nonce), or the claimed set and the package's commitment set disagree.
     DuplicateSigner,
-    /// The intent's `kind` is not a kind this membrane will authorize (only kind:1 in S3b).
+    /// The intent's `kind` is not a kind this membrane will authorize (kind:1 + the three
+    /// Kirby beacon kinds 10100/9100/31000; everything else is refused).
     BadKind,
     /// The intent's content is not already in canonical (publish-path) form: it is not
     /// byte-identical to what `kirby_proto::sanitize_note_for_publish` would emit (it
@@ -235,17 +265,25 @@ pub fn validate(
         SignIntent::NostrEvent {
             kind,
             created_at,
+            tags,
             content,
         } => {
-            // Only kind:1 is authorizable in S3b.
-            if *kind != NOSTR_TEXT_NOTE_KIND {
+            // kind:1 (voice) + the three Kirby beacon kinds are authorizable; nothing else.
+            if !is_authorizable_kind(*kind) {
                 return Err(RefuseReason::BadKind);
             }
-            // Content policy: refuse anything that would not pass as-presented.
-            if !content_is_clean(content) {
+            // CONTENT POLICY (S3e): the note sanitizer applies ONLY to the free-text
+            // voice (kind:1). The beacons (10100/9100/31000) carry machine-generated
+            // JSON state, not user prose, so they are NOT run through the note sanitizer
+            // -- the JSON is signed verbatim (running `split_whitespace`/collapse on it
+            // would corrupt the payload). The guardian still re-derives + equality-checks
+            // their id (over content AND tags), which is the real anti-blind-sign gate.
+            if *kind == NOSTR_TEXT_NOTE_KIND && !content_is_clean(content) {
                 return Err(RefuseReason::DirtyContent);
             }
-            nip01_event_id(&q_hex, *created_at, NOSTR_TEXT_NOTE_KIND, content)
+            // Reconstruct over content AND tags: for a beacon the tags are part of the
+            // signed id, so a coordinator that altered a tag would fail the equality check.
+            nip01_event_id_with_tags(&q_hex, *created_at, *kind, tags, content)
         }
     };
 
@@ -347,6 +385,7 @@ mod tests {
         SignIntent::NostrEvent {
             kind: NOSTR_TEXT_NOTE_KIND,
             created_at: CREATED_AT,
+            tags: Vec::new(),
             content: content.to_string(),
         }
     }
@@ -522,6 +561,7 @@ mod tests {
             intent: SignIntent::NostrEvent {
                 kind: 0,
                 created_at: CREATED_AT,
+                tags: Vec::new(),
                 content: CONTENT.to_string(),
             },
             signer_set: [1u16, 2u16].into_iter().collect(),
@@ -573,5 +613,105 @@ mod tests {
         assert!(content_is_clean(&"x".repeat(MAX_NOTE_BYTES)), "content at exactly MAX -> clean");
 
         println!("G-GUARDIAN-DIRTY-CONTENT PASS: non-canonical (\\n/\\t/dbl-space/lead/trail/ws-only/empty/U+2028/U+2029/control), over-512 all refused; canonical single-line clean");
+    }
+
+    /// G-BEACON-MEMBRANE (custody half): the guardian ACCEPTS a beacon (10100/9100/31000)
+    /// whose id (over content AND tags) matches the package, REFUSES a TAMPERED beacon
+    /// package (wrong tags or wrong content) with MessageMismatch, and does NOT run the
+    /// note-sanitizer on beacon JSON (a beacon whose content would be rewritten by the
+    /// note sanitizer -- it has `:` and spaces and is not "canonical note" form -- still
+    /// validates, proving the kind:1-only content policy).
+    #[test]
+    fn g_beacon_membrane() {
+        let (keyset, signers) = keyset_and_two();
+        let q = group_xonly_q(&keyset.pubkeys).expect("Q");
+        let q_hex = hex::encode(q);
+        let signer_set: BTreeSet<u16> = [1u16, 2u16].into_iter().collect();
+
+        // A realistic beacon JSON content + tags. The JSON is DELIBERATELY shaped so the
+        // note sanitizer WOULD rewrite it (it contains `{`, `:`, multiple spaces around
+        // the JSON) -- if the membrane wrongly applied content_is_clean to it, it would
+        // refuse DirtyContent. It must NOT, because the policy is kind:1-only.
+        let beacon_content = r#"{"agent_id":"agent-0",  "treasury_sats":1234,"lifecycle":"running"}"#;
+        assert!(
+            !content_is_clean(beacon_content),
+            "the beacon JSON is intentionally NON-canonical for the note sanitizer (double space) so this test is meaningful"
+        );
+        let tags: Vec<Vec<String>> = vec![
+            vec!["d".to_string(), "agent-0".to_string()],
+            vec!["t".to_string(), "kirby".to_string()],
+            vec!["node".to_string(), "node-1".to_string()],
+        ];
+
+        for kind in [KIND_KIRBY_PRESENCE, KIND_KIRBY_LIFECYCLE, KIND_KIRBY_AGENT_STATE] {
+            // (a) ACCEPT: the package's message == the id reconstructed over content AND tags.
+            let id = nip01_event_id_with_tags(&q_hex, CREATED_AT, kind, &tags, beacon_content);
+            let package = package_with_message(&signers, &id);
+            let req = CoSignRequest {
+                session_id: 7,
+                intent: SignIntent::NostrEvent {
+                    kind,
+                    created_at: CREATED_AT,
+                    tags: tags.clone(),
+                    content: beacon_content.to_string(),
+                },
+                signer_set: signer_set.clone(),
+            };
+            assert_eq!(
+                validate(&req, &package, &keyset.pubkeys, 1, 2),
+                Ok(()),
+                "kind {kind} beacon with matching id+tags must validate (JSON NOT sanitized)"
+            );
+
+            // (b) REFUSE: a package signing the id with TAMPERED tags (a malicious
+            //     coordinator that changed the node tag) -> MessageMismatch. The request
+            //     still claims the ORIGINAL tags, so the reconstructed id differs.
+            let mut bad_tags = tags.clone();
+            bad_tags[2][1] = "evil-node".to_string();
+            let tampered_id =
+                nip01_event_id_with_tags(&q_hex, CREATED_AT, kind, &bad_tags, beacon_content);
+            let tampered_package = package_with_message(&signers, &tampered_id);
+            assert_eq!(
+                validate(&req, &tampered_package, &keyset.pubkeys, 1, 2),
+                Err(RefuseReason::MessageMismatch),
+                "kind {kind} beacon with tampered tags must refuse MessageMismatch"
+            );
+
+            // (c) REFUSE: a package signing the id over TAMPERED content -> MessageMismatch.
+            let tampered_content_id = nip01_event_id_with_tags(
+                &q_hex,
+                CREATED_AT,
+                kind,
+                &tags,
+                r#"{"agent_id":"agent-0","treasury_sats":999999}"#,
+            );
+            let tcp = package_with_message(&signers, &tampered_content_id);
+            assert_eq!(
+                validate(&req, &tcp, &keyset.pubkeys, 1, 2),
+                Err(RefuseReason::MessageMismatch),
+                "kind {kind} beacon with tampered content must refuse MessageMismatch"
+            );
+        }
+
+        // (d) An unauthorized kind (kind:0) still -> BadKind even with beacon-shaped tags.
+        let id0 = nip01_event_id_with_tags(&q_hex, CREATED_AT, 0, &tags, beacon_content);
+        let pkg0 = package_with_message(&signers, &id0);
+        let req0 = CoSignRequest {
+            session_id: 7,
+            intent: SignIntent::NostrEvent {
+                kind: 0,
+                created_at: CREATED_AT,
+                tags: tags.clone(),
+                content: beacon_content.to_string(),
+            },
+            signer_set: signer_set.clone(),
+        };
+        assert_eq!(
+            validate(&req0, &pkg0, &keyset.pubkeys, 1, 2),
+            Err(RefuseReason::BadKind),
+            "kind:0 is still BadKind"
+        );
+
+        println!("G-BEACON-MEMBRANE (custody) PASS: 10100/9100/31000 accept on matching id+tags, refuse tampered tags/content (MessageMismatch), beacon JSON NOT sanitized, kind:0 still BadKind");
     }
 }

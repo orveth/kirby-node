@@ -880,7 +880,13 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
         };
         // Run until SIGINT/SIGTERM, then shut the presence task down cleanly.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(nerve::run_presence(identity, cfg, shutdown_rx));
+        // The node daemon's own presence is node-level (signed by the node key, not a
+        // FROST tenant key); byte-identical to pre-S3e (G-CLEAN).
+        let task = tokio::spawn(nerve::run_presence(
+            nerve::BeaconSigner::NodeKey(identity),
+            cfg,
+            shutdown_rx,
+        ));
         wait_for_signal().await;
         let _ = shutdown_tx.send(());
         match task.await {
@@ -928,7 +934,12 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
             stale_after: Duration::from_secs(args.presence_stale_after),
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(nerve::run_presence(identity, cfg, rx));
+        // Node-level presence signs with the node key (not a FROST tenant key); G-CLEAN.
+        let handle = tokio::spawn(nerve::run_presence(
+            nerve::BeaconSigner::NodeKey(identity),
+            cfg,
+            rx,
+        ));
         presence_handle = Some((tx, handle));
     }
 

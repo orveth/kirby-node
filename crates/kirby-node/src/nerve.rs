@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -32,6 +33,89 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use kirby_proto::{KIND_KIRBY_AGENT_STATE, KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE};
+
+use crate::quorum_signer::QuorumSigner;
+
+/// S3e: how the agent's PUBLIC beacons (presence 10100 / lifecycle 9100 / agent-state
+/// 31000) are signed. The agent's identity for ALL its Nostr output is ONE key:
+///   * `NodeKey` — the single-agent / non-FROST path (`kirby run` with no
+///     `frost_keystore_dir`). Beacons sign with the node identity key, BYTE-IDENTICAL to
+///     the pre-S3e behavior (G-CLEAN). This is the existing `connect_client(.signer(node))`
+///     + `send_event_builder` path.
+///   * `Frost` — a FROST tenant (the supervisor provisioned a per-agent keystore). Beacons
+///     are quorum-signed under the SAME group taproot key Q the actuator's voice (S3c/S3d)
+///     uses, so EVERY public event the agent emits -- voice AND beacons -- is signed by Q
+///     ("Q signs everything", gudnuf's decision A). The event is built locally, the JSON +
+///     tags are co-signed by the 2-of-3 quorum (guardian membrane on every holder), and
+///     the PRE-SIGNED event is published via `send_event` (NOT `send_event_builder`; there
+///     is no node-local key).
+///
+/// COST NOTE (S5/S6): the Frost branch runs a full quorum ceremony PER beacon (every
+/// presence interval). For S3 the holders are co-located in-process (sub-ms), so this is
+/// fine. When holders move off-box (S5/S6) a ceremony per presence beacon is too expensive
+/// on the wire -- that lane MUST adopt a cheaper presence cadence or a short-lived session
+/// sub-key delegated by Q. Not built here.
+#[derive(Clone)]
+pub enum BeaconSigner {
+    /// Sign beacons with the node identity key (single-agent / non-FROST; unchanged path).
+    NodeKey(NodeIdentity),
+    /// Sign beacons with the agent's FROST quorum key Q (a FROST tenant).
+    Frost(Arc<QuorumSigner>),
+}
+
+impl BeaconSigner {
+    /// The public key beacons are signed under (the node key, or the FROST group key Q).
+    pub fn public_key(&self) -> anyhow::Result<PublicKey> {
+        match self {
+            BeaconSigner::NodeKey(identity) => Ok(identity.public_key()),
+            BeaconSigner::Frost(quorum) => PublicKey::from_slice(&quorum.q_bytes())
+                .map_err(|e| anyhow::anyhow!("FROST group key Q is not a valid x-only key: {e}")),
+        }
+    }
+
+    /// The npub beacons are signed under (the agent's stable public identity).
+    pub fn npub(&self) -> String {
+        self.public_key()
+            .ok()
+            .and_then(|pk| pk.to_bech32().ok())
+            .unwrap_or_default()
+    }
+}
+
+impl From<NodeIdentity> for BeaconSigner {
+    fn from(identity: NodeIdentity) -> Self {
+        BeaconSigner::NodeKey(identity)
+    }
+}
+
+/// FROST-sign a Nostr event (the given `kind`/`tags`/`content`) under the quorum key Q
+/// and re-materialize + locally-VERIFY it as a nostr-sdk [`Event`] before it is published.
+/// Fail closed: if the aggregate signature is bad the event is never built (so a broken
+/// quorum never reaches the relay). Mirrors the actuator's `frost_sign_event`. The beacon
+/// JSON content is signed VERBATIM (the note sanitizer is kind:1-only, inside the signer).
+fn frost_sign_beacon(
+    quorum: &QuorumSigner,
+    kind: u16,
+    tags: &[Tag],
+    content: &str,
+    created_at: u64,
+) -> anyhow::Result<Event> {
+    // Convert nostr-sdk Tags into the `Vec<Vec<String>>` the FROST id is computed over
+    // (the exact wire form NIP-01 hashes). The guardian re-derives the id over these.
+    let tag_vecs: Vec<Vec<String>> = tags.iter().map(|t| t.as_slice().to_vec()).collect();
+    let signed = quorum
+        .sign_nostr_event_with_tags(kind as u32, created_at, &tag_vecs, content)
+        .context("FROST quorum failed to co-sign the beacon event")?;
+    // Re-materialize from NIP-01 JSON and VERIFY locally (id + BIP-340 sig under Q) before
+    // sending -- fail closed if the aggregate is bad.
+    let json = serde_json::to_string(&signed).context("serialize FROST-signed beacon to JSON")?;
+    let event =
+        Event::from_json(&json).map_err(|e| anyhow::anyhow!("parse FROST-signed beacon: {e}"))?;
+    event
+        .verify()
+        .map_err(|e| anyhow::anyhow!("FROST-signed beacon failed local verification: {e}"))?;
+    Ok(event)
+}
 
 /// The default file name for the persisted node Nostr secret key, under the node
 /// state directory (the `--treasury-path` dir, unless `--nostr-key-path` overrides
@@ -207,12 +291,15 @@ struct PresenceContent {
     status: String,
 }
 
-/// Build a presence [`EventBuilder`] for this node: a REPLACEABLE
+/// Build the presence beacon's `(content_json, tags)`: a REPLACEABLE
 /// `KIND_KIRBY_PRESENCE` event whose content is the presence JSON and whose tags
-/// mirror the node_id (and endpoint, if any) for read-path legibility. The client
-/// signs it and sets `created_at` at publish time, so each publish replaces the
-/// prior beacon (bumping last-seen).
-fn build_presence(node_id: &str, endpoint: Option<&str>) -> anyhow::Result<EventBuilder> {
+/// mirror the node_id (and endpoint, if any) for read-path legibility. The node-key
+/// path wraps this in an [`EventBuilder`]; the FROST path feeds the SAME content+tags
+/// into the quorum so both sign byte-identical events.
+fn build_presence_parts(
+    node_id: &str,
+    endpoint: Option<&str>,
+) -> anyhow::Result<(String, Vec<Tag>)> {
     let content = PresenceContent {
         node_id: node_id.to_string(),
         endpoint: endpoint.map(|s| s.to_string()),
@@ -223,6 +310,13 @@ fn build_presence(node_id: &str, endpoint: Option<&str>) -> anyhow::Result<Event
     if let Some(ep) = endpoint {
         tags.push(Tag::parse([TAG_ENDPOINT, ep])?);
     }
+    Ok((json, tags))
+}
+
+/// Build a presence [`EventBuilder`] (the node-key signing path). Kept for the
+/// non-FROST presence publish (and the existing presence tests).
+fn build_presence(node_id: &str, endpoint: Option<&str>) -> anyhow::Result<EventBuilder> {
+    let (json, tags) = build_presence_parts(node_id, endpoint)?;
     Ok(EventBuilder::new(Kind::from(KIND_KIRBY_PRESENCE), json).tags(tags))
 }
 
@@ -246,13 +340,13 @@ pub struct LifecycleContent {
 /// shape. Tags per the contract: `["t","kirby"]`, `["a",<agent_id>]`, `["node",<node_id>]`.
 /// Signed by the node key at publish time. The `event`/`treasury_sats`/`reason` are the
 /// caller's (born = funded + initial budget; died = broke + 0).
-fn build_lifecycle(
+fn build_lifecycle_parts(
     agent_id: &str,
     node_id: &str,
     event: &str,
     treasury_sats: u64,
     reason: &str,
-) -> anyhow::Result<EventBuilder> {
+) -> anyhow::Result<(String, Vec<Tag>)> {
     let content = LifecycleContent {
         agent_id: agent_id.to_string(),
         event: event.to_string(),
@@ -265,6 +359,18 @@ fn build_lifecycle(
         Tag::parse([TAG_A, agent_id])?,
         Tag::parse([TAG_NODE, node_id])?,
     ];
+    Ok((json, tags))
+}
+
+/// Build a 9100 lifecycle [`EventBuilder`] (the node-key signing path).
+fn build_lifecycle(
+    agent_id: &str,
+    node_id: &str,
+    event: &str,
+    treasury_sats: u64,
+    reason: &str,
+) -> anyhow::Result<EventBuilder> {
+    let (json, tags) = build_lifecycle_parts(agent_id, node_id, event, treasury_sats, reason)?;
     Ok(EventBuilder::new(Kind::from(KIND_KIRBY_LIFECYCLE), json).tags(tags))
 }
 
@@ -317,6 +423,28 @@ pub(crate) async fn connect_client(
     Ok(client)
 }
 
+/// Build a connected Nostr [`Client`] for a [`BeaconSigner`]:
+///   * `NodeKey` — the client carries the node-key signer (the existing
+///     `send_event_builder` path, byte-identical to pre-S3e).
+///   * `Frost` — the client carries NO signer (a FROST beacon is signed by the quorum
+///     and published as a PRE-SIGNED owned `Event` via `send_event`; there is no
+///     node-local key), mirroring the actuator's `connect_frost`.
+async fn connect_beacon_client(signer: &BeaconSigner, relay_url: &str) -> anyhow::Result<Client> {
+    let client = match signer {
+        BeaconSigner::NodeKey(identity) => {
+            Client::builder().signer(identity.keys().clone()).build()
+        }
+        // No `.signer(..)`: a FROST beacon is signed by the quorum, never by a local key.
+        BeaconSigner::Frost(_) => Client::builder().build(),
+    };
+    client
+        .add_relay(relay_url)
+        .await
+        .with_context(|| format!("add relay {relay_url}"))?;
+    client.connect().await;
+    Ok(client)
+}
+
 /// Build a connected, read-only Nostr [`Client`] (a throwaway identity) for the
 /// fleet read path: it only queries, never publishes, so it needs no node identity.
 /// Reused by the hibernation wake-request fetch path ([`crate::hibernate::wake`]).
@@ -345,26 +473,30 @@ fn now_unix() -> u64 {
 /// goes STALE, including the current fleet size. Self-beacons are excluded from the
 /// peer set (a node knows its own npub).
 ///
-/// The relay client is built from `identity` so published beacons are signed by
-/// this node's key. The function returns when `shutdown` resolves (a graceful
-/// stop), or on an unrecoverable client error.
+/// Beacons are signed by `signer`: the node key (`NodeKey`, the existing path) OR the
+/// agent's FROST quorum key Q (`Frost`, the per-agent sovereign path -- "Q signs
+/// everything"). The function returns when `shutdown` resolves (a graceful stop), or on
+/// an unrecoverable client error.
 pub async fn run_presence(
-    identity: NodeIdentity,
+    signer: BeaconSigner,
     config: PresenceConfig,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let me = identity.public_key();
-    let my_npub = identity.npub();
+    let me = signer
+        .public_key()
+        .context("resolve the presence signer's public key")?;
+    let my_npub = signer.npub();
     tracing::info!(
         npub = %my_npub,
         node_id = %config.node_id,
         relay = %config.relay_url,
         interval_secs = config.interval.as_secs(),
         stale_after_secs = config.stale_after.as_secs(),
+        frost = matches!(signer, BeaconSigner::Frost(_)),
         "presence task starting (the fleet nerve)"
     );
 
-    let client = connect_client(&identity, &config.relay_url).await?;
+    let client = connect_beacon_client(&signer, &config.relay_url).await?;
 
     // Subscribe to EVERY node's presence beacon (all authors, this kind). The relay
     // keeps only the latest per pubkey, so this stream is the live fleet.
@@ -385,7 +517,7 @@ pub async fn run_presence(
 
     // Publish immediately so peers see us without waiting a full interval, then on
     // the interval thereafter.
-    publish_presence(&client, &config).await;
+    publish_presence(&client, &signer, &config).await;
 
     let mut publish_tick = tokio::time::interval(config.interval);
     publish_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -407,7 +539,7 @@ pub async fn run_presence(
             }
             // Re-publish our beacon (bumps created_at, replaces the prior).
             _ = publish_tick.tick() => {
-                publish_presence(&client, &config).await;
+                publish_presence(&client, &signer, &config).await;
             }
             // Sweep the peer set for staleness.
             _ = sweep_tick.tick() => {
@@ -451,29 +583,51 @@ struct PeerState {
     stale: bool,
 }
 
-/// Publish (or re-publish) this node's presence beacon. Logs but does not fail the
-/// task on a transient publish error (the next interval retries).
-async fn publish_presence(client: &Client, config: &PresenceConfig) {
-    match build_presence(&config.node_id, config.endpoint.as_deref()) {
-        Ok(builder) => match client.send_event_builder(builder).await {
-            Ok(output) => {
-                tracing::debug!(
-                    event_id = %output.val,
-                    node_id = %config.node_id,
-                    "published presence beacon"
-                );
+/// Publish (or re-publish) this node's presence beacon, signed by `signer`. Logs but
+/// does not fail the task on a transient publish error (the next interval retries).
+///   * `NodeKey`: the existing `send_event_builder` path (the client holds the node key).
+///   * `Frost`: quorum-sign the SAME content+tags under Q, then publish the PRE-SIGNED
+///     owned event via `send_event` (the client holds no key).
+async fn publish_presence(client: &Client, signer: &BeaconSigner, config: &PresenceConfig) {
+    let result: anyhow::Result<EventId> = async {
+        match signer {
+            BeaconSigner::NodeKey(_) => {
+                let builder = build_presence(&config.node_id, config.endpoint.as_deref())?;
+                Ok(client.send_event_builder(builder).await?.val)
             }
-            Err(e) => tracing::warn!(error = %e, "failed to publish presence beacon (will retry next interval)"),
-        },
-        Err(e) => tracing::error!(error = %e, "failed to build presence beacon"),
+            BeaconSigner::Frost(quorum) => {
+                let (content, tags) =
+                    build_presence_parts(&config.node_id, config.endpoint.as_deref())?;
+                let created_at = Timestamp::now().as_secs();
+                let event =
+                    frost_sign_beacon(quorum, KIND_KIRBY_PRESENCE, &tags, &content, created_at)?;
+                Ok(client.send_event(&event).await?.val)
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(event_id) => tracing::debug!(
+            event_id = %event_id,
+            node_id = %config.node_id,
+            "published presence beacon"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "failed to publish presence beacon (will retry next interval)"
+        ),
     }
 }
 
 /// Publish ONE 9100 `KIND_KIRBY_LIFECYCLE` event (a born/died milestone) to the relay,
-/// signed by this node's key, then disconnect. A one-shot connect-publish-disconnect:
-/// births and deaths are rare (not an interval cadence), so a dedicated short-lived
-/// client is the simplest correct shape and never contends with the persistent presence
-/// client. Returns the published event id on success.
+/// signed by `signer`, then disconnect. A one-shot connect-publish-disconnect: births
+/// and deaths are rare (not an interval cadence), so a dedicated short-lived client is
+/// the simplest correct shape and never contends with the persistent presence client.
+/// Returns the published event id on success.
+///
+/// Signing (S3e): `NodeKey` uses the existing `send_event_builder` path; `Frost`
+/// quorum-signs the SAME content+tags under Q and publishes the PRE-SIGNED event (the
+/// agent's birth/death log is signed by its sovereign Q -- "Q signs everything").
 ///
 /// This is the SINGLE-AGENT lifecycle path for a sovereign node: it emits `born` once
 /// on its own boot and `died` once on its own budget-death (or clean shutdown). It does
@@ -485,7 +639,7 @@ async fn publish_presence(client: &Client, config: &PresenceConfig) {
 /// `["a",<agent_id>]`, `["node",<node_id>]`, content `{ agent_id, event, treasury_sats,
 /// reason }`.
 pub async fn publish_lifecycle(
-    identity: &NodeIdentity,
+    signer: &BeaconSigner,
     relay_url: &str,
     agent_id: &str,
     node_id: &str,
@@ -493,16 +647,34 @@ pub async fn publish_lifecycle(
     treasury_sats: u64,
     reason: &str,
 ) -> anyhow::Result<String> {
-    let builder = build_lifecycle(agent_id, node_id, event, treasury_sats, reason)?;
-    let client = connect_client(identity, relay_url).await?;
-    let result = client
-        .send_event_builder(builder)
-        .await
-        .context("publish lifecycle event");
+    let client = connect_beacon_client(signer, relay_url).await?;
+    let result: anyhow::Result<EventId> = async {
+        match signer {
+            BeaconSigner::NodeKey(_) => {
+                let builder = build_lifecycle(agent_id, node_id, event, treasury_sats, reason)?;
+                Ok(client
+                    .send_event_builder(builder)
+                    .await
+                    .context("publish lifecycle event")?
+                    .val)
+            }
+            BeaconSigner::Frost(quorum) => {
+                let (content, tags) =
+                    build_lifecycle_parts(agent_id, node_id, event, treasury_sats, reason)?;
+                let created_at = Timestamp::now().as_secs();
+                let ev = frost_sign_beacon(quorum, KIND_KIRBY_LIFECYCLE, &tags, &content, created_at)?;
+                Ok(client
+                    .send_event(&ev)
+                    .await
+                    .context("publish pre-signed FROST lifecycle event")?
+                    .val)
+            }
+        }
+    }
+    .await;
     // Best-effort clean disconnect regardless of the send outcome.
     client.disconnect().await;
-    let output = result?;
-    let id = output.val.to_hex();
+    let id = result?.to_hex();
     tracing::info!(
         agent_id,
         node_id,
@@ -573,7 +745,10 @@ impl AgentStateContent {
 /// `["a",<agent_id>]`, `["node",<node_id>]`. The `d` tag makes it addressable, so the
 /// relay keeps only the latest state per agent. Signed by the node key at publish
 /// time.
-fn build_agent_state(content: &AgentStateContent, node_id: &str) -> anyhow::Result<EventBuilder> {
+fn build_agent_state_parts(
+    content: &AgentStateContent,
+    node_id: &str,
+) -> anyhow::Result<(String, Vec<Tag>)> {
     let json = serde_json::to_string(content).context("serialize agent-state content")?;
     let tags: Vec<Tag> = vec![
         Tag::parse([TAG_D, &content.agent_id])?,
@@ -581,15 +756,24 @@ fn build_agent_state(content: &AgentStateContent, node_id: &str) -> anyhow::Resu
         Tag::parse([TAG_A, &content.agent_id])?,
         Tag::parse([TAG_NODE, node_id])?,
     ];
+    Ok((json, tags))
+}
+
+/// Build a 31000 agent-state [`EventBuilder`] (the node-key signing path).
+fn build_agent_state(content: &AgentStateContent, node_id: &str) -> anyhow::Result<EventBuilder> {
+    let (json, tags) = build_agent_state_parts(content, node_id)?;
     Ok(EventBuilder::new(Kind::from(KIND_KIRBY_AGENT_STATE), json).tags(tags))
 }
 
 /// Publish ONE 31000 `KIND_KIRBY_AGENT_STATE` event (the live "Kirby face") to the
-/// relay, signed by this node's key, then disconnect. A one-shot
-/// connect-publish-disconnect mirroring [`publish_lifecycle`]: the event is
-/// addressable (keyed by the `agent_id` `d` tag), so each publish REPLACES the prior
-/// state on the relay, and the UI reads the latest per agent. Re-published on the
-/// presence cadence with the LIVE treasury balance.
+/// relay, signed by `signer`, then disconnect. A one-shot connect-publish-disconnect
+/// mirroring [`publish_lifecycle`]: the event is addressable (keyed by the `agent_id`
+/// `d` tag), so each publish REPLACES the prior state on the relay, and the UI reads the
+/// latest per agent. Re-published on the presence cadence with the LIVE treasury balance.
+///
+/// Signing (S3e): `NodeKey` uses the existing `send_event_builder` path; `Frost`
+/// quorum-signs the SAME content+tags under Q and publishes the PRE-SIGNED event (the
+/// agent's live face is signed by its sovereign Q -- "Q signs everything").
 ///
 /// `content` carries the live current balance + runway (`None` until a burn rate is
 /// established) + lifecycle ("running" | "dying" | "dead") + backend ("firecracker" |
@@ -599,21 +783,39 @@ fn build_agent_state(content: &AgentStateContent, node_id: &str) -> anyhow::Resu
 /// treasury_sats, runway_secs, lifecycle, backend, lease_holder_node, lease_term }`.
 /// Returns the published event id on success.
 pub async fn publish_agent_state(
-    identity: &NodeIdentity,
+    signer: &BeaconSigner,
     relay_url: &str,
     node_id: &str,
     content: &AgentStateContent,
 ) -> anyhow::Result<String> {
-    let builder = build_agent_state(content, node_id)?;
-    let client = connect_client(identity, relay_url).await?;
-    let result = client
-        .send_event_builder(builder)
-        .await
-        .context("publish agent-state event");
+    let client = connect_beacon_client(signer, relay_url).await?;
+    let result: anyhow::Result<EventId> = async {
+        match signer {
+            BeaconSigner::NodeKey(_) => {
+                let builder = build_agent_state(content, node_id)?;
+                Ok(client
+                    .send_event_builder(builder)
+                    .await
+                    .context("publish agent-state event")?
+                    .val)
+            }
+            BeaconSigner::Frost(quorum) => {
+                let (json, tags) = build_agent_state_parts(content, node_id)?;
+                let created_at = Timestamp::now().as_secs();
+                let ev =
+                    frost_sign_beacon(quorum, KIND_KIRBY_AGENT_STATE, &tags, &json, created_at)?;
+                Ok(client
+                    .send_event(&ev)
+                    .await
+                    .context("publish pre-signed FROST agent-state event")?
+                    .val)
+            }
+        }
+    }
+    .await;
     // Best-effort clean disconnect regardless of the send outcome.
     client.disconnect().await;
-    let output = result?;
-    let id = output.val.to_hex();
+    let id = result?.to_hex();
     tracing::debug!(
         agent_id = %content.agent_id,
         node_id,
@@ -1073,6 +1275,225 @@ mod tests {
         let p3 = NodeIdentity::resolve_key_path(Some(&sub), &dir);
         assert_eq!(p3, sub.join(DEFAULT_KEY_FILE));
         cleanup(&dir);
+    }
+
+    // ---- S3e: the beacons sign through the FROST quorum key Q ("Q signs everything") ----
+    //
+    // These drive `frost_sign_beacon` -- the EXACT FROST-specific step each beacon
+    // publisher (`publish_presence`/`publish_lifecycle`/`publish_agent_state`) runs before
+    // `client.send_event`. Only the generic relay transport is not exercised (it needs a
+    // relay); every load-bearing signing step is the production path. We verify the
+    // aggregate as a raw BIP-340 schnorr sig under the TWEAKED group key Q (and that it
+    // FAILS under the untweaked internal key P, proving the taproot tweak is real).
+
+    use bitcoin::key::TapTweak as _;
+    use bitcoin::secp256k1::{schnorr, Message, Secp256k1};
+    use bitcoin::KnownHrp;
+    use kirby_custody::{generate_dealer_keyset, group_xonly_q, taproot_address};
+
+    /// A fresh real 2-of-3 co-located quorum signer + the keyset it was built from.
+    fn frost_signer() -> (kirby_custody::DealerKeyset, crate::quorum_signer::QuorumSigner) {
+        let ks = generate_dealer_keyset(2, 3).expect("2-of-3 dealer keygen");
+        let qs = crate::quorum_signer::local_quorum_from_keyset(&ks).expect("build quorum signer");
+        (ks, qs)
+    }
+
+    /// Assert `event` (a nostr-sdk Event) is a valid kind-`kind` beacon under Q: pubkey ==
+    /// Q, the NIP-01 id (over content AND tags) is correct, and the aggregate BIP-340 sig
+    /// verifies under the tweaked Q (and FAILS under the untweaked P).
+    fn assert_beacon_under_q(
+        ks: &kirby_custody::DealerKeyset,
+        qs: &crate::quorum_signer::QuorumSigner,
+        event: &Event,
+        kind: u16,
+    ) {
+        let q_bytes = qs.q_bytes();
+        // pubkey == Q
+        assert_eq!(event.pubkey.to_hex(), hex::encode(q_bytes), "beacon author must be Q");
+        assert_eq!(event.kind, Kind::from(kind), "beacon kind");
+        // Re-derive the NIP-01 id over content AND the event's tags (the signed shape).
+        let tag_vecs: Vec<Vec<String>> =
+            event.tags.iter().map(|t| t.as_slice().to_vec()).collect();
+        let expect_id = kirby_custody::cosign_net::nip01_event_id_with_tags(
+            &hex::encode(q_bytes),
+            event.created_at.as_secs(),
+            kind as u32,
+            &tag_vecs,
+            &event.content,
+        );
+        assert_eq!(
+            event.id.to_hex(),
+            hex::encode(expect_id),
+            "beacon id must be the NIP-01 id under Q over content+tags"
+        );
+        // Raw BIP-340: verifies under tweaked Q, fails under untweaked P.
+        let (_addr, internal_p) = taproot_address(&ks.pubkeys, KnownHrp::Testnets).expect("addr");
+        let secp = Secp256k1::verification_only();
+        let (q_tweaked, _parity) = internal_p.tap_tweak(&secp, None);
+        let q_xonly = q_tweaked.to_x_only_public_key();
+        let sig = schnorr::Signature::from_slice(event.sig.as_ref()).expect("64-byte sig");
+        let msg = Message::from_digest(expect_id);
+        assert!(
+            secp.verify_schnorr(&sig, &msg, &q_xonly).is_ok(),
+            "beacon must verify under the tweaked group key Q"
+        );
+        assert!(
+            secp.verify_schnorr(&sig, &msg, &internal_p).is_err(),
+            "beacon must NOT verify under the untweaked internal key P (taproot tweak is real)"
+        );
+        // The nostr-sdk Event itself verifies (id + sig consistency); frost_sign_beacon
+        // already enforced this fail-closed, re-assert here.
+        assert!(event.verify().is_ok(), "beacon event must self-verify");
+    }
+
+    /// G-PRESENCE-SIGNED-BY-Q: a FROST tenant's presence (10100) beacon verifies under Q.
+    #[test]
+    fn g_presence_signed_by_q() {
+        let (ks, qs) = frost_signer();
+        let (content, tags) =
+            build_presence_parts("node-A", Some("1.2.3.4:5000")).expect("presence parts");
+        let event =
+            frost_sign_beacon(&qs, KIND_KIRBY_PRESENCE, &tags, &content, 1_750_000_000).expect("sign");
+        assert_beacon_under_q(&ks, &qs, &event, KIND_KIRBY_PRESENCE);
+        // The node_id tag survived into the signed event (beacon tags are signed).
+        assert!(
+            event.tags.iter().any(|t| t.as_slice() == ["node_id", "node-A"]),
+            "the node_id tag must be present + signed"
+        );
+        // The content is the verbatim presence JSON (NOT mangled by the note sanitizer).
+        let decoded: PresenceContent = serde_json::from_str(&event.content).expect("presence json");
+        assert_eq!(decoded.node_id, "node-A");
+        assert_eq!(decoded.status, "alive");
+        println!("G-PRESENCE-SIGNED-BY-Q PASS: 10100 presence verifies under Q, pubkey==Q, JSON verbatim");
+    }
+
+    /// G-LIFECYCLE-SIGNED-BY-Q: a FROST tenant's lifecycle (9100) beacon verifies under Q.
+    #[test]
+    fn g_lifecycle_signed_by_q() {
+        let (ks, qs) = frost_signer();
+        let (content, tags) =
+            build_lifecycle_parts("agent-0", "node-1", "born", 1_000_000, "funded").expect("parts");
+        let event =
+            frost_sign_beacon(&qs, KIND_KIRBY_LIFECYCLE, &tags, &content, 1_750_000_000).expect("sign");
+        assert_beacon_under_q(&ks, &qs, &event, KIND_KIRBY_LIFECYCLE);
+        let decoded: LifecycleContent = serde_json::from_str(&event.content).expect("lifecycle json");
+        assert_eq!(decoded.event, "born");
+        assert_eq!(decoded.treasury_sats, 1_000_000);
+        assert!(event.tags.iter().any(|t| t.as_slice() == ["a", "agent-0"]));
+        println!("G-LIFECYCLE-SIGNED-BY-Q PASS: 9100 lifecycle verifies under Q, pubkey==Q");
+    }
+
+    /// G-STATE-SIGNED-BY-Q: a FROST tenant's agent-state (31000) beacon verifies under Q.
+    #[test]
+    fn g_state_signed_by_q() {
+        let (ks, qs) = frost_signer();
+        let content =
+            AgentStateContent::sovereign("agent-0", 1_234, Some(42), "running", "firecracker");
+        let (json, tags) = build_agent_state_parts(&content, "node-1").expect("parts");
+        let event =
+            frost_sign_beacon(&qs, KIND_KIRBY_AGENT_STATE, &tags, &json, 1_750_000_000).expect("sign");
+        assert_beacon_under_q(&ks, &qs, &event, KIND_KIRBY_AGENT_STATE);
+        let decoded: AgentStateContent = serde_json::from_str(&event.content).expect("state json");
+        assert_eq!(decoded.treasury_sats, 1_234);
+        assert_eq!(decoded.lifecycle, "running");
+        // The addressable `d` tag (= agent_id) survived into the signed event.
+        assert!(event.tags.iter().any(|t| t.as_slice() == ["d", "agent-0"]));
+        println!("G-STATE-SIGNED-BY-Q PASS: 31000 agent-state verifies under Q, pubkey==Q, d-tag signed");
+    }
+
+    /// G-BEACON-MEMBRANE (nerve half): the guardian membrane gates beacon signing -- a
+    /// quorum whose holders are fed a TAMPERED package refuses (no signature) -- AND the
+    /// beacon JSON content is NOT mangled by the note-sanitizer (it round-trips byte-exact
+    /// through the signed event even though it is not "canonical note" form).
+    #[test]
+    fn g_beacon_membrane() {
+        use crate::quorum_signer::Holder as _;
+        use kirby_custody::guardian::{self, CoSignRequest, RefuseReason, SignIntent};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let (ks, qs) = frost_signer();
+
+        // (1) NOT MANGLED: build agent-state JSON (it has `{`,`:`,`"` and is clearly NOT a
+        //     canonical free-text note) and confirm it round-trips byte-exact through the
+        //     signed event content.
+        let content =
+            AgentStateContent::sovereign("agent-0", 9_999, None, "dying", "vz");
+        let (json, tags) = build_agent_state_parts(&content, "node-1").expect("parts");
+        let event =
+            frost_sign_beacon(&qs, KIND_KIRBY_AGENT_STATE, &tags, &json, 1_750_000_000).expect("sign");
+        assert_eq!(
+            event.content, json,
+            "beacon JSON content must be signed VERBATIM (the note sanitizer is kind:1-only)"
+        );
+
+        // (2) MEMBRANE GATES BEACONS: drive two LocalHolders directly with a TAMPERED
+        //     package (its message is a DIFFERENT beacon's id). Each holder's
+        //     guardian::validate MUST refuse MessageMismatch -> no share -> ceremony aborts.
+        let kps = kirby_custody::key_packages(&ks).expect("kps");
+        let mut kps_vec: Vec<frost_secp256k1_tr::keys::KeyPackage> = kps.into_values().collect();
+        kps_vec.truncate(2);
+        let h1 = crate::quorum_signer::LocalHolder::new(kps_vec[0].clone(), ks.pubkeys.clone());
+        let h2 = crate::quorum_signer::LocalHolder::new(kps_vec[1].clone(), ks.pubkeys.clone());
+
+        let session_id = 99u64;
+        let c1 = h1.commit(session_id).expect("h1 commit");
+        let c2 = h2.commit(session_id).expect("h2 commit");
+        let i1 = frost_secp256k1_tr::Identifier::try_from(h1.id()).unwrap();
+        let i2 = frost_secp256k1_tr::Identifier::try_from(h2.id()).unwrap();
+        let mut commitments = BTreeMap::new();
+        commitments.insert(i1, c1);
+        commitments.insert(i2, c2);
+
+        // The REAL beacon tags + content the request claims:
+        let tag_vecs: Vec<Vec<String>> = tags.iter().map(|t| t.as_slice().to_vec()).collect();
+        let q_hex = hex::encode(group_xonly_q(&ks.pubkeys).unwrap());
+        // A TAMPERED package: signs the id of a DIFFERENT agent-state (treasury altered).
+        let wrong_id = kirby_custody::cosign_net::nip01_event_id_with_tags(
+            &q_hex,
+            1_750_000_000,
+            KIND_KIRBY_AGENT_STATE as u32,
+            &tag_vecs,
+            r#"{"agent_id":"agent-0","treasury_sats":1}"#,
+        );
+        let tampered = frost_secp256k1_tr::SigningPackage::new(commitments, &wrong_id);
+
+        let signer_set: BTreeSet<u16> = [h1.id(), h2.id()].into_iter().collect();
+        let req = CoSignRequest {
+            session_id,
+            intent: SignIntent::NostrEvent {
+                kind: KIND_KIRBY_AGENT_STATE as u32,
+                created_at: 1_750_000_000,
+                tags: tag_vecs.clone(),
+                content: json.clone(),
+            },
+            signer_set,
+        };
+        let r1 = h1.validate_and_sign(session_id, &req, &tampered);
+        let r2 = h2.validate_and_sign(session_id, &req, &tampered);
+        assert_eq!(r1, Err(RefuseReason::MessageMismatch), "holder 1 refuses tampered beacon");
+        assert_eq!(r2, Err(RefuseReason::MessageMismatch), "holder 2 refuses tampered beacon");
+
+        // A correctly-reconstructed request DOES pass validate (positive control).
+        let good_id = kirby_custody::cosign_net::nip01_event_id_with_tags(
+            &q_hex,
+            1_750_000_000,
+            KIND_KIRBY_AGENT_STATE as u32,
+            &tag_vecs,
+            &json,
+        );
+        let h3 = crate::quorum_signer::LocalHolder::new(kps_vec[0].clone(), ks.pubkeys.clone());
+        let h4 = crate::quorum_signer::LocalHolder::new(kps_vec[1].clone(), ks.pubkeys.clone());
+        let sid = 100u64;
+        let mut good_commits = BTreeMap::new();
+        good_commits.insert(i1, h3.commit(sid).unwrap());
+        good_commits.insert(i2, h4.commit(sid).unwrap());
+        let good_pkg = frost_secp256k1_tr::SigningPackage::new(good_commits, &good_id);
+        assert!(
+            guardian::validate(&req, &good_pkg, &ks.pubkeys, h3.id(), 2).is_ok(),
+            "a correctly-reconstructed beacon request must validate (positive control)"
+        );
+
+        println!("G-BEACON-MEMBRANE (nerve) PASS: beacon JSON signed verbatim (not sanitized); tampered beacon package refused MessageMismatch by every holder; good package validates");
     }
 
     // Minimal temp-dir helpers (no extra dev-dep; uses the OS temp dir + pid + a

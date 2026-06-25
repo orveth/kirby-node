@@ -22,7 +22,7 @@ use crate::meter::HostProcessMeterConfig;
 #[cfg(target_os = "linux")]
 use crate::meter::MeterConfig;
 use crate::meter::{Meter, MeterOutcome};
-use crate::nerve::{self, NodeIdentity};
+use crate::nerve;
 use crate::sandbox::MeterSource;
 use crate::treasury::DebitOutcome;
 
@@ -49,8 +49,9 @@ const DYING_RUNWAY_SECS: u64 = 30;
 /// lifecycle). `None` for callers that do not want fleet observability (the gate
 /// tests), so the money/meter path is byte-identical when it is absent.
 pub struct AgentStateEmitter {
-    /// The node's signing identity (the same key the 9100/10100 events use).
-    pub identity: NodeIdentity,
+    /// The agent's beacon signer (the SAME key all its public events sign under: the
+    /// node key, or the FROST quorum key Q for a FROST tenant -- "Q signs everything").
+    pub signer: crate::nerve::BeaconSigner,
     /// The relay websocket URL.
     pub relay_url: String,
     /// The agent id (the addressable `d`-tag value).
@@ -95,7 +96,7 @@ impl AgentStateEmitter {
             &self.backend,
         );
         if let Err(e) =
-            nerve::publish_agent_state(&self.identity, &self.relay_url, &self.node_id, &content)
+            nerve::publish_agent_state(&self.signer, &self.relay_url, &self.node_id, &content)
                 .await
         {
             tracing::warn!(error = %e, lifecycle, "failed to publish 31000 agent-state (will retry next interval)");
@@ -470,9 +471,9 @@ mod tests {
             n
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let identity = NodeIdentity::load_or_create(&dir.join("node.key")).unwrap();
+        let identity = crate::nerve::NodeIdentity::load_or_create(&dir.join("node.key")).unwrap();
         AgentStateEmitter {
-            identity,
+            signer: crate::nerve::BeaconSigner::NodeKey(identity),
             relay_url: "ws://127.0.0.1:7777".to_string(),
             agent_id: "agent-0".to_string(),
             node_id: "node-1".to_string(),

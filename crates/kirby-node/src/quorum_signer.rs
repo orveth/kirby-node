@@ -54,8 +54,13 @@ use frost::round1::{SigningCommitments, SigningNonces};
 use frost::round2::SignatureShare;
 use frost::{Identifier, SigningPackage};
 
-use kirby_custody::cosign_net::{nip01_event_id, NostrEvent};
-use kirby_custody::guardian::{self, CoSignRequest, RefuseReason, SignIntent};
+#[cfg(test)]
+use kirby_custody::cosign_net::nip01_event_id;
+use kirby_custody::cosign_net::{nip01_event_id_with_tags, NostrEvent};
+use kirby_custody::guardian::{
+    self, CoSignRequest, RefuseReason, SignIntent, KIND_KIRBY_AGENT_STATE, KIND_KIRBY_LIFECYCLE,
+    KIND_KIRBY_PRESENCE,
+};
 use kirby_custody::group_xonly_q;
 
 /// The S3 quorum size (a 2-of-3 group: any 2 of the 3 holders co-sign).
@@ -263,46 +268,77 @@ impl QuorumSigner {
         self.q_bytes
     }
 
-    /// Sign a Nostr event through a fresh 2-of-3 FROST ceremony with the guardian
-    /// membrane wired into every participating holder. Returns the finished
-    /// [`NostrEvent`] (id, pubkey = hex(Q), sanitized content, empty tags, the
-    /// aggregate 64-byte BIP-340 sig). Each call is a NEW ceremony (fresh nonces; no
-    /// reuse across ceremonies).
-    ///
-    /// RE-PORTED PUBLISH-PATH GUARDS (a new signing entry point re-enforces them, it
-    /// does not assume the caller sanitized):
-    ///   * kind MUST equal `NOSTR_KIND_TEXT_NOTE` (1) -- the same kind-restrict the
-    ///     actuator's `validate_nostr_publish` enforces.
-    ///   * content is run through `kirby_proto::sanitize_note_for_publish` and the
-    ///     SANITIZED result is what is signed/published (control + U+2028/9 stripped,
-    ///     whitespace collapsed, non-empty, within `MAX_NOTE_BYTES`). Signing the raw
-    ///     string while publishing a rewritten one would produce a mismatched id.
-    ///   * tags are EMPTY (the NIP-01 id is computed over `tags = []`), matching the
-    ///     actuator's reject-non-empty-tags guard.
-    ///
-    /// The guardian membrane independently re-checks kind + content-canonicality per
-    /// holder (defense in depth), so even a bug here cannot get a dirty/wrong-kind
-    /// note co-signed.
+    /// Sign a kind:1 voice note (the S3c path): a thin wrapper over
+    /// [`Self::sign_nostr_event_with_tags`] with EMPTY tags. Kept so the actuator's
+    /// voice call site is unchanged.
     pub fn sign_nostr_event(
         &self,
         kind: u32,
         created_at: u64,
         content: &str,
     ) -> anyhow::Result<NostrEvent> {
-        // 1. RE-PORT THE CONTENT GUARD (kind-restrict + sanitize). Sign the SANITIZED
-        //    content, never the raw input.
-        if kind != kirby_proto::NOSTR_KIND_TEXT_NOTE as u32 {
+        self.sign_nostr_event_with_tags(kind, created_at, &[], content)
+    }
+
+    /// Sign a Nostr event (voice OR beacon) through a fresh 2-of-3 FROST ceremony with
+    /// the guardian membrane wired into every participating holder. Returns the finished
+    /// [`NostrEvent`] (id, pubkey = hex(Q), content, tags, the aggregate 64-byte BIP-340
+    /// sig). Each call is a NEW ceremony (fresh nonces; no reuse across ceremonies).
+    ///
+    /// S3e GENERALIZATION ("Q signs everything"): the agent's PUBLIC Nostr output is its
+    /// voice (kind:1) PLUS its three beacons (10100 presence / 9100 lifecycle / 31000
+    /// agent-state), all under the SAME group key Q. The id is computed over `kind`,
+    /// `created_at`, `tags`, AND `content`, so a beacon's tags are part of the signed id.
+    ///
+    /// RE-PORTED PUBLISH-PATH GUARDS (a signing entry point re-enforces them, it does not
+    /// assume the caller did):
+    ///   * kind MUST be one of {1, 10100, 9100, 31000}; any other kind is refused.
+    ///   * THE NOTE SANITIZER APPLIES ONLY TO kind:1. The free-text voice runs through
+    ///     `kirby_proto::sanitize_note_for_publish` and the SANITIZED result is what is
+    ///     signed/published (control + U+2028/9 stripped, whitespace collapsed, non-empty,
+    ///     within `MAX_NOTE_BYTES`). The BEACONS carry machine-generated JSON state, not
+    ///     prose: running the note sanitizer on JSON would corrupt it (collapse spaces,
+    ///     strip structure), so beacon content is signed VERBATIM. The guardian membrane
+    ///     enforces the same kind:1-only content policy independently per holder.
+    ///
+    /// COST NOTE (S5/S6): this runs a full quorum ceremony PER beacon. For S3 the holders
+    /// are co-located in-process (sub-ms), so a per-presence-interval ceremony is fine.
+    /// When holders move off-box (S5/S6), a quorum ceremony on every presence beacon is
+    /// too expensive on the wire -- that lane MUST adopt a cheaper presence cadence or a
+    /// short-lived session sub-key delegated by Q. Do NOT build that here.
+    ///
+    /// The guardian membrane independently re-checks kind, the (kind:1-only)
+    /// content-canonicality, and the id-over-tags equality per holder (defense in depth),
+    /// so even a bug here cannot get a dirty/wrong-kind/wrong-tags event co-signed.
+    pub fn sign_nostr_event_with_tags(
+        &self,
+        kind: u32,
+        created_at: u64,
+        tags: &[Vec<String>],
+        content: &str,
+    ) -> anyhow::Result<NostrEvent> {
+        // 1. RE-PORT THE GUARDS. kind-restrict to the voice + the three beacon kinds.
+        if !is_signable_kind(kind) {
             anyhow::bail!(
-                "QuorumSigner refuses kind {kind}: only kind {} (a public text note) is signable (S3c)",
-                kirby_proto::NOSTR_KIND_TEXT_NOTE
+                "QuorumSigner refuses kind {kind}: only kind 1 (voice) and the Kirby beacons \
+                 {KIND_KIRBY_PRESENCE}/{KIND_KIRBY_LIFECYCLE}/{KIND_KIRBY_AGENT_STATE} are signable"
             );
         }
-        let sanitized = kirby_proto::sanitize_note_for_publish(content)
-            .map_err(|reason| anyhow::anyhow!("note content refused by the publish guard: {reason}"))?;
+        // The NOTE SANITIZER applies ONLY to kind:1 (free text). Beacons (JSON state) are
+        // signed verbatim -- never run through the note sanitizer.
+        let signed_content = if kind == kirby_proto::NOSTR_KIND_TEXT_NOTE as u32 {
+            kirby_proto::sanitize_note_for_publish(content).map_err(|reason| {
+                anyhow::anyhow!("note content refused by the publish guard: {reason}")
+            })?
+        } else {
+            content.to_string()
+        };
+        let signed_tags: Vec<Vec<String>> = tags.to_vec();
 
-        // 2. Compute the NIP-01 event id under Q (the FROST message). tags = [].
+        // 2. Compute the NIP-01 event id under Q (the FROST message) over content AND tags.
         let q_hex = hex::encode(self.q_bytes);
-        let event_id = nip01_event_id(&q_hex, created_at, kind, &sanitized);
+        let event_id =
+            nip01_event_id_with_tags(&q_hex, created_at, kind, &signed_tags, &signed_content);
 
         // 3. Pick the signer set: the FIRST `MIN_SIGNERS` holders.
         //
@@ -366,7 +402,8 @@ impl QuorumSigner {
             intent: SignIntent::NostrEvent {
                 kind,
                 created_at,
-                content: sanitized.clone(),
+                tags: signed_tags.clone(),
+                content: signed_content.clone(),
             },
             signer_set: signer_set.clone(),
         };
@@ -396,18 +433,30 @@ impl QuorumSigner {
             .try_into()
             .map_err(|_| anyhow::anyhow!("expected a 64-byte BIP-340 signature, got {}", sig_bytes.len()))?;
 
-        // Assemble the finished event: pubkey = hex(Q), the SANITIZED content, empty
-        // tags, the aggregate sig, the precomputed id.
+        // Assemble the finished event: pubkey = hex(Q), the signed content (sanitized for
+        // kind:1, verbatim JSON for a beacon), the signed tags, the aggregate sig, the id.
         Ok(NostrEvent {
             id: hex::encode(event_id),
             pubkey: q_hex,
             created_at,
             kind,
-            tags: Vec::new(),
-            content: sanitized,
+            tags: signed_tags,
+            content: signed_content,
             sig: hex::encode(sig),
         })
     }
+}
+
+/// Is `kind` one the QuorumSigner will sign? The agent's PUBLIC Nostr output: the
+/// free-text voice (kind:1) PLUS its three beacons (presence/lifecycle/agent-state),
+/// all under Q. Mirrors `kirby_custody::guardian`'s authorizable-kind set (the membrane
+/// re-checks independently per holder).
+fn is_signable_kind(kind: u32) -> bool {
+    kind == kirby_proto::NOSTR_KIND_TEXT_NOTE as u32
+        || matches!(
+            kind,
+            KIND_KIRBY_PRESENCE | KIND_KIRBY_LIFECYCLE | KIND_KIRBY_AGENT_STATE
+        )
 }
 
 /// Build the per-guardian `KeyPackage`s + the group `PublicKeyPackage` from a custody
@@ -537,6 +586,7 @@ mod tests {
             intent: SignIntent::NostrEvent {
                 kind: 1,
                 created_at: CREATED_AT,
+                tags: Vec::new(),
                 content: CONTENT.to_string(),
             },
             signer_set,
