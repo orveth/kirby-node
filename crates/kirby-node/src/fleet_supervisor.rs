@@ -845,15 +845,25 @@ mod tests {
     /// tracked, the allocator is empty, and every freed CID is reusable by a fresh batch.
     #[tokio::test]
     async fn mid_batch_launch_failure_kills_and_releases_already_launched_tenants() {
+        // Unique-per-run agent ids: launch_all provisions REAL FROST keystores keyed by
+        // instance_id (= kirby-<agent_id>), and the rug-proof anchor guard (S3d) refuses to
+        // regenerate an existing group_pubkeys.json. Reusing FIXED ids leaks those keystores
+        // across runs into the guard -> a flaky failure (the shared state_root is intentionally
+        // fixed to avoid a $KIRBY_STATE_ROOT env race between parallel tests, so the isolation
+        // lever is the agent_id, not the root). Unique ids keep each run's keystores isolated.
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let a = format!("mb-alice-{suffix}");
+        let b = format!("mb-bob-{suffix}");
+        let c = format!("mb-carol-{suffix}");
         let cfg = base_config_with_tenants(vec![
-            tenant("alice", 1_000_000),
-            tenant("bob", 1_000_000),
-            tenant("carol", 1_000_000), // carol's launch fails, after alice + bob are up
+            tenant(&a, 1_000_000),
+            tenant(&b, 1_000_000),
+            tenant(&c, 1_000_000), // carol's launch fails, after alice + bob are up
         ]);
         let allocator = Allocator::new(&cfg.fleet);
         let grantor = Arc::new(StubGrantor::default());
         let launcher = Arc::new(StubLauncher::default());
-        launcher.set_fail_on("carol");
+        launcher.set_fail_on(&c);
         let mut sup = FleetSupervisor::new(1, cfg, allocator, grantor, launcher.clone());
 
         let err = sup.launch_all().await.unwrap_err();
@@ -867,7 +877,7 @@ mod tests {
 
         // The already-launched tenants' OS children were KILLED (a dropped Child keeps
         // running; the supervisor must signal them). Their kill-switches read false.
-        for id in ["alice", "bob"] {
+        for id in [&a, &b] {
             let flag = launcher.maybe_running_flag(id).expect("alice/bob were launched");
             assert!(
                 !flag.load(Ordering::SeqCst),
@@ -875,11 +885,11 @@ mod tests {
             );
         }
         // carol's launch failed, so carol was never launched.
-        assert!(launcher.maybe_running_flag("carol").is_none(), "carol never launched");
+        assert!(launcher.maybe_running_flag(&c).is_none(), "carol never launched");
 
         // Their allocator slots were RELEASED: a fresh full batch succeeds (no leaked slot,
         // and the freed CIDs are reusable).
-        let cfg2 = base_config_with_tenants(vec![tenant("alice", 1), tenant("bob", 1)]);
+        let cfg2 = base_config_with_tenants(vec![tenant(&a, 1), tenant(&b, 1)]);
         let allocator2 = Allocator::new(&cfg2.fleet);
         let mut sup2 = FleetSupervisor::new(
             1,
@@ -890,6 +900,12 @@ mod tests {
         );
         let records = sup2.launch_all().await.expect("a clean batch after a failed one");
         assert_eq!(records.len(), 2);
+
+        // Tidy: remove the real keystores this test provisioned (both batches, all ids).
+        for id in [&a, &b, &c] {
+            let inst = format!("kirby-{id}");
+            let _ = std::fs::remove_dir_all(crate::keyset_provisioning::keystore_dir_for(&inst));
+        }
     }
 
     /// `reap_dead` releases the allocator slot for EVERY exited tenant (the supervisor's
