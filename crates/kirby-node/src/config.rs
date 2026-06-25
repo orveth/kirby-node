@@ -169,7 +169,7 @@ pub const fn default_tenant_initial_sats() -> u64 {
 /// Validate an agent/node/tenant label that feeds filesystem treasury paths, host
 /// instance ids (jail / cgroup / TAP names), and lease-map keys: non-empty,
 /// length-capped, no path separators or traversal, identifier charset only. The empty
-/// string is reserved as the single-agent lease slot sentinel (raft_lease::DEFAULT_AGENT)
+/// string is reserved as the single-agent lease slot sentinel (lease::DEFAULT_AGENT)
 /// and must never be a configured label. Shared by the top-level `agent_id`/`node_id` and
 /// every fleet tenant id (the new fleet entry points re-port this guard rather than
 /// trusting the input; Codex deep, S1 review).
@@ -840,7 +840,7 @@ impl KirbyConfig {
         // host instance ids (jail / cgroup / TAP names), and lease-map keys, so they must
         // be safe: non-empty, length-capped, and restricted to an identifier charset with
         // no path separators or traversal. The empty string is reserved as the
-        // single-agent lease slot sentinel (raft_lease::DEFAULT_AGENT) and must never be a
+        // single-agent lease slot sentinel (lease::DEFAULT_AGENT) and must never be a
         // configured tenant id. An unvalidated id is a path-traversal / collision footgun
         // at the new fleet entry points (Codex deep, S1 review).
         for (label, value) in [("agent_id", &self.agent_id), ("node_id", &self.node_id)] {

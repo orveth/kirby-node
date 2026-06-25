@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use kirby_custody::cosign_net::NostrEvent;
 use kirby_node::quorum_signer::{local_quorum_from_keyset, QuorumSigner};
-use kirby_node::raft_lease::{FenceVerdict, LeaseAuthority, LeaseNodeId};
+use kirby_node::lease::{FenceVerdict, LeaseAuthority, LeaseNodeId};
 use kirby_node::relay_lease::{RelayLeaseAuthority, LEASE_TTL_SECS};
 
 /// A tiny in-test mock relay: an ADDRESSABLE event store keyed by `(pubkey, kind, d)` that
@@ -79,7 +79,7 @@ fn observer(node_id: LeaseNodeId, agent_id: &str, q: [u8; 32]) -> RelayLeaseAuth
 /// claims term 1 and is active; node B claims term 2 (latest-wins). After both observe both
 /// leases: A's fence for its believed term 1 is FENCED (it sees the higher term 2 by another
 /// holder), and B is active at term 2. The relay-lease enforces the SAME at-most-one-active
-/// invariant the openraft handle did, by monotonic-term latest-wins.
+/// invariant the loopback-Raft handle did, by monotonic-term latest-wins.
 #[tokio::test]
 async fn f9_1_at_most_one_active_supersede() {
     let agent = "agent-alpha";
@@ -314,7 +314,7 @@ async fn f9_3_stale_lease_stands_down() {
 }
 
 /// PER-AGENT ISOLATION: a lease for agent X never affects agent Y's fence (mirrors the
-/// openraft handle's per-agent semantics). A multi-agent observer holds each agent's Q
+/// loopback-Raft handle's per-agent semantics). A multi-agent observer holds each agent's Q
 /// independently; observing X's lease leaves Y with no lease (Fenced/None for Y).
 #[tokio::test]
 async fn per_agent_isolation() {

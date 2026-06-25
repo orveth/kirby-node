@@ -156,7 +156,7 @@ pub const NIP90_JOB_REQUEST_KIND_MIN: u16 = 5000;
 pub const NIP90_JOB_REQUEST_KIND_MAX: u16 = 5999;
 
 /// The Nostr event kind for a Kirby agent's CROSS-MACHINE LEASE (the NAT-friendly,
-/// relay-native failover claim that supersedes the loopback openraft lease for
+/// relay-native failover claim that supersedes the loopback Raft lease for
 /// cross-machine fleets).
 ///
 /// A lease names which node is the active holder of an agent at a given monotonic

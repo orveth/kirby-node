@@ -34,13 +34,13 @@
 //!  7. IDEMPOTENT REPLAY (G9): the resumed genome re-issues the SAME key K; it is
 //!     DUPLICATE_IGNORED, the act is NOT performed twice on the mint, and the treasury
 //!     is debited by C EXACTLY ONCE total (not 2C).
-//!  8. NO SPLIT-BRAIN (G8): the new active node holds active_lease{node2, T+1}
-//!     (committed via openraft); reviving the source node still believing term T, it
+//!  8. NO SPLIT-BRAIN (G8): the new active node claims the relay lease at T+1
+//!     (latest-term-wins); reviving the source node still believing term T, it
 //!     REFUSES to run/debit (term-fenced), no second VM, the treasury debited by at
 //!     most one node, and no observed term boundary shows two actives.
 //!
 //! This module composes the EXISTING machinery, already individually green: the
-//! [`crate::raft_lease`] lease/fence (G8), the [`crate::sandbox`] snapshot/transfer/
+//! [`crate::relay_lease`] lease/fence (G8), the [`crate::sandbox`] snapshot/transfer/
 //! restore primitives the [`crate::firecracker`] backend implements (G6, the SAME
 //! UNCHANGED C-7 path), the [`crate::gateway`] authorize order + the persisted
 //! [`crate::treasury`] (G3/G5/G9), the real [`crate::rail::CdkEcashRail`] + the local
@@ -65,9 +65,7 @@ use crate::firecracker::FirecrackerBackend;
 use crate::gateway::{GatewayService, Session};
 use crate::meter::{Meter, MeterConfig};
 use crate::meter_egress::EgressMeter;
-use crate::raft_lease::{
-    bring_up_cluster, observe_active_nodes, FenceVerdict, LeaseHandle, LeaseNode, LeaseNodeId,
-};
+use crate::lease::{FenceVerdict, LeaseAuthority, LeaseNodeId};
 use crate::rail::Rail;
 use crate::sandbox::{
     GuestImage, GuestSpec, LocalDirTransfer, MeterSource, RestoreSpec, SandboxBackend,
@@ -395,29 +393,23 @@ pub async fn run(
         std::env::temp_dir().join(format!("kirby-c11-treasury-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&treasury_path);
 
-    // ---- G8 frame: bring up the 3-node lease cluster (D-14, D-17) ----
-    let bring_up = bring_up_cluster(&NODE_IDS).await?;
-    let elected_leader = bring_up.leader;
-    let mut nodes = bring_up.nodes;
-    // The handles for the linearizability witness. A KILLED node is removed from this
-    // set the moment it is killed (its process is gone in a real two-host deployment, so
-    // its stale in-process handle must not be counted as a live active node, the C-9
-    // same-host harness note).
-    let mut handles: Vec<LeaseHandle> = nodes.iter().map(|n| n.handle()).collect();
-    tracing::info!(leader = elected_leader, "C11: 3-node lease cluster up (the consensus frame the loop runs in)");
+    // ---- G8 frame: the relay-lease fabric over the 3 node ids (#9) ----
+    // The loopback Raft cluster was CUT; failover now rides the relay-native FROST-signed
+    // lease. The first node is the initial active holder (no leader election -- latest-term-wins
+    // is the linearization). A KILLED node is dropped from the live observer set so its stale
+    // in-process authority is not counted as a live active node (the C-9 same-host note).
+    let mut fabric = LeaseFabric::new(&NODE_IDS)?;
+    let elected_leader = NODE_IDS[0];
+    tracing::info!(leader = elected_leader, "C11: relay-lease fabric up (the consensus frame the loop runs in)");
 
     let mut two_actives_ever = false;
-    sample_actives(&handles, &mut two_actives_ever).await;
+    fabric.sample_actives(&mut two_actives_ever).await;
 
-    // The leader grants itself the lease @ T: it is the active node, the genome's birthplace.
-    let granted = {
-        let leader_node = node_by_id(&nodes, elected_leader)?;
-        leader_node.grant_lease(elected_leader).await?
-    };
-    let term_t = granted.term;
-    tracing::info!(node = granted.node_id, term = term_t, "C11: lease granted (active node @ T; it may run + debit)");
-    sample_actives(&handles, &mut two_actives_ever).await;
-    let active_handle = handle_by_id(&handles, elected_leader)?;
+    // The first node CLAIMS the lease @ T=1: it is the active node, the genome's birthplace.
+    let term_t = fabric.claim(elected_leader, 1).await?;
+    tracing::info!(node = elected_leader, term = term_t, "C11: lease claimed (active node @ T; it may run + debit)");
+    fabric.sample_actives(&mut two_actives_ever).await;
+    let active_handle = fabric.authority(elected_leader)?;
 
     // ---- STEPS 1-4 on the active node: BOOT (G1), the locked-down TAP + real rail,
     // METER (G2 survival), EGRESS DENIED (G4), the BROKERED ACT (G5). ----
@@ -431,20 +423,18 @@ pub async fn run(
     } = match booted {
         Ok(b) => b,
         Err(e) => {
-            shutdown_nodes(nodes).await;
             return Err(e);
         }
     };
 
     // Resolve the per-VM TAP (lockdown was forced on) and attach the eBPF egress meter
     // (gate G4 + G5(iv) instrument) and the cgroup CPU/memory meter (gate G2 survival
-    // half). On any failure: halt the VM + tear down the cluster.
+    // half). On any failure: halt the VM (the in-memory lease fabric drops on its own).
     let setup = setup_meters(&config, instance.as_ref(), treasury.clone()).await;
     let (egress_meter, mut cpu_meter) = match setup {
         Ok(m) => m,
         Err(e) => {
             instance.halt().await;
-            shutdown_nodes(nodes).await;
             return Err(e);
         }
     };
@@ -473,7 +463,6 @@ pub async fn run(
     let perform_count_after_first = perform_count();
     if !boot_round_trip {
         teardown_active(instance, egress_meter, cpu_meter, serve_task, gateway, treasury).await;
-        shutdown_nodes(nodes).await;
         anyhow::bail!("C11: the active node's genome did not complete a boot round-trip (G1)");
     }
     tracing::info!(
@@ -492,7 +481,7 @@ pub async fn run(
     // G2's own test). The lease gates the debit: the active node holds the lease @ T, so
     // metering it is exactly the active node billing its own genome.
     anyhow::ensure!(
-        matches!(active_handle.fence(term_t).await, FenceVerdict::Active { .. }),
+        matches!(active_handle.fence_for(LOOP_AGENT, term_t).await, FenceVerdict::Active { .. }),
         "C11: the active node must hold the lease @ T to meter + debit its genome (G8)"
     );
     let metered_burn_sats = meter_a_little(&mut cpu_meter, 12).await;
@@ -526,7 +515,6 @@ pub async fn run(
         serve_task.abort();
         drop(gateway);
         drop(treasury);
-        shutdown_nodes(nodes).await;
         anyhow::bail!(
             "C11: the active node's genome did not AUTHORIZE_AND_PERFORM the brokered act (got {:?}); cannot run the loop (G5)",
             first.outcome
@@ -543,7 +531,6 @@ pub async fn run(
             serve_task.abort();
             drop(gateway);
             drop(treasury);
-            shutdown_nodes(nodes).await;
             return Err(anyhow::anyhow!("C11: snapshot failed: {e}"));
         }
     };
@@ -554,43 +541,34 @@ pub async fn run(
     let snapshot_bytes = transferred.footprint_bytes();
     tracing::info!(bytes = snapshot_bytes, "C11: snapshot pair staged for the surviving majority (D-13 seam)");
 
-    // ---- STEP 5b (G8): KILL the active node (its VM AND its lease engine). ----
-    tracing::info!(node = elected_leader, "C11: KILLING the active node (VM + lease engine); the surviving majority must carry the genome");
+    // ---- STEP 5b (G8): KILL the active node (its VM; drop it from the live lease set). ----
+    tracing::info!(node = elected_leader, "C11: KILLING the active node (VM + lease holder); the surviving majority must carry the genome");
     instance.halt().await;
     cpu_meter_drop(cpu_meter); // release the meter's treasury clone (the sled lock)
     serve_task.abort();
     drop(gateway);
     drop(treasury); // release the sled lock so the new active node opens the SAME store
-    let killed_node_obj = remove_node(&mut nodes, elected_leader)?;
-    killed_node_obj.shutdown().await;
-    handles.retain(|h| h.id() != elected_leader);
+    fabric.kill(elected_leader);
     // Let the aborted serve task drop its treasury clone before node 2 opens the store.
     tokio::task::yield_now().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    sample_actives(&handles, &mut two_actives_ever).await;
+    fabric.sample_actives(&mut two_actives_ever).await;
 
-    // ---- STEP 5c (G8): the 2-of-3 majority elects a new leader at T+1 (survive-one-loss). ----
-    let survivor_ids: Vec<LeaseNodeId> =
-        NODE_IDS.iter().copied().filter(|&id| id != elected_leader).collect();
-    let new_leader = {
-        let survivor = node_by_id_any(&nodes, &survivor_ids)?;
-        survivor
-            .wait_for_leader_in(Some(&survivor_ids), Duration::from_secs(10))
-            .await
-            .ok_or_else(|| anyhow::anyhow!("C11: the 2-of-3 majority did not elect a new leader after the kill (G8)"))?
-    };
-    let regranted = {
-        let new_leader_node = node_by_id(&nodes, new_leader)?;
-        new_leader_node.grant_lease(new_leader).await?
-    };
-    let term_t1 = regranted.term;
+    // ---- STEP 5c (G8): a surviving node CLAIMS the lease at T+1 (the failover takeover). ----
+    // The relay-lease has no leader election -- a survivor publishes term+1 and latest-wins
+    // supersedes the dead holder's term (the relay-native equivalent of survive-one-loss).
+    let new_leader = NODE_IDS
+        .iter()
+        .copied()
+        .find(|&id| id != elected_leader)
+        .ok_or_else(|| anyhow::anyhow!("C11: no surviving node to take over after the kill (G8)"))?;
+    let term_t1 = fabric.claim(new_leader, term_t + 1).await?;
     anyhow::ensure!(
         term_t1 > term_t,
-        "C11: the handoff must commit the lease at a strictly higher term (T+1): got {term_t1}, was {term_t} (G8)"
+        "C11: the handoff must claim the lease at a strictly higher term (T+1): got {term_t1}, was {term_t} (G8)"
     );
-    tracing::info!(new_leader, term = term_t1, "C11: survive-one-loss handoff committed (new active node @ T+1)");
-    sample_actives(&handles, &mut two_actives_ever).await;
-    let new_active_handle = handle_by_id(&handles, new_leader)?;
+    tracing::info!(new_leader, term = term_t1, "C11: survive-one-loss handoff claimed (new active node @ T+1)");
+    fabric.sample_actives(&mut two_actives_ever).await;
 
     // ---- STEP 5d (G6): the new active node RESTORES the snapshot (the C-7 path) and
     // continues. It opens the SAME persisted treasury (D-9, the ledger crossed). The
@@ -618,7 +596,6 @@ pub async fn run(
     } = match restored {
         Ok(r) => r,
         Err(e) => {
-            shutdown_nodes(nodes).await;
             let _ = std::fs::remove_dir_all(&transfer_dir);
             return Err(anyhow::anyhow!("C11: restore on the new active node failed: {e}"));
         }
@@ -654,17 +631,13 @@ pub async fn run(
 
     // ---- STEP 8 (G8): REVIVE the killed node still believing term T. It must be FENCED. ----
     tracing::info!(node = elected_leader, believed_term = term_t, "C11: REVIVING the source node (stale, believing T); it must be FENCED (no second VM, G8)");
-    let revived = LeaseNode::start(elected_leader, "127.0.0.1:0").await?;
-    let revived_handle = revived.handle();
-    // The revived node catches up on rejoin: it learns the authoritative committed lease
-    // the majority holds (T+1), so the fence sees the higher committed term that
+    // The revived node comes back as a FRESH authority that catches up on the latest published
+    // lease via the relay (term T+1, another holder), so its fence sees the higher term that
     // superseded its old belief (spec 4.3), not merely "no lease".
-    if let Some(authoritative) = new_active_handle.active_lease().await {
-        revived_handle.catch_up_committed_lease(authoritative).await;
-    }
-    let stale_verdict = revived_handle.fence(term_t).await;
+    let revived_handle = fabric.revive_stale(elected_leader).await?;
+    let stale_verdict = revived_handle.fence_for(LOOP_AGENT, term_t).await;
     let revived_stale_fenced = !stale_verdict.may_act();
-    tracing::info!(?stale_verdict, "C11: revived stale node fence verdict (it sees the higher committed term T+1)");
+    tracing::info!(?stale_verdict, "C11: revived stale node fence verdict (it sees the higher term T+1)");
     // The fenced node must not debit (no double-burn).
     let stale_debit = lease_gated_debit(&revived_handle, term_t, &node2_treasury, 777_777).await;
     anyhow::ensure!(
@@ -675,15 +648,13 @@ pub async fn run(
         node2_treasury.remaining()? == treasury_after_reissue,
         "C11: the treasury must be UNCHANGED by the fenced stale node (no double-burn, G8)"
     );
-    sample_actives(&handles, &mut two_actives_ever).await;
+    fabric.sample_actives(&mut two_actives_ever).await;
 
     // ---- Teardown ----
     instance.halt().await;
     node2_serve.abort();
     drop(node2_treasury);
     drop(node2_treasury_read);
-    revived.shutdown().await;
-    shutdown_nodes(nodes).await;
     let _ = std::fs::remove_dir_all(&transfer_dir);
     let _ = std::fs::remove_dir_all(&treasury_path);
 
@@ -1226,71 +1197,148 @@ fn parse_generation(detail: &str) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// Lease helpers (mirroring nosplitbrain_run, the C-9 patterns).
+// Relay-lease harness (#9): the in-process stand-in for the relay-native lease the
+// full-loop's failover rides. The loopback Raft cluster was CUT; this drives the
+// SAME relay-lease mechanism (claim -> publish -> observe; latest-term-wins; stale
+// stand-down) the production path uses, on an in-memory relay so the gated VM run needs
+// no live relay. The agent's failover transfers the keystore WITH the agent (F9-2 note),
+// so every node's authority holds the SAME agent quorum Q.
 // ---------------------------------------------------------------------------
 
-/// Sample the active set right now and OR into `two_actives_ever` whether more than one
-/// node reports active (the linearizability witness, G8).
-async fn sample_actives(handles: &[LeaseHandle], two_actives_ever: &mut bool) {
-    let active = observe_active_nodes(handles).await;
-    if active.len() > 1 {
-        *two_actives_ever = true;
-        tracing::error!(?active, "C11: TWO nodes report active at once (linearizability violated, G8)");
+use std::collections::HashMap as LeaseHashMap;
+use std::sync::Arc as LeaseArc;
+
+use crate::quorum_signer::QuorumSigner;
+use crate::relay_lease::RelayLeaseAuthority;
+use kirby_custody::cosign_net::NostrEvent;
+
+/// The agent the full-loop's single genome runs as (the DEFAULT single-agent slot).
+const LOOP_AGENT: &str = crate::lease::DEFAULT_AGENT;
+
+/// A tiny in-process addressable relay (mirrors the relay_lease.rs test MockRelay): keeps the
+/// latest published lease event per `(pubkey, kind, d)`. NOT the wire -- it lets the harness
+/// publish a signed lease and re-feed it to every node's `observe`, with no network.
+#[derive(Default)]
+struct LeaseRelay {
+    events: LeaseHashMap<(String, u32, String), NostrEvent>,
+}
+
+impl LeaseRelay {
+    fn publish(&mut self, event: NostrEvent) {
+        let d = event
+            .tags
+            .iter()
+            .find(|t| t.first().map(String::as_str) == Some("d"))
+            .and_then(|t| t.get(1).cloned())
+            .unwrap_or_default();
+        self.events.insert((event.pubkey.clone(), event.kind, d), event);
+    }
+}
+
+/// The relay-lease fabric for the full-loop: one shared in-memory relay plus a per-node
+/// [`RelayLeaseAuthority`], each holding the agent's SAME quorum Q (failover carries the
+/// keystore with the agent). A `claim` FROST-signs the lease, publishes it, and re-observes it
+/// on EVERY live node, so each node's fence reflects the latest term -- the relay-native
+/// equivalent of the loopback-Raft committed lease, latest-term-wins.
+struct LeaseFabric {
+    relay: LeaseRelay,
+    authorities: LeaseHashMap<LeaseNodeId, LeaseArc<RelayLeaseAuthority>>,
+    /// Node ids whose authority should still observe (a killed node is dropped so its stale
+    /// in-process authority is not counted as a live active node, the C-9 same-host note).
+    live: Vec<LeaseNodeId>,
+    q: LeaseArc<QuorumSigner>,
+}
+
+impl LeaseFabric {
+    /// Build a fabric for `node_ids`: generate ONE agent quorum (the agent's Q) and give every
+    /// node an authority that holds it (so any node can claim on failover).
+    fn new(node_ids: &[LeaseNodeId]) -> anyhow::Result<Self> {
+        let ks = kirby_custody::generate_dealer_keyset(2, 3)
+            .map_err(|e| anyhow::anyhow!("full-loop lease: 2-of-3 dealer keygen: {e}"))?;
+        let q = LeaseArc::new(
+            crate::quorum_signer::local_quorum_from_keyset(&ks)
+                .map_err(|e| anyhow::anyhow!("full-loop lease: build quorum signer: {e}"))?,
+        );
+        let mut authorities = LeaseHashMap::new();
+        for &id in node_ids {
+            authorities.insert(
+                id,
+                LeaseArc::new(RelayLeaseAuthority::single_agent(id, LOOP_AGENT, q.clone())),
+            );
+        }
+        Ok(Self { relay: LeaseRelay::default(), authorities, live: node_ids.to_vec(), q })
+    }
+
+    /// This node's authority (cloned Arc) for wiring into the gateway fence.
+    fn authority(&self, id: LeaseNodeId) -> anyhow::Result<LeaseArc<RelayLeaseAuthority>> {
+        self.authorities
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("lease authority for node {id} not found"))
+    }
+
+    /// CLAIM the agent's lease for `id` at `term`: FROST-sign + publish + re-observe on every
+    /// live node. Returns the claimed term.
+    async fn claim(&mut self, id: LeaseNodeId, term: u64) -> anyhow::Result<u64> {
+        let event = self.authority(id)?.claim(LOOP_AGENT, term).await?;
+        self.relay.publish(event.clone());
+        for &live_id in &self.live {
+            if let Some(a) = self.authorities.get(&live_id) {
+                a.observe(&event).await;
+            }
+        }
+        Ok(term)
+    }
+
+    /// KILL a node: drop it from the live observer set (its stale authority must not count as
+    /// a live active node).
+    fn kill(&mut self, id: LeaseNodeId) {
+        self.live.retain(|&n| n != id);
+    }
+
+    /// REVIVE a killed node as a STALE authority: a FRESH authority (no observed lease) that
+    /// learns the latest lease via `observe` (the relay catch-up), so its fence sees the higher
+    /// term that superseded its old belief. Returns it WITHOUT adding it back to `live`.
+    async fn revive_stale(&self, id: LeaseNodeId) -> anyhow::Result<LeaseArc<RelayLeaseAuthority>> {
+        let revived = LeaseArc::new(RelayLeaseAuthority::single_agent(id, LOOP_AGENT, self.q.clone()));
+        // Catch up on the latest published lease (the relay delivers it on rejoin).
+        let d = LOOP_AGENT.to_string();
+        if let Some(event) = self.relay.events.get(&(hex::encode(self.q.q_bytes()), kirby_proto::KIND_KIRBY_LEASE as u32, d)) {
+            revived.observe(event).await;
+        }
+        Ok(revived)
+    }
+
+    /// Sample the active set over the LIVE nodes and OR into `two_actives_ever` whether more
+    /// than one reports active (the linearizability witness, G8).
+    async fn sample_actives(&self, two_actives_ever: &mut bool) {
+        let mut active = Vec::new();
+        for &id in &self.live {
+            if let Some(a) = self.authorities.get(&id) {
+                if a.active_term_for(LOOP_AGENT).await.is_some() {
+                    active.push(id);
+                }
+            }
+        }
+        if active.len() > 1 {
+            *two_actives_ever = true;
+            tracing::error!(?active, "C11: TWO nodes report active at once (linearizability violated, G8)");
+        }
     }
 }
 
 /// A lease-gated treasury debit (the money-path the lease gates, G8): debit only if the
-/// fence says this node holds the lease at a current-enough term. A fenced node returns
-/// `None` and the treasury is untouched (no double-burn).
+/// authority's fence says this node holds the lease at a current-enough term. A fenced node
+/// returns `None` and the treasury is untouched (no double-burn).
 async fn lease_gated_debit(
-    handle: &LeaseHandle,
+    authority: &RelayLeaseAuthority,
     believed_term: u64,
     treasury: &Treasury,
     amount: u64,
 ) -> Option<DebitOutcome> {
-    match handle.fence(believed_term).await {
+    match authority.fence_for(LOOP_AGENT, believed_term).await {
         FenceVerdict::Active { .. } => Some(treasury.debit_metered(amount).ok()?),
         FenceVerdict::Fenced { .. } => None,
-    }
-}
-
-/// Find a started lease node by id (the nodes vector shifts as a kill removes one).
-fn node_by_id(nodes: &[LeaseNode], id: LeaseNodeId) -> anyhow::Result<&LeaseNode> {
-    nodes
-        .iter()
-        .find(|n| n.id() == id)
-        .ok_or_else(|| anyhow::anyhow!("lease node {id} not found"))
-}
-
-/// Find any started lease node whose id is in `ids` (a surviving node after a kill).
-fn node_by_id_any<'a>(nodes: &'a [LeaseNode], ids: &[LeaseNodeId]) -> anyhow::Result<&'a LeaseNode> {
-    nodes
-        .iter()
-        .find(|n| ids.contains(&n.id()))
-        .ok_or_else(|| anyhow::anyhow!("no surviving lease node among {ids:?}"))
-}
-
-/// Find a lease handle by id.
-fn handle_by_id(handles: &[LeaseHandle], id: LeaseNodeId) -> anyhow::Result<&LeaseHandle> {
-    handles
-        .iter()
-        .find(|h| h.id() == id)
-        .ok_or_else(|| anyhow::anyhow!("lease handle {id} not found"))
-}
-
-/// Remove a started lease node by id from the vector (consuming it for shutdown).
-fn remove_node(nodes: &mut Vec<LeaseNode>, id: LeaseNodeId) -> anyhow::Result<LeaseNode> {
-    let idx = nodes
-        .iter()
-        .position(|n| n.id() == id)
-        .ok_or_else(|| anyhow::anyhow!("lease node {id} not found to remove"))?;
-    Ok(nodes.remove(idx))
-}
-
-/// Shut down all remaining lease nodes (teardown).
-async fn shutdown_nodes(nodes: Vec<LeaseNode>) {
-    for n in nodes {
-        n.shutdown().await;
     }
 }
 

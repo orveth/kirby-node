@@ -31,13 +31,13 @@
 //!  7. IDEMPOTENT REPLAY (G9): the resumed genome re-issues the SAME key K; it is
 //!     DUPLICATE_IGNORED, the act is NOT performed twice, and the treasury is debited by
 //!     C EXACTLY ONCE total (not 2C).
-//!  8. NO SPLIT-BRAIN (G8): the new active node holds active_lease{node2, T+1} (committed
-//!     via openraft); the revived source node believing term T REFUSES to run/debit
+//!  8. NO SPLIT-BRAIN (G8): the new active node claims the relay lease at T+1
+//!     (latest-term-wins); the revived source node believing term T REFUSES to run/debit
 //!     (term-fenced), no second VM, the treasury debited by at most one node, and no
 //!     observed term boundary shows two actives.
 //!
-//! This boots a REAL local mint + REAL Firecracker microVMs under the jailer + a REAL
-//! 3-node Raft cluster, so it SKIPS (green no-op) when `KIRBY_GENOME_IMAGE` is unset,
+//! This boots a REAL local mint + REAL Firecracker microVMs under the jailer + the
+//! relay-native lease fabric, so it SKIPS (green no-op) when `KIRBY_GENOME_IMAGE` is unset,
 //! exactly like the other real-VM gates, so `cargo test` stays green on an image-less
 //! host. The verifier runs it with the var set as the C-11 producing command.
 
