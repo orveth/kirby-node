@@ -9,9 +9,20 @@
 # nix-installer action) is wired up before it will actually execute.
 name: ci
 
+# Trigger ONCE per change. A push to a branch that has an open PR fires BOTH a
+# `push` and a `pull_request` event, double-running the same SHA. Restricting
+# `push` to `main` means PR branches run only via `pull_request`, and `main`
+# runs only on merge -- one run per change either way.
 on:
   push:
+    branches: [main]
   pull_request:
+
+# Cancel a superseded in-progress run when a newer commit lands on the same ref
+# (e.g. a quick follow-up push), so only the latest commit's CI holds the gate.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-and-clippy:
