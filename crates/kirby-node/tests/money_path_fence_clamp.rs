@@ -52,6 +52,7 @@ fn test_session() -> Session {
         task_descriptor: "money-path-batch1".into(),
         budget_sats: 1_000_000,
         allowlisted_destinations: vec![MINT.to_string()],
+        allowlisted_inbound_kinds: Vec::new(),
     }
 }
 

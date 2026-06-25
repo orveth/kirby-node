@@ -28,6 +28,7 @@ fn gateway_with_observer() -> (GatewayService, tokio::sync::mpsc::UnboundedRecei
         task_descriptor: "entropy-ordering".into(),
         budget_sats: 1_000_000,
         allowlisted_destinations: vec!["mint.test.local".to_string()],
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let mut svc = GatewayService::new(treasury, Arc::new(MockRail::new()), session);
     let rx = svc.observe_events();

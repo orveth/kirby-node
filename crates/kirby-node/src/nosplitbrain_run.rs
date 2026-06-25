@@ -419,6 +419,7 @@ async fn boot_active_genome(
         task_descriptor: config.task.clone(),
         budget_sats: 1_000_000,
         allowlisted_destinations: vec!["mint.test.local".to_string()],
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let rail: Arc<dyn Rail> = Arc::new(MockRail::new());
     let mut gateway = GatewayService::new(treasury.clone(), rail, session);
@@ -494,6 +495,7 @@ async fn restore_on_new_active(
         task_descriptor: config.task.clone(),
         budget_sats: 1_000_000,
         allowlisted_destinations: vec!["mint.test.local".to_string()],
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let rail: Arc<dyn Rail> = Arc::new(MockRail::new());
     let mut gateway = GatewayService::new(treasury.clone(), rail, session);

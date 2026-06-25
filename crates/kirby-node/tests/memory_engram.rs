@@ -38,6 +38,7 @@ fn gateway_over(treasury: Treasury) -> GatewayService {
         task_descriptor: "engram-test".into(),
         budget_sats: u64::MAX,
         allowlisted_destinations: vec![MEMORY_DESTINATION.to_string()],
+        allowlisted_inbound_kinds: Vec::new(),
     };
     GatewayService::new(treasury, Arc::new(MockRail::new()), session)
         .with_memory_backend(Arc::new(StubMemory::new(1)))

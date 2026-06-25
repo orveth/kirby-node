@@ -801,6 +801,7 @@ async fn boot_active_node(
         task_descriptor: config.task.clone(),
         budget_sats: config.initial_sats,
         allowlisted_destinations: vec![config.allow_mint.clone()],
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let mut gateway = GatewayService::new(treasury.clone(), rail, session);
     let events = gateway.observe_events();
@@ -987,6 +988,7 @@ async fn restore_on_new_active(
         task_descriptor: config.task.clone(),
         budget_sats: config.initial_sats,
         allowlisted_destinations: vec![config.allow_mint.clone()],
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let mut gateway = GatewayService::new(treasury.clone(), rail, session);
     // The VMGenID bump on restore (the C-8 hook): a restored VM is a new generation.

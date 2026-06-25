@@ -29,6 +29,16 @@ service NodeGateway {
   // the treasury and meters, then the daemon performs, then a receipt
   // (spec 3.2).
   rpc RequestCapability(CapabilityRequest) returns (CapabilityReceipt);
+
+  // inbound: the genome long-polls for externally-originated events the daemon
+  // has VERIFIED and queued for it (earn-loop Component 1). The daemon holds the
+  // request open up to a server-side deadline, returning as soon as >=1 event is
+  // queued (or an empty batch on deadline, so the genome re-polls). The genome
+  // stays a pure client: no socket, no inbound listener, just another OUTBOUND
+  // call on the same vsock channel. The daemon is the trust boundary -- it
+  // signature-verifies, kind-allowlists (default-deny), size-caps, and re-emits a
+  // TYPED InboundEvent; the genome never sees a raw relay frame.
+  rpc PollInbox(InboxRequest) returns (InboundBatch);
 }
 
 // All messages carry schema_version (starts at 1, additive-only thereafter).
@@ -197,6 +207,57 @@ message NostrPublish {
 // A nested message because protobuf has no repeated-of-repeated.
 message NostrTag {
   repeated string elements = 1;
+}
+
+// The earn-loop INBOUND surface (Component 1). The genome's poll request: which
+// inbound kinds it wants to be woken for, its consume cursor, and a long-poll budget.
+message InboxRequest {
+  uint32 schema_version = 1;
+  // P2: the genome's subscribe-filter -- which inbound kinds it wants to be woken
+  // for. The daemon INTERSECTS this with the session inbound allowlist (1.4); the
+  // genome can only NARROW, never widen, what the session permits. Empty => the
+  // session's full allowlisted set (a sensible default for a DVM agent).
+  repeated InboundKind want_kinds = 2;
+  // The highest inbox_seq the genome has already consumed (its cursor). The daemon
+  // returns only events with seq > ack_seq, so a redial + re-poll never re-delivers
+  // an already-seen event and never skips one (at-least-once becomes exactly-once at
+  // the genome via this monotonic cursor; mirrors the gateway idempotency_key idiom).
+  uint64 ack_seq = 3;
+  // Long-poll budget: the max millis the daemon may hold this request open before
+  // returning an empty batch. The daemon CLAMPS to a host max so a hostile value
+  // cannot pin a server task forever.
+  uint64 wait_ms = 4;
+}
+
+// The result of a PollInbox: zero or more typed inbound events plus the high-water
+// cursor the genome acks next time.
+message InboundBatch {
+  uint32 schema_version = 1;
+  repeated InboundEvent events = 2;   // size-capped per event (1.3); may be empty on deadline
+  uint64 high_seq = 3;                // the highest inbox_seq in this batch (the genome's next ack_seq)
+}
+
+// A TYPED, daemon-verified inbound record. The genome NEVER sees a raw relay frame:
+// the daemon signature-verifies, kind-allowlists, size-caps, and re-emits this typed
+// shape (1.3). `payload` is the TYPED, size-capped body for this kind, NOT a raw event.
+message InboundEvent {
+  uint64 inbox_seq      = 1;   // daemon-assigned monotonic per-genome cursor
+  InboundKind kind      = 2;   // the kind-allowlisted classification (1.3)
+  bytes payload         = 3;   // the TYPED, size-capped payload for this kind (NOT a raw event)
+  string source_pubkey  = 4;   // the verified author hex pubkey (informational; the daemon already verified the sig)
+  uint64 created_at     = 5;   // the source event created_at (informational)
+  string correlation_id = 6;   // ties a settlement notice back to a charge_id (Component 2) or a job request id
+}
+
+enum InboundKind {
+  INBOUND_KIND_UNSPECIFIED = 0;
+  // P1 minimum set. Extend additively as new outward surfaces land. For THIS chunk
+  // only JOB_REQUEST is wired end-to-end (the earn trigger); the others reserve
+  // wire numbers for additive growth.
+  JOB_REQUEST       = 1;   // a NIP-90 DVM job request (the earn trigger; relay kinds 5000-5999)
+  MENTION           = 2;   // a public mention / reply addressed to the agent
+  DIRECT_MESSAGE    = 3;   // a DM addressed to the agent (decrypted host-side; see SAFETY note)
+  PAYMENT_SETTLED   = 4;   // "charge X settled, treasury credited" -- the Component 2 settlement notice (daemon-produced)
 }
 
 message CapabilityRequest {

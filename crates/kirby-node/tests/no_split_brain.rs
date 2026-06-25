@@ -377,6 +377,7 @@ async fn g8_gateway_debit_path_is_lease_fenced() {
         task_descriptor: "g8-gateway-fence".to_string(),
         budget_sats: 1_000_000,
         allowlisted_destinations: vec!["mint.test.local".to_string()],
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let rail: Arc<dyn Rail> = Arc::new(MockRail::new());
 

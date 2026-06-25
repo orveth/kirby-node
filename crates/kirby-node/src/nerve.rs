@@ -22,17 +22,21 @@
 //! directory, then loaded thereafter, so a node keeps the SAME npub across restarts
 //! (the stable cluster identity). See [`NodeIdentity`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use kirby_proto::{KIND_KIRBY_AGENT_STATE, KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE};
+use kirby_proto::{
+    InboundEvent, InboundKind, KIND_KIRBY_AGENT_STATE, KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE,
+    NIP90_JOB_REQUEST_KIND_MAX, NIP90_JOB_REQUEST_KIND_MIN,
+};
 
 use crate::quorum_signer::QuorumSigner;
 
@@ -574,6 +578,357 @@ pub async fn run_presence(
     client.disconnect().await;
     Ok(())
 }
+
+// ============================================================================
+// INBOUND DELIVERY (earn-loop Component 1, daemon half): the daemon -> genome inbox.
+//
+// This is a NEW ATTACKER-CONTROLLED ENTRY POINT. The inbound subscription is the
+// trust boundary: every relay event is signature-verified, kind-allowlisted
+// (default-deny), and size-capped BEFORE it becomes a typed [`InboundEvent`] on a
+// bounded per-genome queue. The genome NEVER sees a raw relay frame -- it long-polls
+// the typed queue over the SAME outbound vsock gRPC channel (`PollInbox`), so the
+// genome stays a pure client and the C-5 egress lockdown is untouched (this task is
+// host-side network, exactly like `run_presence`).
+//
+// SAFETY ORDER (1.3), enforced in `verify_and_enqueue` for every event, BEFORE the
+// queue: (1) signature-verify -- bad sig => DROP + log; (2) kind-allowlist via a fixed
+// host-side table -- unrecognized => DROP + log; (3) size-cap the extracted payload --
+// oversized => DROP + log, never TRUNCATE (a truncation could split a multibyte
+// boundary, the `capable.rs` reasoning); (4) re-emit as a typed `InboundEvent` with a
+// monotonic `inbox_seq` and enqueue on a BOUNDED queue (drop-oldest on overflow so the
+// relay task never blocks and the host never OOMs).
+// ============================================================================
+
+/// The hard byte cap on a single inbound payload the daemon will deliver to the genome.
+/// Reuses the engram value ceiling (`rail::MAX_MEMORY_VALUE_BYTES`) so the two inbound
+/// and durable-store bounds cannot drift. An oversized extracted payload is DROPPED (not
+/// truncated): a truncation could sever a multibyte char, the same reasoning as the
+/// publish-note cap and `capable.rs`'s byte-boundary discipline.
+pub const MAX_INBOUND_PAYLOAD_BYTES: usize = crate::rail::MAX_MEMORY_VALUE_BYTES;
+
+/// The bounded capacity of a per-genome inbound queue. On overflow the daemon drops the
+/// OLDEST queued event and logs (back-pressure that never blocks the relay task and never
+/// OOMs the host). 1024 is generous for a long-poll consumer that drains on every tick.
+pub const INBOUND_QUEUE_CAP: usize = 1024;
+
+/// The fixed HOST-SIDE kind-allowlist table (1.3, step 2): map a raw relay event kind to
+/// a typed [`InboundKind`], default-deny. An unrecognized kind returns `None` and is
+/// DROPPED. Only `JOB_REQUEST` (NIP-90 requests, kinds 5000-5999) is wired end-to-end this
+/// chunk -- the earn trigger; MENTION / DIRECT_MESSAGE / PAYMENT_SETTLED are reserved in the
+/// enum for additive growth but no relay kind maps to them yet (PAYMENT_SETTLED is
+/// daemon-produced in a later chunk, never a foreign relay event). Adding a future surface
+/// is a new arm here, exactly like the `capable.rs` positive-allowlist discipline.
+pub fn classify_inbound_kind(relay_kind: u16) -> Option<InboundKind> {
+    if (NIP90_JOB_REQUEST_KIND_MIN..=NIP90_JOB_REQUEST_KIND_MAX).contains(&relay_kind) {
+        Some(InboundKind::JobRequest)
+    } else {
+        None
+    }
+}
+
+/// Extract the TYPED, size-capped payload bytes for an allowlisted inbound kind from a
+/// verified relay event. The genome never sees the raw frame: for a `JOB_REQUEST` the
+/// daemon hands the genome the bounded job-input TEXT (the event content), which the
+/// genome later parses with its own positive-allowlist parser (a later chunk). Returns
+/// `None` if the extracted payload exceeds [`MAX_INBOUND_PAYLOAD_BYTES`] (DROP, never
+/// truncate).
+fn extract_payload(kind: InboundKind, event: &Event) -> Option<Vec<u8>> {
+    let payload = match kind {
+        // The job input the genome will think on. The content is opaque text here; the
+        // genome applies its own total parser. We deliver the raw content BYTES.
+        InboundKind::JobRequest => event.content.as_bytes().to_vec(),
+        // No foreign relay kind maps to these yet (see `classify_inbound_kind`); a future
+        // chunk wires their extraction. Treat as not-extractable (drop) for now.
+        _ => return None,
+    };
+    if payload.len() > MAX_INBOUND_PAYLOAD_BYTES {
+        return None;
+    }
+    Some(payload)
+}
+
+/// The per-genome BOUNDED inbound queue: the typed, daemon-verified events waiting for the
+/// genome to `PollInbox`. Cheap to clone (`Arc`), so the relay task (the producer) and the
+/// gateway service (the long-poll consumer) share one handle. The queue assigns a
+/// MONOTONIC `inbox_seq` to every accepted event (an [`AtomicU64`]), so a genome's `ack_seq`
+/// cursor makes delivery exactly-once across a redial (never re-deliver, never skip). A
+/// [`tokio::sync::Notify`] lets a parked long-poll wake the instant an event lands.
+#[derive(Clone)]
+pub struct InboundQueue {
+    inner: Arc<Mutex<VecDeque<InboundEvent>>>,
+    /// The next `inbox_seq` to assign. Monotonic for the queue's lifetime; never reused even
+    /// after a drop-oldest eviction (the cursor must never go backwards).
+    next_seq: Arc<AtomicU64>,
+    cap: usize,
+    /// Wakes a parked `PollInbox` the instant a new event is enqueued (long-poll latency).
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl InboundQueue {
+    /// A bounded queue with the default capacity ([`INBOUND_QUEUE_CAP`]).
+    pub fn new() -> Self {
+        Self::with_capacity(INBOUND_QUEUE_CAP)
+    }
+
+    /// A bounded queue with an explicit capacity (tests use a small cap to exercise the
+    /// drop-oldest path). `inbox_seq` starts at 1 so 0 is a sentinel "no events consumed"
+    /// (a genome's initial `ack_seq = 0` then receives seq >= 1).
+    pub fn with_capacity(cap: usize) -> Self {
+        InboundQueue {
+            inner: Arc::new(Mutex::new(VecDeque::new())),
+            next_seq: Arc::new(AtomicU64::new(1)),
+            cap: cap.max(1),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Enqueue an already-CLASSIFIED, already-SIZE-CAPPED typed event, assigning it the next
+    /// monotonic `inbox_seq`. On overflow the OLDEST queued event is evicted (drop-oldest
+    /// back-pressure) and logged. Returns the assigned `inbox_seq`. The caller MUST have run
+    /// the verify -> allowlist -> size-cap pipeline first (`verify_and_enqueue` does).
+    pub fn push_typed(
+        &self,
+        kind: InboundKind,
+        payload: Vec<u8>,
+        source_pubkey: String,
+        created_at: u64,
+        correlation_id: String,
+    ) -> u64 {
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let event = InboundEvent {
+            inbox_seq: seq,
+            kind: kind as i32,
+            payload,
+            source_pubkey,
+            created_at,
+            correlation_id,
+        };
+        {
+            let mut q = self.inner.lock().expect("inbound queue poisoned");
+            while q.len() >= self.cap {
+                if let Some(dropped) = q.pop_front() {
+                    tracing::warn!(
+                        dropped_seq = dropped.inbox_seq,
+                        cap = self.cap,
+                        "inbound queue full; dropped the OLDEST event (back-pressure)"
+                    );
+                }
+            }
+            q.push_back(event);
+        }
+        // Wake any parked long-poll: an event is now drainable.
+        self.notify.notify_waiters();
+        seq
+    }
+
+    /// Collect every queued event with `inbox_seq > ack_seq` whose kind is in `want` (the
+    /// already-intersected effective set; an EMPTY `want` means deliver ALL kinds), returned
+    /// oldest-first. The `ack_seq` cursor is the genome's CONFIRMED progress: any event with
+    /// `seq <= ack_seq` is PRUNED here (the genome has consumed it; never re-deliver, never
+    /// keep it forever). Delivered-but-unacked events (`seq > ack_seq`) STAY queued, so
+    /// delivery is at-least-once on the wire and exactly-once at the genome via the monotonic
+    /// cursor (a redial + re-poll at the same ack_seq re-delivers, and the genome dedupes;
+    /// once the genome advances ack_seq past them, the next poll prunes them). An event whose
+    /// kind is NOT in `want` also stays queued (a later, broader want can still see it). This
+    /// mirrors the gateway `idempotency_key` idiom: the cursor, not the queue, is the
+    /// exactly-once authority.
+    fn drain_after(&self, ack_seq: u64, want: &[InboundKind]) -> Vec<InboundEvent> {
+        let mut q = self.inner.lock().expect("inbound queue poisoned");
+        // Prune everything the genome has CONFIRMED consuming (seq <= ack_seq).
+        q.retain(|ev| ev.inbox_seq > ack_seq);
+        // Collect (without removing) the events this poll's `want` matches.
+        q.iter()
+            .filter(|ev| want.is_empty() || want.iter().any(|k| *k as i32 == ev.kind))
+            .cloned()
+            .collect()
+    }
+
+    /// Current queued depth (test/diagnostic).
+    pub fn len(&self) -> usize {
+        self.inner.lock().expect("inbound queue poisoned").len()
+    }
+
+    /// Whether the queue is empty (test/diagnostic).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The long-poll DRAIN the gateway's `PollInbox` calls. Returns immediately with any
+    /// events `> ack_seq` matching `want`; otherwise PARKS up to `wait` (waking the instant
+    /// an event is enqueued), then returns whatever is drainable (possibly empty on the
+    /// deadline, so the genome re-polls). `want` is the EFFECTIVE set (already intersected
+    /// with the session allowlist by the caller); empty => all kinds.
+    pub async fn poll(
+        &self,
+        ack_seq: u64,
+        want: &[InboundKind],
+        wait: Duration,
+    ) -> Vec<InboundEvent> {
+        // Fast path: something is already drainable.
+        let first = self.drain_after(ack_seq, want);
+        if !first.is_empty() {
+            return first;
+        }
+        // Slow path: park until an event lands OR the deadline elapses. Re-check on each
+        // wake (a notify could be for an event a NARROWER want does not match).
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let notified = self.notify.notified();
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Vec::new();
+            }
+            tokio::select! {
+                _ = notified => {
+                    let batch = self.drain_after(ack_seq, want);
+                    if !batch.is_empty() {
+                        return batch;
+                    }
+                    // Spurious for this want (e.g. an event of an unwanted kind): keep parking.
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    // Deadline: return an empty batch so the genome re-polls.
+                    return self.drain_after(ack_seq, want);
+                }
+            }
+        }
+    }
+}
+
+impl Default for InboundQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The verify -> allowlist -> size-cap -> typed-enqueue pipeline for ONE relay event
+/// (1.3). This is the trust boundary: it is the ONLY way a foreign event reaches the
+/// genome's inbox, and it NEVER panics on hostile input (a malformed event is a DROP +
+/// log, never a crash). Returns the assigned `inbox_seq` on accept, `None` on any drop.
+///
+/// Order is load-bearing:
+///   1. `event.verify()` (id + schnorr signature). A bad signature => DROP + log. nostr-sdk
+///      treats relay events as pre-verified, but the daemon is the trust boundary now, so we
+///      verify EXPLICITLY -- never assume the relay checked.
+///   2. `classify_inbound_kind` (default-deny). An unrecognized kind => DROP + log.
+///   3. `extract_payload` + size-cap. An oversized payload => DROP + log (never truncate).
+///   4. enqueue as a typed `InboundEvent` with a monotonic `inbox_seq` (drop-oldest on full).
+pub fn verify_and_enqueue(queue: &InboundQueue, event: &Event) -> Option<u64> {
+    // (1) Signature-verify EXPLICITLY -- the daemon is the trust boundary.
+    if let Err(e) = event.verify() {
+        tracing::warn!(error = %e, "inbound: DROPPED event with a bad signature/id");
+        return None;
+    }
+    // (2) Kind-allowlist (default-deny).
+    let kind = match classify_inbound_kind(event.kind.as_u16()) {
+        Some(k) => k,
+        None => {
+            tracing::warn!(
+                relay_kind = event.kind.as_u16(),
+                "inbound: DROPPED event of an unrecognized/unallowlisted kind (default-deny)"
+            );
+            return None;
+        }
+    };
+    // (3) Size-cap the EXTRACTED typed payload (drop, never truncate).
+    let payload = match extract_payload(kind, event) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                relay_kind = event.kind.as_u16(),
+                cap = MAX_INBOUND_PAYLOAD_BYTES,
+                "inbound: DROPPED event whose extracted payload was oversized or unextractable"
+            );
+            return None;
+        }
+    };
+    // (4) Re-emit as a typed event with a monotonic seq; correlation_id = the source event
+    // id (a stable per-job id the genome can echo back when it delivers + charges).
+    let seq = queue.push_typed(
+        kind,
+        payload,
+        event.pubkey.to_hex(),
+        event.created_at.as_secs(),
+        event.id.to_hex(),
+    );
+    tracing::info!(
+        inbox_seq = seq,
+        ?kind,
+        relay_kind = event.kind.as_u16(),
+        source = %event.pubkey.to_hex(),
+        "inbound: VERIFIED + enqueued a typed event"
+    );
+    Some(seq)
+}
+
+/// Run the persistent INBOUND subscription task to completion (until `shutdown` fires), the
+/// SIBLING of [`run_presence`]. It connects a read client, subscribes with a `#p`-addressed
+/// filter (events tagged to THIS node's pubkey) for the allowlisted kinds, and runs the
+/// `verify_and_enqueue` pipeline on every notification, feeding the shared [`InboundQueue`]
+/// the gateway drains via `PollInbox`. Pure host-side network, exactly like presence: it
+/// touches no genome, no socket into the VM, no egress path. Returns on graceful shutdown or
+/// an unrecoverable client error.
+pub async fn run_inbound(
+    identity: &NodeIdentity,
+    relay_url: &str,
+    queue: InboundQueue,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> anyhow::Result<()> {
+    let me = identity.public_key();
+    tracing::info!(
+        npub = %identity.npub(),
+        relay = %relay_url,
+        "inbound subscription task starting (the earn-loop inbox)"
+    );
+
+    let client = connect_reader(relay_url).await?;
+    // Subscribe to the allowlisted inbound kinds ADDRESSED to this node (`#p` = node pubkey).
+    // JOB_REQUEST = NIP-90 requests (kinds 5000-5999). The relay filter is a coarse prefilter;
+    // `verify_and_enqueue` is the authoritative wall (it re-verifies + re-allowlists every
+    // event, never trusting the filter or the relay).
+    let kinds: Vec<Kind> = (NIP90_JOB_REQUEST_KIND_MIN..=NIP90_JOB_REQUEST_KIND_MAX)
+        .map(Kind::from)
+        .collect();
+    let filter = Filter::new().kinds(kinds).pubkey(me);
+    client
+        .subscribe(filter, None)
+        .await
+        .context("subscribe to the inbound (earn) surface")?;
+
+    let mut notifications = client.notifications();
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                tracing::info!(npub = %identity.npub(), "inbound task shutting down");
+                break;
+            }
+            notif = notifications.recv() => {
+                match notif {
+                    Ok(RelayPoolNotification::Event { event, .. }) => {
+                        // The trust boundary: verify -> allowlist -> size-cap -> enqueue.
+                        verify_and_enqueue(&queue, &event);
+                    }
+                    Ok(RelayPoolNotification::Shutdown) => {
+                        tracing::warn!("relay pool shut down; inbound task stopping");
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "inbound notifications lagged; some events skipped");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::warn!("inbound notification channel closed; task stopping");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    client.disconnect().await;
+    Ok(())
+}
+
 
 /// Per-peer tracking state for the live presence task.
 struct PeerState {

@@ -140,6 +140,7 @@ fn actuator_gateway(
         task_descriptor: "post-actuator-test".into(),
         budget_sats: initial_sats,
         allowlisted_destinations: allow,
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let service = GatewayService::new(treasury, Arc::new(rail), session);
     (service, actuator)

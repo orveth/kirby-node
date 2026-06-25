@@ -35,6 +35,7 @@ fn gateway_with(initial_sats: u64, rail: MockRail) -> (GatewayService, MockRail)
         task_descriptor: "test".into(),
         budget_sats: initial_sats,
         allowlisted_destinations: vec![MINT.to_string(), "paid.test.local".to_string()],
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let rail_handle = rail.clone();
     let service = GatewayService::new(treasury, Arc::new(rail), session);
@@ -502,6 +503,7 @@ async fn idempotent_across_resume_persisted() {
             task_descriptor: "t".into(),
             budget_sats: 1000,
             allowlisted_destinations: vec![MINT.to_string()],
+            allowlisted_inbound_kinds: Vec::new(),
         };
         let rail = MockRail::new();
         let rail_handle = rail.clone();
@@ -523,6 +525,7 @@ async fn idempotent_across_resume_persisted() {
             task_descriptor: "t".into(),
             budget_sats: 1000,
             allowlisted_destinations: vec![MINT.to_string()],
+            allowlisted_inbound_kinds: Vec::new(),
         };
         let rail = MockRail::new();
         let rail_handle = rail.clone();

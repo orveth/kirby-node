@@ -486,6 +486,7 @@ pub async fn boot_and_observe_with_rail(
         task_descriptor: config.task.clone(),
         budget_sats: config.budget_sats,
         allowlisted_destinations: config.allow.clone(),
+        allowlisted_inbound_kinds: Vec::new(),
     };
     // The meter and the gateway share ONE treasury instance (one authoritative
     // counter, D-9): metered ticks and capability spends debit the same balance.

@@ -325,6 +325,7 @@ pub async fn run_with_rail(
         task_descriptor: config.boot.task.clone(),
         budget_sats: config.boot.budget_sats,
         allowlisted_destinations: config.boot.allow.clone(),
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let mut node2_gateway = GatewayService::new(node2_treasury, rail, session);
     // The VMGenID bump on restore (the C-8 hook): a restored VM is a NEW generation,
@@ -454,6 +455,7 @@ async fn boot_node1(
         task_descriptor: config.boot.task.clone(),
         budget_sats: config.boot.budget_sats,
         allowlisted_destinations: config.boot.allow.clone(),
+        allowlisted_inbound_kinds: Vec::new(),
     };
     let mut gateway = GatewayService::new(treasury.clone(), rail, session);
     if let Some(checkpoint) = config.boot.restore_checkpoint.clone() {
