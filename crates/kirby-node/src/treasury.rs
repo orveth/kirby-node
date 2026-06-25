@@ -4,12 +4,26 @@
 //! ON THE DAEMON (host), never in the VM. The genome can observe it (the
 //! `treasury_remaining` field on a receipt) but cannot mutate it: there is no
 //! public method on this type that lets a gateway request ADD balance or SET
-//! `remaining` directly. The only mutation is `debit`, which only ever
-//! decreases the balance, and it is reachable only from daemon-side code that
-//! holds a `&Treasury`. This is the unforgeability core (D-9, gate G3b).
+//! `remaining` directly. The debit paths (`debit_metered`, `debit_and_record`)
+//! only ever decrease the balance, and they are reachable only from daemon-side
+//! code that holds a `&Treasury`. This is the unforgeability core (D-9, gate G3b).
+//!
+//! The balance INCREASES through exactly one path: `credit_verified`. It is the
+//! sole credit path and it is NARROW and daemon-only:
+//! - It is callable only by daemon-side settlement-verification code holding a
+//!   `&Treasury` (e.g. the host has independently verified an inbound ecash /
+//!   lightning settlement). NO gateway RPC reaches it -- the genome cannot ASSERT
+//!   a credit any more than it can assert a debit; a self-reported "I was paid"
+//!   over ReportEvent moves nothing (gate G3c). Adding `credit_verified` does not
+//!   widen the genome's authority by one sat: the only NEW caller is host code.
+//! - It is idempotent on `credit_id`: a re-delivered settlement, or a daemon
+//!   restart mid-verify, credits EXACTLY ONCE (the no-double-credit wall, deduped
+//!   inside the same transaction that mutates the balance).
+//! - It never wraps: an add that would overflow u64 is refused with no mutation.
 //!
 //! Invariants this module enforces (spec 4.2):
-//! - Unforgeable: only daemon-side code debits; no path adds or sets balance.
+//! - Unforgeable: only daemon-side code debits or credits; no genome-reachable
+//!   path adds, sets, or subtracts balance.
 //! - Never-negative / never-overspend: a debit that would drive the balance
 //!   below zero is refused BEFORE it happens (and, per the gateway order, before
 //!   the act). The estimate gate refuses pre-perform; the post-perform debit is
@@ -112,8 +126,17 @@ pub struct Treasury {
 struct Inner {
     /// Single-value tree holding `remaining_sats`.
     balance: sled::Tree,
-    /// idempotency_key -> PerformedRecord (the dedupe ledger).
+    /// idempotency_key -> PerformedRecord (the dedupe ledger for DEBITS / capability
+    /// acts). These keys are genome-supplied (the `idempotency_key` on a
+    /// `CapabilityRequest`) and free-form.
     ledger: sled::Tree,
+    /// credit_id -> credit row (the dedupe ledger for CREDITS). A SEPARATE tree from
+    /// `ledger` on purpose: credit_ids are daemon-assigned settlement ids, and keeping
+    /// them in their own tree makes the credit namespace STRUCTURALLY disjoint from the
+    /// genome-supplied capability keys (a genome cannot pre-occupy a credit key by
+    /// choosing a colliding `idempotency_key`), and keeps `lookup()` /
+    /// `max_idempotency_seq` (which scan only `ledger`) blind to credits.
+    credit_ledger: sled::Tree,
     /// Held so the database is flushed and dropped with the treasury.
     db: sled::Db,
 }
@@ -130,6 +153,7 @@ impl Treasury {
         let db = sled::open(path)?;
         let balance = db.open_tree("balance")?;
         let ledger = db.open_tree("ledger")?;
+        let credit_ledger = db.open_tree("credit_ledger")?;
 
         // Seed only on first creation. compare_and_swap with expected None makes
         // this idempotent across daemon restarts and resumes: the outer result
@@ -144,7 +168,7 @@ impl Treasury {
         db.flush()?;
 
         Ok(Treasury {
-            inner: Arc::new(Inner { balance, ledger, db }),
+            inner: Arc::new(Inner { balance, ledger, credit_ledger, db }),
         })
     }
 
@@ -155,9 +179,10 @@ impl Treasury {
         let db = sled::Config::new().temporary(true).open()?;
         let balance = db.open_tree("balance")?;
         let ledger = db.open_tree("ledger")?;
+        let credit_ledger = db.open_tree("credit_ledger")?;
         balance.insert(BALANCE_KEY, &initial_sats.to_be_bytes())?;
         Ok(Treasury {
-            inner: Arc::new(Inner { balance, ledger, db }),
+            inner: Arc::new(Inner { balance, ledger, credit_ledger, db }),
         })
     }
 
@@ -344,6 +369,109 @@ impl Treasury {
         self.inner.db.flush()?;
         Ok(outcome)
     }
+
+    /// The treasury's ONE and ONLY credit path: atomically ADD `amount_sats` to
+    /// the balance AND record a credit row, in a single transaction, idempotent
+    /// on `credit_id`. This is the inverse of `debit_and_record` and the only
+    /// method on this type that can raise the balance.
+    ///
+    /// DAEMON-ONLY: there is no gateway RPC that reaches here. The genome cannot
+    /// assert a credit; only daemon-side settlement-verification code holding a
+    /// `&Treasury` calls this, AFTER the host has independently verified an
+    /// inbound settlement (ecash redeemed, an invoice paid, etc). The genome's
+    /// self-reported numbers (ReportEvent) move nothing (G3c) -- this path does
+    /// not change that.
+    ///
+    /// DEDUPE (the no-double-credit wall): the dedupe lives INSIDE the txn, on
+    /// `credit_id`, exactly as `debit_and_record` dedupes on its key. A row
+    /// already present under the credit key means this settlement was already
+    /// credited -- a re-delivered settlement or a daemon restart mid-verify -- so
+    /// we return `Duplicate` with the stored record and make NO balance change.
+    /// Credit happens EXACTLY ONCE per `credit_id`.
+    ///
+    /// OVERFLOW: the add uses `checked_add`. An add that would overflow u64 is
+    /// REFUSED (`Overflow`, no mutation), never wrapped. u64::MAX sats is
+    /// unreachable in practice, but a credit must never silently wrap the balance
+    /// to a smaller value.
+    ///
+    /// KEY NAMESPACE (structural, not by convention): credit rows live in their OWN
+    /// sled tree (`credit_ledger`), SEPARATE from the debit `ledger` that holds the
+    /// genome-supplied capability `idempotency_key`s. This makes the credit namespace
+    /// STRUCTURALLY disjoint from genome keys: a genome cannot pre-occupy a credit key
+    /// by choosing a colliding `idempotency_key` (it writes to a different tree), so it
+    /// cannot grief a future settlement into a skipped (`Duplicate`) credit. The
+    /// `credit_id` is stored bare (daemon-assigned settlement id). The debit-side
+    /// `lookup()` / `max_idempotency_seq` scan only `ledger`, so they never see a
+    /// credit row at all -- there is no homogeneity or shape concern to manage.
+    pub fn credit_verified(
+        &self,
+        credit_id: &str,
+        amount_sats: u64,
+    ) -> Result<CreditOutcome, TreasuryError> {
+        let key_bytes = credit_id.as_bytes().to_vec();
+
+        // Transact over (balance, credit_ledger): the credit tree is SEPARATE from the
+        // debit `ledger`, so a credit can never alias a genome-supplied capability key.
+        let outcome = (&self.inner.balance, &self.inner.credit_ledger).transaction(
+            move |(balance, credit_ledger)| {
+                // Dedupe inside the transaction is the no-double-credit wall: a row
+                // already under this credit_id means this settlement was already
+                // credited (re-delivery or restart-mid-verify), so make NO balance
+                // change and return the stored record.
+                if let Some(existing) = credit_ledger.get(&key_bytes)? {
+                    let rec: PerformedRecord = serde_json::from_slice(&existing)
+                        .map_err(|e| abort(format!("credit record: {e}")))?;
+                    return Ok(CreditOutcome::Duplicate(rec));
+                }
+
+                let current_raw = balance
+                    .get(BALANCE_KEY)?
+                    .ok_or_else(|| abort("balance key missing".into()))?;
+                let current = decode_u64_tx(&current_raw)?;
+
+                // Never wrap: an add that would overflow u64 is refused with no
+                // mutation, the mirror of the debit path's never-negative guard.
+                let Some(next) = current.checked_add(amount_sats) else {
+                    return Ok(CreditOutcome::Overflow { remaining: current });
+                };
+
+                balance.insert(BALANCE_KEY, &next.to_be_bytes())?;
+
+                // The credit row reuses the PerformedRecord shape (it is the only
+                // serde row type in this db) recorded as a credit marker: cost_sats = 0
+                // (a credit costs nothing), the post-credit balance, and a
+                // `credit-verified` proof marker. It lives in `credit_ledger`, never the
+                // debit `ledger`.
+                let rec = PerformedRecord {
+                    cost_sats: 0,
+                    treasury_remaining_after: next,
+                    proof: b"credit-verified".to_vec(),
+                    completion: Vec::new(),
+                    memory: Vec::new(),
+                    request_hash: Vec::new(),
+                };
+                let rec_bytes = serde_json::to_vec(&rec)
+                    .map_err(|e| abort(format!("encode credit record: {e}")))?;
+                credit_ledger.insert(key_bytes.as_slice(), rec_bytes)?;
+
+                Ok(CreditOutcome::Credited {
+                    amount_sats,
+                    remaining: next,
+                })
+            },
+        );
+
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(TransactionError::Abort(msg)) => return Err(TreasuryError::Corrupt(msg)),
+            Err(TransactionError::Storage(e)) => return Err(TreasuryError::Storage(e)),
+        };
+
+        // Durability: flush so a crash after a credit cannot lose it, exactly as
+        // the debit paths do.
+        self.inner.db.flush()?;
+        Ok(outcome)
+    }
 }
 
 /// The result of a `debit_and_record` attempt.
@@ -354,6 +482,20 @@ pub enum DebitOutcome {
     Duplicate(PerformedRecord),
     /// The debit would have driven the balance below zero; refused, no mutation.
     Insufficient { remaining: u64 },
+}
+
+/// The result of a `credit_verified` attempt. The mirror of `DebitOutcome`:
+/// `Credited` raised the balance, `Duplicate` is the no-double-credit no-op
+/// (this `credit_id` was already credited), and `Overflow` is the never-wrap
+/// refusal (an add that would exceed u64::MAX, with no mutation).
+pub enum CreditOutcome {
+    /// Credited successfully; the balance is now `remaining`.
+    Credited { amount_sats: u64, remaining: u64 },
+    /// This `credit_id` was already credited (re-delivered settlement or a
+    /// restart mid-verify); no credit happened. Carries the stored record.
+    Duplicate(PerformedRecord),
+    /// The credit would have overflowed u64; refused, no mutation.
+    Overflow { remaining: u64 },
 }
 
 /// Abort a sled transaction with a corruption message (host-side fault).

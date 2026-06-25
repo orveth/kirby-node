@@ -12,7 +12,7 @@ use std::sync::Arc;
 use kirby_node::checkpoint::{checkpoint_ref, CheckpointArtifact};
 use kirby_node::gateway::{GatewayService, Session};
 use kirby_node::rail::MockRail;
-use kirby_node::treasury::Treasury;
+use kirby_node::treasury::{CreditOutcome, Treasury};
 // The async RPC methods (get_session_context, get_entropy_nonce, report_event,
 // request_capability) are trait methods; bring the trait into scope to call
 // them on the service directly (the in-process tonic test calls them via the
@@ -241,13 +241,16 @@ async fn get_session_context_carries_restore_checkpoint() {
     assert_eq!(ctx.restore_checkpoint_blob, checkpoint.payload);
 }
 
-/// G3b (inspection, encoded as a property): the treasury type exposes exactly
-/// one mutation, a debit that only subtracts. This test exercises that there is
-/// no "credit" or "set" by attempting every public capability path and showing
-/// the balance can only fall. An authorized spend lowers
-/// the balance by exactly the cost and never raises it.
+/// G3b (inspection, encoded as a property): no GENOME-REACHABLE path credits the
+/// treasury. Every path reachable through a `CapabilityRequest` leaves the balance
+/// equal or lower; an authorized spend lowers it by exactly the cost and never
+/// raises it, and a duplicate key cannot be used to "top up". The treasury now has
+/// exactly one path that RAISES the balance -- the daemon-private `credit_verified`
+/// -- but it is NOT reachable from any gateway/genome path, so the genome-facing
+/// invariant ("the genome cannot mint life") is unchanged. The daemon-only credit
+/// path is covered by `credit_is_only_via_host_verified_settlement` below.
 #[tokio::test]
-async fn g3b_debit_is_the_only_mutation_and_only_subtracts() {
+async fn g3b_no_genome_reachable_path_credits_only_daemon_credit_raises() {
     let (svc, rail) = gateway_with(1000, MockRail::new());
     assert_eq!(svc.treasury_remaining().unwrap(), 1000);
 
@@ -269,6 +272,67 @@ async fn g3b_debit_is_the_only_mutation_and_only_subtracts() {
     let r2 = svc.authorize_capability(&settle_req("b", 200, 200)).await.unwrap();
     assert_eq!(r2.outcome, Outcome::AuthorizedAndPerformed as i32);
     assert_eq!(svc.treasury_remaining().unwrap(), 500);
+}
+
+/// The daemon-only credit path: `credit_verified` is the ONE method that raises
+/// the balance, it credits by exactly the verified amount, it is idempotent on
+/// `credit_id` (no double-credit on a re-delivered settlement or a restart
+/// mid-verify), and it never wraps on overflow. Driven directly on `Treasury`
+/// because that is the call site: only daemon-side settlement-verification code
+/// calls it, never a gateway RPC (the no-genome-credit property is proven by
+/// `g3b_no_genome_reachable_path_credits_only_daemon_credit_raises` and the
+/// `g3b_no_gateway_method_increases_treasury` fuzz, which drive the genome surface).
+#[test]
+fn credit_is_only_via_host_verified_settlement() {
+    let t = Treasury::open_temporary(1_000).expect("open temporary treasury");
+    assert_eq!(t.remaining().unwrap(), 1_000);
+
+    // (b) a verified settlement credits by EXACTLY the amount.
+    match t.credit_verified("charge-1", 250).unwrap() {
+        CreditOutcome::Credited { amount_sats, remaining } => {
+            assert_eq!(amount_sats, 250);
+            assert_eq!(remaining, 1_250);
+        }
+        _ => panic!("first credit must be Credited"),
+    }
+    assert_eq!(t.remaining().unwrap(), 1_250);
+
+    // (c) DEDUPE: a second credit with the SAME id is a no-op (no double-credit).
+    match t.credit_verified("charge-1", 250).unwrap() {
+        CreditOutcome::Duplicate(rec) => {
+            // The stored row reflects the original credit, not a second one.
+            assert_eq!(rec.treasury_remaining_after, 1_250);
+        }
+        _ => panic!("re-crediting the same id must be Duplicate"),
+    }
+    assert_eq!(t.remaining().unwrap(), 1_250, "a duplicate credit must not raise the balance");
+
+    // Dedupe is PER-id: a distinct settlement still credits.
+    match t.credit_verified("charge-2", 50).unwrap() {
+        CreditOutcome::Credited { amount_sats, remaining } => {
+            assert_eq!(amount_sats, 50);
+            assert_eq!(remaining, 1_300);
+        }
+        _ => panic!("a distinct credit_id must credit"),
+    }
+    assert_eq!(t.remaining().unwrap(), 1_300);
+
+    // STRUCTURAL DISJOINTNESS: credit rows live in their OWN tree, not the debit
+    // `ledger`. The debit-side lookup never sees a credit (so a genome cannot grief a
+    // settlement by pre-claiming a colliding idempotency_key), and the `mem-write-`
+    // wseq scan never sees one either. Both queries over the debit ledger come back
+    // empty for credit ids.
+    assert!(t.lookup("charge-1").unwrap().is_none(), "a credit must NOT appear in the debit ledger");
+    assert!(t.lookup("credit-charge-1").unwrap().is_none(), "no `credit-`-prefixed debit row exists either");
+    assert_eq!(t.max_idempotency_seq("mem-write-").unwrap(), None);
+
+    // (overflow) an add that would exceed u64::MAX is REFUSED with no mutation.
+    let big = Treasury::open_temporary(u64::MAX - 10).expect("open near-max treasury");
+    match big.credit_verified("charge-overflow", 100).unwrap() {
+        CreditOutcome::Overflow { remaining } => assert_eq!(remaining, u64::MAX - 10),
+        _ => panic!("an overflowing credit must be Overflow"),
+    }
+    assert_eq!(big.remaining().unwrap(), u64::MAX - 10, "an overflow credit must not wrap the balance");
 }
 
 // ---- G3c: self-reported numbers are never billed ----
