@@ -45,6 +45,7 @@
 //! `authorize_actuate` reserve-before-publish ordering is unchanged by this slice).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use anyhow::Context as _;
@@ -229,6 +230,15 @@ pub struct QuorumSigner {
     /// The group taproot output key Q as 32 x-only bytes (= `hex(Q)` is the event
     /// pubkey). Derived once at construction.
     q_bytes: [u8; 32],
+    /// A MONOTONIC per-ceremony session-id counter. Each `sign_nostr_event*` call
+    /// takes the next value (`fetch_add(1)`) as its FROST `session_id`, so two
+    /// ceremonies NEVER collide -- even when they start in the same second (a beacon
+    /// burst at startup: presence + `born` lifecycle + the metered 31000 emitter).
+    /// Deriving the session id from `created_at` (seconds) tripped the holder's
+    /// nonce-reuse guard on same-second ceremonies -> a fail-closed LOST publish.
+    /// The guard itself stays intact: a genuine double-use of ONE session id still
+    /// refuses; this just guarantees distinct ceremonies get distinct ids.
+    next_session: AtomicU64,
 }
 
 impl QuorumSigner {
@@ -245,6 +255,7 @@ impl QuorumSigner {
             holders,
             pubkeys,
             q_bytes,
+            next_session: AtomicU64::new(0),
         })
     }
 
@@ -369,11 +380,17 @@ impl QuorumSigner {
         }
 
         // A per-ceremony session id: each participating holder stores its own nonce
-        // under this id in `commit` and removes+drops it in `validate_and_sign`. Use
-        // the host clock; if two ceremonies share a second the holder's own
-        // contains-key guard refuses the second commit (a clobber would strand a live
-        // nonce). No `SigningNonces` is ever held by the QuorumSigner.
-        let session_id = created_at;
+        // under this id in `commit` and removes+drops it in `validate_and_sign`. It is
+        // a MONOTONIC counter (NOT `created_at`): two ceremonies that start in the same
+        // second would otherwise share a session id and the holder's nonce-reuse guard
+        // would fail-close the second one (a clobber would strand a live nonce) -> a
+        // LOST publish. Same-second concurrent beacons are realistic at startup
+        // (presence + `born` + the 31000 emitter), so distinct ceremonies MUST get
+        // distinct session ids while the guard stays meaningful (a genuine double-use
+        // of one id still refuses). The published event's `created_at` is unchanged --
+        // only this internal ceremony id differs. No `SigningNonces` is ever held by
+        // the QuorumSigner.
+        let session_id = self.next_session.fetch_add(1, Ordering::Relaxed);
 
         // 4a. Round 1: each participating holder GENERATES + STORES its OWN fresh
         //     single-use nonce and returns ONLY its public commitment (the secret nonce
@@ -750,5 +767,72 @@ mod tests {
             );
         }
         println!("G-QUORUM-ALL-PAIRS-SIGN PASS: {{1,2}} {{1,3}} {{2,3}} each co-sign valid-under-Q (no privileged holder)");
+    }
+
+    /// G-SAME-SECOND-BEACONS-DONT-COLLIDE: two ceremonies that share a wall-clock
+    /// second (the same `created_at`) BOTH succeed and produce valid-under-Q events.
+    /// Regression guard for the availability bug where the session id was derived from
+    /// `created_at` (seconds): same-second beacons collided on the holder's nonce-reuse
+    /// guard and one fail-closed -> a LOST presence/lifecycle/agent-state publish.
+    /// Realistic at startup: presence + `born` lifecycle + the 31000 emitter all fire
+    /// near the same instant. The monotonic per-ceremony session counter makes the two
+    /// ceremonies use DISTINCT session ids, so neither trips the guard.
+    #[test]
+    fn g_same_second_beacons_dont_collide() {
+        let (ks, qs) = signer();
+
+        // Two beacons in the SAME second: presence (10100) then lifecycle (9100), both
+        // at CREATED_AT, exercising distinct kinds + content but an identical timestamp.
+        let presence = qs
+            .sign_nostr_event_with_tags(
+                KIND_KIRBY_PRESENCE,
+                CREATED_AT,
+                &[],
+                "{\"status\":\"online\"}",
+            )
+            .expect("first same-second beacon must sign");
+        let lifecycle = qs
+            .sign_nostr_event_with_tags(
+                KIND_KIRBY_LIFECYCLE,
+                CREATED_AT,
+                &[],
+                "{\"event\":\"born\"}",
+            )
+            .expect("second same-second beacon must ALSO sign (no collision)");
+
+        // Both carry the real timestamp unchanged (only the internal session id differs).
+        assert_eq!(presence.created_at, CREATED_AT);
+        assert_eq!(lifecycle.created_at, CREATED_AT);
+        assert_eq!(presence.kind, KIND_KIRBY_PRESENCE);
+        assert_eq!(lifecycle.kind, KIND_KIRBY_LIFECYCLE);
+
+        // Both verify as real BIP-340 sigs over their NIP-01 id under the tweaked Q.
+        let (_addr, internal_p) =
+            taproot_address(&ks.pubkeys, KnownHrp::Testnets).expect("address");
+        let secp = Secp256k1::verification_only();
+        let (q_tweaked, _parity) = internal_p.tap_tweak(&secp, None);
+        let q_xonly = q_tweaked.to_x_only_public_key();
+
+        for (ev, content) in [
+            (&presence, "{\"status\":\"online\"}"),
+            (&lifecycle, "{\"event\":\"born\"}"),
+        ] {
+            let id = nip01_event_id_with_tags(
+                &hex::encode(qs.q_bytes()),
+                ev.created_at,
+                ev.kind,
+                &[],
+                content,
+            );
+            assert_eq!(ev.id, hex::encode(id), "event id must be the NIP-01 id under Q");
+            let sig =
+                schnorr::Signature::from_slice(&hex::decode(&ev.sig).unwrap()).expect("parse sig");
+            assert!(
+                secp.verify_schnorr(&sig, &Message::from_digest(id), &q_xonly).is_ok(),
+                "same-second beacon kind {} must verify under Q",
+                ev.kind
+            );
+        }
+        println!("G-SAME-SECOND-BEACONS-DONT-COLLIDE PASS: two beacons sharing created_at BOTH sign + verify under Q (no nonce-reuse collision)");
     }
 }
