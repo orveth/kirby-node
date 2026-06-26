@@ -410,8 +410,10 @@ impl QuorumSigner {
 
         let mut last_err: Option<anyhow::Error> = None;
         for subset in &subsets {
-            let participants: Vec<&Box<dyn Holder>> =
-                subset.iter().map(|&i| &self.holders[i]).collect();
+            // `&dyn Holder` (deref the box) so the helper takes a `&[&dyn Holder]` -- the
+            // ceremony does not care whether a holder is co-located or remote.
+            let participants: Vec<&dyn Holder> =
+                subset.iter().map(|&i| self.holders[i].as_ref()).collect();
             match self.try_subset_ceremony(&participants, &event_id, &intent) {
                 Ok(sig) => {
                     // Assemble the finished event: pubkey = hex(Q), the signed content
@@ -486,7 +488,7 @@ impl QuorumSigner {
     /// membrane re-validates kind/content/id-over-tags per holder per attempt independently.
     fn try_subset_ceremony(
         &self,
-        participants: &[&Box<dyn Holder>],
+        participants: &[&dyn Holder],
         event_id: &[u8; 32],
         intent: &SignIntent,
     ) -> anyhow::Result<[u8; 64]> {
