@@ -969,4 +969,351 @@ mod tests {
         }
         println!("G-SAME-SECOND-BEACONS-DONT-COLLIDE PASS: two beacons sharing created_at BOTH sign + verify under Q (no nonce-reuse collision)");
     }
+
+    // ------------------------------------------------------------------------------------
+    // ANY-AVAILABLE-2-of-3 SELECTION + FALLBACK (cross-machine FROST keyset chunk 2) TEETH.
+    // ------------------------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Arc;
+
+    /// A configurable `Holder` test double wrapping a real `LocalHolder`. When healthy it
+    /// produces real commitments + shares (so a quorum it is part of yields a Q-valid
+    /// aggregate); when told to fail it returns `Err` from `commit` and/or
+    /// `validate_and_sign` -- modeling an unreachable/refusing remote holder (a remote
+    /// timeout and a refusal both surface as `Err` to the QuorumSigner, exactly what this
+    /// double simulates). It also RECORDS every `session_id` it is asked to commit, so a
+    /// test can assert no session id is reused across fallback attempts.
+    struct FlakyHolder {
+        inner: LocalHolder,
+        fail_commit: AtomicBool,
+        fail_sign: AtomicBool,
+        /// Every session id this holder was asked to `commit` (in call order), so a test
+        /// can assert strictly distinct ids across fallback attempts.
+        committed_sessions: Arc<Mutex<Vec<u64>>>,
+        /// How many times `commit` was called (proves a fallback actually re-attempted).
+        commit_calls: Arc<AtomicUsize>,
+    }
+
+    impl FlakyHolder {
+        fn new(inner: LocalHolder) -> Self {
+            Self {
+                inner,
+                fail_commit: AtomicBool::new(false),
+                fail_sign: AtomicBool::new(false),
+                committed_sessions: Arc::new(Mutex::new(Vec::new())),
+                commit_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+        fn failing_commit(inner: LocalHolder) -> Self {
+            let h = Self::new(inner);
+            h.fail_commit.store(true, Ordering::Relaxed);
+            h
+        }
+        fn failing_sign(inner: LocalHolder) -> Self {
+            let h = Self::new(inner);
+            h.fail_sign.store(true, Ordering::Relaxed);
+            h
+        }
+        fn sessions_handle(&self) -> Arc<Mutex<Vec<u64>>> {
+            Arc::clone(&self.committed_sessions)
+        }
+        fn commit_calls_handle(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.commit_calls)
+        }
+    }
+
+    impl Holder for FlakyHolder {
+        fn id(&self) -> u16 {
+            self.inner.id()
+        }
+        fn commit(&self, session_id: u64) -> anyhow::Result<SigningCommitments> {
+            self.commit_calls.fetch_add(1, Ordering::Relaxed);
+            self.committed_sessions
+                .lock()
+                .expect("sessions lock")
+                .push(session_id);
+            if self.fail_commit.load(Ordering::Relaxed) {
+                anyhow::bail!("FlakyHolder {} simulated commit failure (unreachable)", self.id());
+            }
+            // Healthy: produce a REAL commitment (stores the real nonce internally).
+            self.inner.commit(session_id)
+        }
+        fn validate_and_sign(
+            &self,
+            session_id: u64,
+            req: &CoSignRequest,
+            package: &SigningPackage,
+        ) -> Result<SignatureShare, RefuseReason> {
+            if self.fail_sign.load(Ordering::Relaxed) {
+                // A refusal surfaces as Err exactly like a remote timeout would.
+                return Err(RefuseReason::BadKeyset);
+            }
+            self.inner.validate_and_sign(session_id, req, package)
+        }
+    }
+
+    /// Independent BIP-340-under-Q verification of a finished event (re-derives Q from the
+    /// keyset, never trusts the signer's own view). Returns true iff the aggregate verifies.
+    fn event_verifies_under_q(event: &NostrEvent, ks: &kirby_custody::DealerKeyset) -> bool {
+        let (_addr, internal_p) =
+            taproot_address(&ks.pubkeys, KnownHrp::Testnets).expect("address");
+        let secp = Secp256k1::verification_only();
+        let (q_tweaked, _parity) = internal_p.tap_tweak(&secp, None);
+        let q_xonly = q_tweaked.to_x_only_public_key();
+        let id = nip01_event_id_with_tags(&event.pubkey, event.created_at, event.kind, &event.tags, &event.content);
+        let Ok(sig_bytes) = hex::decode(&event.sig) else { return false };
+        let Ok(sig) = schnorr::Signature::from_slice(&sig_bytes) else { return false };
+        secp.verify_schnorr(&sig, &Message::from_digest(id), &q_xonly).is_ok()
+    }
+
+    /// Build three FlakyHolders (identifiers 1,2,3) over a fresh keyset, ALL healthy by
+    /// default. Returns the keyset + the three holders (the caller flips failure flags and
+    /// grabs the recording handles BEFORE moving them into a QuorumSigner).
+    fn three_flaky(ks: &kirby_custody::DealerKeyset) -> Vec<FlakyHolder> {
+        let kps = kirby_custody::key_packages(ks).expect("key packages");
+        // BTreeMap iteration is identifier-ordered (1,2,3).
+        kps.into_values()
+            .map(|kp| FlakyHolder::new(LocalHolder::new(kp, ks.pubkeys.clone())))
+            .collect()
+    }
+
+    /// QUORUM-SUBSETS-ENUMERATION: the 2-of-3 subsets are exactly {0,1},{0,2},{1,2} in that
+    /// order, and the FIRST is the first-MIN_SIGNERS set (the all-healthy invariant root).
+    #[test]
+    fn quorum_subsets_enumerates_first_min_signers_first() {
+        let subsets = quorum_subsets(3, MIN_SIGNERS as usize);
+        assert_eq!(
+            subsets,
+            vec![vec![0, 1], vec![0, 2], vec![1, 2]],
+            "2-of-3 subsets must be {{0,1}},{{0,2}},{{1,2}} in lexicographic order"
+        );
+        assert_eq!(
+            subsets[0],
+            (0..MIN_SIGNERS as usize).collect::<Vec<_>>(),
+            "the FIRST subset must be the first-MIN_SIGNERS set (all-healthy byte-identical invariant)"
+        );
+        // Degenerate guards: t==0 or t>n yield no subsets (the caller has guarded n>=t).
+        assert!(quorum_subsets(3, 0).is_empty(), "t==0 -> no subsets");
+        assert!(quorum_subsets(1, 2).is_empty(), "t>n -> no subsets");
+        // A 4-holder pool still lists [0,1] first, then the rest in lex order.
+        assert_eq!(quorum_subsets(4, 2)[0], vec![0, 1]);
+        println!("QUORUM-SUBSETS-ENUMERATION PASS: 2-of-3 = {{0,1}},{{0,2}},{{1,2}}; first = first-MIN_SIGNERS");
+    }
+
+    /// ONE-UNAVAILABLE-FALLS-BACK: exactly one holder is unreachable -> the ceremony
+    /// SUCCEEDS via an alternate 2-of-3 subset, and the resulting signature VERIFIES under
+    /// Q (real signature verification, not just `is_ok()`). Holder at index 1 fails its
+    /// commit, so the first subset {0,1} is abandoned and the signer falls back to {0,2}
+    /// (both healthy) which completes.
+    #[test]
+    fn one_unavailable_falls_back() {
+        let ks = keyset();
+        let mut flaky = three_flaky(&ks);
+        // Make holder index 1 unreachable (fails commit). Indices 0 and 2 stay healthy.
+        flaky[1] = FlakyHolder::failing_commit(LocalHolder::new(
+            kirby_custody::key_packages(&ks)
+                .expect("kps")
+                .into_values()
+                .nth(1)
+                .expect("second kp"),
+            ks.pubkeys.clone(),
+        ));
+
+        let holders: Vec<Box<dyn Holder>> =
+            flaky.into_iter().map(|h| Box::new(h) as Box<dyn Holder>).collect();
+        let qs = QuorumSigner::new(holders, ks.pubkeys.clone()).expect("build flaky signer");
+
+        let event = qs
+            .sign_nostr_event(1, CREATED_AT, CONTENT)
+            .expect("one unavailable holder must fall back to a reachable 2-of-3 subset");
+        assert!(
+            event_verifies_under_q(&event, &ks),
+            "the fallback subset's aggregate must verify under Q (real BIP-340 verification)"
+        );
+        let expect_id = nip01_event_id(&hex::encode(qs.q_bytes()), CREATED_AT, 1, CONTENT);
+        assert_eq!(event.id, hex::encode(expect_id), "id is the NIP-01 id under Q");
+        println!("ONE-UNAVAILABLE-FALLS-BACK PASS: holder 2 unreachable -> ceremony completes via {{1,3}}, sig verifies under Q");
+    }
+
+    /// ONE-UNAVAILABLE-FALLS-BACK (sign-side): the same availability boundary when the
+    /// unreachable holder fails at ROUND 2 (validate_and_sign) rather than commit -- the
+    /// ceremony still falls back and produces a Q-valid signature. Proves fallback triggers
+    /// on a round-2 holder Err too, not just a round-1 one.
+    #[test]
+    fn one_unavailable_at_sign_falls_back() {
+        let ks = keyset();
+        let mut flaky = three_flaky(&ks);
+        flaky[1] = FlakyHolder::failing_sign(LocalHolder::new(
+            kirby_custody::key_packages(&ks)
+                .expect("kps")
+                .into_values()
+                .nth(1)
+                .expect("second kp"),
+            ks.pubkeys.clone(),
+        ));
+        let holders: Vec<Box<dyn Holder>> =
+            flaky.into_iter().map(|h| Box::new(h) as Box<dyn Holder>).collect();
+        let qs = QuorumSigner::new(holders, ks.pubkeys.clone()).expect("build flaky signer");
+
+        let event = qs
+            .sign_nostr_event(1, CREATED_AT, CONTENT)
+            .expect("a round-2 holder failure must fall back to a reachable subset");
+        assert!(
+            event_verifies_under_q(&event, &ks),
+            "the fallback subset's aggregate must verify under Q after a round-2 failure"
+        );
+        println!("ONE-UNAVAILABLE-AT-SIGN-FALLS-BACK PASS: holder 2 refuses round 2 -> fall back to {{1,3}}, sig verifies under Q");
+    }
+
+    /// TWO-UNAVAILABLE-FAILS-CLEAN: two holders are unreachable -> the ceremony returns
+    /// `Err`, emits NO signature, does not panic, does not hang. Holders at indices 1 and 2
+    /// fail commit; every 2-of-3 subset ({0,1},{0,2},{1,2}) contains at least one of them,
+    /// so none can complete and the signer fails cleanly.
+    #[test]
+    fn two_unavailable_fails_clean() {
+        let ks = keyset();
+        let kps: Vec<KeyPackage> = kirby_custody::key_packages(&ks)
+            .expect("kps")
+            .into_values()
+            .collect();
+        let h0 = FlakyHolder::new(LocalHolder::new(kps[0].clone(), ks.pubkeys.clone()));
+        let h1 = FlakyHolder::failing_commit(LocalHolder::new(kps[1].clone(), ks.pubkeys.clone()));
+        let h2 = FlakyHolder::failing_commit(LocalHolder::new(kps[2].clone(), ks.pubkeys.clone()));
+        let holders: Vec<Box<dyn Holder>> =
+            vec![Box::new(h0), Box::new(h1), Box::new(h2)];
+        let qs = QuorumSigner::new(holders, ks.pubkeys.clone()).expect("build signer");
+
+        let res = qs.sign_nostr_event(1, CREATED_AT, CONTENT);
+        assert!(
+            res.is_err(),
+            "two unavailable holders leave no completable 2-of-3 subset -> must fail, got {res:?}"
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("no available") && msg.contains("NO signature"),
+            "the clean failure must say no subset completed + NO signature emitted: {msg}"
+        );
+        println!("TWO-UNAVAILABLE-FAILS-CLEAN PASS: two holders unreachable -> clean Err, no signature, no panic, no hang");
+    }
+
+    /// FRESH-SESSION-PER-ATTEMPT: no session id is reused across fallback attempts. A
+    /// recording healthy holder (index 0) is part of BOTH the abandoned subset {0,1} and
+    /// the successful subset {0,2}; it observes STRICTLY DISTINCT session ids across the two
+    /// attempts (and is asked to commit more than once, proving a real fallback happened).
+    /// Reusing a session id would trip the holder nonce-reuse guard AND is the cardinal
+    /// FROST sin; this proves the fallback never does it.
+    #[test]
+    fn fresh_session_per_attempt() {
+        let ks = keyset();
+        let kps: Vec<KeyPackage> = kirby_custody::key_packages(&ks)
+            .expect("kps")
+            .into_values()
+            .collect();
+        // Index 0: a healthy RECORDING holder (in both {0,1} and {0,2}).
+        let h0 = FlakyHolder::new(LocalHolder::new(kps[0].clone(), ks.pubkeys.clone()));
+        let sessions = h0.sessions_handle();
+        let commit_calls = h0.commit_calls_handle();
+        // Index 1: fails commit -> the first subset {0,1} is abandoned AFTER h0 commits.
+        let h1 = FlakyHolder::failing_commit(LocalHolder::new(kps[1].clone(), ks.pubkeys.clone()));
+        // Index 2: healthy -> the fallback subset {0,2} completes.
+        let h2 = FlakyHolder::new(LocalHolder::new(kps[2].clone(), ks.pubkeys.clone()));
+
+        let holders: Vec<Box<dyn Holder>> =
+            vec![Box::new(h0), Box::new(h1), Box::new(h2)];
+        let qs = QuorumSigner::new(holders, ks.pubkeys.clone()).expect("build signer");
+        let event = qs
+            .sign_nostr_event(1, CREATED_AT, CONTENT)
+            .expect("falls back to {0,2} and signs");
+        assert!(event_verifies_under_q(&event, &ks), "the fallback sig must verify under Q");
+
+        // The recording holder committed in MORE THAN ONE attempt (a real fallback), and
+        // every session id it saw is DISTINCT (no reuse across attempts).
+        let seen = sessions.lock().expect("sessions lock").clone();
+        assert!(
+            commit_calls.load(Ordering::Relaxed) >= 2 && seen.len() >= 2,
+            "the recording holder must have committed across at least two attempts; saw {seen:?}"
+        );
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "every per-attempt session id must be DISTINCT (no reuse across fallback); saw {seen:?}"
+        );
+        println!(
+            "FRESH-SESSION-PER-ATTEMPT PASS: recording holder saw distinct session ids {seen:?} across fallback attempts (no reuse)"
+        );
+    }
+
+    /// HAPPY-PATH-UNCHANGED: all holders healthy -> the FIRST subset {0,1} succeeds on the
+    /// first try, the sig verifies under Q, and NO fallback occurs. The recording holder is
+    /// asked to commit EXACTLY ONCE (a single attempt) under a single session id -- the
+    /// all-healthy path is the same one-ceremony shape as before this chunk.
+    #[test]
+    fn happy_path_unchanged() {
+        let ks = keyset();
+        let kps: Vec<KeyPackage> = kirby_custody::key_packages(&ks)
+            .expect("kps")
+            .into_values()
+            .collect();
+        let h0 = FlakyHolder::new(LocalHolder::new(kps[0].clone(), ks.pubkeys.clone()));
+        let sessions = h0.sessions_handle();
+        let commit_calls = h0.commit_calls_handle();
+        let h1 = FlakyHolder::new(LocalHolder::new(kps[1].clone(), ks.pubkeys.clone()));
+        let h2 = FlakyHolder::new(LocalHolder::new(kps[2].clone(), ks.pubkeys.clone()));
+
+        let holders: Vec<Box<dyn Holder>> =
+            vec![Box::new(h0), Box::new(h1), Box::new(h2)];
+        let qs = QuorumSigner::new(holders, ks.pubkeys.clone()).expect("build signer");
+        let event = qs.sign_nostr_event(1, CREATED_AT, CONTENT).expect("all-healthy signs");
+        assert!(event_verifies_under_q(&event, &ks), "the all-healthy sig must verify under Q");
+
+        // Exactly ONE attempt: the recording holder committed once (the first subset {0,1}
+        // succeeded; index 2 was never reached). The all-healthy first-subset invariant.
+        assert_eq!(
+            commit_calls.load(Ordering::Relaxed),
+            1,
+            "all-healthy must run exactly ONE ceremony (the first subset), no fallback"
+        );
+        let seen = sessions.lock().expect("sessions lock").clone();
+        assert_eq!(seen.len(), 1, "exactly one session id used (one attempt); saw {seen:?}");
+        // And holder index 2 (h2) was NEVER asked to commit (it is not in the first subset
+        // {0,1}); we assert this indirectly: only h0 + h1 participated. h2's absence is
+        // implied by h0's single commit + the {0,1}-first ordering proven separately.
+        println!("HAPPY-PATH-UNCHANGED PASS: all-healthy -> first subset {{1,2}} signs on the first try (one ceremony, one session id), sig verifies under Q");
+    }
+
+    /// NO-HONEST-QUORUM-STILL-FAILS (fallback must NOT mask a genuine policy refusal): if
+    /// no 2-of-3 subset has two SIGNING holders, the ceremony must STILL fail -- the
+    /// fallback must never fabricate a success out of subsets that each refuse. Holders at
+    /// indices 1 and 2 refuse at round 2 (a genuine guardian refusal, not a transport
+    /// flake); every subset contains at least one refuser, so no subset yields two shares.
+    #[test]
+    fn no_honest_quorum_still_fails() {
+        let ks = keyset();
+        let kps: Vec<KeyPackage> = kirby_custody::key_packages(&ks)
+            .expect("kps")
+            .into_values()
+            .collect();
+        let h0 = FlakyHolder::new(LocalHolder::new(kps[0].clone(), ks.pubkeys.clone()));
+        let h1 = FlakyHolder::failing_sign(LocalHolder::new(kps[1].clone(), ks.pubkeys.clone()));
+        let h2 = FlakyHolder::failing_sign(LocalHolder::new(kps[2].clone(), ks.pubkeys.clone()));
+        let holders: Vec<Box<dyn Holder>> =
+            vec![Box::new(h0), Box::new(h1), Box::new(h2)];
+        let qs = QuorumSigner::new(holders, ks.pubkeys.clone()).expect("build signer");
+
+        let res = qs.sign_nostr_event(1, CREATED_AT, CONTENT);
+        assert!(
+            res.is_err(),
+            "no subset has two signing holders -> the ceremony MUST fail (fallback must not mask refusals), got {res:?}"
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("no available") && msg.contains("NO signature"),
+            "the failure must be the clean no-subset-completed error, NO signature: {msg}"
+        );
+        println!("NO-HONEST-QUORUM-STILL-FAILS PASS: every subset has a refuser -> clean Err, fallback did NOT mask the refusals into a forged success");
+    }
 }
