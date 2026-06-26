@@ -146,14 +146,16 @@ impl MachineBinding for HostMachineBinding {
 
 /// Derive the 32-byte XChaCha key for a sink from the machine IKM, the per-sink salt, and
 /// the sink label (domain-separated). The derived key is returned in a zeroizing buffer.
-fn derive_key(ikm: &[u8], salt: &[u8], sink_label: &str) -> [u8; 32] {
+fn derive_key(ikm: &[u8], salt: &[u8], sink_label: &str) -> zeroize::Zeroizing<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
     let mut info = Vec::with_capacity(SEAL_INFO_PREFIX.len() + sink_label.len());
     info.extend_from_slice(SEAL_INFO_PREFIX);
     info.extend_from_slice(sink_label.as_bytes());
-    let mut okm = [0u8; 32];
+    // Zeroizing buffer: the derived key is wiped on drop, including this function-local
+    // copy (the return moves the buffer, so no un-zeroized [u8;32] stack copy is left).
+    let mut okm = zeroize::Zeroizing::new([0u8; 32]);
     // HKDF-Expand cannot fail for a 32-byte output (well under 255*HashLen).
-    hk.expand(&info, &mut okm).expect("HKDF expand 32 bytes");
+    hk.expand(&info, &mut *okm).expect("HKDF expand 32 bytes");
     okm
 }
 
@@ -181,9 +183,9 @@ pub fn seal<B: MachineBinding + ?Sized>(
     plaintext: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let ikm = binding.ikm(sink_dir).context("read machine binding for seal")?;
-    let mut key = derive_key(&ikm, salt, sink_label);
-    let cipher = XChaCha20Poly1305::new((&key).into());
-    key.zeroize();
+    let key = derive_key(&ikm, salt, sink_label);
+    let cipher = XChaCha20Poly1305::new((&*key).into());
+    drop(key); // Zeroizing: wipe the derived key now that the cipher holds its own copy.
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng); // 192-bit random, per-seal
     let aad = aad_for(sink_label);
     let ciphertext = cipher
@@ -217,9 +219,9 @@ pub fn unseal<B: MachineBinding + ?Sized>(
     let (nonce_bytes, ciphertext) = sealed.split_at(NONCE_LEN);
     let nonce = XNonce::from_slice(nonce_bytes);
     let ikm = binding.ikm(sink_dir).context("read machine binding for unseal")?;
-    let mut key = derive_key(&ikm, salt, sink_label);
-    let cipher = XChaCha20Poly1305::new((&key).into());
-    key.zeroize();
+    let key = derive_key(&ikm, salt, sink_label);
+    let cipher = XChaCha20Poly1305::new((&*key).into());
+    drop(key); // Zeroizing: wipe the derived key now that the cipher holds its own copy.
     let aad = aad_for(sink_label);
     cipher.decrypt(nonce, Payload { msg: ciphertext, aad: &aad }).map_err(|_| {
         anyhow::anyhow!(
