@@ -228,7 +228,10 @@ impl Holder for LocalHolder {
 /// the guardian membrane wired into every holder.
 pub struct QuorumSigner {
     /// The 3 share holders (any 2 form a quorum). Behind the [`Holder`] seam so S5/S6
-    /// swaps co-located holders for remote ones without changing `sign_nostr_event`.
+    /// swaps co-located holders for remote ones without changing `sign_nostr_event`. The
+    /// signer chooses an AVAILABLE 2-of-3 subset per call (any-available selection with
+    /// fallback; see `sign_nostr_event_with_tags` step 3), so one unreachable holder does
+    /// not kill a ceremony another reachable subset could complete.
     holders: Vec<Box<dyn Holder>>,
     /// The group public key package (the FROST verifying material): used to assemble
     /// the coordinator's view AND to aggregate the shares. Each holder ALSO carries
@@ -319,11 +322,19 @@ impl QuorumSigner {
     ///     strip structure), so beacon content is signed VERBATIM. The guardian membrane
     ///     enforces the same kind:1-only content policy independently per holder.
     ///
-    /// COST NOTE (S5/S6): this runs a full quorum ceremony PER beacon. For S3 the holders
-    /// are co-located in-process (sub-ms), so a per-presence-interval ceremony is fine.
-    /// When holders move off-box (S5/S6), a quorum ceremony on every presence beacon is
-    /// too expensive on the wire -- that lane MUST adopt a cheaper presence cadence or a
-    /// short-lived session sub-key delegated by Q. Do NOT build that here.
+    /// AVAILABILITY (S5/S6): the signer set is chosen by ANY-AVAILABLE-2-of-3 selection
+    /// with fallback (see step 3 + `try_subset_ceremony`). When every holder is reachable
+    /// the first subset tried is `holders[0..MIN_SIGNERS]`, so the all-healthy path is the
+    /// SAME ceremony as before; when a holder times out or refuses, the ceremony falls back
+    /// to another 2-of-3 subset and only fails when NO subset can complete. One unreachable
+    /// holder no longer kills a ceremony a different reachable subset could finish.
+    ///
+    /// COST NOTE (S5/S6): this still runs a full quorum ceremony PER beacon. For S3 the
+    /// holders are co-located in-process (sub-ms), so a per-presence-interval ceremony is
+    /// fine. When holders move off-box, a quorum ceremony on every presence beacon is too
+    /// expensive on the wire -- that lane MUST adopt a cheaper presence cadence or a
+    /// short-lived session sub-key delegated by Q. Do NOT build that here (it is the
+    /// deferred cost note, separate from this availability chunk).
     ///
     /// The guardian membrane independently re-checks kind, the (kind:1-only)
     /// content-canonicality, and the id-over-tags equality per holder (defense in depth),
@@ -359,86 +370,178 @@ impl QuorumSigner {
         let event_id =
             nip01_event_id_with_tags(&q_hex, created_at, kind, &signed_tags, &signed_content);
 
-        // 3. Pick the signer set: the FIRST `MIN_SIGNERS` holders.
+        // 3. ANY-AVAILABLE-t-of-n SELECTION + FALLBACK (S5/S6: replaces the old
+        //    "2-of-the-first-MIN_SIGNERS, abort on any refusal" stub). Enumerate the
+        //    MIN_SIGNERS-of-n holder subsets and try each one's FULL ceremony in turn. On
+        //    a holder error in EITHER round (a remote timeout OR a refusal both surface as
+        //    `Err`), ABANDON that subset and fall back to the next untried one. Succeed as
+        //    soon as any subset yields a Q-valid aggregate; fail cleanly only when NO
+        //    subset completes.
         //
-        //    S3 SIMPLIFICATION (known): this is "2-of-the-first-2", NOT "any available
-        //    2-of-3". The ceremony always uses `holders[0..MIN_SIGNERS]` and ABORTS on
-        //    any refusal or commit failure -- it does not fall back to a different
-        //    holder. That is fine for S3, where all 3 holders are co-located in this
-        //    process and always healthy. S5/S6 (remote holders that CAN be unavailable
-        //    or slow) MUST replace this with any-available-2-of-3 selection: try a
-        //    quorum, and on a holder timeout/refusal fall back to another subset +
-        //    retry, only failing when no 2-of-3 subset is reachable. Do NOT assume the
-        //    first MIN_SIGNERS are alive once holders are off-box.
+        //    ALL-HEALTHY INVARIANT (constraint: byte-for-byte same as the old path when
+        //    every holder is reachable): `quorum_subsets` lists the first-MIN_SIGNERS set
+        //    FIRST (it is the lexicographically smallest index combination,
+        //    `[0..MIN_SIGNERS]`). So when no holder fails, the FIRST subset tried is
+        //    exactly `holders.iter().take(MIN_SIGNERS)` and the ceremony is identical to
+        //    today's -- no feature flag, a strict generalization.
+        //
+        //    NO HANG: there are no async/wall-clock timeouts here. The `Holder` ops look
+        //    synchronous; a real remote holder's per-wire timeout lives INSIDE its
+        //    transport (it returns `Err` on timeout). We react to the `Err`, never block on
+        //    wall clock, so this loop terminates after at most `quorum_subsets.len()`
+        //    attempts.
         if self.holders.len() < MIN_SIGNERS as usize {
             anyhow::bail!(
                 "QuorumSigner has {} holders, need at least {MIN_SIGNERS} to form a quorum",
                 self.holders.len()
             );
         }
-        let participants: Vec<&Box<dyn Holder>> =
-            self.holders.iter().take(MIN_SIGNERS as usize).collect();
+        let subsets = quorum_subsets(self.holders.len(), MIN_SIGNERS as usize);
 
-        // The claimed signer set the membrane cross-checks against the package.
-        let signer_set: BTreeSet<u16> = participants.iter().map(|h| h.id()).collect();
-        if signer_set.len() < MIN_SIGNERS as usize {
-            // Two holders aliased to the same u16: refuse rather than form a
-            // degenerate quorum (mirrors the coordinator's dup-signer guard).
-            anyhow::bail!("quorum holders collapsed to fewer than {MIN_SIGNERS} distinct identifiers");
+        // The typed request intent + tags are the SAME for every attempt (only the per-
+        // attempt session id and signer_set differ); build the shared parts once and clone
+        // the per-attempt `CoSignRequest` inside the loop (the membrane needs an owned req).
+        let intent = SignIntent::NostrEvent {
+            kind,
+            created_at,
+            tags: signed_tags.clone(),
+            content: signed_content.clone(),
+        };
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for subset in &subsets {
+            let participants: Vec<&Box<dyn Holder>> =
+                subset.iter().map(|&i| &self.holders[i]).collect();
+            match self.try_subset_ceremony(&participants, &event_id, &intent) {
+                Ok(sig) => {
+                    // Assemble the finished event: pubkey = hex(Q), the signed content
+                    // (sanitized for kind:1, verbatim JSON for a beacon), the signed tags,
+                    // the aggregate sig, the id.
+                    return Ok(NostrEvent {
+                        id: hex::encode(event_id),
+                        pubkey: q_hex,
+                        created_at,
+                        kind,
+                        tags: signed_tags,
+                        content: signed_content,
+                        sig: hex::encode(sig),
+                    });
+                }
+                Err(e) => {
+                    // ABANDON this subset and fall back to the next. A stranded nonce from a
+                    // holder that DID commit in this failed attempt is left under that
+                    // attempt's session id; because session ids are never reused (the
+                    // monotonic counter) it can never be re-signed, so it is at worst a
+                    // bounded in-memory map entry on that holder (the documented-leak choice;
+                    // see `try_subset_ceremony`). No partial signature is ever emitted.
+                    let ids: Vec<u16> = participants.iter().map(|h| h.id()).collect();
+                    last_err = Some(e.context(format!(
+                        "quorum subset {ids:?} failed; trying the next reachable subset"
+                    )));
+                }
+            }
         }
 
-        // A per-ceremony session id: each participating holder stores its own nonce
-        // under this id in `commit` and removes+drops it in `validate_and_sign`. It is
-        // a MONOTONIC counter (NOT `created_at`): two ceremonies that start in the same
-        // second would otherwise share a session id and the holder's nonce-reuse guard
-        // would fail-close the second one (a clobber would strand a live nonce) -> a
-        // LOST publish. Same-second concurrent beacons are realistic at startup
-        // (presence + `born` + the 31000 emitter), so distinct ceremonies MUST get
-        // distinct session ids while the guard stays meaningful (a genuine double-use
-        // of one id still refuses). The published event's `created_at` is unchanged --
-        // only this internal ceremony id differs. No `SigningNonces` is ever held by
-        // the QuorumSigner.
+        // No MIN_SIGNERS-of-n subset completed: fail CLEANLY (no partial/forged signature,
+        // no hang, no panic). Surface the last subset's failure as the cause.
+        let detail = match last_err {
+            Some(e) => format!("{e:#}"),
+            None => "no quorum subset was available".to_string(),
+        };
+        anyhow::bail!(
+            "no available {MIN_SIGNERS}-of-{n} holder subset could complete the ceremony; \
+             NO signature emitted (last failure: {detail})",
+            n = self.holders.len()
+        );
+    }
+
+    /// Run ONE subset's full 2-of-3 ceremony: a FRESH session id, round-1 commit over the
+    /// subset, assemble the `SigningPackage`, the membrane + round-2 sign, and aggregate.
+    /// Returns the 64-byte BIP-340 aggregate signature on success, or an `Err` (which the
+    /// caller treats as "abandon this subset, fall back to the next").
+    ///
+    /// FRESH SESSION ID PER ATTEMPT (the cardinal FROST rule): the session id comes from
+    /// the monotonic `self.next_session.fetch_add` so it is DISTINCT from every other
+    /// attempt's. Never reused across attempts -> a holder that committed in a failed
+    /// attempt cannot have its single-use nonce re-signed (its nonce is stranded under that
+    /// old, never-to-recur session id). The published event's `created_at` is unchanged;
+    /// only this internal ceremony id differs.
+    ///
+    /// STRANDED-NONCE POLICY (documented bounded leak, NOT `Holder::release`): when this
+    /// attempt is abandoned, a holder that already committed keeps a single-use nonce in its
+    /// in-memory store keyed by this attempt's session id. That entry is harmless: the
+    /// session id is never reused, so the nonce can never be re-signed (zero nonce-reuse
+    /// risk), and it is bounded (at most one stranded nonce per committed holder per failed
+    /// attempt). We deliberately do NOT widen the `Holder` seam with a `release` op in this
+    /// chunk (that would touch the freshly-merged RemoteHolder wire format, which is out of
+    /// scope here); the leak is documented and bounded instead. A future chunk MAY add a
+    /// best-effort `release(session_id)` to drop the stranded nonce eagerly.
+    ///
+    /// RE-PORTED GUARDS PER ATTEMPT (the `feedback_new_entry_point_needs_input_guards`
+    /// lesson -- a guard must hold on EVERY attempt, not just the first): the dup-signer
+    /// distinct-identifier check runs HERE, inside the per-attempt helper, so a fallback
+    /// subset is checked too. The kind-restrict + kind:1 note-sanitizer guards ran once in
+    /// `sign_nostr_event_with_tags` and feed the SAME `event_id` + `intent` into every
+    /// attempt (so a dirty/wrong-kind event is rejected before ANY attempt). The guardian
+    /// membrane re-validates kind/content/id-over-tags per holder per attempt independently.
+    fn try_subset_ceremony(
+        &self,
+        participants: &[&Box<dyn Holder>],
+        event_id: &[u8; 32],
+        intent: &SignIntent,
+    ) -> anyhow::Result<[u8; 64]> {
+        // RE-PORT THE DUP-SIGNER GUARD (per attempt). The claimed signer set the membrane
+        // cross-checks against the package: two holders aliased to the same u16 would form a
+        // degenerate quorum (mirrors the coordinator's dup-signer guard + the
+        // QuorumSigner's old pre-ceremony check). Refuse rather than reuse a single-use
+        // nonce across an aliased identifier.
+        let signer_set: BTreeSet<u16> = participants.iter().map(|h| h.id()).collect();
+        if signer_set.len() < MIN_SIGNERS as usize {
+            anyhow::bail!(
+                "quorum holders collapsed to fewer than {MIN_SIGNERS} distinct identifiers"
+            );
+        }
+
+        // A FRESH per-attempt session id (see the doc comment): monotonic, never reused.
         let session_id = self.next_session.fetch_add(1, Ordering::Relaxed);
 
-        // 4a. Round 1: each participating holder GENERATES + STORES its OWN fresh
-        //     single-use nonce and returns ONLY its public commitment (the secret nonce
-        //     never crosses the seam -- the remote-readiness contract).
+        // Round 1: each participating holder GENERATES + STORES its OWN fresh single-use
+        // nonce and returns ONLY its public commitment (the secret nonce never crosses the
+        // seam -- the remote-readiness contract). A commit `Err` (a remote timeout or a
+        // refusal) propagates up -> the caller abandons this subset.
         let mut commitments: BTreeMap<Identifier, SigningCommitments> = BTreeMap::new();
-        for holder in &participants {
+        for holder in participants {
             let commitment = holder.commit(session_id).with_context(|| {
                 format!("holder {} round-1 commit (session {session_id})", holder.id())
             })?;
             // Recover the frost Identifier for the package map from the holder's u16.
             // The trusted-dealer identifiers are 1..=n, so u16 -> Identifier is exact.
-            let ident = Identifier::try_from(holder.id())
-                .map_err(|e| anyhow::anyhow!("holder id {} is not a valid FROST identifier: {e}", holder.id()))?;
+            let ident = Identifier::try_from(holder.id()).map_err(|e| {
+                anyhow::anyhow!("holder id {} is not a valid FROST identifier: {e}", holder.id())
+            })?;
             commitments.insert(ident, commitment);
         }
 
-        // 4b. Assemble exactly ONE SigningPackage over the event id.
-        let package = SigningPackage::new(commitments, &event_id);
+        // Assemble exactly ONE SigningPackage over the event id for this attempt.
+        let package = SigningPackage::new(commitments, event_id);
 
-        // 4c. THE MEMBRANE + round 2: each participating holder removes its own nonce,
-        //     validates, THEN signs. The QuorumSigner passes NO nonce -- the holder
-        //     looks up + drops its own (used-once). The typed request the membrane
-        //     re-reconstructs and equality-checks.
+        // THE MEMBRANE + round 2: each participating holder removes its own nonce,
+        // validates against its OWN pubkeys, THEN signs. The QuorumSigner passes NO nonce --
+        // the holder looks up + drops its own (used-once). A `validate_and_sign` `Err` (a
+        // remote timeout OR a guardian refusal) propagates up -> the caller abandons this
+        // subset. NO partial signature is ever emitted on the failure path.
         let req = CoSignRequest {
             session_id, // routing/dedupe only (not security-load-bearing)
-            intent: SignIntent::NostrEvent {
-                kind,
-                created_at,
-                tags: signed_tags.clone(),
-                content: signed_content.clone(),
-            },
+            intent: intent.clone(),
             signer_set: signer_set.clone(),
         };
         let mut shares: BTreeMap<Identifier, SignatureShare> = BTreeMap::new();
-        for holder in &participants {
+        for holder in participants {
             let share = holder
                 .validate_and_sign(session_id, &req, &package)
                 .map_err(|reason| {
                     anyhow::anyhow!(
-                        "holder {} REFUSED to co-sign ({reason:?}); ceremony aborted, NO signature emitted",
+                        "holder {} REFUSED to co-sign ({reason:?}); subset abandoned, NO signature emitted",
                         holder.id()
                     )
                 })?;
@@ -447,29 +550,52 @@ impl QuorumSigner {
             shares.insert(ident, share);
         }
 
-        // 5. Aggregate the tweaked shares -> the 64-byte BIP-340 signature under Q.
+        // Aggregate the tweaked shares -> the 64-byte BIP-340 signature under Q. (An
+        // aggregate failure also abandons this subset rather than emitting anything.)
         let group_sig = frost::aggregate_with_tweak(&package, &shares, &self.pubkeys, None)
             .map_err(|e| anyhow::anyhow!("aggregate FROST shares: {e}"))?;
         let sig_bytes = group_sig
             .serialize()
             .map_err(|e| anyhow::anyhow!("serialize aggregate signature: {e}"))?;
-        let sig: [u8; 64] = sig_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("expected a 64-byte BIP-340 signature, got {}", sig_bytes.len()))?;
-
-        // Assemble the finished event: pubkey = hex(Q), the signed content (sanitized for
-        // kind:1, verbatim JSON for a beacon), the signed tags, the aggregate sig, the id.
-        Ok(NostrEvent {
-            id: hex::encode(event_id),
-            pubkey: q_hex,
-            created_at,
-            kind,
-            tags: signed_tags,
-            content: signed_content,
-            sig: hex::encode(sig),
-        })
+        let sig: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!("expected a 64-byte BIP-340 signature, got {}", sig_bytes.len())
+        })?;
+        Ok(sig)
     }
+}
+
+/// Enumerate the `t`-of-`n` holder subsets as ASCENDING lists of holder INDICES, in
+/// lexicographic order. For n=3, t=2 this yields `[[0,1],[0,2],[1,2]]`.
+///
+/// THE ORDER IS LOAD-BEARING: the FIRST element is always `[0, 1, .., t-1]` (the
+/// first-`t` holders). The any-available selection tries subsets in this order, so when
+/// every holder is healthy the first attempt is exactly `holders.iter().take(t)` -- the
+/// SAME ceremony the old "2-of-the-first-MIN_SIGNERS" stub ran (the all-healthy
+/// byte-identical invariant). Fallback then walks the remaining subsets in a stable order.
+///
+/// Returns an empty vec if `t == 0` or `t > n` (the caller has already guarded `n >= t`).
+fn quorum_subsets(n: usize, t: usize) -> Vec<Vec<usize>> {
+    if t == 0 || t > n {
+        return Vec::new();
+    }
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    // `combo` holds the current ascending index selection; emit each complete one.
+    let mut combo: Vec<usize> = Vec::with_capacity(t);
+    fn recurse(start: usize, n: usize, t: usize, combo: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        if combo.len() == t {
+            out.push(combo.clone());
+            return;
+        }
+        // Stop early once too few indices remain to complete a `t`-set (keeps it minimal).
+        let need = t - combo.len();
+        for i in start..=n - need {
+            combo.push(i);
+            recurse(i + 1, n, t, combo, out);
+            combo.pop();
+        }
+    }
+    recurse(0, n, t, &mut combo, &mut out);
+    out
 }
 
 /// Is `kind` one the QuorumSigner will sign? The agent's PUBLIC Nostr output: the
