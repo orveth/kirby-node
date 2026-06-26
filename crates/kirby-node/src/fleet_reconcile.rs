@@ -287,6 +287,10 @@ impl TenantProcess for PidTenant {
             libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
         }
     }
+
+    fn pid(&self) -> Option<u32> {
+        Some(self.pid)
+    }
 }
 
 // ----------------------------------------------------------------------------------------
