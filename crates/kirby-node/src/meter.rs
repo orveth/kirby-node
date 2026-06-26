@@ -190,6 +190,21 @@ pub struct HostProcessMeterConfig {
     pub rates: BurnRates,
 }
 
+/// Configuration for ALLOCATION-based metering (chunk D pt.2). Bills the vCPU/memory
+/// RESERVATION as if fully utilized: CPU = `vcpu_count × elapsed`, memory = `mem_mib`
+/// cap. Used by the VZ backend, where the guest's real vCPU time is unmeterable.
+#[derive(Clone)]
+pub struct AllocationMeterConfig {
+    pub vcpu_count: u32,
+    pub mem_mib: usize,
+    /// Boot-time instant; `elapsed()` from here is the allocated-CPU-seconds clock.
+    pub start: std::time::Instant,
+    /// The sampling tick. The halt is accurate to one of these (spec section 11).
+    pub tick: Duration,
+    /// The synthetic burn rates (the SAME per-cpu-second rate as every source).
+    pub rates: BurnRates,
+}
+
 /// A handle the daemon polls each tick: it reads the host meter source, computes the
 /// per-tick burn, and debits the treasury. Held by the metered-run loop, which
 /// owns the VM-lifecycle transition to the terminal state on exhaustion.
@@ -229,6 +244,9 @@ enum MeterSampleSource {
     Cgroup(CgroupMeterSource),
     #[cfg(target_os = "macos")]
     HostProcess(HostProcessMeterSource),
+    /// ALLOCATION-based source (chunk D pt.2): bills the vCPU/memory RESERVATION as
+    /// if 100% utilized. Pure arithmetic, no syscalls, so not platform-gated.
+    Allocation(AllocationMeterSource),
     /// TEST-ONLY: a fixed in-memory sample source (no cgroup, no VZ host process), so the
     /// metered-run loop — and the diarist's rent=0 FLOOR-HALT — are exercisable in CI without
     /// a live VM. Never constructed in production (the variant is `cfg(test)`).
@@ -256,6 +274,36 @@ struct HostProcessMeterSource {
     /// frozen value contributes the exited pid's accumulated compute exactly once
     /// more and then never increases, so the total is monotonic across an exit.
     last_cpu_nsec_by_pid: std::collections::HashMap<u32, u64>,
+}
+
+/// ALLOCATION-based sample source (chunk D pt.2). Reports the guest's RESERVATION as
+/// cumulative consumption: CPU = `vcpu_count × elapsed-since-boot` (so the meter's
+/// delta-billing turns it into `vcpu_count × dt × rate` automatically — usage billing
+/// at 100% utilization), memory = the fixed `mem_mib` cap. Both are monotonic (CPU
+/// grows with wall-time, memory is constant), exactly what `tick_once`'s delta math
+/// expects. No syscalls: this is why a busy guest and an idle guest bill identically
+/// under VZ, where the guest's real vCPU time is invisible at the host.
+struct AllocationMeterSource {
+    vcpu_count: u32,
+    mem_bytes: u64,
+    start: std::time::Instant,
+}
+
+impl AllocationMeterSource {
+    /// The pure sample math, parameterized by elapsed time so it is deterministically
+    /// testable without a clock: cumulative CPU = `vcpu_count × elapsed_usec`,
+    /// memory = the fixed cap. Both monotonic in `elapsed`.
+    fn sample_at(&self, elapsed: Duration) -> MeterSample {
+        let cpu_usec = (self.vcpu_count as u64).saturating_mul(elapsed.as_micros() as u64);
+        MeterSample {
+            cpu_usec,
+            mem_bytes: self.mem_bytes,
+        }
+    }
+
+    fn sample(&self) -> MeterSample {
+        self.sample_at(self.start.elapsed())
+    }
 }
 
 struct MeterSample {
@@ -400,6 +448,46 @@ impl Meter {
             // Disabled by default; the metered run sets it for the diarist (set_halt_floor).
             halt_floor_sats: 0,
             last_cpu_usec: baseline.cpu_usec,
+            burned_sats: 0,
+            cpu_usec: 0,
+            ticks: 0,
+        })
+    }
+
+    /// Attach an ALLOCATION-based meter (chunk D pt.2). Bills the vCPU/memory
+    /// RESERVATION as if 100% utilized: CPU accrues as `vcpu_count × elapsed-since-
+    /// boot` fed into the SAME per-cpu-second [`BurnRates`], memory is the fixed cap.
+    /// Used by the VZ backend, where the guest's real vCPU time is structurally
+    /// invisible at the host. Pure arithmetic; available on every platform.
+    pub fn attach_allocation(
+        config: &AllocationMeterConfig,
+        treasury: Treasury,
+    ) -> Result<Self, MeterError> {
+        let mem_bytes = (config.mem_mib as u64).checked_mul(1024 * 1024).ok_or_else(|| {
+            MeterError::AllocationInvalid {
+                reason: format!("memory cap {} MiB overflows bytes", config.mem_mib),
+            }
+        })?;
+        let source = AllocationMeterSource {
+            vcpu_count: config.vcpu_count,
+            mem_bytes,
+            start: config.start,
+        };
+        // Seed the CPU baseline from the current elapsed so the first tick bills only
+        // post-attach allocated time (matches the cgroup/host-process attach semantics).
+        let baseline = source.sample();
+
+        Ok(Meter {
+            source: MeterSampleSource::Allocation(source),
+            treasury,
+            rates: config.rates,
+            tick: config.tick,
+            halt_floor_sats: 0,
+            last_cpu_usec: baseline.cpu_usec,
+            #[cfg(target_os = "linux")]
+            egress: None,
+            #[cfg(target_os = "linux")]
+            last_egress_bytes: 0,
             burned_sats: 0,
             cpu_usec: 0,
             ticks: 0,
@@ -557,6 +645,7 @@ impl MeterSampleSource {
             MeterSampleSource::Cgroup(source) => source.sample(),
             #[cfg(target_os = "macos")]
             MeterSampleSource::HostProcess(source) => source.sample(),
+            MeterSampleSource::Allocation(source) => Ok(source.sample()),
             #[cfg(test)]
             MeterSampleSource::Mock(source) => Ok(source.sample()),
         }
@@ -886,6 +975,8 @@ pub enum MeterError {
     #[cfg(target_os = "macos")]
     #[error("host-process meter source rooted at pid {root_pid} is unreadable: {reason}")]
     HostProcessUnreadable { root_pid: u32, reason: String },
+    #[error("allocation meter config invalid: {reason}")]
+    AllocationInvalid { reason: String },
     #[error(transparent)]
     Treasury(#[from] TreasuryError),
 }
@@ -1157,5 +1248,123 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    // ---- ALLOCATION-based metering teeth (chunk D pt.2) ----
+    //
+    // These replace the now-dead `g2_vz_busy_burns_more_than_idle` precision test
+    // (which asserted busy > idle — a now-impossible invariant, since allocation
+    // billing is utilization-blind BY DESIGN). They are DETERMINISTIC unit tests on
+    // `AllocationMeterSource::sample_at(elapsed)`: no VM, no clock, no flakiness.
+
+    /// (a) Same vcpu_count: cumulative CPU scales LINEARLY with elapsed, and equal
+    /// elapsed yields equal CPU — the "busy == idle by design" property (allocation
+    /// billing does not depend on what the guest actually did, only on wall-time).
+    #[test]
+    fn allocation_cpu_scales_linearly_with_elapsed() {
+        let source = AllocationMeterSource {
+            vcpu_count: 1,
+            mem_bytes: 128 * 1024 * 1024,
+            start: std::time::Instant::now(),
+        };
+
+        let s1 = source.sample_at(Duration::from_secs(1));
+        let s2 = source.sample_at(Duration::from_secs(2));
+        let s4 = source.sample_at(Duration::from_secs(4));
+
+        // 1 vCPU × elapsed_usec.
+        assert_eq!(s1.cpu_usec, 1_000_000);
+        assert_eq!(s2.cpu_usec, 2_000_000);
+        assert_eq!(s4.cpu_usec, 4_000_000);
+        // Linear: doubling elapsed doubles cumulative CPU.
+        assert_eq!(s2.cpu_usec, s1.cpu_usec * 2);
+        assert_eq!(s4.cpu_usec, s2.cpu_usec * 2);
+
+        // Equal elapsed → equal CPU regardless of anything else: busy == idle by design.
+        let again = source.sample_at(Duration::from_secs(2));
+        assert_eq!(
+            again.cpu_usec, s2.cpu_usec,
+            "allocation billing is utilization-blind: equal elapsed bills equal CPU"
+        );
+
+        // Memory is the fixed cap (allocation, not RSS), independent of elapsed.
+        assert_eq!(s1.mem_bytes, 128 * 1024 * 1024);
+        assert_eq!(s4.mem_bytes, 128 * 1024 * 1024);
+    }
+
+    /// (b) 2 vCPU samples ~2× the cpu_usec of 1 vCPU for the SAME elapsed: the bill
+    /// scales with the ALLOCATION (vcpu_count), not utilization.
+    #[test]
+    fn allocation_cpu_scales_with_vcpu_count() {
+        let one = AllocationMeterSource {
+            vcpu_count: 1,
+            mem_bytes: 0,
+            start: std::time::Instant::now(),
+        };
+        let two = AllocationMeterSource {
+            vcpu_count: 2,
+            mem_bytes: 0,
+            start: std::time::Instant::now(),
+        };
+
+        let elapsed = Duration::from_secs(3);
+        let c1 = one.sample_at(elapsed).cpu_usec;
+        let c2 = two.sample_at(elapsed).cpu_usec;
+
+        assert_eq!(c1, 3_000_000, "1 vCPU × 3s");
+        assert_eq!(c2, 6_000_000, "2 vCPU × 3s");
+        // The teeth: the 2-vCPU reservation bills EXACTLY 2× the 1-vCPU reservation
+        // for the same wall-time. Scaling factor = 2.
+        assert_eq!(
+            c2,
+            c1 * 2,
+            "2 vCPU must bill 2x a 1 vCPU allocation for the same elapsed (scales with ALLOCATION not utilization)"
+        );
+    }
+
+    /// The cumulative CPU fed to the meter is MONOTONIC in elapsed (never decreases),
+    /// so `tick_once`'s delta-billing (`saturating_sub`) yields a non-negative per-tick
+    /// burn — the same monotonicity contract every source upholds.
+    #[test]
+    fn allocation_cpu_is_monotonic_in_elapsed() {
+        let source = AllocationMeterSource {
+            vcpu_count: 2,
+            mem_bytes: 0,
+            start: std::time::Instant::now(),
+        };
+        let mut prev = 0u64;
+        for ms in [0u64, 50, 100, 250, 1000, 5000] {
+            let cur = source.sample_at(Duration::from_millis(ms)).cpu_usec;
+            assert!(cur >= prev, "cumulative CPU must not decrease: {cur} < {prev} at {ms}ms");
+            prev = cur;
+        }
+    }
+
+    /// End-to-end through the real per-tick burn math: a 1-vCPU allocation over one
+    /// tick's worth of elapsed produces the SAME per-tick burn as feeding the equivalent
+    /// cpu_delta to `burn_for_tick` directly — i.e. the allocation source plugs into the
+    /// existing delta-billing with NO new coefficient (it reuses cpu_sats_per_usec).
+    #[test]
+    fn allocation_feeds_existing_burn_math_no_new_coefficient() {
+        let rates = BurnRates {
+            cpu_sats_per_usec_num: 1,
+            cpu_sats_per_usec_den: 1,
+            mem_sats_per_mib_sec: 0,
+            egress_sats_per_byte_num: 0,
+            egress_sats_per_byte_den: 1,
+        };
+        // 2 vCPU over a 100ms tick = a cpu delta of 2 × 100_000 usec = 200_000 usec.
+        let source = AllocationMeterSource {
+            vcpu_count: 2,
+            mem_bytes: 0,
+            start: std::time::Instant::now(),
+        };
+        let t0 = source.sample_at(Duration::from_millis(0)).cpu_usec;
+        let t1 = source.sample_at(Duration::from_millis(100)).cpu_usec;
+        let cpu_delta = t1 - t0;
+        assert_eq!(cpu_delta, 200_000, "2 vCPU × 100ms = 200_000 usec");
+
+        let burn = rates.burn_for_tick(cpu_delta, 0, 0, Duration::from_millis(100));
+        assert_eq!(burn, 200_000, "reuses cpu_sats_per_usec (1/1); no new coefficient");
     }
 }

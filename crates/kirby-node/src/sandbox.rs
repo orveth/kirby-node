@@ -453,6 +453,20 @@ pub enum MeterSource {
         service_pids: Vec<u32>,
         memory_mib: usize,
     },
+    /// ALLOCATION-BASED metering (chunk D pt.2). A VZ guest's vCPU time is
+    /// structurally unmeterable on macOS (billed to Hypervisor.framework, invisible
+    /// to `proc_pid_rusage`; `task_for_pid` SIP-blocked), so we bill the RESERVATION,
+    /// not measured use: usage billing assuming 100% utilization. A pinned vCPU then
+    /// costs the same on VZ as on Firecracker at full load. This is pure arithmetic
+    /// (no platform syscalls), so it is NOT platform-gated. CPU is `vcpu_count ×
+    /// elapsed` (fed into the SAME per-cpu-second [`crate::meter::BurnRates`] as every
+    /// other source — no new coefficient); memory is allocation-billed as `mem_mib`
+    /// (the cap, not RSS), unchanged from `HostProcess`.
+    Allocation {
+        vcpu_count: u32,
+        mem_mib: usize,
+        start: std::time::Instant,
+    },
 }
 
 /// A booted genome guest: the per-instance handle the daemon drives. The backend

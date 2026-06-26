@@ -4,26 +4,29 @@
 //! This is the macOS-gated sibling of `metering_halt.rs` (the Linux/Firecracker G2
 //! test). On macOS the sandbox backend resolves to VZ (`backend = auto` →
 //! `default_backend()` selects Virtualization), and the host meter is the
-//! `HostProcessMeterSource`: it reads real guest CPU via `proc_pid_rusage` across
-//! the VZ helper + service-pid process trees (meter.rs:570-629). The Linux test
-//! reads cgroup `cpu.stat`; here the same metered-run entry drives the VZ backend
-//! and the proc_pid_rusage meter instead.
+//! ALLOCATION source (chunk D pt.2): a VZ guest's vCPU time is structurally
+//! unmeterable at the host (billed to Hypervisor.framework, invisible to
+//! `proc_pid_rusage`; `task_for_pid` SIP-blocked), so the meter bills the
+//! RESERVATION — `vcpu_count × elapsed × rate`, i.e. usage billing assuming 100%
+//! utilization — plus the memory cap. The Linux test reads cgroup `cpu.stat`; here
+//! the same metered-run entry drives the VZ backend and the allocation meter instead.
 //!
-//! WHY this test exists: the VZ meter is implemented, but nothing positively proved
-//! it has TEETH. This test boots a real burn genome under VZ with a small budget +
-//! short tick and asserts the G2 properties end-to-end:
+//! WHY this test exists: the VZ meter must have TEETH. This test boots a real burn
+//! genome under VZ with a small budget + short tick and asserts the G2 properties
+//! end-to-end:
 //!   - the VM ends in `Terminated::BudgetExhausted` (the daemon halted it);
 //!   - the kill was daemon-initiated (the genome burned until killed);
-//!   - metered burn is NON-ZERO (the proc_pid_rusage meter read real guest CPU);
+//!   - metered burn is NON-ZERO (the allocation meter accrued vcpu×elapsed + memory);
 //!   - conservation: burned + remaining == budget;
 //!   - the halt is accurate to ~one tick (treasury drained to ~0).
 //!
-//! It ALSO adds a busy-vs-idle precision signal (the "teeth" check the Linux test
-//! does not need, because cgroup accounting is exact): a burn run and an idle run
-//! over the SAME wall-time with the SAME large budget (so neither exhausts), then
-//! asserts the burn run billed measurably MORE than the idle run. If the meter
-//! under-counted guest CPU (e.g. only saw the helper, not the busy guest threads),
-//! busy ≈ idle and this assertion fails — exposing the undercounting gap.
+//! NOTE: the former `g2_vz_busy_burns_more_than_idle` precision test is RETIRED. It
+//! asserted busy > idle, a now-dead invariant: allocation billing is utilization-
+//! blind BY DESIGN (a pinned vCPU and an idle vCPU bill identically — that is the
+//! whole point of billing the reservation). The allocation TEETH now live as
+//! deterministic unit tests on `AllocationMeterSource::sample_at` in `meter.rs`
+//! (linear-in-elapsed, equal-elapsed-equal-bill, 2× scaling with vcpu_count) — no VM,
+//! no flakiness. The end-to-end die-when-broke teeth remain here, below, unweakened.
 //!
 //! With `KIRBY_GENOME_IMAGE` unset the test SKIPS (green), same idiom as the Linux
 //! test; the verifier runs it with the var pointed at the aarch64 genome image.
@@ -128,12 +131,12 @@ async fn g2_vz_meters_and_halts_on_budget() {
         "the budget-death halt must be daemon-initiated"
     );
 
-    // Metered burn is NON-ZERO: proves the proc_pid_rusage meter read real guest CPU
-    // across the VZ helper + service-pid trees. Zero would mean the meter saw no
-    // busy process (the service pids were not captured).
+    // Metered burn is NON-ZERO: proves the allocation meter accrued the reservation
+    // (vcpu_count × elapsed for CPU + the memory cap) and debited the treasury. Zero
+    // would mean the allocation source never advanced (a broken sample/attach).
     assert!(
         outcome.burned_sats > 0,
-        "metered burn must be non-zero (proc_pid_rusage read real guest CPU), got 0"
+        "metered burn must be non-zero (allocation meter billed vcpu×elapsed + memory), got 0"
     );
 
     // Conservation: debited burn + remaining == budget (budget == initial treasury).
@@ -168,90 +171,5 @@ async fn g2_vz_meters_and_halts_on_budget() {
         outcome.daemon_initiated_kill,
         outcome.ticks,
         outcome.tick.as_millis(),
-    );
-}
-
-/// Precision teeth: burn must bill measurably MORE than idle over the SAME wall-time.
-///
-/// Both runs get a large budget (so NEITHER exhausts: both end Stopped at max_run)
-/// and the SAME tick + max_run, so wall-time and tick count match. A meter that
-/// reads real guest CPU bills the spinning burn far more than the parked idle
-/// genome. If the meter undercounts (only sees the helper, not the busy guest), the
-/// two are ~equal and this fails — that is the undercounting gap.
-///
-/// DEFERRED: this precision assertion currently fails because the VZ guest's busy
-/// vCPU is invisible at `proc_pid_rusage` granularity (the host helper + service
-/// pids do not reflect the guest's spinning threads), so busy ≈ idle. That is a
-/// separate metering-precision DESIGN question (how to attribute in-guest CPU to
-/// the host meter), pending the keeper — NOT the robustness bug fixed in this
-/// change. The assertion is kept here, unweakened, as the documented teeth for that
-/// precision work; it is `#[ignore]`d so it does not mask the (now-green) G2
-/// budget-halt behavior. Remove the `#[ignore]` once guest-CPU attribution lands.
-#[tokio::test]
-#[ignore = "pending VZ guest-CPU metering precision fix (guest vCPU invisible at proc_pid_rusage granularity); tracked with keeper"]
-async fn g2_vz_busy_burns_more_than_idle() {
-    let Some(image) = image_or_skip("g2_vz_busy_burns_more_than_idle") else {
-        return;
-    };
-
-    // Large enough that ~4s of burn cannot exhaust it (so we compare burn-over-time,
-    // not time-to-halt).
-    let budget: u64 = 10_000_000;
-    let tick = Duration::from_millis(100);
-    let max_run = Duration::from_secs(4);
-
-    // Idle first (distinct CID/port from the burn run and from the test above).
-    let idle = run(
-        vz_boot(image.clone(), "g2vz-idle", budget, None, 30, 5030),
-        tick,
-        max_run,
-    )
-    .await;
-
-    let burn = run(
-        vz_boot(image, "g2vz-busy", budget, Some("burn"), 31, 5031),
-        tick,
-        max_run,
-    )
-    .await;
-
-    eprintln!(
-        "G2-VZ busy-vs-idle: idle_burn_sats={} (terminal={:?}, ticks={}) ; \
-         busy_burn_sats={} (terminal={:?}, ticks={})",
-        idle.burned_sats,
-        idle.terminated,
-        idle.ticks,
-        burn.burned_sats,
-        burn.terminated,
-        burn.ticks,
-    );
-
-    // Neither should have exhausted the (large) budget over ~4s; both stop at max_run.
-    assert_eq!(
-        idle.terminated,
-        Terminated::Stopped,
-        "idle run unexpectedly exhausted the large budget"
-    );
-    assert_eq!(
-        burn.terminated,
-        Terminated::Stopped,
-        "burn run unexpectedly exhausted the large budget over {max_run:?}"
-    );
-
-    // The teeth: the spinning burn must bill strictly (and meaningfully) more than
-    // the parked idle genome over the same wall-time. A 2x floor is conservative; a
-    // pinned vCPU should dwarf an idle guest. busy ≈ idle here = the meter is NOT
-    // reading the busy guest CPU (the undercounting gap).
-    assert!(
-        burn.burned_sats > idle.burned_sats.saturating_mul(2),
-        "busy burn ({}) must be >2x idle burn ({}) over the same {max_run:?} — \
-         busy ≈ idle means the meter is NOT capturing busy guest CPU",
-        burn.burned_sats,
-        idle.burned_sats
-    );
-
-    eprintln!(
-        "G2-VZ PRECISION PASS: busy_burn_sats={} > 2x idle_burn_sats={} over {max_run:?}",
-        burn.burned_sats, idle.burned_sats
     );
 }

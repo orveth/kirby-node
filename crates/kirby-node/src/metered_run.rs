@@ -294,6 +294,36 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
             );
             meter
         }
+        MeterSource::Allocation {
+            vcpu_count,
+            mem_mib,
+            start,
+        } => {
+            let meter_config = crate::meter::AllocationMeterConfig {
+                vcpu_count,
+                mem_mib,
+                start,
+                tick,
+                rates: config.rates,
+            };
+            let meter = match Meter::attach_allocation(&meter_config, treasury) {
+                Ok(m) => m,
+                Err(e) => {
+                    vm.halt().await;
+                    return Err(anyhow::anyhow!(
+                        "metered run: allocation meter attach failed: {e}"
+                    ));
+                }
+            };
+            tracing::info!(
+                budget_sats,
+                tick_ms = tick.as_millis() as u64,
+                vcpu_count,
+                mem_mib,
+                "metering started from allocation source (chunk D pt.2; vCPU/memory reservation billed at 100% utilization)"
+            );
+            meter
+        }
     };
     // Arm the FLOOR-HALT for the diarist (no-op when 0, i.e. every other workload). With zero
     // rent this is the diarist's death: the meter halts when remaining < brain.max_cost_sats.

@@ -196,6 +196,9 @@ impl SandboxBackend for VzBackend {
             pid,
             service_pids,
             memory_mib: spec.mem_size_mib,
+            vcpu_count: spec.vcpu_count as u32,
+            // The allocated-CPU-seconds clock starts now (the VM has reported READY).
+            start: std::time::Instant::now(),
             gateway_uds,
             gateway_port: spec.gateway_port,
             temp_kernel,
@@ -224,8 +227,18 @@ impl SandboxBackend for VzBackend {
 pub(crate) struct BootedVzVm {
     child: Child,
     pid: u32,
+    /// Discovered VZ VM service pids. Unread since the VZ meter selection flipped to
+    /// allocation-based metering (chunk D pt.2); retained as insurance for reviving
+    /// the dormant `MeterSource::HostProcess` path. The boot-time discovery + warning
+    /// logging still populates it.
+    #[allow(dead_code)]
     service_pids: Vec<u32>,
     memory_mib: usize,
+    /// vCPU count the VM was booted with (allocation-based metering, chunk D pt.2).
+    vcpu_count: u32,
+    /// Boot-time instant; `elapsed()` is the allocated-CPU-seconds clock the meter
+    /// bills against (vcpu_count × elapsed × rate — usage billing at 100% util).
+    start: std::time::Instant,
     gateway_uds: PathBuf,
     gateway_port: u32,
     temp_kernel: Option<PathBuf>,
@@ -295,10 +308,16 @@ impl SandboxInstance for BootedVzVm {
     }
 
     fn meter_source(&self) -> MeterSource {
-        MeterSource::HostProcess {
-            root_pid: self.pid,
-            service_pids: self.service_pids.clone(),
-            memory_mib: self.memory_mib,
+        // ALLOCATION-based metering (chunk D pt.2): a VZ guest's vCPU time is
+        // structurally unmeterable at the host (billed to Hypervisor.framework,
+        // invisible to proc_pid_rusage; task_for_pid SIP-blocked). So bill the
+        // RESERVATION — vcpu_count × elapsed × rate — i.e. usage billing assuming
+        // 100% utilization. A pinned vCPU then costs the same on VZ as on Firecracker
+        // at full load. `HostProcess` is left dormant (see MeterSource) as insurance.
+        MeterSource::Allocation {
+            vcpu_count: self.vcpu_count,
+            mem_mib: self.memory_mib,
+            start: self.start,
         }
     }
 

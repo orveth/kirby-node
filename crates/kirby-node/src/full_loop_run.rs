@@ -843,6 +843,11 @@ async fn setup_meters(
     // on a bad placement, so metering reads a real cgroup, never a silent zero.
     let cgroup_rel_path = match instance.meter_source() {
         MeterSource::CgroupV2 { rel_path } => rel_path,
+        // full_loop_run is the Firecracker/cgroup-only C11 path (cfg linux); the
+        // VZ-only allocation source can never legitimately reach here.
+        MeterSource::Allocation { .. } => anyhow::bail!(
+            "full_loop_run (C11) is cgroup/Firecracker-only; the allocation meter source is VZ-only and unsupported here"
+        ),
     };
     let meter_config = MeterConfig {
         cgroup_rel_path,
