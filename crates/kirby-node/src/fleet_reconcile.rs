@@ -424,6 +424,77 @@ pub fn reconcile(
         .collect()
 }
 
+/// How COMPLETE the lease observation that built the [`LeaseSnapshot`] is — the guard that
+/// decides whether a lease-ABSENCE may be trusted as "the agent is gone".
+///
+/// ## Why this exists (the false-reap fence)
+/// The pure [`reconcile`] decision is correct GIVEN ACCURATE INPUT, but it treats a missing lease
+/// as `Reap(LeaseStale)` — and a reap is DESTRUCTIVE (it kills the VM, releases the slot, DELETES
+/// the keystore = the agent's FROST identity, and clears the ledger). The wiring drains the
+/// relay's RETAINED leases to build the snapshot; the relay signals it has sent every stored
+/// event with an EOSE ("end of stored events"). Until EOSE arrives the snapshot is INCOMPLETE: an
+/// absent lease might just be a not-yet-delivered retained event (relay latency / propagation /
+/// load), NOT a dead agent. Reaping an ALIVE agent on that unconfirmed absence destroys a healthy
+/// sovereign identity over a timing race — the catastrophic bug this guard closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseObservation {
+    /// EOSE was received: the relay has delivered every RETAINED lease, so the snapshot is
+    /// AUTHORITATIVE. A still-absent lease genuinely means stale/gone (a dead-to-fleet zombie),
+    /// so the full reconcile (including a lease-absence reap) is correct.
+    Complete,
+    /// EOSE was NOT received within the bounded backstop (relay slow / no EOSE / hiccup): the
+    /// snapshot is UNTRUSTWORTHY for ABSENCE. We must NOT run a lease-absence reap (it could kill
+    /// a healthy agent whose retained lease simply had not arrived yet).
+    Incomplete,
+}
+
+/// The plan the guarded reconcile produces: either APPLY the per-agent verdicts (the lease
+/// observation was confirmed complete), or SKIP the destructive reconcile entirely (the
+/// observation was incomplete — fail SAFE, leave the orphans running for a later restart with a
+/// healthy relay to reconcile).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcilePlan {
+    /// Run these per-agent verdicts (re-adopt / reap). Produced only when the lease observation is
+    /// [`LeaseObservation::Complete`].
+    Apply(Vec<ReconcileItem>),
+    /// Do NOTHING destructive: the lease observation was [`LeaseObservation::Incomplete`], so a
+    /// lease-absence cannot be trusted. The orphans keep running; a later restart reconciles them.
+    SkipUnconfirmedObservation,
+}
+
+/// THE GUARDED RECONCILE DECISION (the false-reap fence, pure + unit-tested). Wraps the pure
+/// [`reconcile`] with the [`LeaseObservation`] completeness gate so the wiring NEVER performs a
+/// destructive lease-absence reap on UNCONFIRMED lease data:
+///  - `obs == Complete` (EOSE received) => `Apply(reconcile(..))`: the retained-lease snapshot is
+///    authoritative, so an absent lease truly means stale/gone and the full decision (re-adopt the
+///    healthy, reap the dead/stale/lost) is correct — exactly as before.
+///  - `obs == Incomplete` (no EOSE within the backstop) => `SkipUnconfirmedObservation`: FAIL
+///    SAFE. The snapshot cannot be trusted for absence, so we do nothing destructive — an ALIVE
+///    orphan is left running (it keeps burning compute but its identity + state are preserved),
+///    and a later restart against a healthy relay reconciles it. Matches the spirit of the
+///    existing connection-error fail-open.
+///
+/// This is the single seam the false-reap bug lives behind, factored out so the load-bearing
+/// teeth ("an alive orphan with no observed lease is NOT reaped when the observation is
+/// incomplete") run in-process with no real relay — mirroring the fence-test style in `spawn.rs`.
+pub fn reconcile_plan(
+    obs: LeaseObservation,
+    records: &[LaunchRecord],
+    probe: &dyn OrphanLivenessProbe,
+    lease_view: &dyn ReconcileLeaseView,
+    this_node: LeaseNodeId,
+) -> ReconcilePlan {
+    match obs {
+        // The retained leases are all in: the snapshot is authoritative — proceed exactly as today.
+        LeaseObservation::Complete => {
+            ReconcilePlan::Apply(reconcile(records, probe, lease_view, this_node))
+        }
+        // The observation is incomplete: absence is not proof of death. Never destructively reap on
+        // unconfirmed lease data — skip the whole reconcile and let the orphans keep running.
+        LeaseObservation::Incomplete => ReconcilePlan::SkipUnconfirmedObservation,
+    }
+}
+
 /// The per-agent decision (factored out so it reads as the 4-case table above).
 fn decide_one(
     record: &LaunchRecord,
@@ -568,6 +639,92 @@ mod tests {
         assert_eq!(by_agent["alice"], ReconcileVerdict::ReAdopt);
         assert_eq!(by_agent["bob"], ReconcileVerdict::Reap(ReapReason::NotAlive));
         assert_eq!(by_agent["carol"], ReconcileVerdict::Reap(ReapReason::LeaseLostToNode(9)));
+    }
+
+    // ---- THE FALSE-REAP FENCE: lease-observation completeness gates destructive reaps ----
+
+    /// TEETH (THE BUG): an ALIVE orphan with NO observed lease must NOT be destructively reaped
+    /// when the lease observation is INCOMPLETE (EOSE not received — the relay was reachable but
+    /// its retained lease simply had not arrived yet). The pure `reconcile` alone would reap it as
+    /// `Reap(LeaseStale)` — and a reap DELETES the agent's FROST identity. The guard turns that
+    /// into a fail-SAFE skip: nothing destructive runs, so the healthy agent keeps its identity +
+    /// state and a later restart against a healthy relay reconciles it.
+    ///
+    /// This is the regression guard for the catastrophic false-reap: a destructive, irreversible
+    /// operation MUST NOT be gated on a timing race against incomplete lease delivery.
+    #[test]
+    fn incomplete_observation_does_not_reap_alive_orphan_on_lease_absence() {
+        let records = [rec("alice", 1000)];
+        // alice IS alive + ours (a perfectly healthy orphan)...
+        let probe = MockProbe::with_alive(&[(1000, "alice")]);
+        // ...but her retained lease has NOT been observed yet (empty snapshot). With a COMPLETE
+        // observation this would mean stale; with an INCOMPLETE one it means "not yet delivered".
+        let view = LeaseSnapshot::new();
+
+        // INCOMPLETE (no EOSE): the guard must SKIP the whole reconcile — no reap of the alive orphan.
+        let plan = reconcile_plan(LeaseObservation::Incomplete, &records, &probe, &view, 7);
+        assert_eq!(
+            plan,
+            ReconcilePlan::SkipUnconfirmedObservation,
+            "no-EOSE + an alive orphan with no observed lease MUST fail safe (skip), NEVER reap a \
+             healthy agent + destroy its identity on unconfirmed lease data"
+        );
+
+        // Belt-and-braces: whatever the plan, an alive orphan is NEVER in a Reap verdict under an
+        // incomplete observation (the destructive path is closed for the live agent).
+        if let ReconcilePlan::Apply(items) = &plan {
+            for item in items {
+                let alive = probe.alive_and_ours(item.record.pid, &item.record.agent_id);
+                assert!(
+                    !(alive && matches!(item.verdict, ReconcileVerdict::Reap(_))),
+                    "an ALIVE orphan must never be reaped under an incomplete observation"
+                );
+            }
+        }
+    }
+
+    /// TEETH (the safe side): with a COMPLETE observation (EOSE received), the snapshot is
+    /// authoritative — an alive orphan with NO fresh lease is a dead-to-fleet zombie and IS reaped
+    /// as `Reap(LeaseStale)`, exactly as before the fence. The guard only suppresses the reap when
+    /// the observation is UNCONFIRMED; it never weakens the confirmed path.
+    #[test]
+    fn complete_observation_reaps_alive_orphan_with_no_lease_as_before() {
+        let records = [rec("alice", 1000)];
+        let probe = MockProbe::with_alive(&[(1000, "alice")]);
+        let view = LeaseSnapshot::new(); // EOSE-confirmed: alice genuinely holds no fresh lease
+
+        let plan = reconcile_plan(LeaseObservation::Complete, &records, &probe, &view, 7);
+        match plan {
+            ReconcilePlan::Apply(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(
+                    items[0].verdict,
+                    ReconcileVerdict::Reap(ReapReason::LeaseStale),
+                    "EOSE received + alive + no fresh lease => reap (authoritative absence), as before"
+                );
+            }
+            ReconcilePlan::SkipUnconfirmedObservation => {
+                panic!("a COMPLETE observation must APPLY the reconcile, not skip it");
+            }
+        }
+    }
+
+    /// A COMPLETE observation is a pass-through to the pure `reconcile`: a mixed fleet produces the
+    /// SAME per-agent verdicts whether routed through the guard (Complete) or called directly. The
+    /// fence adds the completeness gate WITHOUT changing the confirmed decision.
+    #[test]
+    fn complete_observation_matches_direct_reconcile() {
+        let records = [rec("alice", 1000), rec("bob", 1001), rec("carol", 1002)];
+        let probe = MockProbe::with_alive(&[(1000, "alice"), (1002, "carol")]);
+        let view = LeaseSnapshot::new().with("alice", lease(7, 1)).with("carol", lease(9, 4));
+
+        let direct = reconcile(&records, &probe, &view, 7);
+        let plan = reconcile_plan(LeaseObservation::Complete, &records, &probe, &view, 7);
+        assert_eq!(
+            plan,
+            ReconcilePlan::Apply(direct),
+            "Complete observation must equal a direct reconcile (pass-through, no behavior change)"
+        );
     }
 
     // ---- LaunchRegistry: record / forget / persist round-trip ----

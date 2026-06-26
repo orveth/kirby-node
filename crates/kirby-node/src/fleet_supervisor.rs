@@ -630,17 +630,42 @@ impl FleetSupervisor {
     /// the side effects. Returns a [`ReconcileSummary`] for logging. MUST be called BEFORE
     /// `launch_all` / the listen loop, so a static tenant that is also a healthy orphan is
     /// re-adopted rather than double-launched.
+    ///
+    /// THE FALSE-REAP FENCE: `obs` reports whether the lease snapshot is COMPLETE (the relay sent
+    /// an EOSE — every retained lease is in) or INCOMPLETE (no EOSE within the wiring's backstop).
+    /// A reap is DESTRUCTIVE (kills the VM + releases the slot + DELETES the keystore = the agent's
+    /// FROST identity + clears the ledger), so we route through
+    /// [`crate::fleet_reconcile::reconcile_plan`]: on an INCOMPLETE observation it returns
+    /// `SkipUnconfirmedObservation` and this fn performs NO side effects (an alive orphan whose
+    /// retained lease simply had not arrived is left running for a later restart to reconcile) —
+    /// an alive agent is NEVER reaped on unconfirmed lease data.
     pub fn apply_reconcile(
         &mut self,
         probe: Arc<dyn crate::fleet_reconcile::OrphanLivenessProbe>,
         lease_view: &dyn crate::fleet_reconcile::ReconcileLeaseView,
+        obs: crate::fleet_reconcile::LeaseObservation,
         ledger: Option<&dyn crate::spawn::SpawnLedger>,
     ) -> ReconcileSummary {
-        use crate::fleet_reconcile::{reconcile, PidTenant, ReconcileVerdict};
+        use crate::fleet_reconcile::{reconcile_plan, PidTenant, ReconcilePlan, ReconcileVerdict};
 
         let records = self.launch_registry.all();
-        let items = reconcile(&records, probe.as_ref(), lease_view, self.node_id);
         let mut summary = ReconcileSummary::default();
+        // THE FENCE: only act on a CONFIRMED-COMPLETE lease observation. An incomplete one
+        // (relay slow / no EOSE) yields a fail-SAFE skip — no destructive reap on absence.
+        let items = match reconcile_plan(obs, &records, probe.as_ref(), lease_view, self.node_id) {
+            ReconcilePlan::Apply(items) => items,
+            ReconcilePlan::SkipUnconfirmedObservation => {
+                tracing::warn!(
+                    agents = records.len(),
+                    "FLEET reconcile: SKIPPED — the lease observation was INCOMPLETE (no EOSE from \
+                     the relay within the backstop), so a lease-absence cannot be trusted as a dead \
+                     agent. Failing SAFE: orphans keep running; a later restart against a healthy \
+                     relay will reconcile them. (Never reap an alive agent on unconfirmed lease data.)"
+                );
+                summary.skipped_unconfirmed = true;
+                return summary;
+            }
+        };
 
         for item in items {
             let rec = &item.record;
@@ -743,10 +768,17 @@ pub struct ReconcileSummary {
     pub readopted: Vec<AgentId>,
     /// `(agent_id, reason)` of orphans REAPED (killed + slot released + keystore cleaned).
     pub reaped: Vec<(AgentId, String)>,
+    /// THE FALSE-REAP FENCE: `true` if the whole reconcile was SKIPPED because the lease
+    /// observation was incomplete (no EOSE) — NOTHING was reaped or re-adopted, the orphans were
+    /// left running, and a later restart will reconcile them. Distinguishes a fail-safe skip from
+    /// a genuine "nothing to do".
+    pub skipped_unconfirmed: bool,
 }
 
 impl ReconcileSummary {
-    /// Whether the reconcile touched anything (so the wiring can log a tidy "nothing to do").
+    /// Whether the reconcile touched anything (so the wiring can log a tidy "nothing to do"). A
+    /// fail-safe skip on an incomplete observation also reads empty (it touched nothing), but the
+    /// wiring inspects [`Self::skipped_unconfirmed`] to log it distinctly.
     pub fn is_empty(&self) -> bool {
         self.readopted.is_empty() && self.reaped.is_empty()
     }
