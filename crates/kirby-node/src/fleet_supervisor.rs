@@ -611,6 +611,145 @@ impl FleetSupervisor {
         // Forget the PID sidecar record so the orphan is not probed again on the next restart.
         self.forget_launch_record(instance_id);
     }
+
+    /// RECONCILE persisted state with reality on supervisor restart (re-adopt/reap, G-3) — the
+    /// EXECUTOR that turns the pure [`crate::fleet_reconcile::reconcile`] decision into action.
+    /// Runs over THIS supervisor's own persisted launch registry (the PIDs it recorded before the
+    /// restart), the injected liveness `probe`, and the resolved `lease_view` snapshot (the wiring
+    /// drains the relay's retained leases into it). For each persisted orphan:
+    ///  - RE-ADOPT: reconstruct its [`TenantRecord`] from the reloaded allocator + deterministic
+    ///    path helpers + the observed lease term, build a supervise-by-PID
+    ///    [`crate::fleet_reconcile::PidTenant`] from its persisted PID, and re-track it (the
+    ///    heartbeat then covers it).
+    ///  - REAP: kill the orphan + release its slot + clean its keystore (#15) + forget its sidecar
+    ///    record (via [`Self::reap_orphan`]), and clear its durable spawn-ledger entry (if a
+    ///    `ledger` is wired) so a future spawn request for the same agent_id can re-spawn it.
+    ///
+    /// The PURE decision is kept in `fleet_reconcile` (unit-tested); this is the thin glue that
+    /// supplies the supervisor's real state (registry PIDs, allocator, path helpers) and performs
+    /// the side effects. Returns a [`ReconcileSummary`] for logging. MUST be called BEFORE
+    /// `launch_all` / the listen loop, so a static tenant that is also a healthy orphan is
+    /// re-adopted rather than double-launched.
+    pub fn apply_reconcile(
+        &mut self,
+        probe: Arc<dyn crate::fleet_reconcile::OrphanLivenessProbe>,
+        lease_view: &dyn crate::fleet_reconcile::ReconcileLeaseView,
+        ledger: Option<&dyn crate::spawn::SpawnLedger>,
+    ) -> ReconcileSummary {
+        use crate::fleet_reconcile::{reconcile, PidTenant, ReconcileVerdict};
+
+        let records = self.launch_registry.all();
+        let items = reconcile(&records, probe.as_ref(), lease_view, self.node_id);
+        let mut summary = ReconcileSummary::default();
+
+        for item in items {
+            let rec = &item.record;
+            match item.verdict {
+                ReconcileVerdict::ReAdopt => {
+                    // Reconstruct the live tenant's record from durable + deterministic sources.
+                    // The allocation survived in the reloaded allocator (load_or_new); the lease
+                    // term is the one we just observed as fresh + ours; the keystore + treasury
+                    // paths are deterministic from the instance_id. The npub is best-effort
+                    // (informational; a load failure does not block re-adopting a live agent).
+                    let allocation = match self.allocator.allocation_for(&rec.agent_id) {
+                        Some(a) => a.clone(),
+                        None => {
+                            // The PID record outlived its allocation (a torn persist). Treat it as
+                            // un-re-adoptable: reap the orphan so it is not left un-tracked.
+                            tracing::warn!(
+                                agent_id = %rec.agent_id,
+                                "FLEET reconcile: re-adopt wanted but no allocation survived; reaping the orphan instead"
+                            );
+                            let keystore_dir =
+                                crate::keyset_provisioning::keystore_dir_for(&rec.instance_id);
+                            let pid_tenant = Box::new(PidTenant::new(
+                                rec.pid,
+                                rec.agent_id.clone(),
+                                probe.clone(),
+                            ));
+                            self.reap_orphan(pid_tenant, &rec.agent_id, &rec.instance_id, &keystore_dir);
+                            if let Some(l) = ledger {
+                                let _ = l.release(&rec.agent_id);
+                            }
+                            summary.reaped.push((rec.agent_id.clone(), "no allocation survived".to_string()));
+                            continue;
+                        }
+                    };
+                    let keystore_dir =
+                        crate::keyset_provisioning::keystore_dir_for(&rec.instance_id);
+                    let lease_term =
+                        lease_view.fresh_lease_for(&rec.agent_id).map(|l| l.term).unwrap_or(1);
+                    let frost_npub = crate::frost_identity::FrostIdentity::load(
+                        &keystore_dir.join("group_pubkeys.json"),
+                    )
+                    .map(|id| id.npub())
+                    .unwrap_or_default();
+                    let record = TenantRecord {
+                        agent_id: rec.agent_id.clone(),
+                        treasury_path: crate::boot::treasury_path_for(&allocation.instance_id),
+                        allocation,
+                        lease_term,
+                        keystore_dir,
+                        frost_npub,
+                    };
+                    let pid_tenant =
+                        Box::new(PidTenant::new(rec.pid, rec.agent_id.clone(), probe.clone()));
+                    self.re_adopt(record, pid_tenant);
+                    tracing::info!(
+                        agent_id = %rec.agent_id, pid = rec.pid, term = lease_term,
+                        "FLEET reconcile: RE-ADOPTED a healthy orphan (heartbeat resumes its lease + presence)"
+                    );
+                    summary.readopted.push(rec.agent_id.clone());
+                }
+                ReconcileVerdict::Reap(reason) => {
+                    let keystore_dir =
+                        crate::keyset_provisioning::keystore_dir_for(&rec.instance_id);
+                    let pid_tenant =
+                        Box::new(PidTenant::new(rec.pid, rec.agent_id.clone(), probe.clone()));
+                    self.reap_orphan(pid_tenant, &rec.agent_id, &rec.instance_id, &keystore_dir);
+                    // Clear the durable spawn-ledger entry so the reaped agent_id can be re-spawned
+                    // (the reaped agent is forgotten; a fresh request mints a new sovereign Q).
+                    if let Some(l) = ledger {
+                        if let Err(e) = l.release(&rec.agent_id) {
+                            tracing::warn!(
+                                agent_id = %rec.agent_id, error = %e,
+                                "FLEET reconcile: failed to clear the spawn-ledger entry for a reaped orphan"
+                            );
+                        }
+                    }
+                    tracing::info!(
+                        agent_id = %rec.agent_id, pid = rec.pid, reason = %reason,
+                        "FLEET reconcile: REAPED an orphan (killed + slot released + keystore cleaned + ledger cleared)"
+                    );
+                    summary.reaped.push((rec.agent_id.clone(), reason.to_string()));
+                }
+            }
+        }
+        summary
+    }
+
+    /// The allocation a tenant currently holds in the (possibly reloaded) allocator, if any. A
+    /// passthrough so the reconcile executor can reconstruct a re-adopted orphan's record from the
+    /// allocation that survived the restart.
+    pub fn allocation_for(&self, agent_id: &str) -> Option<TenantAllocation> {
+        self.allocator.allocation_for(agent_id).cloned()
+    }
+}
+
+/// What a startup reconcile (re-adopt/reap, G-3) did, for logging + the operator evidence line.
+#[derive(Debug, Default, Clone)]
+pub struct ReconcileSummary {
+    /// Agent ids of healthy orphans RE-ADOPTED (re-tracked, no relaunch).
+    pub readopted: Vec<AgentId>,
+    /// `(agent_id, reason)` of orphans REAPED (killed + slot released + keystore cleaned).
+    pub reaped: Vec<(AgentId, String)>,
+}
+
+impl ReconcileSummary {
+    /// Whether the reconcile touched anything (so the wiring can log a tidy "nothing to do").
+    pub fn is_empty(&self) -> bool {
+        self.readopted.is_empty() && self.reaped.is_empty()
+    }
 }
 
 /// The REAL tenant launcher (fleet-host S2): spawns each tenant as a child `kirby agent`
