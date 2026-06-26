@@ -470,8 +470,10 @@ async fn run_fleet_supervisor_cmd(
     use anyhow::Context as _;
     use kirby_node::config::KirbyConfig;
     use kirby_node::fleet::Allocator;
+    use kirby_node::fleet_reconcile::LaunchRegistry;
     use kirby_node::fleet_supervisor::{FleetSupervisor, ProcessTenantLauncher};
     use kirby_node::relay_lease::{RelayLeaseGrantor, RelayLeasePublisher};
+    use kirby_node::spawn::SledSpawnLedger;
 
     let config = KirbyConfig::load(&config_path)?;
     tracing::info!(path = %config_path.display(), tenants = config.fleet.tenants.len(), "loaded fleet config");
@@ -499,6 +501,25 @@ async fn run_fleet_supervisor_cmd(
     let alloc_path = alloc_dir.join("fleet-allocator.json");
     let allocator = Allocator::load_or_new(&config.fleet, &alloc_path)?;
 
+    // The durable spawn ledger (#11): opened HERE (once) rather than inside the control-plane
+    // loop, so the startup reconcile (below) can CLEAR a reaped orphan's ledger entry (letting a
+    // future spawn request re-spawn that agent_id) using the SAME handle the loop later uses —
+    // sled takes an exclusive dir lock, so it must be opened exactly once and threaded through.
+    let ledger = Arc::new(
+        SledSpawnLedger::open(alloc_dir.join("spawn-ledger"))
+            .context("open the durable spawn ledger")?,
+    );
+
+    // The DURABLE PID sidecar (re-adopt/reap, G-3): reload the launch records this node persisted
+    // before any restart, so the startup reconcile can probe its orphans PID-reuse-safe. Snapshot
+    // the persisted agent ids BEFORE the registry is moved into the supervisor (the reconcile
+    // queries each one's lease). The supervisor OWNS the registry from here on (recording new
+    // launches, forgetting reaped ones).
+    let registry_path = alloc_dir.join("fleet-launch-registry.json");
+    let launch_registry = LaunchRegistry::load_or_new(&registry_path)?;
+    let persisted_agent_ids: Vec<String> =
+        launch_registry.all().into_iter().map(|r| r.agent_id).collect();
+
     // The real launcher spawns each tenant as a child `kirby agent` (the existing
     // single-agent path) with the allocated CID/port; derived per-tenant configs land under
     // the node's config dir.
@@ -512,7 +533,34 @@ async fn run_fleet_supervisor_cmd(
     let spawn_relay_url = config.relay.url.clone();
     let spawn_max_tenants = config.fleet.max_tenants as usize;
 
-    let mut supervisor = FleetSupervisor::new(node_id, config, allocator, grantor, launcher);
+    let mut supervisor = FleetSupervisor::new(node_id, config, allocator, grantor, launcher)
+        .with_launch_registry(launch_registry);
+
+    // RECONCILE persisted state with reality (re-adopt/reap, G-3, closes the orphan-zombie),
+    // BEFORE launching any static tenant or entering the listen loop. A killed supervisor leaves
+    // its tenant VMs running (reparented to init) but un-presenced; on restart we re-adopt the
+    // healthy orphans this node still owns (re-track them so the heartbeat resumes their lease +
+    // presence — a bounce becomes invisible to the fleet) and reap the rest (kill + release the
+    // slot + clean the abandoned keystore + clear the ledger). No-op on a first start (an empty
+    // registry).
+    if !persisted_agent_ids.is_empty() {
+        if let Err(e) = reconcile_fleet_on_startup(
+            &mut supervisor,
+            node_id,
+            &persisted_agent_ids,
+            &spawn_relay_url,
+            ledger.as_ref(),
+        )
+        .await
+        {
+            // A reconcile failure (e.g. the relay is unreachable to learn the leases) must not
+            // crash the supervisor: log it and proceed. The orphans keep running; the next reap
+            // tick + a later restart get another chance. Failing open here is safer than refusing
+            // to start the node at all.
+            tracing::error!(error = %e, "FLEET reconcile on startup failed; proceeding without it (orphans keep running)");
+        }
+    }
+
     let records = supervisor.launch_all().await?;
     for r in &records {
         println!(
@@ -540,9 +588,143 @@ async fn run_fleet_supervisor_cmd(
         spawn_cfg,
         &spawn_relay_url,
         spawn_max_tenants,
-        &alloc_dir,
+        ledger,
     )
     .await
+}
+
+/// RECONCILE the supervisor's persisted state with reality on `kirby fleet` startup
+/// (re-adopt/reap, G-3): the relay-facing glue around the pure decision. Connects a READ-ONLY
+/// client to the fleet relay, subscribes to the agents' retained `KIND_KIRBY_LEASE` events, drains
+/// them into a [`kirby_node::relay_lease::FleetLeaseObserver`] for a brief settle window so the
+/// node learns the CURRENT fleet leases (the relay RETAINS the latest addressable lease per
+/// agent), resolves each persisted agent's FRESH lease into a sync
+/// [`kirby_node::fleet_reconcile::LeaseSnapshot`], then hands `(probe, snapshot, ledger)` to
+/// [`kirby_node::fleet_supervisor::FleetSupervisor::apply_reconcile`] (which does the re-adopt /
+/// reap side effects). The liveness probe is the real PID-reuse-safe `/proc` probe.
+async fn reconcile_fleet_on_startup(
+    supervisor: &mut kirby_node::fleet_supervisor::FleetSupervisor,
+    node_id: kirby_node::lease::LeaseNodeId,
+    persisted_agent_ids: &[String],
+    relay_url: &str,
+    ledger: &kirby_node::spawn::SledSpawnLedger,
+) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use anyhow::Context as _;
+    use nostr_sdk::prelude::*;
+
+    use kirby_node::fleet_reconcile::{
+        LeaseObservation, LeaseSnapshot, OrphanLivenessProbe, ProcLivenessProbe,
+    };
+    use kirby_node::relay_lease::FleetLeaseObserver;
+    use kirby_proto::KIND_KIRBY_LEASE;
+
+    tracing::info!(
+        agents = persisted_agent_ids.len(),
+        "FLEET reconcile: probing {} persisted orphan(s) for re-adopt/reap",
+        persisted_agent_ids.len()
+    );
+
+    // Subscribe to the retained lease events so we learn which agents are still held + by whom.
+    let observer = Arc::new(FleetLeaseObserver::new(node_id));
+    let client = Client::builder().signer(Keys::generate()).build();
+    client
+        .add_relay(relay_url)
+        .await
+        .with_context(|| format!("add fleet relay {relay_url} for reconcile lease observe"))?;
+    client.connect().await;
+    let filter = Filter::new().kind(Kind::from(KIND_KIRBY_LEASE));
+    // Capture the subscription id so we recognise THIS subscription's EOSE.
+    let sub = client
+        .subscribe(filter, None)
+        .await
+        .context("subscribe to KIND_KIRBY_LEASE for reconcile")?;
+    let sub_id = sub.val;
+
+    // THE FALSE-REAP FENCE (drain the RETAINED leases, then WAIT FOR EOSE — not a fixed timer).
+    // The relay sends every RETAINED (stored) lease and then an EOSE ("end of stored events");
+    // until that EOSE lands, an ABSENT lease might just be a not-yet-delivered retained event, NOT
+    // a dead agent. A reap is DESTRUCTIVE (kills the VM + DELETES the keystore = the agent's FROST
+    // identity), so we must NOT trust absence until the observation is CONFIRMED COMPLETE. We fold
+    // each observed lease into the occupancy view and stop on EOSE; a bounded backstop timeout
+    // guards against a relay that is reachable but slow / never sends EOSE — in which case the
+    // observation stays INCOMPLETE and the reconcile fails SAFE (skips) below.
+    let mut notifications = client.notifications();
+    let backstop = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(backstop);
+    let mut eose_received = false;
+    loop {
+        tokio::select! {
+            _ = &mut backstop => {
+                // Reachable-but-slow / no EOSE: leave `eose_received = false` => fail safe below.
+                tracing::warn!(
+                    relay = relay_url,
+                    "FLEET reconcile: lease observation backstop elapsed WITHOUT an EOSE; the \
+                     retained-lease snapshot is INCOMPLETE so it cannot be trusted for absence"
+                );
+                break;
+            }
+            notif = notifications.recv() => match notif {
+                Ok(RelayPoolNotification::Event { event, .. }) => {
+                    if event.kind.as_u16() == KIND_KIRBY_LEASE {
+                        observer.observe_occupancy(&event).await;
+                    }
+                }
+                // EOSE for OUR subscription: the relay has delivered every retained lease — the
+                // snapshot is now AUTHORITATIVE. Stop draining; absence now genuinely means gone.
+                Ok(RelayPoolNotification::Message {
+                    message: RelayMessage::EndOfStoredEvents(id),
+                    ..
+                }) if *id == sub_id => {
+                    eose_received = true;
+                    break;
+                }
+                Ok(RelayPoolNotification::Shutdown) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+
+    // Resolve each persisted agent's FRESH lease (judged at NOW against the TTL) into a sync
+    // snapshot — the pure reconcile decision then needs no await.
+    let mut snapshot = LeaseSnapshot::new();
+    for agent_id in persisted_agent_ids {
+        if let Some(lease) =
+            kirby_node::lease::SpawnFenceView::active_lease_for(observer.as_ref(), agent_id).await
+        {
+            snapshot.insert(agent_id, lease);
+        }
+    }
+
+    // Done observing; drop the reconcile client (the control-plane loop opens its own).
+    let _ = client.shutdown().await;
+
+    // Execute the decision GUARDED by observation completeness: re-adopt healthy orphans + reap
+    // the rest ONLY if EOSE confirmed the snapshot is complete; otherwise FAIL SAFE (skip — never
+    // reap an alive agent on unconfirmed lease data). Reaped ledger entries clear through the SAME
+    // ledger handle the control-plane loop uses.
+    let obs = if eose_received { LeaseObservation::Complete } else { LeaseObservation::Incomplete };
+    let probe: Arc<dyn OrphanLivenessProbe> = Arc::new(ProcLivenessProbe);
+    let summary = supervisor.apply_reconcile(probe, &snapshot, obs, Some(ledger));
+
+    if summary.skipped_unconfirmed {
+        println!(
+            "FLEET reconcile: SKIPPED (fail-safe) — no EOSE from the relay, so the lease snapshot \
+             was incomplete; orphans left running, a later restart with a healthy relay reconciles them"
+        );
+    } else if summary.is_empty() {
+        println!("FLEET reconcile: nothing to reconcile (no live orphans found for the persisted set)");
+    } else {
+        for agent_id in &summary.readopted {
+            println!("FLEET reconcile: RE-ADOPTED orphan agent_id={agent_id} (heartbeat resumes its lease+presence)");
+        }
+        for (agent_id, reason) in &summary.reaped {
+            println!("FLEET reconcile: REAPED orphan agent_id={agent_id} ({reason})");
+        }
+    }
+    Ok(())
 }
 
 /// The dynamic spawn control-plane loop (#11): subscribe to `KIND_KIRBY_SPAWN_REQUEST` on the
@@ -558,7 +740,7 @@ async fn run_spawn_control_plane(
     spawn_cfg: kirby_node::config::SpawnConfig,
     relay_url: &str,
     max_tenants: usize,
-    alloc_dir: &std::path::Path,
+    ledger: std::sync::Arc<kirby_node::spawn::SledSpawnLedger>,
 ) -> anyhow::Result<()> {
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -568,9 +750,7 @@ async fn run_spawn_control_plane(
     use nostr_sdk::prelude::*;
 
     use kirby_node::relay_lease::FleetLeaseObserver;
-    use kirby_node::spawn::{
-        AllowlistAuthorizer, SeedFunder, SledSpawnLedger, SpawnConsumer, SpawnOutcome,
-    };
+    use kirby_node::spawn::{AllowlistAuthorizer, SeedFunder, SpawnConsumer, SpawnOutcome};
     use kirby_proto::{KIND_KIRBY_LEASE, KIND_KIRBY_SPAWN_REQUEST};
 
     // Build the consumer from config (MVP authz: operator allowlist + rate limit; pops later).
@@ -590,10 +770,9 @@ async fn run_spawn_control_plane(
         spawn_cfg.rate_window_secs,
     ));
     let funder = Arc::new(SeedFunder::new(spawn_cfg.max_seed_sats));
-    let ledger = Arc::new(
-        SledSpawnLedger::open(alloc_dir.join("spawn-ledger"))
-            .context("open the durable spawn ledger")?,
-    );
+    // The durable spawn ledger is opened ONCE by `run_fleet_supervisor_cmd` (so the startup
+    // reconcile can clear reaped entries) and threaded in here — sled holds an exclusive dir lock,
+    // so it must not be re-opened.
     // The CLAIM-BEFORE-LAUNCH fence read-side (closes G-1): a cooperative occupancy view of the
     // fleet's leases, folded from the KIND_KIRBY_LEASE events the loop observes. Before launching,
     // the consumer asks it whether ANOTHER node already holds the agent and backs off if so (no

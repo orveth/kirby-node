@@ -208,6 +208,14 @@ pub mod remote_holder;
 // Platform-agnostic host-side type (like `quorum_signer`), so NOT cfg-gated.
 pub mod keyset_provisioning;
 pub mod fleet_supervisor;
+// RE-ADOPT / REAP on supervisor restart (closes resilience finding G-3, the orphan-zombie).
+// The PID sidecar + PID-reuse-safe liveness probe + supervise-by-PID tenant + the PURE
+// reconcile decision ({ReAdopt | Reap}) a restarted `kirby fleet` runs over its persisted state
+// before the listen loop. Platform-agnostic host-side logic (the pure decision + registry are
+// VM-free); `libc::kill`/`/proc` liveness is unix. Fleet-supervisor-only — a bare `kirby run`
+// never reconciles. NOT cfg-gated (like `fleet_supervisor`); the `/proc` probe degrades to
+// not-alive off Linux.
+pub mod fleet_reconcile;
 #[cfg(target_os = "linux")]
 pub mod full_loop_run;
 pub mod gateway;
