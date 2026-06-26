@@ -247,6 +247,15 @@ struct HostProcessMeterSource {
     root_pid: u32,
     service_pids: Vec<u32>,
     memory_cap_bytes: u64,
+    /// Last successfully-sampled cumulative CPU nsec per pid. When a pid vanishes
+    /// (ESRCH) mid-run we substitute its FROZEN last-known value into the summed
+    /// total instead of dropping it to zero — otherwise the summed cumulative
+    /// total would DROP, `tick_once`'s `total_now - total_prev` delta would clamp
+    /// to 0, and the new (lower) sum would become the baseline: a persistent
+    /// undercount in the agent's favor (free compute => die-when-broke fails). The
+    /// frozen value contributes the exited pid's accumulated compute exactly once
+    /// more and then never increases, so the total is monotonic across an exit.
+    last_cpu_nsec_by_pid: std::collections::HashMap<u32, u64>,
 }
 
 struct MeterSample {
@@ -375,10 +384,11 @@ impl Meter {
                 root_pid: config.root_pid,
                 reason: format!("memory cap {} MiB overflows bytes", config.memory_mib),
             })?;
-        let source = HostProcessMeterSource {
+        let mut source = HostProcessMeterSource {
             root_pid: config.root_pid,
             service_pids: config.service_pids.clone(),
             memory_cap_bytes,
+            last_cpu_nsec_by_pid: std::collections::HashMap::new(),
         };
         let baseline = source.sample()?;
 
@@ -541,7 +551,7 @@ impl Meter {
 }
 
 impl MeterSampleSource {
-    fn sample(&self) -> Result<MeterSample, MeterError> {
+    fn sample(&mut self) -> Result<MeterSample, MeterError> {
         match self {
             #[cfg(target_os = "linux")]
             MeterSampleSource::Cgroup(source) => source.sample(),
@@ -569,7 +579,7 @@ impl CgroupMeterSource {
 
 #[cfg(target_os = "macos")]
 impl HostProcessMeterSource {
-    fn sample(&self) -> Result<MeterSample, MeterError> {
+    fn sample(&mut self) -> Result<MeterSample, MeterError> {
         let mut pids = macos_process_tree_pids(self.root_pid).map_err(|e| {
             MeterError::HostProcessUnreadable {
                 root_pid: self.root_pid,
@@ -593,25 +603,11 @@ impl HostProcessMeterSource {
         let mut cpu_nsec = 0u64;
         let mut sampled = 0usize;
         for pid in pids {
-            match macos_process_cpu_nsec(pid) {
-                Ok(pid_cpu_nsec) => {
-                    cpu_nsec = cpu_nsec.saturating_add(pid_cpu_nsec);
-                    sampled += 1;
-                }
-                Err(e) if pid == self.root_pid || self.service_pids.contains(&pid) => {
-                    return Err(MeterError::HostProcessUnreadable {
-                        root_pid: self.root_pid,
-                        reason: e,
-                    });
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        pid,
-                        root_pid = self.root_pid,
-                        error = %e,
-                        "skipping disappeared non-root process during macOS VZ meter sample"
-                    );
-                }
+            let (contribution, was_live) =
+                self.accumulate_pid(pid, macos_process_cpu_nsec(pid))?;
+            cpu_nsec = cpu_nsec.saturating_add(contribution);
+            if was_live {
+                sampled += 1;
             }
         }
 
@@ -626,6 +622,75 @@ impl HostProcessMeterSource {
             cpu_usec: cpu_nsec / 1000,
             mem_bytes: self.memory_cap_bytes,
         })
+    }
+
+    /// Decide one pid's contribution to this tick's cumulative CPU sum and update the
+    /// per-pid frozen-value map. Pure w.r.t. the syscall — it takes the already-fetched
+    /// `proc_pid_rusage` result — so the undercount-safety invariant is unit-testable with
+    /// injected samples (no live VM). Returns `(cpu_nsec_contribution, was_live)`:
+    ///   - live sample: contribute the fresh cumulative value, remember it, count it live;
+    ///   - root pid gone: hard-fail (losing the helper means we cannot meter at all);
+    ///   - service/tree pid gone (ESRCH): contribute its FROZEN last-sampled value (not 0)
+    ///     so the summed cumulative total does NOT drop across the exit — preventing the
+    ///     persistent undercount (free compute => die-when-broke fails) the keeper flagged;
+    ///   - service pid non-ESRCH fault: hard-fail (a real accounting/permission fault);
+    ///   - non-root tree pid non-ESRCH fault: skip (contribute 0, not live).
+    fn accumulate_pid(
+        &mut self,
+        pid: u32,
+        sample: Result<u64, CpuSampleError>,
+    ) -> Result<(u64, bool), MeterError> {
+        match sample {
+            Ok(pid_cpu_nsec) => {
+                self.last_cpu_nsec_by_pid.insert(pid, pid_cpu_nsec);
+                Ok((pid_cpu_nsec, true))
+            }
+            // The ROOT pid (the VZ helper) vanishing is a real failure: losing the
+            // helper means we can no longer meter the run at all, so fail loudly.
+            Err(e) if pid == self.root_pid => Err(MeterError::HostProcessUnreadable {
+                root_pid: self.root_pid,
+                reason: e.reason,
+            }),
+            // A SERVICE pid (or a non-root tree pid) that is genuinely GONE (ESRCH)
+            // exited between discovery and this sample — benign for the RUN, but its
+            // accumulated CPU must NOT silently leave the summed total: that would
+            // make `total_now < total_prev`, the per-tick delta would clamp to 0, and
+            // the lower sum would become the baseline forever (a persistent undercount
+            // in the agent's favor => free compute => die-when-broke fails). RETAIN the
+            // pid's last-sampled cumulative value (frozen), so it contributes its
+            // accumulated compute one last time and the total stays monotonic across
+            // the exit. A non-ESRCH failure on a service pid (e.g. a permission/
+            // accounting fault) is NOT benign and still hard-fails below.
+            Err(e) if e.is_no_such_process() => {
+                let frozen = self.last_cpu_nsec_by_pid.get(&pid).copied().unwrap_or(0);
+                tracing::debug!(
+                    pid,
+                    root_pid = self.root_pid,
+                    is_service = self.service_pids.contains(&pid),
+                    frozen_cpu_nsec = frozen,
+                    error = %e.reason,
+                    "retaining last-sampled CPU for disappeared process (ESRCH) during macOS VZ meter sample"
+                );
+                Ok((frozen, false))
+            }
+            // A service pid that failed for a reason OTHER than having exited is a
+            // real fault: surface it.
+            Err(e) if self.service_pids.contains(&pid) => {
+                Err(MeterError::HostProcessUnreadable {
+                    root_pid: self.root_pid,
+                    reason: e.reason,
+                })
+            }
+            Err(e) => {
+                tracing::debug!(
+                    pid,
+                    root_pid = self.root_pid,
+                    error = %e.reason,
+                    "skipping disappeared non-root process during macOS VZ meter sample"
+                );
+                Ok((0, false))
+            }
+        }
     }
 }
 
@@ -762,16 +827,38 @@ fn macos_child_pids(pid: u32) -> Result<Vec<u32>, String> {
         .collect())
 }
 
+/// A `proc_pid_rusage` sampling failure: the human-readable `reason` (surfaced in
+/// `MeterError`) plus the raw OS errno so the caller can distinguish a genuinely
+/// gone pid (`ESRCH` / "no such process") from other faults without string-matching.
 #[cfg(target_os = "macos")]
-fn macos_process_cpu_nsec(pid: u32) -> Result<u64, String> {
-    let pid = macos_pid_to_c_int(pid)?;
+struct CpuSampleError {
+    reason: String,
+    raw_os_error: Option<i32>,
+}
+
+#[cfg(target_os = "macos")]
+impl CpuSampleError {
+    /// True when the pid is genuinely gone (`ESRCH`): the process exited between
+    /// discovery and sampling — benign for a secondary/service pid.
+    fn is_no_such_process(&self) -> bool {
+        self.raw_os_error == Some(libc::ESRCH)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_cpu_nsec(pid: u32) -> Result<u64, CpuSampleError> {
+    let pid = macos_pid_to_c_int(pid).map_err(|reason| CpuSampleError {
+        reason,
+        raw_os_error: None,
+    })?;
     let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
     let rc = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, usage.as_mut_ptr().cast()) };
     if rc != 0 {
-        return Err(format!(
-            "proc_pid_rusage({pid}) failed: {}",
-            std::io::Error::last_os_error()
-        ));
+        let err = std::io::Error::last_os_error();
+        return Err(CpuSampleError {
+            reason: format!("proc_pid_rusage({pid}) failed: {err}"),
+            raw_os_error: err.raw_os_error(),
+        });
     }
     let usage = unsafe { usage.assume_init() };
     Ok(usage.ri_user_time.saturating_add(usage.ri_system_time))
@@ -909,6 +996,141 @@ mod tests {
         // CPU + mem + egress all contribute and sum.
         let all = rates.burn_for_tick(100_000, 64 * 1024 * 1024, 200, Duration::from_millis(1000));
         assert_eq!(all, 100 + 64 + 200);
+    }
+
+    /// UNDERCOUNT SAFETY (the keeper's correctness nuance): each pid's `proc_pid_rusage`
+    /// value is CUMULATIVE (monotonic since process start), the meter sums the live pids'
+    /// cumulative values each tick, and `tick_once` bills the DELTA of that summed total
+    /// (`total_now - total_prev`, `saturating_sub` => clamped to 0 when it would go
+    /// negative). So if an exited service pid's accumulated CPU silently LEFT the sum, the
+    /// summed total would DROP, the delta would clamp to 0, and the lower sum would become
+    /// the baseline forever — a persistent undercount in the agent's favor (free compute,
+    /// die-when-broke fails). This drives the pure `accumulate_pid` (no live VM) with
+    /// injected samples to assert that an ESRCH-exited pid RETAINS its last-sampled value
+    /// so the summed total does NOT decrease across the exit.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn esrch_pid_retains_last_sample_so_total_does_not_drop() {
+        use std::collections::HashMap;
+
+        let mut source = HostProcessMeterSource {
+            root_pid: 1,
+            service_pids: vec![2],
+            memory_cap_bytes: 0,
+            last_cpu_nsec_by_pid: HashMap::new(),
+        };
+
+        let esrch = || CpuSampleError {
+            reason: "proc_pid_rusage(2) failed: No such process".to_string(),
+            raw_os_error: Some(libc::ESRCH),
+        };
+
+        // Tick 1: root pid (1) and service pid (2) both live with cumulative values.
+        let (root_c1, root_live1) = source.accumulate_pid(1, Ok(5_000)).expect("root live");
+        let (svc_c1, svc_live1) = source.accumulate_pid(2, Ok(3_000)).expect("service live");
+        let total1 = root_c1 + svc_c1;
+        assert_eq!(total1, 8_000);
+        assert!(root_live1 && svc_live1, "both pids counted live");
+
+        // Tick 2: root pid (1) advanced (cumulative grew); service pid (2) EXITED (ESRCH).
+        // Its frozen last-sampled 3_000 must still be contributed, so the summed total is
+        // monotonic — it does NOT drop below tick 1 even though pid 2 is gone.
+        let (root_c2, root_live2) = source.accumulate_pid(1, Ok(6_000)).expect("root live");
+        let (svc_c2, svc_live2) = source.accumulate_pid(2, Err(esrch())).expect("esrch is benign");
+        let total2 = root_c2 + svc_c2;
+        assert_eq!(svc_c2, 3_000, "exited pid contributes its FROZEN last value, not 0");
+        assert!(root_live2, "root still live");
+        assert!(!svc_live2, "exited pid is not counted live");
+        assert!(
+            total2 >= total1,
+            "cumulative summed total must not decrease when a pid vanishes (no undercount): {total2} < {total1}"
+        );
+        assert_eq!(total2, 9_000, "6_000 (root) + 3_000 (frozen service) = 9_000");
+
+        // CONTRAST: the OLD skip-to-zero behavior would have dropped the service term to 0,
+        // giving total2' = 6_000 < total1 = 8_000 — the negative delta that clamps and
+        // re-baselines low. The retained-frozen value is exactly what prevents that.
+        let dropped_to_zero = root_c2; // service term == 0 under the old skip
+        assert!(dropped_to_zero < total1, "demonstrates the undercount the fix prevents");
+    }
+
+    /// A first-seen pid that is ALREADY gone (ESRCH) with no prior sample contributes 0
+    /// (there is nothing accumulated to retain) — no phantom compute, matching the prior
+    /// behavior for a never-sampled pid.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn esrch_pid_never_sampled_contributes_zero() {
+        use std::collections::HashMap;
+
+        let mut source = HostProcessMeterSource {
+            root_pid: 1,
+            service_pids: vec![7],
+            memory_cap_bytes: 0,
+            last_cpu_nsec_by_pid: HashMap::new(),
+        };
+        let (c, live) = source
+            .accumulate_pid(
+                7,
+                Err(CpuSampleError {
+                    reason: "gone".to_string(),
+                    raw_os_error: Some(libc::ESRCH),
+                }),
+            )
+            .expect("esrch benign");
+        assert_eq!(c, 0, "never-sampled exited pid contributes 0 (no phantom compute)");
+        assert!(!live);
+    }
+
+    /// A SERVICE pid failing for a reason OTHER than ESRCH is a real accounting/permission
+    /// fault and still HARD-FAILS (unchanged): we never silently freeze a non-exit fault.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn service_pid_non_esrch_fault_hard_fails() {
+        use std::collections::HashMap;
+
+        let mut source = HostProcessMeterSource {
+            root_pid: 1,
+            service_pids: vec![2],
+            memory_cap_bytes: 0,
+            last_cpu_nsec_by_pid: HashMap::new(),
+        };
+        let err = source.accumulate_pid(
+            2,
+            Err(CpuSampleError {
+                reason: "permission denied".to_string(),
+                raw_os_error: Some(libc::EPERM),
+            }),
+        );
+        assert!(
+            matches!(err, Err(MeterError::HostProcessUnreadable { .. })),
+            "a non-ESRCH service-pid fault must still hard-fail"
+        );
+    }
+
+    /// The ROOT pid vanishing (even via ESRCH) is a hard failure (unchanged): losing the
+    /// VZ helper means we can no longer meter the run at all.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn root_pid_loss_hard_fails() {
+        use std::collections::HashMap;
+
+        let mut source = HostProcessMeterSource {
+            root_pid: 1,
+            service_pids: vec![2],
+            memory_cap_bytes: 0,
+            last_cpu_nsec_by_pid: HashMap::new(),
+        };
+        let err = source.accumulate_pid(
+            1,
+            Err(CpuSampleError {
+                reason: "gone".to_string(),
+                raw_os_error: Some(libc::ESRCH),
+            }),
+        );
+        assert!(
+            matches!(err, Err(MeterError::HostProcessUnreadable { .. })),
+            "root pid loss must hard-fail even on ESRCH"
+        );
     }
 
     #[test]
