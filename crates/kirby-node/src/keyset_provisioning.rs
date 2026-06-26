@@ -1178,7 +1178,7 @@ mod tests {
             .collect()
     }
 
-    fn as_dyn<'a>(sinks: &'a [LocalSealedSink<FixedBinding>]) -> Vec<&'a dyn ShareSink> {
+    fn as_dyn(sinks: &[LocalSealedSink<FixedBinding>]) -> Vec<&dyn ShareSink> {
         sinks.iter().map(|s| s as &dyn ShareSink).collect()
     }
 
