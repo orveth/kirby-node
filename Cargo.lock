@@ -2628,6 +2628,7 @@ dependencies = [
  "cdk-mintd",
  "cdk-sqlite",
  "cgroups-rs",
+ "chacha20poly1305",
  "clap",
  "fctools",
  "frost-secp256k1-tr",

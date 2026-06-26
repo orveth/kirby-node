@@ -57,6 +57,7 @@ use frost_secp256k1_tr::keys::{KeyPackage, PublicKeyPackage};
 
 use crate::frost_identity::{self, FrostIdentity};
 use crate::quorum_signer::QuorumSigner;
+use crate::share_seal;
 
 /// The group-pubkeys file name inside a keystore dir (the PUBLIC verifying material;
 /// safe to read for identity). Written via [`frost_identity::save_pubkeys`] so the
@@ -461,6 +462,387 @@ fn read_share_file(path: &Path) -> anyhow::Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("read holder share {}", path.display()))
 }
 
+// ============================================================================================
+// S5/S6 chunk 3: DISTRIBUTED PROVISIONING via a per-holder SHARE SINK seam.
+//
+// TODAY (above): the trusted dealer splits the key 2-of-3 then writes all 3 holder
+// KeyPackages PLAINTEXT-0600 into ONE keystore dir on ONE host, anchor last. That is the
+// co-located default and stays BYTE-IDENTICAL (the functions above are untouched).
+//
+// THIS CHUNK adds an OPT-IN distributed path that keeps the trusted-dealer split UNCHANGED
+// but hands share `i` to SINK `i` instead of writing all 3 to one dir. Each sink is a
+// distinct holder store on (in production) its own machine; in this chunk the only sink
+// impl is a LOCAL SEALED sink (a distinct directory, sealing its share at rest under a
+// host-bound key, `share_seal.rs`). The build + tests use distinct LOCAL dirs standing in
+// for distinct machines.
+//
+// PRESERVED EXACTLY (the anti-identity-loss invariants, ported to the sink layout):
+//   * IDEMPOTENT FAIL-CLOSED RELOAD: anchor-exists => reload + VALIDATE every share ACROSS
+//     the sinks (each must unseal to a well-formed KeyPackage), NEVER regenerate. A missing
+//     or corrupt share over an established anchor is a LOUD error (restore the sinks), never
+//     a silent new Q.
+//   * CRASH-SAFETY ORDERING: distribute all shares to the sinks FIRST, write the anchor
+//     (group_pubkeys.json, node-local) LAST. A surviving anchor implies the shares were
+//     distributed; a crash before the anchor leaves NO anchor => the next spawn cleanly
+//     regenerates (no identity was established).
+//
+// DEFERRED (NOT built here; the next follow-up chunk): the REAL cross-machine NETWORK
+// distribution (a remote sink that sends share `i` to a `RemoteHolderServer` on ANOTHER
+// machine) + the endpoint mutual-auth / placement (design spec section 6.6). This chunk
+// builds the SINK SEAM + the local sealed sink ONLY; a remote sink drops into the
+// `ShareSink` seam later WITHOUT changing this provisioning/reload body. There is also no
+// network auth handshake here.
+// ============================================================================================
+
+/// A destination for ONE holder's FROST share (the S5/S6 seam). Distributed provisioning
+/// splits as today (trusted dealer) then hands share `i` to SINK `i` -- so no sink ever
+/// receives two shares, and the combined key is still materialized nowhere.
+///
+/// The plaintext crossing this trait is a share `KeyPackage` serialized to JSON (the same
+/// bytes the co-located path writes to `share_<i>.json`). A sealing sink encrypts it at
+/// rest; the trait contract is in terms of the plaintext so the provisioner/loader never
+/// sees the sealed form. Implementors MUST persist durably (a sink that loses its share
+/// after `put_share` returns would, with a surviving anchor, trip the fail-closed reload).
+///
+/// SCOPE: the in-tree impl is [`LocalSealedSink`] (a distinct local dir per holder). A
+/// future remote sink (share `i` shipped to a `RemoteHolderServer` on another machine over
+/// the relay seam) implements this SAME trait and drops in unchanged; that network sink +
+/// its endpoint auth is the deferred follow-up chunk.
+pub trait ShareSink {
+    /// A stable label for this sink (the holder identity for diagnostics + the seal's
+    /// domain separator). MUST be distinct per sink in a provisioning set.
+    fn label(&self) -> &str;
+
+    /// Persist share `idx`'s plaintext KeyPackage bytes durably (sealing it at rest if the
+    /// sink seals). Idempotent-overwrite is fine; the provisioner only calls this on first
+    /// spawn (anchor absent). MUST NOT return `Ok` until the share is durably stored.
+    fn put_share(&self, idx: u16, plaintext: &[u8]) -> anyhow::Result<()>;
+
+    /// Whether this sink currently holds share `idx` (a stored, readable share file).
+    /// Used by the fail-closed reload to detect a missing share over an established anchor.
+    fn has_share(&self, idx: u16) -> bool;
+
+    /// Read + (if sealed) unseal share `idx`, returning the plaintext KeyPackage bytes. A
+    /// missing or unauthenticated share is an `Err` (the reload turns that into a loud
+    /// fail-closed error -- never a silent regeneration).
+    fn get_share(&self, idx: u16) -> anyhow::Result<Vec<u8>>;
+}
+
+/// The sealed-share file name inside a sink dir for share index `idx`.
+/// `<sink_dir>/share_<idx>.sealed`.
+fn sealed_share_path(sink_dir: &Path, idx: u16) -> PathBuf {
+    sink_dir.join(format!("share_{idx}.sealed"))
+}
+
+/// A LOCAL holder store that SEALS its one share at rest (`share_seal.rs`). Each sink is a
+/// DISTINCT directory; in production each lives on its own machine, here distinct local
+/// dirs stand in for distinct machines. The share is XChaCha20Poly1305-sealed under a key
+/// HKDF-derived from the host machine binding + a per-sink salt (so a stolen disk image of
+/// this one sink yields nothing usable; the honest residual -- a LIVE host still reads its
+/// own one share -- is documented in `share_seal`).
+///
+/// The sink is GENERIC over the [`share_seal::MachineBinding`] so tests can inject a fixed
+/// binding (two test sinks = two "machines"); production uses [`share_seal::HostMachineBinding`].
+pub struct LocalSealedSink<B: share_seal::MachineBinding> {
+    /// This sink's own directory (its "machine"'s store).
+    dir: PathBuf,
+    /// The sink label (the seal domain separator + diagnostics). Distinct per sink.
+    label: String,
+    /// The machine binding source for the seal key (machine-id in production).
+    binding: B,
+}
+
+impl LocalSealedSink<share_seal::HostMachineBinding> {
+    /// Build a production sealed sink at `dir` labelled `label`, binding the seal key to the
+    /// host machine (machine-id, with the documented loud fallback). Creates `dir` 0700.
+    pub fn open(dir: impl Into<PathBuf>, label: impl Into<String>) -> anyhow::Result<Self> {
+        Self::open_with_binding(dir, label, share_seal::HostMachineBinding)
+    }
+}
+
+impl<B: share_seal::MachineBinding> LocalSealedSink<B> {
+    /// Build a sealed sink with an explicit machine binding (the test seam). Creates the
+    /// sink dir owner-only.
+    pub fn open_with_binding(
+        dir: impl Into<PathBuf>,
+        label: impl Into<String>,
+        binding: B,
+    ) -> anyhow::Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create sealed share sink dir {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Owner-only dir (0700): the sealed share + its salt live here.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("chmod 0700 sink dir {}", dir.display()))?;
+        }
+        Ok(Self { dir, label: label.into(), binding })
+    }
+
+    /// This sink's directory (for diagnostics + tests that inspect raw bytes).
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl<B: share_seal::MachineBinding> ShareSink for LocalSealedSink<B> {
+    fn label(&self) -> &str {
+        &self.label
+    }
+
+    fn put_share(&self, idx: u16, plaintext: &[u8]) -> anyhow::Result<()> {
+        // Load-or-create this sink's per-sink salt (separates sinks on one machine), then
+        // seal the share plaintext under the host-bound key and write the sealed body 0600.
+        let salt = share_seal::load_or_create_salt(&self.dir)
+            .with_context(|| format!("salt for sink {}", self.label))?;
+        let sealed = share_seal::seal(&self.binding, &self.dir, &self.label, &salt, plaintext)
+            .with_context(|| format!("seal share {idx} for sink {}", self.label))?;
+        write_file_0600(&sealed_share_path(&self.dir, idx), &sealed)?;
+        Ok(())
+    }
+
+    fn has_share(&self, idx: u16) -> bool {
+        sealed_share_path(&self.dir, idx).is_file()
+    }
+
+    fn get_share(&self, idx: u16) -> anyhow::Result<Vec<u8>> {
+        let path = sealed_share_path(&self.dir, idx);
+        // Bounded read + symlink/regular-file guard (a sealed share is well under a KiB),
+        // mirroring `read_share_file`'s hardening.
+        let sealed = read_share_file(&path)?;
+        // The salt MUST already exist (load_salt does NOT create it): a missing salt over a
+        // stored sealed share is corruption, a loud error -- never a silent re-create that
+        // would derive the wrong key and make the share permanently un-unsealable.
+        let salt = share_seal::load_salt(&self.dir)
+            .with_context(|| format!("salt for sink {} (unseal)", self.label))?;
+        share_seal::unseal(&self.binding, &self.dir, &self.label, &salt, &sealed)
+            .with_context(|| format!("unseal share {idx} from sink {}", self.label))
+    }
+}
+
+/// Provision (or idempotently reload) a per-agent FROST keyset whose 3 holder shares are
+/// DISTRIBUTED across `sinks` (one share per sink), with the PUBLIC group anchor
+/// (`group_pubkeys.json`) written node-local under `anchor_dir`. Returns the agent's PUBLIC
+/// [`FrostIdentity`] (its Q + npub).
+///
+/// This is the OPT-IN distributed counterpart of [`provision_keyset_at`] (the co-located
+/// default, byte-identical, untouched). It keeps the trusted-dealer split UNCHANGED and the
+/// SAME anti-identity-loss invariants, ported to the sink layout:
+///
+///   * IDEMPOTENT FAIL-CLOSED RELOAD: if `anchor_dir` already holds `group_pubkeys.json` an
+///     established sovereign Q exists, so this RELOADS it and VALIDATES every share across
+///     the sinks (each must read + unseal to a well-formed KeyPackage), returning the SAME
+///     Q. It NEVER regenerates; a missing/corrupt share is a LOUD error.
+///   * CRASH-SAFETY ORDERING: on FIRST spawn, all shares go to the sinks FIRST and the
+///     anchor is written LAST -- a surviving anchor implies the shares were distributed.
+///
+/// `sinks` MUST have exactly [`SHARE_COUNT`] entries with DISTINCT labels (distinct holder
+/// stores); the i-th share (identifier `i+1`) goes to `sinks[i]`. The dealer host retains NO
+/// share after this returns (the keyset + its derived KeyPackages are ZeroizeOnDrop and
+/// dropped; only the per-sink sealed stores hold a share).
+pub fn provision_keyset_with_sinks(
+    anchor_dir: &Path,
+    sinks: &[&dyn ShareSink],
+) -> anyhow::Result<FrostIdentity> {
+    if sinks.len() != SHARE_COUNT as usize {
+        anyhow::bail!(
+            "distributed provisioning needs exactly {SHARE_COUNT} share sinks (one per holder), \
+             got {}",
+            sinks.len()
+        );
+    }
+    // Distinct sink labels (two shares to the same store would re-create the co-located hole
+    // on that store + collide their seal domain). Reject a duplicated label up front.
+    for i in 0..sinks.len() {
+        for j in (i + 1)..sinks.len() {
+            if sinks[i].label() == sinks[j].label() {
+                anyhow::bail!(
+                    "share sinks {i} and {j} share the label {:?}; each holder sink MUST be \
+                     distinct (no sink may hold two shares)",
+                    sinks[i].label()
+                );
+            }
+        }
+    }
+
+    // FAIL-CLOSED RELOAD (idempotent restart): the anchor is the durable proof a sovereign Q
+    // was minted. If it exists we NEVER regenerate -- reload it and validate every share
+    // across the sinks, failing LOUD on any missing/corrupt share.
+    if has_identity_anchor(anchor_dir) {
+        let id = FrostIdentity::load(&pubkeys_path(anchor_dir)).with_context(|| {
+            format!(
+                "reload established FROST identity anchor {} (idempotent distributed restart). \
+                 The anchor (group_pubkeys.json) exists, so a sovereign Q was already minted and \
+                 MUST NOT be regenerated.",
+                anchor_dir.display()
+            )
+        })?;
+        assert_shares_loadable_from_sinks(sinks).with_context(|| {
+            format!(
+                "established distributed FROST identity at {} has a missing or corrupt holder \
+                 share in one of its sinks. The identity anchor (group_pubkeys.json) is present, \
+                 so this agent ALREADY OWNS a sovereign Q -- refusing to regenerate (that would \
+                 mint a NEW key and permanently lose this identity + its funds). RESTORE the \
+                 missing sink's sealed share (+ its salt) from backup.",
+                anchor_dir.display()
+            )
+        })?;
+        tracing::info!(
+            npub = %id.npub(),
+            anchor = %anchor_dir.display(),
+            sinks = sinks.len(),
+            "reloaded established DISTRIBUTED per-agent FROST keyset (idempotent; same sovereign Q across restart; all shares validated across sinks)"
+        );
+        return Ok(id);
+    }
+
+    // FIRST SPAWN (no anchor): the supervisor is the trusted dealer (split UNCHANGED).
+    std::fs::create_dir_all(anchor_dir).with_context(|| {
+        format!("create per-agent FROST anchor dir {}", anchor_dir.display())
+    })?;
+
+    // (1) Trusted-dealer 2-of-3 keygen (the combined key lives + dies inside this call; see
+    //     the module ZEROIZE note). UNCHANGED from the co-located path.
+    let keyset = kirby_custody::generate_dealer_keyset(MIN_SIGNERS, MAX_SIGNERS)
+        .map_err(|e| anyhow::anyhow!("trusted-dealer 2-of-3 keygen: {e}"))?;
+
+    // CRASH-SAFETY ORDERING: DISTRIBUTE all shares to the sinks FIRST, write the anchor LAST.
+    // (2a) Hand share `i` (identifier i+1) to sink `i`. Each sink seals it at rest. The
+    //      KeyPackages are ZeroizeOnDrop and wiped when this scope ends; only the per-sink
+    //      sealed stores retain a share. No sink receives two shares (one put per sink).
+    {
+        let kps = kirby_custody::key_packages(&keyset)
+            .map_err(|e| anyhow::anyhow!("derive holder KeyPackages from the dealer keyset: {e}"))?;
+        if kps.len() != SHARE_COUNT as usize {
+            anyhow::bail!(
+                "expected {SHARE_COUNT} holder KeyPackages from the dealer split, got {} (keygen mismatch)",
+                kps.len()
+            );
+        }
+        // Map each KeyPackage by its identifier u16 (1..=3) to the matching sink. The sinks
+        // are indexed 0..n; share identifier `i` (1-based) goes to `sinks[i-1]`.
+        for (id, kp) in &kps {
+            let idx = identifier_to_u16(id);
+            if idx < 1 || idx as usize > sinks.len() {
+                anyhow::bail!(
+                    "holder identifier {idx} out of range for {} sinks (trusted-dealer ids are 1..=n)",
+                    sinks.len()
+                );
+            }
+            let kp_json = serde_json::to_vec(kp)
+                .with_context(|| format!("serialize holder KeyPackage {idx}"))?;
+            let sink = sinks[idx as usize - 1];
+            sink.put_share(idx, &kp_json).with_context(|| {
+                format!("distribute share {idx} to sink {:?}", sink.label())
+            })?;
+        }
+        // `kps` (ZeroizeOnDrop KeyPackages) drops here, wiping the secret shares it held.
+    }
+
+    // (2b) The PUBLIC anchor (group PublicKeyPackage), written LAST (crash-safety invariant).
+    let pubkeys_file = pubkeys_path(anchor_dir);
+    frost_identity::save_pubkeys(&keyset.pubkeys, &pubkeys_file)
+        .context("persist FROST group pubkeys (the distributed identity anchor; written LAST)")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&pubkeys_file, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 group pubkeys {}", pubkeys_file.display()))?;
+    }
+
+    // (3) Derive the agent's PUBLIC identity (Q + npub) from the persisted public package.
+    let identity = FrostIdentity::from_pubkeys(keyset.pubkeys.clone(), &pubkeys_path(anchor_dir))
+        .context("derive FROST identity (Q + npub) from the freshly distributed group")?;
+
+    tracing::info!(
+        npub = %identity.npub(),
+        anchor = %anchor_dir.display(),
+        sinks = sinks.len(),
+        "provisioned NEW DISTRIBUTED per-agent FROST keyset (trusted-dealer 2-of-3; shares sealed to distinct sinks FIRST, anchor LAST; the agent is born with sovereign Q)"
+    );
+
+    // (4) ZEROIZE: drop the dealer keyset. Its SecretShares are ZeroizeOnDrop. After this
+    //     drop the dealer host retains NO share -- the shares live ONLY in the per-sink
+    //     sealed stores. The combined key was already zeroized inside the dealer keygen.
+    drop(keyset);
+
+    Ok(identity)
+}
+
+/// FAIL-CLOSED validation for the distributed layout: every sink (identifier 1..=n) must
+/// currently hold a share that reads + unseals to a well-formed `KeyPackage`. Called when an
+/// established anchor is found, so a partial/corrupt distributed keystore over an
+/// established Q is a LOUD error rather than a silent regeneration. The shares it reads are
+/// dropped immediately (ZeroizeOnDrop) -- no combined-secret materialization, no lingering
+/// copy.
+fn assert_shares_loadable_from_sinks(sinks: &[&dyn ShareSink]) -> anyhow::Result<()> {
+    for (i, sink) in sinks.iter().enumerate() {
+        let idx = (i + 1) as u16;
+        if !sink.has_share(idx) {
+            anyhow::bail!("holder share {idx} missing from sink {:?}", sink.label());
+        }
+        let bytes = sink
+            .get_share(idx)
+            .with_context(|| format!("read+unseal share {idx} from sink {:?}", sink.label()))?;
+        let _kp: KeyPackage = serde_json::from_slice(&bytes).with_context(|| {
+            format!("deserialize holder KeyPackage {idx} from sink {:?}", sink.label())
+        })?;
+        // `_kp` (ZeroizeOnDrop) drops here, wiping the share scalar it held.
+    }
+    Ok(())
+}
+
+/// Build a live [`QuorumSigner`] from a DISTRIBUTED keyset: read + unseal each sink's share
+/// and the node-local group anchor, returning a signer over those shares. The loader
+/// counterpart of [`provision_keyset_with_sinks`].
+///
+/// SCOPE (this chunk): the sealed shares are read back into a co-located [`QuorumSigner`]
+/// (the local sealed sinks are still on one box here). The REAL cross-machine signer -- a
+/// `QuorumSigner` whose holders are `RemoteHolder`s pointed at `RemoteHolderServer`s that
+/// each hold their OWN unsealed share on their OWN machine -- is the deferred network chunk;
+/// it wires the SAME sinks to remote holder servers without changing this provisioning body.
+/// Here the sink seam handles share STORAGE + at-rest SEALING; chunk 1's `RemoteHolder`
+/// already handles the cross-machine SIGNING seam.
+pub fn load_quorum_signer_from_sinks(
+    anchor_dir: &Path,
+    sinks: &[&dyn ShareSink],
+) -> anyhow::Result<QuorumSigner> {
+    if sinks.len() != SHARE_COUNT as usize {
+        anyhow::bail!(
+            "loading a distributed quorum signer needs exactly {SHARE_COUNT} sinks, got {}",
+            sinks.len()
+        );
+    }
+    if !has_identity_anchor(anchor_dir) {
+        anyhow::bail!(
+            "distributed FROST keyset anchor {} is not provisioned (no group_pubkeys.json); \
+             provision it at spawn before loading a quorum signer",
+            anchor_dir.display()
+        );
+    }
+    let identity = FrostIdentity::load(&pubkeys_path(anchor_dir))
+        .with_context(|| format!("load group pubkeys from {}", anchor_dir.display()))?;
+    let pubkeys: PublicKeyPackage = identity.pubkeys().clone();
+
+    // Read + unseal each sink's share into a KeyPackage (ordered by identifier 1..=n).
+    let mut key_packages: Vec<KeyPackage> = Vec::with_capacity(SHARE_COUNT as usize);
+    for (i, sink) in sinks.iter().enumerate() {
+        let idx = (i + 1) as u16;
+        let bytes = sink
+            .get_share(idx)
+            .with_context(|| format!("read+unseal share {idx} from sink {:?}", sink.label()))?;
+        let kp: KeyPackage = serde_json::from_slice(&bytes).with_context(|| {
+            format!("deserialize holder KeyPackage {idx} from sink {:?}", sink.label())
+        })?;
+        key_packages.push(kp);
+    }
+
+    QuorumSigner::from_local_key_packages(key_packages, pubkeys)
+        .context("build QuorumSigner from the distributed (unsealed) sink shares")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +1140,343 @@ mod tests {
             "a keystore missing a holder share must refuse to load"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ========================================================================================
+    // S5/S6 chunk 3: DISTRIBUTED PROVISIONING teeth (the sink seam + at-rest sealing).
+    // ========================================================================================
+
+    use crate::share_seal::FixedBinding;
+
+    /// A distinct sink root under temp, holding the 3 per-holder sink dirs + the node-local
+    /// anchor dir. The 3 sinks each get a DIFFERENT FixedBinding so they model 3 distinct
+    /// machines (sink i's seal key is unrelated to sink j's). Returns (anchor_dir, [dir1,2,3]).
+    fn dist_dirs(tag: &str) -> (PathBuf, [PathBuf; 3]) {
+        let root = std::env::temp_dir().join(format!(
+            "kirby-s3d-dist-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let anchor = root.join("anchor");
+        let sinks = [root.join("sink-1"), root.join("sink-2"), root.join("sink-3")];
+        (anchor, sinks)
+    }
+
+    /// Build the 3 sealed sinks over `dirs`, each on its own "machine" (distinct binding +
+    /// distinct label). Returned owned so the caller can borrow them as `&dyn ShareSink`.
+    fn sealed_sinks(dirs: &[PathBuf; 3]) -> Vec<LocalSealedSink<FixedBinding>> {
+        (0..3)
+            .map(|i| {
+                LocalSealedSink::open_with_binding(
+                    dirs[i].clone(),
+                    format!("holder-{}", i + 1),
+                    FixedBinding(format!("machine-{}-binding-secret", i + 1).into_bytes()),
+                )
+                .expect("open sealed sink")
+            })
+            .collect()
+    }
+
+    fn as_dyn(sinks: &[LocalSealedSink<FixedBinding>]) -> Vec<&dyn ShareSink> {
+        sinks.iter().map(|s| s as &dyn ShareSink).collect()
+    }
+
+    /// TEETH (no-sink-holds-2 + dealer-retains-0): after distributed provisioning, each of
+    /// the 3 sinks holds EXACTLY ONE share and the dealer's anchor dir holds ZERO shares
+    /// (only the public group_pubkeys.json). The combined key is materialized nowhere.
+    #[test]
+    fn distributed_provisioning_one_share_per_sink_dealer_retains_none() {
+        let (anchor, dirs) = dist_dirs("oneeach");
+        let sinks = sealed_sinks(&dirs);
+        let id = provision_keyset_with_sinks(&anchor, &as_dyn(&sinks))
+            .expect("distributed first spawn provisions");
+        assert!(id.npub().starts_with("npub1"), "npub must encode");
+
+        // NO SINK HOLDS 2: each sink dir has exactly its own share_<i>.sealed and no other
+        // share_*.sealed (no sink received a second share).
+        for (i, sink) in sinks.iter().enumerate() {
+            let idx = (i + 1) as u16;
+            assert!(sink.has_share(idx), "sink {} must hold its own share {idx}", sink.label());
+            // It must NOT hold any OTHER holder's share.
+            for other in 1..=3u16 {
+                if other != idx {
+                    assert!(
+                        !sealed_share_path(sink.dir(), other).is_file(),
+                        "sink {} (holds share {idx}) must NOT also hold share {other}",
+                        sink.label()
+                    );
+                }
+            }
+            // Count *.sealed files in the dir == 1 (exactly one share).
+            let sealed_count = std::fs::read_dir(sink.dir())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".sealed"))
+                .count();
+            assert_eq!(sealed_count, 1, "sink {} must hold exactly ONE sealed share", sink.label());
+        }
+
+        // DEALER RETAINS 0: the anchor dir holds the public anchor but NO share material
+        // (no share_*.json from the co-located layout, no *.sealed from a sink). The dealer
+        // host keeps nothing signable after distribution.
+        assert!(pubkeys_path(&anchor).is_file(), "the anchor (group_pubkeys.json) is node-local");
+        for entry in std::fs::read_dir(&anchor).unwrap().filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with("share_") && !name.ends_with(".sealed"),
+                "the dealer anchor dir must hold NO share material, found {name}"
+            );
+        }
+        // The anchor dir is exactly {group_pubkeys.json}.
+        let anchor_entries: Vec<String> = std::fs::read_dir(&anchor)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(anchor_entries, vec![PUBKEYS_FILE.to_string()], "anchor dir = only the pubkeys anchor");
+
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!("DIST-ONE-SHARE-PER-SINK PASS: 3 sinks hold 1 share each; dealer anchor dir holds 0 shares");
+    }
+
+    /// TEETH (sealed-at-rest): a RAW byte read of a sink's stored share file does NOT contain
+    /// the plaintext KeyPackage (it is actually AEAD-sealed, not just renamed). We prove it by
+    /// deriving the SAME plaintext the provisioner would store (the share KeyPackage JSON for
+    /// that identifier) is NOT a substring of the sealed bytes -- and that the sealed bytes DO
+    /// unseal back to a valid KeyPackage via the sink's own get_share.
+    #[test]
+    fn distributed_shares_are_sealed_at_rest_not_plaintext() {
+        let (anchor, dirs) = dist_dirs("sealed");
+        let sinks = sealed_sinks(&dirs);
+        provision_keyset_with_sinks(&anchor, &as_dyn(&sinks)).expect("provision");
+
+        for (i, sink) in sinks.iter().enumerate() {
+            let idx = (i + 1) as u16;
+            let raw = std::fs::read(sealed_share_path(sink.dir(), idx)).expect("read raw sealed share");
+
+            // The unsealed plaintext (what the sink would return) really IS a KeyPackage.
+            let plaintext = sink.get_share(idx).expect("unseal share");
+            let _kp: KeyPackage = serde_json::from_slice(&plaintext).expect("unsealed is a KeyPackage");
+
+            // SEALED, NOT RENAMED: the raw on-disk bytes do NOT contain the plaintext verbatim.
+            assert!(
+                !contains(&raw, &plaintext),
+                "sink {} raw bytes contain the unsealed plaintext verbatim -- NOT sealed!",
+                sink.label()
+            );
+            // And the raw bytes do NOT even parse as a KeyPackage (so it is not stored as a
+            // re-encoded-but-cleartext blob): a sealed body is opaque ciphertext.
+            assert!(
+                serde_json::from_slice::<KeyPackage>(&raw).is_err(),
+                "sink {} raw bytes parse as a cleartext KeyPackage -- NOT sealed!",
+                sink.label()
+            );
+            // Derive the plaintext JSON's OWN top-level field names + values and assert NONE
+            // of them appear verbatim in the sealed body (robust regardless of the exact frost
+            // serde field names; if the share were plaintext these byte runs would be present).
+            let v: serde_json::Value = serde_json::from_slice(&plaintext).expect("plaintext is JSON");
+            if let Some(obj) = v.as_object() {
+                assert!(!obj.is_empty(), "a KeyPackage JSON object should have fields");
+                for (k, val) in obj {
+                    assert!(
+                        !contains(&raw, k.as_bytes()),
+                        "sink {} raw bytes contain plaintext field name {k:?} -- NOT sealed!",
+                        sink.label()
+                    );
+                    // String values (the hex-encoded share scalar etc.) must also be absent.
+                    if let Some(s) = val.as_str() {
+                        if s.len() >= 8 {
+                            assert!(
+                                !contains(&raw, s.as_bytes()),
+                                "sink {} raw bytes contain a plaintext field VALUE -- NOT sealed!",
+                                sink.label()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!("DIST-SEALED-AT-REST PASS: every sink's stored share is AEAD-sealed (no plaintext KeyPackage on disk)");
+    }
+
+    /// TEETH (reload -> same Q, idempotent): provision distributed, then re-provision (a
+    /// restart) -> the SAME Q/npub, no regeneration; and a quorum signer loaded from the
+    /// unsealed sinks signs a note that verifies under that SAME persistent Q.
+    #[test]
+    fn distributed_reload_yields_same_q_and_signs_under_it() {
+        let (anchor, dirs) = dist_dirs("reload");
+        let sinks = sealed_sinks(&dirs);
+
+        let id1 = provision_keyset_with_sinks(&anchor, &as_dyn(&sinks)).expect("first spawn");
+        let q1 = id1.q_bytes();
+        let npub1 = id1.npub();
+
+        // Capture the sealed share bytes before the restart (a regen would change them).
+        let sealed_before: Vec<Vec<u8>> = (1..=3u16)
+            .map(|idx| std::fs::read(sealed_share_path(&dirs[idx as usize - 1], idx)).unwrap())
+            .collect();
+
+        // Restart: re-provision over the same anchor + sinks -> RELOAD, not regenerate.
+        let sinks2 = sealed_sinks(&dirs);
+        let id2 = provision_keyset_with_sinks(&anchor, &as_dyn(&sinks2)).expect("restart reloads");
+        assert_eq!(q1, id2.q_bytes(), "Q must be identical across restart (no regeneration)");
+        assert_eq!(npub1, id2.npub(), "npub must be identical across restart");
+
+        // The sealed shares were NOT rewritten on reload (byte-identical => no regen).
+        for (idx, before) in sealed_before.iter().enumerate() {
+            let after = std::fs::read(sealed_share_path(&dirs[idx], (idx + 1) as u16)).unwrap();
+            assert_eq!(before, &after, "sealed share {} must be byte-identical on reload", idx + 1);
+        }
+
+        // Load a quorum signer from the unsealed sinks; it signs under the SAME persistent Q.
+        let sinks3 = sealed_sinks(&dirs);
+        let signer =
+            load_quorum_signer_from_sinks(&anchor, &as_dyn(&sinks3)).expect("load signer from sinks");
+        assert_eq!(signer.q_bytes(), q1, "the loaded signer's Q must be the persistent distributed Q");
+
+        let event = signer
+            .sign_nostr_event(1, 1_750_000_000, "Sovereign across distinct sealed sinks.")
+            .expect("the distributed quorum signs");
+        assert_eq!(event.pubkey, hex::encode(q1), "event pubkey must be the persistent Q");
+
+        // Independently verify the aggregate under the tweaked Q.
+        let pubkeys = FrostIdentity::load(&pubkeys_path(&anchor)).unwrap().pubkeys().clone();
+        let (_addr, internal_p) = taproot_address(&pubkeys, KnownHrp::Testnets).expect("address");
+        let secp = Secp256k1::verification_only();
+        let (q_tweaked, _parity) = internal_p.tap_tweak(&secp, None);
+        let q_xonly = q_tweaked.to_x_only_public_key();
+        let event_id = hex::decode(&event.id).expect("event id hex");
+        let msg = Message::from_digest(event_id.as_slice().try_into().expect("32-byte id"));
+        let sig = schnorr::Signature::from_slice(&hex::decode(&event.sig).expect("sig hex"))
+            .expect("parse 64-byte sig");
+        assert!(
+            secp.verify_schnorr(&sig, &msg, &q_xonly).is_ok(),
+            "the distributed aggregate must verify under the persistent (tweaked) Q"
+        );
+
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!("DIST-RELOAD-SAME-Q PASS: restart yields the same Q (no regen); unsealed sinks sign verifying under it");
+    }
+
+    /// TEETH (fail-closed preserved, the catastrophic case ported to the sink layout): an
+    /// ESTABLISHED distributed keyset (anchor + 3 sealed sinks) with ONE sink's share DELETED
+    /// must make `provision_keyset_with_sinks` FAIL LOUD -- it must NEVER silently regenerate a
+    /// new Q. We assert (a) it errors with a restore message, (b) the anchor is untouched (the
+    /// original Q is preserved on disk), and (c) the surviving sinks' sealed shares are
+    /// byte-identical (no regeneration ran).
+    #[test]
+    fn distributed_fails_closed_on_missing_share_over_established_anchor() {
+        let (anchor, dirs) = dist_dirs("failclosed");
+        let sinks = sealed_sinks(&dirs);
+        let id1 = provision_keyset_with_sinks(&anchor, &as_dyn(&sinks)).expect("establish identity");
+        let q1 = id1.q_bytes();
+        let anchor_before = std::fs::read(pubkeys_path(&anchor)).expect("read anchor before");
+        let surviving_before: Vec<(u16, Vec<u8>)> = [1u16, 3u16]
+            .into_iter()
+            .map(|idx| (idx, std::fs::read(sealed_share_path(&dirs[idx as usize - 1], idx)).unwrap()))
+            .collect();
+
+        // Catastrophe: delete sink 2's sealed share, leaving the anchor intact.
+        std::fs::remove_file(sealed_share_path(&dirs[1], 2)).expect("delete sink 2 share");
+
+        // FAIL-CLOSED: provisioning over an established anchor with a missing share must ERROR.
+        let sinks2 = sealed_sinks(&dirs);
+        let err = provision_keyset_with_sinks(&anchor, &as_dyn(&sinks2))
+            .map(|_| ())
+            .expect_err("a missing sink share over an established anchor MUST fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing or corrupt") || msg.to_lowercase().contains("restore"),
+            "the error must tell the operator to restore the sink, got: {msg}"
+        );
+
+        // The anchor is UNTOUCHED -- no new Q minted over the established identity.
+        let anchor_after = std::fs::read(pubkeys_path(&anchor)).expect("read anchor after");
+        assert_eq!(anchor_before, anchor_after, "the anchor must NOT be rewritten (no regen)");
+        let reloaded = FrostIdentity::load(&pubkeys_path(&anchor)).expect("anchor still loads");
+        assert_eq!(reloaded.q_bytes(), q1, "the original sovereign Q must be preserved (no new key)");
+
+        // The surviving sinks were NOT rewritten (no regeneration cycle ran).
+        for (idx, before) in &surviving_before {
+            let after = std::fs::read(sealed_share_path(&dirs[*idx as usize - 1], *idx)).unwrap();
+            assert_eq!(before, &after, "surviving sink share {idx} must be byte-identical (no regen)");
+        }
+        // The deleted share is still absent.
+        assert!(!sealed_share_path(&dirs[1], 2).exists(), "the missing share stays missing (no re-mint)");
+
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!("DIST-FAIL-CLOSED PASS: a missing sink share over an established anchor errors loudly; original Q preserved; NO new key minted");
+    }
+
+    /// TEETH (fail-closed on a CORRUPT/unsealable share): an established anchor with a sink
+    /// whose sealed share is TAMPERED (cannot unseal) must also fail closed -- the unseal tag
+    /// mismatch surfaces as a loud error, never a silent regeneration.
+    #[test]
+    fn distributed_fails_closed_on_corrupt_sealed_share() {
+        let (anchor, dirs) = dist_dirs("corrupt");
+        let sinks = sealed_sinks(&dirs);
+        let id1 = provision_keyset_with_sinks(&anchor, &as_dyn(&sinks)).expect("establish identity");
+        let q1 = id1.q_bytes();
+
+        // Corrupt sink 3's sealed share (flip a ciphertext byte) so it cannot unseal.
+        let p = sealed_share_path(&dirs[2], 3);
+        let mut bytes = std::fs::read(&p).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        write_file_0600(&p, &bytes).expect("write corrupted sealed share");
+
+        let sinks2 = sealed_sinks(&dirs);
+        let err = provision_keyset_with_sinks(&anchor, &as_dyn(&sinks2))
+            .map(|_| ())
+            .expect_err("a corrupt (unsealable) sink share over an established anchor MUST fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("restore") || msg.contains("missing or corrupt") || msg.contains("tag mismatch"),
+            "the error must be a loud unseal/restore failure, got: {msg}"
+        );
+        // Anchor + Q preserved.
+        let reloaded = FrostIdentity::load(&pubkeys_path(&anchor)).expect("anchor still loads");
+        assert_eq!(reloaded.q_bytes(), q1, "the original sovereign Q must be preserved (no new key)");
+
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!("DIST-CORRUPT-SHARE-FAIL-CLOSED PASS: an unsealable sink share over an established anchor errors loudly; Q preserved");
+    }
+
+    /// TEETH (sink-set hygiene): provisioning rejects a duplicated sink (two shares to one
+    /// store would re-create the co-located hole) and a wrong-count sink set, before any
+    /// keygen.
+    #[test]
+    fn distributed_rejects_duplicate_or_wrong_count_sinks() {
+        let (anchor, dirs) = dist_dirs("hygiene");
+        // Two sinks with the SAME label -> rejected.
+        let dup = vec![
+            LocalSealedSink::open_with_binding(dirs[0].clone(), "holder-1", FixedBinding(b"m1".to_vec())).unwrap(),
+            LocalSealedSink::open_with_binding(dirs[1].clone(), "holder-1", FixedBinding(b"m2".to_vec())).unwrap(),
+            LocalSealedSink::open_with_binding(dirs[2].clone(), "holder-3", FixedBinding(b"m3".to_vec())).unwrap(),
+        ];
+        let dyn_dup: Vec<&dyn ShareSink> = dup.iter().map(|s| s as &dyn ShareSink).collect();
+        assert!(
+            provision_keyset_with_sinks(&anchor, &dyn_dup).is_err(),
+            "two sinks sharing a label must be rejected (no sink may hold two shares)"
+        );
+        // Wrong count (2 sinks for a 2-of-3) -> rejected.
+        let two = sealed_sinks(&dirs);
+        let dyn_two: Vec<&dyn ShareSink> = two.iter().take(2).map(|s| s as &dyn ShareSink).collect();
+        assert!(
+            provision_keyset_with_sinks(&anchor, &dyn_two).is_err(),
+            "a sink set that is not exactly SHARE_COUNT must be rejected"
+        );
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!("DIST-SINK-HYGIENE PASS: duplicate-label + wrong-count sink sets are rejected before keygen");
+    }
+
+    /// A naive subslice search (no extra deps), for the sealed-at-rest assertion.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return false;
+        }
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 }

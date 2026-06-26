@@ -207,6 +207,13 @@ pub mod remote_holder;
 // the supervisor's launch path; the single-key `kirby run` path never reaches it.
 // Platform-agnostic host-side type (like `quorum_signer`), so NOT cfg-gated.
 pub mod keyset_provisioning;
+// S5/S6 chunk 3: per-holder AT-REST SEALING of a FROST share. When the keyset distributes
+// (each holder stores ONE share on its own machine), that holder seals its share with
+// XChaCha20Poly1305 under a host-bound key (HKDF over the machine binding + a per-sink
+// salt). Reused by `keyset_provisioning`'s sealed share sink. Host-side only; a sealed
+// share never crosses vsock. Sealing protects a stolen disk image, NOT a live host (the
+// irreducible residual, carried in the module docs).
+pub mod share_seal;
 pub mod fleet_supervisor;
 // RE-ADOPT / REAP on supervisor restart (closes resilience finding G-3, the orphan-zombie).
 // The PID sidecar + PID-reuse-safe liveness probe + supervise-by-PID tenant + the PURE
