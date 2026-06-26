@@ -139,6 +139,16 @@ uuid = "1"
 # to the RustCrypto 0.12 generation that pairs with sha2 0.10's digest 0.10 traits.
 hkdf = "0.12"
 hmac = "0.12"
+# chacha20poly1305 is the at-rest AEAD for the cross-machine FROST keyset (S5/S6
+# chunk 3): when a holder share moves to its own sealed sink, that sink SEALS the
+# share KeyPackage at rest with XChaCha20Poly1305 under a host-bound key
+# (HKDF-SHA256 over the machine binding + a per-sink random salt). XChaCha's 192-bit
+# random nonce makes per-seal nonces collision-safe without a counter, and it is the
+# SAME well-reviewed RustCrypto construction NIP-44 already uses in-tree (so no new
+# crypto family enters the build). Pinned to the 0.10 line already resolved in the
+# lock (via nostr-sdk's nip44); pairs with the aead 0.5 traits. Host-side only (the
+# genome never seals a share); a sealed share never crosses vsock.
+chacha20poly1305 = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = { version = "0.7.2", features = ["tonic012"] }
