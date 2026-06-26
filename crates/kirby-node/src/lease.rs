@@ -117,3 +117,45 @@ impl FenceVerdict {
         matches!(self, FenceVerdict::Active { .. })
     }
 }
+
+/// THE SPAWN FENCE READ-SIDE: exactly what the spawn consumer needs to answer "is `agent_id`
+/// already held by a FRESH lease, and by which node?" before it launches — the claim-before-
+/// launch fence that closes the cross-node DOUBLE-SPAWN (resilience finding G-1: a retained
+/// spawn request re-delivered to a second node would otherwise launch a duplicate).
+///
+/// Deliberately NARROWER than [`LeaseAuthority`]: it exposes only `node_id` + `active_lease_for`,
+/// and NONE of the money-fence methods (`fence_for` / `active_term_for`). This is on purpose —
+/// the double-spawn guard must NEVER be mistaken for, or wired as, the gateway's money
+/// safety-fence. The blanket impl below lets a fully Q-VERIFIED [`LeaseAuthority`] satisfy this
+/// seam directly (so once cross-machine keyset sharing lands — G-2 — the spawn fence can verify
+/// the peer lease under the agent's quorum), while a cooperative occupancy view
+/// (`crate::relay_lease::FleetLeaseObserver`) satisfies it today without that key.
+#[async_trait::async_trait]
+pub trait SpawnFenceView: Send + Sync {
+    /// This node's id. The consumer backs off ONLY when a fresh lease names a node OTHER than
+    /// this one (a same-node lease, or none, lets the spawn proceed — same-node idempotency is
+    /// the durable spawned-set's job).
+    fn node_id(&self) -> LeaseNodeId;
+
+    /// The fresh active lease for `agent_id`, or `None` if none is held (none observed, or the
+    /// latest has gone stale). A `Some` whose `node_id` differs from [`Self::node_id`] means
+    /// another node already hosts the agent → the consumer must NOT launch a duplicate.
+    async fn active_lease_for(&self, agent_id: &str) -> Option<ActiveLease>;
+}
+
+/// A fully Q-VERIFIED [`LeaseAuthority`] is a strictly stronger fence than the cooperative
+/// occupancy view, so it satisfies [`SpawnFenceView`] directly. This is the path the spawn
+/// fence upgrades to once an agent's keyset is shared across nodes (G-2): the consumer then
+/// backs off only on a lease it has cryptographically verified under the agent's quorum Q.
+#[async_trait::async_trait]
+impl SpawnFenceView for std::sync::Arc<dyn LeaseAuthority> {
+    // UFCS (`LeaseAuthority::method(&**self, ..)`) is deliberate: `Arc<dyn LeaseAuthority>` now
+    // ALSO implements `SpawnFenceView`, so a bare `self.node_id()` would re-resolve to THIS impl
+    // (infinite recursion). Forcing the call onto `&dyn LeaseAuthority` selects the inner method.
+    fn node_id(&self) -> LeaseNodeId {
+        LeaseAuthority::node_id(&**self)
+    }
+    async fn active_lease_for(&self, agent_id: &str) -> Option<ActiveLease> {
+        LeaseAuthority::active_lease_for(&**self, agent_id).await
+    }
+}

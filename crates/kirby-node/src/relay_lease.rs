@@ -47,7 +47,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::lease::{ActiveLease, FenceVerdict, LeaseAuthority, LeaseNodeId, LeaseResponse};
+use crate::lease::{ActiveLease, FenceVerdict, LeaseAuthority, LeaseNodeId, LeaseResponse, SpawnFenceView};
 use crate::quorum_signer::QuorumSigner;
 use kirby_custody::cosign_net::{nip01_event_id_with_tags, NostrEvent};
 
@@ -544,14 +544,227 @@ impl RelayLeaseGrantor {
 
 #[async_trait::async_trait]
 impl crate::fleet_supervisor::LeaseGrantor for RelayLeaseGrantor {
-    /// Claim `agent_id`'s lease at term 1 (MVP first-launch claim). A failover takeover that
-    /// claims `term + 1` is a later chunk; on first launch the term is 1.
-    async fn grant_for(
+    /// Claim `agent_id`'s lease at an EXPLICIT `term`: term 1 on first launch (via the default
+    /// `grant_for`), the CURRENT term on a heartbeat re-publish (refresh `issued_at`), or
+    /// `term + 1` on a failover takeover. Loads the agent's quorum Q from `keystore_dir` and
+    /// FROST-signs the lease under it (F9-2), then publishes it to the relay.
+    async fn claim_at(
         &self,
         agent_id: &str,
         node_id: LeaseNodeId,
+        term: u64,
         keystore_dir: &std::path::Path,
     ) -> anyhow::Result<LeaseResponse> {
-        self.claim_for(agent_id, node_id, 1, keystore_dir).await
+        self.claim_for(agent_id, node_id, term, keystore_dir).await
+    }
+}
+
+/// Read the `d` addressable-tag value off a nostr-sdk event (the agent_id the relay routes by).
+/// The fleet occupancy observer reads live relay events (`nostr_sdk::Event`), distinct from the
+/// transport-free [`NostrEvent`] the verified [`RelayLeaseAuthority`] path uses.
+fn sdk_d_tag(event: &nostr_sdk::Event) -> Option<String> {
+    event.tags.iter().find_map(|t| {
+        let s = t.as_slice();
+        if s.first().map(String::as_str) == Some(TAG_D) {
+            s.get(1).cloned()
+        } else {
+            None
+        }
+    })
+}
+
+/// THE CLAIM-BEFORE-LAUNCH FENCE read-side (closes resilience finding G-1, the cross-node
+/// DOUBLE-SPAWN): a COOPERATIVE-FLEET occupancy view of which node currently holds which agent,
+/// folded from the lease events ([`kirby_proto::KIND_KIRBY_LEASE`]) the fleet publishes to the
+/// relay. A node about to spawn `agent_id` consults [`SpawnFenceView::active_lease_for`]; if a
+/// FRESH lease names ANOTHER node, it backs off (no duplicate launch).
+///
+/// **NOT a security boundary, and NOT a money authority — read this before reusing it.** Unlike
+/// [`RelayLeaseAuthority`] (which VERIFIES every observed lease under the agent's quorum Q before
+/// trusting it, F9-2), this observer does NOT verify the FROST signature. The reason is finding
+/// G-2: today each node provisions its OWN per-agent keyset, so a node about to spawn `agent_id`
+/// does not yet hold or even KNOW that agent's Q and cannot verify a peer's lease under it. So
+/// the fence trusts a lease STRUCTURALLY (right kind + the `d` tag agreeing with the signed
+/// `agent_id` + still within the TTL) as a cooperative-fleet hint.
+///
+/// The bounded residual this accepts: a forged 31002 (any key) can BLOCK a spawn of one specific
+/// `agent_id` — a targeted denial. That is strictly LESS harmful than the double-spawn it prevents
+/// (which burns real money on two VMs and forks the agent's identity), it is bounded to one label,
+/// and it is CLOSED once cross-machine keyset sharing (G-2) lets the fence verify under Q — at
+/// which point a Q-verified [`RelayLeaseAuthority`] is swapped in via the blanket
+/// `SpawnFenceView for Arc<dyn LeaseAuthority>` impl with NO change to the consumer. It
+/// deliberately does NOT implement [`LeaseAuthority`], so it can never be wired as the gateway
+/// money-fence. The other residual (a true simultaneous claim race between two nodes that have
+/// not yet observed each other) still needs the monotonic-term tiebreak the spec calls out and is
+/// not closed here.
+pub struct FleetLeaseObserver {
+    /// This node's id (so the fence skips only a lease held by ANOTHER node).
+    node_id: LeaseNodeId,
+    /// The latest lease OBSERVED per agent (latest-wins by monotonic term, observe-only-forward).
+    /// Stores the raw [`LeaseContent`] so freshness is judged against the SIGNED `issued_at`.
+    observed: RwLock<HashMap<String, LeaseContent>>,
+}
+
+impl FleetLeaseObserver {
+    /// Build an occupancy observer for `node_id` (the node that will consult it before spawning).
+    pub fn new(node_id: LeaseNodeId) -> Self {
+        Self { node_id, observed: RwLock::new(HashMap::new()) }
+    }
+
+    /// OBSERVE a lease event from the relay and fold it into the occupancy view. Accepts a
+    /// strictly-NEWER term (a new claim or a failover takeover) AND a SAME-term re-publish by the
+    /// SAME holder with a fresher `issued_at` (a HEARTBEAT — it refreshes freshness so a live,
+    /// heartbeating agent does not look dead to a peer's fence after one TTL, WITHOUT bumping the
+    /// fencing token). STRUCTURAL ONLY — no Q verification (see the type doc). Returns whether the
+    /// event was folded in (`true`), or ignored (`false`: wrong kind, malformed content, a `d` tag
+    /// that disagrees with the signed `agent_id`, an older term, a same-term event from a DIFFERENT
+    /// holder, or a non-fresher replay).
+    pub async fn observe_occupancy(&self, event: &nostr_sdk::Event) -> bool {
+        if event.kind.as_u16() != kirby_proto::KIND_KIRBY_LEASE {
+            return false;
+        }
+        let content: LeaseContent = match serde_json::from_str(&event.content) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        // The addressable `d` tag MUST agree with the signed content's agent_id (a mis-addressed
+        // or malformed event is dropped), mirroring the verified observe path's check.
+        if sdk_d_tag(event).as_deref() != Some(content.agent_id.as_str()) {
+            return false;
+        }
+        let mut observed = self.observed.write().await;
+        let accept = match observed.get(&content.agent_id) {
+            None => true,
+            // A strictly-NEWER term is a new epoch (first claim, or a failover takeover that bumped
+            // the fencing token) -- always fold it in.
+            Some(prev) if content.term > prev.term => true,
+            // A SAME-term re-publish by the SAME holder with a fresher `issued_at` is a HEARTBEAT
+            // (heartbeat_leases re-claims at the current term to refresh freshness WITHOUT bumping
+            // the token) -- fold it in so the lease stays fresh for peers' fences. A same-term
+            // event from a DIFFERENT holder is the simultaneous-claim race (a documented residual
+            // the term tiebreak resolves, not here) and a non-fresher one is a replay/dup; both are
+            // ignored so the observed holder never flaps within a term.
+            Some(prev) => content.holder_node_id == prev.holder_node_id && content.issued_at > prev.issued_at,
+        };
+        if accept {
+            observed.insert(content.agent_id.clone(), content);
+        }
+        accept
+    }
+
+    /// Test/diagnostic seam: observe with an injectable observe time is not needed here (freshness
+    /// is read at query time via [`SpawnFenceView::active_lease_for`]); this exposes the freshness
+    /// projection at an explicit `now` for deterministic TTL tests.
+    async fn fresh_active_lease_at(&self, agent_id: &str, now: u64) -> Option<ActiveLease> {
+        let observed = self.observed.read().await;
+        let c = observed.get(agent_id)?;
+        if is_stale(c.issued_at, now) {
+            return None;
+        }
+        Some(ActiveLease { node_id: c.holder_node_id, term: c.term })
+    }
+}
+
+#[async_trait::async_trait]
+impl SpawnFenceView for FleetLeaseObserver {
+    fn node_id(&self) -> LeaseNodeId {
+        self.node_id
+    }
+    /// The latest observed lease for `agent_id` IF still within its TTL (a stale lease — the
+    /// holder stopped heartbeating, e.g. it died — does NOT count as occupancy, so the agent can
+    /// be (re)spawned). Freshness is judged at the moment of the query.
+    async fn active_lease_for(&self, agent_id: &str) -> Option<ActiveLease> {
+        self.fresh_active_lease_at(agent_id, now_secs()).await
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+    use nostr_sdk::prelude::*;
+
+    /// Build a lease event signed by a THROWAWAY key — the occupancy observer does NOT verify the
+    /// signature (the whole point: cross-node the agent's Q is not yet known, finding G-2). The
+    /// `d_tag` is separate from `agent_id` so a test can force a mis-addressed event.
+    fn lease_event(agent_id: &str, holder: LeaseNodeId, term: u64, issued_at: u64, d_tag: &str) -> nostr_sdk::Event {
+        let content = serde_json::to_string(&LeaseContent {
+            agent_id: agent_id.to_string(),
+            holder_node_id: holder,
+            term,
+            issued_at,
+        })
+        .unwrap();
+        EventBuilder::new(Kind::from(kirby_proto::KIND_KIRBY_LEASE), content)
+            .tags([Tag::parse(["d", d_tag]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn observe_latest_wins_by_monotonic_term() {
+        let obs = FleetLeaseObserver::new(1);
+        assert!(obs.observe_occupancy(&lease_event("a", 2, 1, 1000, "a")).await);
+        // A strictly-newer term replaces it.
+        assert!(obs.observe_occupancy(&lease_event("a", 3, 2, 1000, "a")).await);
+        let l = obs.fresh_active_lease_at("a", 1000).await.unwrap();
+        assert_eq!((l.node_id, l.term), (3, 2), "latest-wins by term");
+        // An equal or older term is ignored (observe-only-forward — the term never moves backward).
+        assert!(!obs.observe_occupancy(&lease_event("a", 9, 2, 1000, "a")).await, "equal term ignored");
+        assert!(!obs.observe_occupancy(&lease_event("a", 9, 1, 1000, "a")).await, "older term ignored");
+        let l = obs.fresh_active_lease_at("a", 1000).await.unwrap();
+        assert_eq!((l.node_id, l.term), (3, 2), "term never moves backward");
+    }
+
+    #[tokio::test]
+    async fn stale_lease_is_not_occupancy() {
+        let obs = FleetLeaseObserver::new(1);
+        assert!(obs.observe_occupancy(&lease_event("a", 2, 1, 1000, "a")).await);
+        // Within the TTL the agent is occupied (a fence would back off).
+        assert!(obs.fresh_active_lease_at("a", 1000 + LEASE_TTL_SECS).await.is_some(), "within TTL = occupied");
+        // Past the TTL it is NOT occupancy: the holder stopped heartbeating (it died), so the
+        // agent is free to (re)spawn. This is exactly what makes the heartbeat load-bearing.
+        assert!(obs.fresh_active_lease_at("a", 1000 + LEASE_TTL_SECS + 1).await.is_none(), "past TTL = free");
+    }
+
+    /// HEARTBEAT REFRESH (the keystone the whole lifecycle rests on): a SAME-term re-publish with
+    /// a fresher `issued_at` -- exactly what `FleetSupervisor::heartbeat_leases` emits every 10s
+    /// WITHOUT bumping the term -- MUST refresh the observed lease's freshness. Otherwise a peer's
+    /// occupancy fence sees a live, heartbeating agent go stale ~one TTL after launch and
+    /// double-spawns it (the bug strict latest-wins-by-term hid: it dropped every same-term
+    /// heartbeat, so the stored `issued_at` froze at first observation).
+    #[tokio::test]
+    async fn heartbeat_same_term_refreshes_freshness() {
+        let obs = FleetLeaseObserver::new(1);
+        // Node 2 claims agent "a" at term 1, issued_at = 1000.
+        assert!(obs.observe_occupancy(&lease_event("a", 2, 1, 1000, "a")).await);
+        // 20s later node 2 HEARTBEATS: SAME term 1, fresher issued_at = 1020 (no term bump).
+        assert!(
+            obs.observe_occupancy(&lease_event("a", 2, 1, 1020, "a")).await,
+            "a same-term heartbeat with a fresher issued_at must be folded in (it refreshes the lease)"
+        );
+        // At 1035 the ORIGINAL issue (1000) is 35s old (> TTL) but the heartbeat (1020) is 15s old:
+        // a live, heartbeating agent must still read as occupied (so a peer fence keeps backing off).
+        let l = obs.fresh_active_lease_at("a", 1035).await;
+        assert!(
+            l.is_some_and(|l| l.node_id == 2 && l.term == 1),
+            "heartbeat must keep the lease fresh for the fence (got {l:?})"
+        );
+        // Sanity: a same-term re-publish that is NOT fresher (a true replay/dup) is still ignored.
+        assert!(
+            !obs.observe_occupancy(&lease_event("a", 2, 1, 1020, "a")).await,
+            "a same-term, non-fresher re-publish (replay) must be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn d_tag_disagreement_and_wrong_kind_are_dropped() {
+        let obs = FleetLeaseObserver::new(1);
+        // A `d` tag ("x") that disagrees with the signed content's agent_id ("y") is dropped.
+        assert!(!obs.observe_occupancy(&lease_event("y", 2, 1, 1000, "x")).await);
+        assert!(obs.fresh_active_lease_at("y", 1000).await.is_none());
+        assert!(obs.fresh_active_lease_at("x", 1000).await.is_none());
+        // A non-lease kind is dropped.
+        let wrong = EventBuilder::new(Kind::from(1u16), "{}").sign_with_keys(&Keys::generate()).unwrap();
+        assert!(!obs.observe_occupancy(&wrong).await);
     }
 }

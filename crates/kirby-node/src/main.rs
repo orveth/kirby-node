@@ -536,6 +536,7 @@ async fn run_fleet_supervisor_cmd(
     // launched above and are monitored by the same reap tick.)
     run_spawn_control_plane(
         supervisor,
+        node_id,
         spawn_cfg,
         &spawn_relay_url,
         spawn_max_tenants,
@@ -553,6 +554,7 @@ async fn run_fleet_supervisor_cmd(
 /// killed (a spawn host is long-lived; it does NOT auto-exit when its static tenants die).
 async fn run_spawn_control_plane(
     mut supervisor: kirby_node::fleet_supervisor::FleetSupervisor,
+    node_id: kirby_node::lease::LeaseNodeId,
     spawn_cfg: kirby_node::config::SpawnConfig,
     relay_url: &str,
     max_tenants: usize,
@@ -565,10 +567,11 @@ async fn run_spawn_control_plane(
     use anyhow::Context as _;
     use nostr_sdk::prelude::*;
 
+    use kirby_node::relay_lease::FleetLeaseObserver;
     use kirby_node::spawn::{
         AllowlistAuthorizer, SeedFunder, SledSpawnLedger, SpawnConsumer, SpawnOutcome,
     };
-    use kirby_proto::KIND_KIRBY_SPAWN_REQUEST;
+    use kirby_proto::{KIND_KIRBY_LEASE, KIND_KIRBY_SPAWN_REQUEST};
 
     // Build the consumer from config (MVP authz: operator allowlist + rate limit; pops later).
     let operators: HashSet<String> = spawn_cfg.operators.iter().cloned().collect();
@@ -591,48 +594,76 @@ async fn run_spawn_control_plane(
         SledSpawnLedger::open(alloc_dir.join("spawn-ledger"))
             .context("open the durable spawn ledger")?,
     );
-    let consumer = SpawnConsumer::new(max_tenants, images, authorizer, funder, ledger);
+    // The CLAIM-BEFORE-LAUNCH fence read-side (closes G-1): a cooperative occupancy view of the
+    // fleet's leases, folded from the KIND_KIRBY_LEASE events the loop observes. Before launching,
+    // the consumer asks it whether ANOTHER node already holds the agent and backs off if so (no
+    // cross-node double-spawn). Shared (Arc) between the consumer's fence and the observe loop.
+    let observer = Arc::new(FleetLeaseObserver::new(node_id));
+    let consumer = SpawnConsumer::new(max_tenants, images, authorizer, funder, ledger)
+        .with_fence(observer.clone());
 
-    // Subscribe to spawn requests on the relay (read-only: an ephemeral key signs nothing).
+    // Subscribe to spawn requests AND lease events on the relay (read-only: an ephemeral key
+    // signs nothing). The lease subscription feeds the occupancy fence; the relay RETAINS the
+    // latest addressable lease per agent, so on connect this node immediately learns which agents
+    // its peers already hold.
     let client = Client::builder().signer(Keys::generate()).build();
     client
         .add_relay(relay_url)
         .await
         .with_context(|| format!("add fleet relay {relay_url} for spawn subscription"))?;
     client.connect().await;
-    let filter = Filter::new().kind(Kind::from(KIND_KIRBY_SPAWN_REQUEST));
+    let filter = Filter::new().kinds([
+        Kind::from(KIND_KIRBY_SPAWN_REQUEST),
+        Kind::from(KIND_KIRBY_LEASE),
+    ]);
     client
         .subscribe(filter, None)
         .await
-        .context("subscribe to KIND_KIRBY_SPAWN_REQUEST")?;
+        .context("subscribe to KIND_KIRBY_SPAWN_REQUEST + KIND_KIRBY_LEASE")?;
     let mut notifications = client.notifications();
-    println!("FLEET spawn control-plane: listening for spawn requests on {relay_url}");
+    println!("FLEET spawn control-plane: listening for spawn requests + leases on {relay_url}");
 
-    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    // Two cadences: reap dead tenants often (free slots quickly); heartbeat leases within the TTL
+    // so a live agent's lease never goes stale (the keystone for the fence AND for failover).
+    let mut reap_tick = tokio::time::interval(Duration::from_secs(2));
+    let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(10));
     loop {
         tokio::select! {
-            _ = tick.tick() => {
+            _ = reap_tick.tick() => {
                 // Reap dead spawned tenants so their CID/port slots free up for new spawns.
                 let reaped = supervisor.reap_dead();
                 for r in &reaped {
                     tracing::info!(agent_id = %r.agent_id, "FLEET spawn: reaped a dead tenant, slot freed");
                 }
             }
+            _ = heartbeat_tick.tick() => {
+                // Re-publish every live tenant's lease so it stays within the TTL. The keystone:
+                // without it a healthy agent's lease goes stale (~one TTL after launch), the
+                // claim-before-launch fence goes blind, and a failover detector sees false deaths.
+                supervisor.heartbeat_leases().await;
+            }
             notif = notifications.recv() => {
                 match notif {
                     Ok(RelayPoolNotification::Event { event, .. }) => {
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        match consumer.handle_event(&event, now, &mut supervisor).await {
-                            SpawnOutcome::Launched { agent_id, frost_npub, lease_term } => {
-                                println!(
-                                    "FLEET spawn: LAUNCHED agent_id={agent_id} npub={frost_npub} lease_term={lease_term}"
-                                );
-                            }
-                            other => {
-                                tracing::debug!(?other, "FLEET spawn: request not launched");
+                        let kind = event.kind.as_u16();
+                        if kind == KIND_KIRBY_LEASE {
+                            // Fold a peer's (or our own) lease into the occupancy view the fence
+                            // reads. Structural-only (no Q verify); see FleetLeaseObserver.
+                            observer.observe_occupancy(&event).await;
+                        } else if kind == KIND_KIRBY_SPAWN_REQUEST {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            match consumer.handle_event(&event, now, &mut supervisor).await {
+                                SpawnOutcome::Launched { agent_id, frost_npub, lease_term } => {
+                                    println!(
+                                        "FLEET spawn: LAUNCHED agent_id={agent_id} npub={frost_npub} lease_term={lease_term}"
+                                    );
+                                }
+                                other => {
+                                    tracing::debug!(?other, "FLEET spawn: request not launched");
+                                }
                             }
                         }
                     }

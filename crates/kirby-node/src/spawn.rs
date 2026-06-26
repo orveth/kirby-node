@@ -67,6 +67,7 @@ use kirby_proto::KIND_KIRBY_SPAWN_REQUEST;
 
 use crate::config::{validate_agent_label, TenantConfig};
 use crate::fleet_supervisor::{FleetSupervisor, TenantRecord};
+use crate::lease::{LeaseNodeId, SpawnFenceView};
 
 /// The maximum byte length of a spawn request's relay-event content (the JSON
 /// [`SpawnRequest`]). A spawn request is small (an agent label, a brain/budget descriptor,
@@ -172,6 +173,10 @@ pub enum SpawnSkip {
     /// This node already spawned this agent_id (durable spawned-set). A re-delivered or
     /// replayed request is a no-op (no double-launch, no resurrection).
     AlreadySpawned,
+    /// ANOTHER node already holds a FRESH lease for this agent_id (the claim-before-launch
+    /// fence, closes G-1). The request is well-formed and authorized, but launching here would
+    /// be a cross-node DOUBLE-SPAWN — so this node backs off and lets the holder keep the agent.
+    AlreadyClaimedElsewhere { holder: LeaseNodeId, term: u64 },
 }
 
 /// The outcome of handling one spawn event.
@@ -467,12 +472,19 @@ pub struct SpawnConsumer {
     authorizer: Arc<dyn SpawnAuthorizer>,
     funder: Arc<dyn SpawnFunder>,
     ledger: Arc<dyn SpawnLedger>,
+    /// The CLAIM-BEFORE-LAUNCH fence read-side (closes G-1). When present, the consumer checks
+    /// whether a FRESH lease for the agent already names ANOTHER node before launching, and backs
+    /// off if so (no cross-node double-spawn). `None` disables the cross-node fence (the
+    /// single-node path, and the pure-unit tests that drive the gate logic directly) — same-node
+    /// idempotency is always enforced by the durable spawned-set regardless.
+    fence: Option<Arc<dyn SpawnFenceView>>,
 }
 
 impl SpawnConsumer {
     /// Build a spawn consumer. `max_tenants` is the per-host ceiling (typically
     /// `fleet.max_tenants`); `image_allowlist` is the set of pre-staged `image_ref`s the node
-    /// will run (empty => spawn nothing, default-deny).
+    /// will run (empty => spawn nothing, default-deny). No cross-node fence by default; wire one
+    /// with [`Self::with_fence`].
     pub fn new(
         max_tenants: usize,
         image_allowlist: HashSet<String>,
@@ -480,7 +492,17 @@ impl SpawnConsumer {
         funder: Arc<dyn SpawnFunder>,
         ledger: Arc<dyn SpawnLedger>,
     ) -> Self {
-        SpawnConsumer { max_tenants, image_allowlist, authorizer, funder, ledger }
+        SpawnConsumer { max_tenants, image_allowlist, authorizer, funder, ledger, fence: None }
+    }
+
+    /// Wire the CLAIM-BEFORE-LAUNCH fence (closes G-1). With a fence, before reserving/launching
+    /// the consumer consults [`SpawnFenceView::active_lease_for`]; a FRESH lease naming ANOTHER
+    /// node makes it back off ([`SpawnSkip::AlreadyClaimedElsewhere`]) so two nodes that both see
+    /// one (retained) request do not both launch. Live, this is the relay
+    /// [`crate::relay_lease::FleetLeaseObserver`]; tests inject a mock.
+    pub fn with_fence(mut self, fence: Arc<dyn SpawnFenceView>) -> Self {
+        self.fence = Some(fence);
+        self
     }
 
     /// Handle ONE relay event: the full trust boundary + the spawn decision. `now_secs` is the
@@ -531,6 +553,30 @@ impl SpawnConsumer {
         if sink.tenant_count() >= self.max_tenants {
             tracing::info!(agent_id = %req.agent_id, "spawn: at capacity, not claiming");
             return SpawnOutcome::Skipped(SpawnSkip::OverCapacity);
+        }
+
+        // (7.5) CLAIM-BEFORE-LAUNCH FENCE (closes G-1, the cross-node DOUBLE-SPAWN). If a FRESH
+        // lease for this agent already names ANOTHER node, that node hosts it — do NOT launch a
+        // duplicate. The per-node durable ledger below (8) only dedups within THIS node, so a
+        // request re-delivered to a SECOND node (the relay retains the addressable 31003) would
+        // double-spawn without this cross-node check. A lease naming THIS node, or no fresh lease
+        // (none, or the holder stopped heartbeating → it died → re-spawn is allowed), proceeds.
+        // The fence is consulted BEFORE reserving so a backed-off node does not consume the
+        // agent_id (another node legitimately holds it). Checked only when a fence is wired (the
+        // single-node path and the pure-gate unit tests pass `None`).
+        if let Some(fence) = &self.fence {
+            if let Some(lease) = fence.active_lease_for(&req.agent_id).await {
+                if lease.node_id != fence.node_id() {
+                    tracing::info!(
+                        agent_id = %req.agent_id, holder = lease.node_id, term = lease.term,
+                        "spawn: a fresh lease names another node; backing off (no cross-node double-spawn)"
+                    );
+                    return SpawnOutcome::Skipped(SpawnSkip::AlreadyClaimedElsewhere {
+                        holder: lease.node_id,
+                        term: lease.term,
+                    });
+                }
+            }
         }
 
         // (8) DURABLE reserve-before-launch — the idempotency guarantee. Atomically mark the
@@ -1088,5 +1134,125 @@ mod tests {
             ReserveOutcome::Fresh,
             "a failed launch must release the reservation so a retry can proceed"
         );
+    }
+
+    // ---- the CLAIM-BEFORE-LAUNCH FENCE (closes G-1, the cross-node double-spawn) ----
+
+    // `LeaseNodeId` + `SpawnFenceView` are already in scope via `use super::*`; only `ActiveLease`
+    // is new here.
+    use crate::lease::ActiveLease;
+
+    /// A mock occupancy view for the consumer fence tests: a node id + a shared map of
+    /// agent_id -> the lease currently held. Two mock fences can share one map (each reporting
+    /// its OWN node id) to model two nodes observing the same relay-lease.
+    #[derive(Clone)]
+    struct MockFence {
+        node_id: LeaseNodeId,
+        leases: Arc<std::sync::Mutex<std::collections::HashMap<String, ActiveLease>>>,
+    }
+    impl MockFence {
+        fn new(node_id: LeaseNodeId) -> Self {
+            MockFence { node_id, leases: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())) }
+        }
+        /// Build another view over the SAME lease map but with a different node id (a second node).
+        fn sharing(&self, node_id: LeaseNodeId) -> Self {
+            MockFence { node_id, leases: self.leases.clone() }
+        }
+        fn record(&self, agent_id: &str, lease: ActiveLease) {
+            self.leases.lock().unwrap().insert(agent_id.to_string(), lease);
+        }
+    }
+    #[async_trait::async_trait]
+    impl SpawnFenceView for MockFence {
+        fn node_id(&self) -> LeaseNodeId {
+            self.node_id
+        }
+        async fn active_lease_for(&self, agent_id: &str) -> Option<ActiveLease> {
+            self.leases.lock().unwrap().get(agent_id).copied()
+        }
+    }
+
+    /// FENCE: a FRESH lease naming ANOTHER node makes the consumer back off — no launch, and the
+    /// agent_id is NOT consumed (the holder owns it).
+    #[tokio::test]
+    async fn fence_backs_off_when_another_node_holds_a_fresh_lease() {
+        let keys = Keys::generate();
+        let op = keys.public_key().to_hex();
+        let ledger = Arc::new(MemLedger::default());
+        let fence = Arc::new(MockFence::new(1)); // THIS node is 1
+        fence.record("kirby-x", ActiveLease { node_id: 2, term: 1 }); // node 2 already holds it
+        let consumer = consumer_with(16, ledger.clone(), &op, 100).with_fence(fence);
+        let event = build_spawn_request_event(&keys, &req("kirby-x", "img", 5_000)).unwrap();
+        let (mut sink, launches) = StubSink::new(0);
+
+        let out = consumer.handle_event(&event, 0, &mut sink).await;
+        assert!(
+            matches!(out, SpawnOutcome::Skipped(SpawnSkip::AlreadyClaimedElsewhere { holder: 2, .. })),
+            "a fresh lease held by another node must skip, got {out:?}"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 0, "must not launch when another node holds the lease");
+        assert_eq!(
+            ledger.reserve("kirby-x").unwrap(),
+            ReserveOutcome::Fresh,
+            "a fence skip must NOT consume the agent_id (the holder owns it)"
+        );
+    }
+
+    /// FENCE: no lease, or a lease naming THIS node, both PROCEED (a node's own lease — e.g. its
+    /// own prior heartbeat — must not block its own launch; same-node idempotency is the ledger's job).
+    #[tokio::test]
+    async fn fence_allows_when_lease_is_absent_or_this_node() {
+        let keys = Keys::generate();
+        let op = keys.public_key().to_hex();
+        // (a) no lease -> launches.
+        let consumer_a = consumer_with(16, Arc::new(MemLedger::default()), &op, 100)
+            .with_fence(Arc::new(MockFence::new(1)));
+        let e_a = build_spawn_request_event(&keys, &req("kirby-y", "img", 5_000)).unwrap();
+        let (mut sink_a, launches_a) = StubSink::new(0);
+        assert!(matches!(consumer_a.handle_event(&e_a, 0, &mut sink_a).await, SpawnOutcome::Launched { .. }));
+        assert_eq!(launches_a.load(Ordering::SeqCst), 1);
+        // (b) lease names THIS node -> still launches.
+        let fence_b = Arc::new(MockFence::new(1));
+        fence_b.record("kirby-z", ActiveLease { node_id: 1, term: 3 });
+        let consumer_b = consumer_with(16, Arc::new(MemLedger::default()), &op, 100).with_fence(fence_b);
+        let e_b = build_spawn_request_event(&keys, &req("kirby-z", "img", 5_000)).unwrap();
+        let (mut sink_b, launches_b) = StubSink::new(0);
+        assert!(
+            matches!(consumer_b.handle_event(&e_b, 0, &mut sink_b).await, SpawnOutcome::Launched { .. }),
+            "a lease naming THIS node must not block its own launch"
+        );
+        assert_eq!(launches_b.load(Ordering::SeqCst), 1);
+    }
+
+    /// THE SPEC'S TEETH: two nodes sharing one relay-lease view launch the agent EXACTLY ONCE.
+    /// Node 1 sees no holder and launches; its claim reaches the shared view (modeled by the
+    /// record, as the supervisor's claim-on-launch publishes the lease and both nodes observe
+    /// it); node 2, handling the SAME (retained) request, sees node 1's fresh lease and backs off.
+    #[tokio::test]
+    async fn two_nodes_sharing_one_fence_launch_exactly_once() {
+        let keys = Keys::generate();
+        let op = keys.public_key().to_hex();
+        let fence1 = MockFence::new(1);
+        let fence2 = fence1.sharing(2); // node 2, SAME observed-lease map
+
+        let consumer1 = consumer_with(16, Arc::new(MemLedger::default()), &op, 100)
+            .with_fence(Arc::new(fence1.clone()));
+        let consumer2 = consumer_with(16, Arc::new(MemLedger::default()), &op, 100)
+            .with_fence(Arc::new(fence2));
+        let event = build_spawn_request_event(&keys, &req("kirby-shared", "img", 5_000)).unwrap();
+        let (mut sink1, launches1) = StubSink::new(0);
+        let (mut sink2, launches2) = StubSink::new(0);
+
+        // Node 1: no holder yet -> launches.
+        assert!(matches!(consumer1.handle_event(&event, 0, &mut sink1).await, SpawnOutcome::Launched { .. }));
+        // Node 1's claim-on-launch publishes the lease; both nodes' observers fold it.
+        fence1.record("kirby-shared", ActiveLease { node_id: 1, term: 1 });
+        // Node 2: the SAME request, but now a fresh lease names node 1 -> backs off.
+        let out2 = consumer2.handle_event(&event, 1, &mut sink2).await;
+        assert!(
+            matches!(out2, SpawnOutcome::Skipped(SpawnSkip::AlreadyClaimedElsewhere { holder: 1, .. })),
+            "node 2 must back off once node 1 holds the lease, got {out2:?}"
+        );
+        assert_eq!(launches1.load(Ordering::SeqCst) + launches2.load(Ordering::SeqCst), 1, "exactly one launch across the fleet");
     }
 }

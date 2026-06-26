@@ -124,20 +124,35 @@ pub trait TenantLauncher: Send + Sync {
 /// because claiming is impl-specific and write-side, while the fence is read-only.
 #[async_trait::async_trait]
 pub trait LeaseGrantor: Send + Sync {
-    /// Claim `agent_id`'s lease for this node and return the claimed lease (node + term).
-    /// Only touches this agent's lease entry (per-agent isolation, S1). The MVP claims at
-    /// term 1 on launch; a failover takeover (a later chunk) claims `term + 1`.
+    /// Claim `agent_id`'s lease for this node AT an explicit `term` and return the claimed lease
+    /// (node + term). Only touches this agent's lease entry (per-agent isolation, S1). Three
+    /// callers, three terms: first launch claims term 1 (via the default [`grant_for`]); a
+    /// HEARTBEAT re-claims at the CURRENT term (re-publishing refreshes the lease's `issued_at`
+    /// so it stays within the TTL and the agent is not falsely seen as dead); a FAILOVER takeover
+    /// claims `term + 1` (the monotonic fencing token that fences out the dead holder if it
+    /// revives).
     ///
-    /// `keystore_dir` is the tenant's just-provisioned per-agent FROST keystore: the
-    /// relay-native grantor loads the agent's quorum Q from it to FROST-SIGN the lease (F9-2 --
-    /// a node can only claim a lease for an agent whose quorum it holds). A stub grantor (the
-    /// tests) ignores it.
+    /// `keystore_dir` is the tenant's per-agent FROST keystore: the relay-native grantor loads
+    /// the agent's quorum Q from it to FROST-SIGN the lease (F9-2 -- a node can only claim a
+    /// lease for an agent whose quorum it holds). A stub grantor (the tests) ignores it.
+    async fn claim_at(
+        &self,
+        agent_id: &str,
+        node_id: LeaseNodeId,
+        term: u64,
+        keystore_dir: &std::path::Path,
+    ) -> anyhow::Result<LeaseResponse>;
+
+    /// Claim `agent_id`'s lease at term 1 -- the first-launch claim (the common case). Defined
+    /// in terms of [`Self::claim_at`]; an impl only needs to provide `claim_at`.
     async fn grant_for(
         &self,
         agent_id: &str,
         node_id: LeaseNodeId,
         keystore_dir: &std::path::Path,
-    ) -> anyhow::Result<LeaseResponse>;
+    ) -> anyhow::Result<LeaseResponse> {
+        self.claim_at(agent_id, node_id, 1, keystore_dir).await
+    }
 }
 
 /// The fleet supervisor itself (fleet-host S2). Owns the resource allocator, the base config
@@ -353,6 +368,43 @@ impl FleetSupervisor {
     /// The number of tenants the supervisor is currently tracking (launched, not yet reaped).
     pub fn tenant_count(&self) -> usize {
         self.tenants.len()
+    }
+
+    /// The agent ids of the tenants this node currently hosts (launched, not yet reaped).
+    pub fn live_agent_ids(&self) -> Vec<AgentId> {
+        self.tenants.keys().cloned().collect()
+    }
+
+    /// HEARTBEAT every live tenant's lease: re-claim it at its CURRENT term so the lease's signed
+    /// `issued_at` is refreshed and stays within [`crate::relay_lease::LEASE_TTL_SECS`]. This is
+    /// the keystone the whole lease lifecycle rests on. Without it every lease would go stale
+    /// ~one TTL after launch and (a) the claim-before-launch fence would go blind, letting a
+    /// re-delivered spawn request double-spawn, and (b) a failover detector would see a HEALTHY
+    /// agent as dead and wrongly take it over. Re-claiming at the SAME term refreshes freshness
+    /// WITHOUT bumping the fencing token (only a failover bumps the term, so a heartbeat can never
+    /// fence out a healthy sibling).
+    ///
+    /// Best-effort per tenant: a transient publish failure is logged and retried on the next
+    /// tick — the TTL tolerates several missed heartbeats, so one bad heartbeat never kills a
+    /// lease. Read-only on the supervisor (`&self`): it re-publishes existing leases, it does not
+    /// mutate the tenant set.
+    pub async fn heartbeat_leases(&self) {
+        for (agent_id, live) in &self.tenants {
+            let term = live.record.lease_term;
+            match self
+                .grantor
+                .claim_at(agent_id, self.node_id, term, &live.record.keystore_dir)
+                .await
+            {
+                Ok(_) => {
+                    tracing::debug!(agent_id = %agent_id, term, "FLEET: lease heartbeat re-published")
+                }
+                Err(e) => tracing::warn!(
+                    agent_id = %agent_id, term, error = %e,
+                    "FLEET: lease heartbeat failed (will retry next tick)"
+                ),
+            }
+        }
     }
 
     /// The status of a tracked tenant (RUNNING vs EXITED), or `None` if not tracked. This is
@@ -611,24 +663,24 @@ mod tests {
         }
     }
 
-    /// A stub grantor: records every (agent_id, node_id) grant and stamps an increasing term
-    /// PER agent, so a test can assert per-agent independence without a live Raft cluster.
+    /// A stub grantor: records every (agent_id, node_id) claim so a test can assert per-agent
+    /// independence without a live relay, and ECHOES the term it was claimed at (so a heartbeat
+    /// re-claims at the same term, a failover at term + 1, and a test can read it back).
     #[derive(Default)]
     struct StubGrantor {
         grants: std::sync::Mutex<Vec<(AgentId, LeaseNodeId)>>,
-        next_term: std::sync::atomic::AtomicU64,
     }
 
     #[async_trait::async_trait]
     impl LeaseGrantor for StubGrantor {
-        async fn grant_for(
+        async fn claim_at(
             &self,
             agent_id: &str,
             node_id: LeaseNodeId,
+            term: u64,
             _keystore_dir: &std::path::Path,
         ) -> anyhow::Result<LeaseResponse> {
             self.grants.lock().unwrap().push((agent_id.to_string(), node_id));
-            let term = self.next_term.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(LeaseResponse { node_id, term })
         }
     }
@@ -844,10 +896,11 @@ mod tests {
         struct FailingGrantor;
         #[async_trait::async_trait]
         impl LeaseGrantor for FailingGrantor {
-            async fn grant_for(
+            async fn claim_at(
                 &self,
                 _agent_id: &str,
                 _node_id: LeaseNodeId,
+                _term: u64,
                 _keystore_dir: &std::path::Path,
             ) -> anyhow::Result<LeaseResponse> {
                 anyhow::bail!("grant refused (not leader)")
