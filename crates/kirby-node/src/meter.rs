@@ -598,17 +598,43 @@ impl HostProcessMeterSource {
                     cpu_nsec = cpu_nsec.saturating_add(pid_cpu_nsec);
                     sampled += 1;
                 }
-                Err(e) if pid == self.root_pid || self.service_pids.contains(&pid) => {
+                // The ROOT pid (the VZ helper) vanishing is a real failure: losing the
+                // helper means we can no longer meter the run at all, so fail loudly.
+                Err(e) if pid == self.root_pid => {
                     return Err(MeterError::HostProcessUnreadable {
                         root_pid: self.root_pid,
-                        reason: e,
+                        reason: e.reason,
+                    });
+                }
+                // A SERVICE pid (or a non-root tree pid) that is genuinely GONE (ESRCH)
+                // exited between discovery and this sample — benign. Skip it and keep
+                // summing the rest. This coarseness is consistent with
+                // MeterFidelity::HostCoarse: we lose the (already-exited) process's last
+                // sub-tick of CPU rather than abort the whole metered run. A non-ESRCH
+                // failure on a service pid (e.g. a permission/accounting fault) is NOT
+                // benign and still hard-fails below.
+                Err(e) if e.is_no_such_process() => {
+                    tracing::debug!(
+                        pid,
+                        root_pid = self.root_pid,
+                        is_service = self.service_pids.contains(&pid),
+                        error = %e.reason,
+                        "skipping disappeared process (ESRCH) during macOS VZ meter sample"
+                    );
+                }
+                // A service pid that failed for a reason OTHER than having exited is a
+                // real fault: surface it.
+                Err(e) if self.service_pids.contains(&pid) => {
+                    return Err(MeterError::HostProcessUnreadable {
+                        root_pid: self.root_pid,
+                        reason: e.reason,
                     });
                 }
                 Err(e) => {
                     tracing::debug!(
                         pid,
                         root_pid = self.root_pid,
-                        error = %e,
+                        error = %e.reason,
                         "skipping disappeared non-root process during macOS VZ meter sample"
                     );
                 }
@@ -762,16 +788,38 @@ fn macos_child_pids(pid: u32) -> Result<Vec<u32>, String> {
         .collect())
 }
 
+/// A `proc_pid_rusage` sampling failure: the human-readable `reason` (surfaced in
+/// `MeterError`) plus the raw OS errno so the caller can distinguish a genuinely
+/// gone pid (`ESRCH` / "no such process") from other faults without string-matching.
 #[cfg(target_os = "macos")]
-fn macos_process_cpu_nsec(pid: u32) -> Result<u64, String> {
-    let pid = macos_pid_to_c_int(pid)?;
+struct CpuSampleError {
+    reason: String,
+    raw_os_error: Option<i32>,
+}
+
+#[cfg(target_os = "macos")]
+impl CpuSampleError {
+    /// True when the pid is genuinely gone (`ESRCH`): the process exited between
+    /// discovery and sampling — benign for a secondary/service pid.
+    fn is_no_such_process(&self) -> bool {
+        self.raw_os_error == Some(libc::ESRCH)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_cpu_nsec(pid: u32) -> Result<u64, CpuSampleError> {
+    let pid = macos_pid_to_c_int(pid).map_err(|reason| CpuSampleError {
+        reason,
+        raw_os_error: None,
+    })?;
     let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
     let rc = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, usage.as_mut_ptr().cast()) };
     if rc != 0 {
-        return Err(format!(
-            "proc_pid_rusage({pid}) failed: {}",
-            std::io::Error::last_os_error()
-        ));
+        let err = std::io::Error::last_os_error();
+        return Err(CpuSampleError {
+            reason: format!("proc_pid_rusage({pid}) failed: {err}"),
+            raw_os_error: err.raw_os_error(),
+        });
     }
     let usage = unsafe { usage.assume_init() };
     Ok(usage.ri_user_time.saturating_add(usage.ri_system_time))
