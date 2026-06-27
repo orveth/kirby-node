@@ -751,8 +751,14 @@ async fn run_spawn_control_plane(
     use anyhow::Context as _;
     use nostr_sdk::prelude::*;
 
-    use kirby_node::relay_lease::FleetLeaseObserver;
-    use kirby_node::spawn::{AllowlistAuthorizer, SeedFunder, SpawnConsumer, SpawnOutcome};
+    use std::collections::BTreeMap;
+
+    use kirby_node::failover_detect::detect_takeovers;
+    use kirby_node::keyset_provisioning::{keystore_dir_for, keystore_loadable_at};
+    use kirby_node::relay_lease::{FleetLeaseObserver, LEASE_TTL_SECS};
+    use kirby_node::spawn::{
+        AllowlistAuthorizer, SeedFunder, SpawnConsumer, SpawnOutcome, TakeoverAdmission,
+    };
     use kirby_proto::{KIND_KIRBY_LEASE, KIND_KIRBY_SPAWN_REQUEST};
 
     // Build the consumer from config (MVP authz: operator allowlist + rate limit; pops later).
@@ -806,10 +812,40 @@ async fn run_spawn_control_plane(
     let mut notifications = client.notifications();
     println!("FLEET spawn control-plane: listening for spawn requests + leases on {relay_url}");
 
-    // Two cadences: reap dead tenants often (free slots quickly); heartbeat leases within the TTL
-    // so a live agent's lease never goes stale (the keystone for the fence AND for failover).
+    // The node's representative pre-staged image (the image a TAKEOVER would relaunch the agent on
+    // — the node's OWN configured image, never attacker-supplied). Used by the failover admission
+    // gate's image-allowlist check (the SAME default-deny the spawn path applies): an empty
+    // allowlist (the node is staged to run nothing) yields `""`, which is not in the (empty)
+    // allowlist, so a takeover is correctly suppressed on an image-incapable node.
+    let node_image: String = spawn_cfg.image_allowlist.first().cloned().unwrap_or_default();
+
+    // The G-4 takeover grace window (config dial, default = the lease TTL). A `debug_assert` guards
+    // the config default from drifting from the lease TTL / the detector's documented default.
+    let takeover_grace = spawn_cfg.takeover_grace_secs;
+    debug_assert_eq!(
+        kirby_node::config::default_spawn_takeover_grace_secs(),
+        LEASE_TTL_SECS,
+        "the takeover_grace config default must track LEASE_TTL_SECS (failover_detect::DEFAULT_TAKEOVER_GRACE_SECS)"
+    );
+
+    // The per-agent CONTINUOUS-STALENESS dwell state the failover detector threads across scan
+    // ticks (agent_id -> first-seen-stale `now`). OWNED by this loop and passed `&mut` into
+    // `detect_takeovers` each tick: a candidate that recovers (goes fresh), becomes hosted, or
+    // vanishes has its dwell cleared; the observer-blind fail-safe leaves it untouched on a blind
+    // tick (so a recovered link does not instantly mass-take-over). Persisting it HERE (not inside
+    // the arm) is what makes the dwell measure continuous staleness rather than restarting every tick.
+    let mut grace_state: BTreeMap<String, u64> = BTreeMap::new();
+
+    // Three cadences: reap dead tenants often (free slots quickly); heartbeat leases within the TTL
+    // so a live agent's lease never goes stale (the keystone for the fence AND for failover); and
+    // SCAN for dead PEERS to take over (G-4 automatic failover). The scan's snapshot+decision is
+    // cheap; the claim/launch side-effect is bounded to ONE takeover per tick so a slow VM launch
+    // never starves the reap/heartbeat/notification arms for long (the 30s lease TTL tolerates the
+    // few-second stall a single launch can cause — see the failover_scan_tick arm).
     let mut reap_tick = tokio::time::interval(Duration::from_secs(2));
     let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(10));
+    let mut failover_scan_tick =
+        tokio::time::interval(Duration::from_secs(spawn_cfg.failover_scan_secs.max(1)));
     loop {
         tokio::select! {
             _ = reap_tick.tick() => {
@@ -824,6 +860,110 @@ async fn run_spawn_control_plane(
                 // without it a healthy agent's lease goes stale (~one TTL after launch), the
                 // claim-before-launch fence goes blind, and a failover detector sees false deaths.
                 supervisor.heartbeat_leases().await;
+            }
+            _ = failover_scan_tick.tick() => {
+                // AUTOMATIC FAILOVER (G-4): take over a dead PEER's agent. THIS is the live-daemon
+                // caller of the VERIFIED pure decision + the real FROST-claim + the agent launch —
+                // a NEW money/safety entry point, so every admitted takeover passes the SAME
+                // admission gates a fresh spawn passes (default-deny), via the SpawnConsumer chain.
+                //
+                // (1) DECIDE (fast, no launch I/O): build the observed-lease snapshot, run the pure
+                //     `detect_takeovers` over it with this node's hosted set as the exclusion. The
+                //     observer-blind fail-safe (no fresh lease => stand down, leave the dwell
+                //     untouched) is enforced INSIDE the pure decision; `grace_state` (owned by this
+                //     loop) is threaded `&mut` so the continuous-staleness dwell carries across ticks.
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let snapshot = observer.observed_snapshot().await;
+                let hosted: HashSet<String> =
+                    supervisor.live_agent_ids().into_iter().collect();
+                let verdicts = detect_takeovers(
+                    &snapshot,
+                    node_id,
+                    &hosted,
+                    now,
+                    LEASE_TTL_SECS,
+                    takeover_grace,
+                    &mut grace_state,
+                );
+
+                // (2) GATE each verdict through the SAME admission chain a fresh spawn passes
+                //     (default-deny, in order: keystore-loadable -> capacity -> image -> no-double-
+                //     host fence), collecting the FIRST that is admitted. We act on at most ONE
+                //     takeover per tick so a slow VM launch (the only slow step) does not starve the
+                //     reap/heartbeat/notification arms — the next tick re-decides and takes the next
+                //     (a multi-agent backlog drains over a few ticks; the 30s lease TTL tolerates the
+                //     brief per-launch stall). Re-deciding next tick is safe + idempotent: a verdict
+                //     we just took over leaves THIS node hosting the agent, so the detector's
+                //     `hosted` exclusion drops it; one we could not admit is re-evaluated fresh.
+                let mut admitted: Option<(String, u64)> = None;
+                for verdict in &verdicts {
+                    // Gate (a) input: can THIS node FROST-sign as the agent? Derive the agent's
+                    // keystore dir the SAME way the supervisor does (instance_id_for(agent_id) ->
+                    // keystore_dir_for) and test loadability WITHOUT materializing a signer. A
+                    // DIFFERENT node (no keystore) is `false` => skipped (the cross-machine
+                    // boundary, finding G-2). The supervisor reloads the SAME keystore on launch
+                    // (idempotent provision -> same sovereign Q).
+                    let keystore_dir = keystore_dir_for(
+                        &kirby_node::fleet::instance_id_for(&verdict.agent_id),
+                    );
+                    let loadable = keystore_loadable_at(&keystore_dir);
+                    match consumer
+                        .admit_takeover(
+                            &verdict.agent_id,
+                            loadable,
+                            &node_image,
+                            supervisor.tenant_count(),
+                        )
+                        .await
+                    {
+                        TakeoverAdmission::Admit => {
+                            admitted = Some((verdict.agent_id.clone(), verdict.beat_term));
+                            break;
+                        }
+                        TakeoverAdmission::Skip(reason) => {
+                            tracing::debug!(
+                                agent_id = %verdict.agent_id, beat_term = verdict.beat_term,
+                                %reason, "FLEET failover: takeover suppressed by an admission gate"
+                            );
+                        }
+                    }
+                }
+
+                // (3) ACT (the side-effect at the edge): claim the lease at `beat_term` + launch the
+                //     agent through the supervisor's EXISTING launch path (`launch_one_at_term`
+                //     claims `beat_term` via the relay-lease grantor, then launches — the same
+                //     allocate/provision/launch path a spawn uses, only the term differs). No-split-
+                //     brain + single-winner are already guaranteed by the monotonic-term lease
+                //     (proven); we are only the new CALLER. A launch failure releases its allocation
+                //     inside `launch_one_at_term`; we log and let the next tick retry.
+                if let Some((agent_id, beat_term)) = admitted {
+                    let tenant = kirby_node::config::TenantConfig {
+                        agent_id: agent_id.clone(),
+                        initial_sats: kirby_node::config::default_tenant_initial_sats(),
+                    };
+                    match supervisor.launch_one_at_term(&tenant, beat_term).await {
+                        Ok(record) => {
+                            println!(
+                                "FLEET failover: TOOK OVER agent_id={agent_id} at beat_term={beat_term} \
+                                 (npub={} cid={} port={})",
+                                record.frost_npub, record.allocation.guest_cid, record.allocation.gateway_port
+                            );
+                            tracing::info!(
+                                agent_id = %agent_id, beat_term, npub = %record.frost_npub,
+                                "FLEET failover: autonomous takeover of a dead peer's agent"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                agent_id = %agent_id, beat_term, error = %e,
+                                "FLEET failover: takeover launch failed (allocation released; will retry next scan)"
+                            );
+                        }
+                    }
+                }
             }
             notif = notifications.recv() => {
                 match notif {

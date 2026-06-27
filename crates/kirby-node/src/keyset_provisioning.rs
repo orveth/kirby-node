@@ -387,6 +387,25 @@ pub fn load_quorum_signer_at(keystore_dir: &Path) -> anyhow::Result<QuorumSigner
         .context("build co-located QuorumSigner from the persisted keystore")
 }
 
+/// Whether THIS node can SIGN AS the agent at `keystore_dir`: the group anchor AND all 3 holder
+/// shares are present and each share deserializes to a well-formed `KeyPackage`. This is the
+/// FAILOVER admission gate (G-4): a node may take over a peer's agent only if it can FROST-sign
+/// the agent's `term + 1` lease + voice — i.e. it actually holds the agent's quorum shares. It is
+/// the SAME loadability check the loader and the fail-closed reload run ([`is_provisioned`] +
+/// [`assert_shares_loadable`]), exposed as a side-effect-free boolean so a scan can cheaply test
+/// "could I claim for this agent?" WITHOUT materializing a `QuorumSigner` (no combined-secret
+/// build, no lingering share copy — the shares it reads to validate are dropped ZeroizeOnDrop).
+///
+/// CROSS-MACHINE BOUNDARY (finding G-2, the right behavior NOW): each node today provisions its
+/// OWN per-agent keystore, so a DIFFERENT node simply has no keystore for the agent and this is
+/// `false` — the failover scan correctly SKIPS an agent it cannot sign for (same-host takeover
+/// works; cross-machine takeover is gated until distributed shares land, NOT silently mis-claimed
+/// under a key this node does not hold). It is read-only + non-secret-leaking, so a scan may call
+/// it every tick.
+pub fn keystore_loadable_at(keystore_dir: &Path) -> bool {
+    is_provisioned(keystore_dir) && assert_shares_loadable(keystore_dir).is_ok()
+}
+
 /// FIX 1 (fail-closed): validate that all 3 holder shares are present AND deserialize as
 /// `KeyPackage`s. Called when an established identity anchor is found, so a partial/corrupt
 /// keystore over an established Q is a LOUD error rather than a silent regeneration. Does NOT
@@ -902,6 +921,38 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         println!("G-SPAWN-PROVISIONS-KEYSET PASS: pubkeys + 3 shares written 0600; Q derivable + stable");
+    }
+
+    /// G-4 FAILOVER ADMISSION GATE: `keystore_loadable_at` is the cross-machine boundary the
+    /// failover scan gates on. It is TRUE only for a node that actually holds the agent's full
+    /// quorum (anchor + all 3 shares loadable), and FALSE for an absent keystore (a DIFFERENT node
+    /// that never provisioned the agent — the G-2 boundary) AND for a partial/corrupt one (anchor
+    /// present but a share missing). So a node only ever takes over an agent it can FROST-sign for.
+    #[test]
+    fn keystore_loadable_gate_true_only_when_this_node_holds_the_quorum() {
+        // (a) ABSENT keystore (a peer's agent this node never provisioned) => NOT loadable.
+        let absent = temp_keystore("loadable-absent");
+        assert!(
+            !keystore_loadable_at(&absent),
+            "an absent keystore (the cross-machine case) must NOT be loadable (the scan SKIPS it)"
+        );
+
+        // (b) FULLY provisioned on THIS node => loadable (a same-host takeover can sign as it).
+        let full = temp_keystore("loadable-full");
+        provision_keyset_at(&full).expect("provision");
+        assert!(keystore_loadable_at(&full), "a complete keystore on this node must be loadable");
+
+        // (c) PARTIAL: the identity anchor survives but a holder share is removed => NOT loadable
+        //     (a node missing a share cannot complete the 2-of-3 sign, so it must not claim).
+        std::fs::remove_file(share_path(&full, 1)).expect("remove a share");
+        assert!(
+            !keystore_loadable_at(&full),
+            "a keystore missing a holder share must NOT be loadable even with the anchor present"
+        );
+
+        let _ = std::fs::remove_dir_all(&absent);
+        let _ = std::fs::remove_dir_all(&full);
+        println!("G-4-LOADABLE-GATE PASS: loadable only when this node holds anchor + all 3 shares");
     }
 
     /// G-IDENTITY-PERSISTS-ACROSS-RESTART: re-provisioning an already-provisioned keystore
