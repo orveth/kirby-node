@@ -177,6 +177,23 @@ pub struct SpawnConfig {
     /// request cannot over-seed the host. Default 1_000_000 (the play-money tenant default).
     #[serde(default = "default_spawn_max_seed_sats")]
     pub max_seed_sats: u64,
+    /// AUTOMATIC FAILOVER (G-4): how often, in seconds, this node scans the leases it observes for
+    /// a peer that went dark and (if it holds the agent's quorum + passes the same admission gates
+    /// a fresh spawn passes) takes the agent over. Default 5s (≈ the reap cadence). A scan is
+    /// cheap (a snapshot + a pure decision); the claim/launch side-effect is the only slow part and
+    /// is kept off the select! loop's critical path. The observer-blind fail-safe inside
+    /// `detect_takeovers` is what keeps a node whose own relay link dropped from mass-false-taking-
+    /// over the fleet — see `crate::failover_detect`.
+    #[serde(default = "default_spawn_failover_scan_secs")]
+    pub failover_scan_secs: u64,
+    /// AUTOMATIC FAILOVER (G-4): how long, in seconds, a peer's lease must be CONTINUOUSLY stale
+    /// (past the TTL) before this node takes it over — the grace window layered ON TOP of the lease
+    /// TTL, absorbing a brief relay blip / a holder slow to heartbeat without prematurely double-
+    /// spawning. Default = the lease TTL (`crate::relay_lease::LEASE_TTL_SECS`, 30s) per
+    /// `failover_detect::DEFAULT_TAKEOVER_GRACE_SECS`; this is a MONEY dial (it trades change-
+    /// stranding against the false-failover rate), so the operator can retune it.
+    #[serde(default = "default_spawn_takeover_grace_secs")]
+    pub takeover_grace_secs: u64,
 }
 
 /// Default anti-spam rate: 10 spawns per operator per window.
@@ -191,6 +208,18 @@ pub const fn default_spawn_rate_window_secs() -> u64 {
 pub const fn default_spawn_max_seed_sats() -> u64 {
     1_000_000
 }
+/// Default failover scan cadence: 5 seconds (≈ the reap cadence; a scan is a cheap snapshot + a
+/// pure decision, so a tight cadence is fine).
+pub const fn default_spawn_failover_scan_secs() -> u64 {
+    5
+}
+/// Default takeover grace window: the lease TTL (kept in sync with
+/// `crate::relay_lease::LEASE_TTL_SECS` = 30 and `failover_detect::DEFAULT_TAKEOVER_GRACE_SECS`).
+/// Defined here as a literal so the config block stays self-contained (config must not depend on
+/// relay internals); a `debug_assert` in the failover wiring guards the two from drifting.
+pub const fn default_spawn_takeover_grace_secs() -> u64 {
+    30
+}
 
 impl Default for SpawnConfig {
     fn default() -> Self {
@@ -200,6 +229,8 @@ impl Default for SpawnConfig {
             max_per_window: default_spawn_max_per_window(),
             rate_window_secs: default_spawn_rate_window_secs(),
             max_seed_sats: default_spawn_max_seed_sats(),
+            failover_scan_secs: default_spawn_failover_scan_secs(),
+            takeover_grace_secs: default_spawn_takeover_grace_secs(),
         }
     }
 }

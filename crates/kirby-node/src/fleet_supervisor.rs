@@ -308,10 +308,29 @@ impl FleetSupervisor {
         }
     }
 
-    /// Launch ONE tenant: allocate -> derive treasury path -> grant lease -> launch child ->
-    /// track. Releases the allocation on any later failure so no slot leaks. Public so a test
-    /// (and a later spawn control-plane) can launch a single tenant; `launch_all` calls it.
+    /// Launch ONE tenant for the FIRST time (claims the lease at term 1, via
+    /// [`Self::launch_one_at_term`]). Public so a test (and the spawn control-plane) can launch a
+    /// single tenant; `launch_all` calls it.
     pub async fn launch_one(&mut self, tenant: &TenantConfig) -> anyhow::Result<TenantRecord> {
+        // A first launch claims term 1 (the lease's opening epoch). A FAILOVER takeover instead
+        // calls `launch_one_at_term` with the verdict's `beat_term` (the monotonic fencing token
+        // that beats the dead holder's stale lease) so the tenant is RECORDED at the right term and
+        // its heartbeat re-publishes at THAT term, never silently dropping back to term 1.
+        self.launch_one_at_term(tenant, 1).await
+    }
+
+    /// Launch ONE tenant CLAIMING ITS LEASE AT AN EXPLICIT `term`: the SAME allocate -> provision
+    /// keyset -> claim -> launch -> track path as [`Self::launch_one`], but the lease is claimed at
+    /// `term` (term 1 for a first launch; the verdict's `beat_term` for a G-4 failover TAKEOVER —
+    /// the monotonic fencing token that fences out the dead holder if it revives). Recording the
+    /// tenant at `term` is what makes the subsequent [`Self::heartbeat_leases`] re-publish at the
+    /// takeover term rather than reverting to term 1 (which observers would ignore as stale, slowly
+    /// re-staling the lease). Releases the allocation on any later failure so no slot leaks.
+    pub async fn launch_one_at_term(
+        &mut self,
+        tenant: &TenantConfig,
+        term: u64,
+    ) -> anyhow::Result<TenantRecord> {
         // (1) Allocate the distinct resource triple (S0). At-most-once per agent; the
         // allocator rejects a duplicate or an over-cap request without consuming a slot.
         let allocation = match self.allocator.allocate(&tenant.agent_id) {
@@ -325,7 +344,7 @@ impl FleetSupervisor {
         };
 
         // From here on, a failure must RELEASE the allocation so no CID/port slot leaks.
-        let result = self.provision_and_launch(tenant, &allocation).await;
+        let result = self.provision_and_launch(tenant, &allocation, term).await;
         match result {
             Ok(record) => Ok(record),
             Err(e) => {
@@ -335,13 +354,14 @@ impl FleetSupervisor {
         }
     }
 
-    /// The fallible middle of a launch (split out so `launch_one` can release the allocation
-    /// on failure): derive the treasury path, grant the lease, launch the child, and record
-    /// the live tenant.
+    /// The fallible middle of a launch (split out so `launch_one_at_term` can release the
+    /// allocation on failure): derive the treasury path, claim the lease AT `term`, launch the
+    /// child, and record the live tenant.
     async fn provision_and_launch(
         &mut self,
         tenant: &TenantConfig,
         allocation: &TenantAllocation,
+        term: u64,
     ) -> anyhow::Result<TenantRecord> {
         // (2) Per-agent treasury path (DB-per-agent, spec 2.1): each tenant takes its OWN
         // sled exclusive dir lock, so opening tenant A's treasury never blocks on B's
@@ -372,13 +392,14 @@ impl FleetSupervisor {
             })?;
         let frost_npub = frost_identity.npub();
 
-        // (3) Grant the per-agent lease to THIS node at the current term (S1). Touches only
-        // this agent's entry, so granting tenant A never perturbs tenant B's lease.
+        // (3) Claim the per-agent lease for THIS node at `term` (S1): term 1 for a first launch,
+        // the verdict's `beat_term` for a failover takeover. Touches only this agent's entry, so
+        // claiming tenant A never perturbs tenant B's lease.
         let granted = self
             .grantor
-            .grant_for(&tenant.agent_id, self.node_id, &keystore_dir)
+            .claim_at(&tenant.agent_id, self.node_id, term, &keystore_dir)
             .await
-            .map_err(|e| anyhow::anyhow!("fleet supervisor: grant lease for tenant {:?}: {e}", tenant.agent_id))?;
+            .map_err(|e| anyhow::anyhow!("fleet supervisor: claim lease (term {term}) for tenant {:?}: {e}", tenant.agent_id))?;
 
         // (4) Launch the child running the existing single-agent path with the allocated
         // resources. Behind the TenantLauncher seam: the real impl spawns `kirby agent`; a
@@ -1250,7 +1271,7 @@ mod tests {
         let mut sup = FleetSupervisor::new(1, cfg, allocator, Arc::new(FailingGrantor), launcher.clone());
 
         let err = sup.launch_one(&tenant(&a, 1_000_000)).await.unwrap_err();
-        assert!(err.to_string().contains("grant lease"), "the grant failure surfaces: {err}");
+        assert!(err.to_string().contains("claim lease"), "the claim/grant failure surfaces: {err}");
         // The allocation was released: nothing is tracked, and nothing was launched.
         assert_eq!(sup.tenant_count(), 0);
         assert!(launcher.launched.lock().unwrap().is_empty(), "a failed grant must not launch a child");
