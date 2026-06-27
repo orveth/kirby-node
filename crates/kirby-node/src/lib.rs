@@ -223,6 +223,13 @@ pub mod fleet_supervisor;
 // never reconciles. NOT cfg-gated (like `fleet_supervisor`); the `/proc` probe degrades to
 // not-alive off Linux.
 pub mod fleet_reconcile;
+// AUTOMATIC FAILOVER DETECTION (closes resilience finding G-4, the no-failover gap): the PURE
+// decision a surviving node runs over its observed fleet-lease snapshot to decide which PEER
+// agents (their relay-lease went stale) to take over -- with the observer-blind fail-safe that
+// stands a relay-blind node down rather than mass-false-taking-over the fleet. Transport-free +
+// VM-free pure logic (like `lease`/`fleet_reconcile`), so NOT cfg-gated; the daemon wiring +
+// actual `claim(term+1)` are a later chunk.
+pub mod failover_detect;
 #[cfg(target_os = "linux")]
 pub mod full_loop_run;
 pub mod gateway;
