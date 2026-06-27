@@ -1217,6 +1217,16 @@ use crate::quorum_signer::QuorumSigner;
 use crate::relay_lease::RelayLeaseAuthority;
 use kirby_custody::cosign_net::NostrEvent;
 
+// The G-4 autonomous-failover tick + its harness helpers are exercised ONLY by
+// `failover_loop_tests`, so they (and the symbols they alone pull in) are `#[cfg(test)]` —
+// gating keeps the non-test library build free of dead-code / unused-import warnings.
+#[cfg(test)]
+use std::collections::{BTreeMap as LeaseBTreeMap, HashSet as LeaseHashSet};
+#[cfg(test)]
+use crate::failover_detect::detect_takeovers;
+#[cfg(test)]
+use crate::relay_lease::{LeaseContent, ObservedLeaseRecord, LEASE_TTL_SECS};
+
 /// The agent the full-loop's single genome runs as (the DEFAULT single-agent slot).
 const LOOP_AGENT: &str = crate::lease::DEFAULT_AGENT;
 
@@ -1312,6 +1322,160 @@ impl LeaseFabric {
             revived.observe(event).await;
         }
         Ok(revived)
+    }
+
+    /// Seed a FRESH "liveness" lease for a SEPARATE agent into the shared relay (the detecting
+    /// node's own healthy, heartbeating agent). It carries a DISTINCT `d`/agent_id so it never
+    /// collides with `LOOP_AGENT` (the failover target) and, being fresh, is never itself a
+    /// takeover candidate. Its sole job is to make a survivor's observed snapshot NON-blind: a
+    /// single-agent fabric whose only lease just went stale would (correctly) trip the
+    /// observer-blind fail-safe and stand down, exactly as the pure detector's tests include a
+    /// fresh `live` peer beside the stale one. This is the in-harness equivalent of that peer.
+    ///
+    /// It is built STRUCTURALLY (content JSON + the `d` tag), not FROST-signed: the detection tick
+    /// reads the relay map structurally (the same cooperative-fleet trust level
+    /// `FleetLeaseObserver` uses — NOT a security boundary), so no signature is needed. It is
+    /// published only into the relay map, never `observe`d into the verifying authorities.
+    #[cfg(test)]
+    fn seed_liveness(&mut self, agent_id: &str, holder: LeaseNodeId, term: u64, issued_at: u64) {
+        let content = LeaseContent {
+            agent_id: agent_id.to_string(),
+            holder_node_id: holder,
+            term,
+            issued_at,
+        };
+        let json = serde_json::to_string(&content).expect("serialize liveness lease content");
+        // A structurally-valid lease event: real kind + the `d` addressable tag agreeing with the
+        // content's agent_id (the only fields the structural snapshot read consults). The pubkey is
+        // the shared Q hex (so the relay key is well-formed); the id/sig are placeholders because
+        // the detection tick does not verify them (see the doc above).
+        let event = NostrEvent {
+            id: String::new(),
+            pubkey: hex::encode(self.q.q_bytes()),
+            created_at: issued_at,
+            kind: kirby_proto::KIND_KIRBY_LEASE as u32,
+            tags: vec![vec!["d".to_string(), agent_id.to_string()]],
+            content: json,
+            sig: String::new(),
+        };
+        self.relay.publish(event);
+    }
+
+    /// AGE an already-published lease in the shared relay by rewriting its content `issued_at` to
+    /// `issued_at` (the structural snapshot read judges staleness against this signed field). This
+    /// is the in-harness equivalent of TIME PASSING with no heartbeat: a dead peer's lease was
+    /// issued a while ago and has not been refreshed, so it reads STALE at a `now` that is the
+    /// PRESENT — WITHOUT having to push the detection clock far past the real wall-clock `issued_at`
+    /// the fabric `claim` stamps (which would also make a fresh takeover lease look stale to the
+    /// next tick and break single-winner). The detection clock and the `claim` clock stay aligned at
+    /// ~real wall-clock; only the dead lease is backdated. Returns whether a lease was found + aged.
+    #[cfg(test)]
+    fn age_lease(&mut self, agent_id: &str, issued_at: u64) -> bool {
+        let key = (
+            hex::encode(self.q.q_bytes()),
+            kirby_proto::KIND_KIRBY_LEASE as u32,
+            agent_id.to_string(),
+        );
+        let Some(event) = self.relay.events.get(&key) else {
+            return false;
+        };
+        let Ok(mut content) = serde_json::from_str::<LeaseContent>(&event.content) else {
+            return false;
+        };
+        content.issued_at = issued_at;
+        let json = serde_json::to_string(&content).expect("re-serialize aged lease content");
+        let mut aged = event.clone();
+        aged.content = json;
+        self.relay.events.insert(key, aged);
+        true
+    }
+
+    /// Build THIS node's observed-lease snapshot the way `detect_takeovers` consumes it: decode
+    /// every lease event currently in the shared relay map into an [`ObservedLeaseRecord`] keyed by
+    /// its `d`/agent_id (latest-wins is already enforced by the relay's addressable `(pubkey,
+    /// kind, d)` overwrite — one event per agent). `RelayLeaseAuthority` exposes no
+    /// `observed_snapshot()` (its observed map is private and only ever TTL-filtered), so per the
+    /// chunk brief the snapshot is built from the fabric's lease map. The read is STRUCTURAL (no Q
+    /// verification), matching the cooperative-fleet trust level the detector reasons over.
+    #[cfg(test)]
+    fn observed_snapshot_from_relay(&self) -> LeaseBTreeMap<String, ObservedLeaseRecord> {
+        let mut snap = LeaseBTreeMap::new();
+        for ((_pubkey, kind, d), event) in &self.relay.events {
+            if *kind != kirby_proto::KIND_KIRBY_LEASE as u32 {
+                continue;
+            }
+            let content: LeaseContent = match serde_json::from_str(&event.content) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            // The `d` addressable key must agree with the signed content's agent_id (mirrors the
+            // observer's structural check); a mis-addressed event is dropped.
+            if d.as_str() != content.agent_id.as_str() {
+                continue;
+            }
+            snap.insert(
+                content.agent_id,
+                ObservedLeaseRecord {
+                    holder_node_id: content.holder_node_id,
+                    term: content.term,
+                    issued_at: content.issued_at,
+                },
+            );
+        }
+        snap
+    }
+
+    /// AUTONOMOUS FAILOVER TICK (the G-4 loop, in-process): for `node_id`, build its observed-lease
+    /// snapshot from the relay, run the VERIFIED pure decision
+    /// [`detect_takeovers`] over it (the node hosts NOTHING in this single-agent harness — a
+    /// survivor takes over the dead peer's agent, never one it already runs), and for EACH verdict
+    /// perform the SAME real fabric `claim(node_id, beat_term)` the C11 fence arc uses (FROST-sign
+    /// the lease at the beat term, publish it, re-observe on every live node). The FABRIC — not the
+    /// test script — decides AND acts. Returns what was claimed (`(agent_id, term)` per verdict) so
+    /// tests can assert the autonomous takeover.
+    ///
+    /// `now`/the TTL/the grace window judge staleness; `grace_state` is the per-agent continuous-
+    /// staleness dwell threaded across ticks (consulted + updated in place by the pure decision).
+    /// The observer-blind fail-safe is enforced INSIDE `detect_takeovers`: a snapshot with no fresh
+    /// lease yields zero verdicts and this claims nothing.
+    #[cfg(test)]
+    async fn run_detection_tick(
+        &mut self,
+        node_id: LeaseNodeId,
+        now: u64,
+        grace_state: &mut LeaseBTreeMap<String, u64>,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        let snapshot = self.observed_snapshot_from_relay();
+        // The set of agents this node already hosts (never taken over). In the single-agent fabric
+        // a survivor that is NOT yet the lease holder hosts nothing; the test sets this explicitly.
+        let hosted: LeaseHashSet<String> = self
+            .authorities
+            .get(&node_id)
+            .map(|_| LeaseHashSet::new())
+            .unwrap_or_default();
+        let verdicts = detect_takeovers(
+            &snapshot,
+            node_id,
+            &hosted,
+            now,
+            LEASE_TTL_SECS,
+            crate::failover_detect::DEFAULT_TAKEOVER_GRACE_SECS,
+            grace_state,
+        );
+        let mut claimed = Vec::new();
+        for verdict in verdicts {
+            // The SAME real fabric claim the C11 path uses. The fabric is single-agent
+            // (`LOOP_AGENT`), so a real verdict is always for that agent; assert it so a future
+            // multi-agent fabric does not silently mis-claim under the hardcoded `claim` agent.
+            anyhow::ensure!(
+                verdict.agent_id == LOOP_AGENT,
+                "the single-agent fabric can only act on a verdict for LOOP_AGENT, got {:?}",
+                verdict.agent_id
+            );
+            let term = self.claim(node_id, verdict.beat_term).await?;
+            claimed.push((verdict.agent_id, term));
+        }
+        Ok(claimed)
     }
 
     /// Sample the active set over the LIVE nodes and OR into `two_actives_ever` whether more
@@ -1522,5 +1686,257 @@ mod tests {
         // G8 violated: two actives were observed.
         let split = FullLoopOutcome { two_actives_ever_observed: true, ..canonical() };
         assert!(!split.passed(8192), "two observed actives must FAIL G8 (linearizability)");
+    }
+}
+
+/// THE AUTONOMOUS G-4 FAILOVER LOOP, proven IN-PROCESS over the real `LeaseFabric` (fast,
+/// ungated — no VM/relay/HW). These exercise `LeaseFabric::run_detection_tick`: the FABRIC ITSELF
+/// (running the VERIFIED `detect_takeovers` decision and performing the SAME real `claim` the C11
+/// fence arc uses) detects a dead peer, claims `term + 1`, and the revival is FENCED — the C11
+/// fence arc, now DETECTOR-TRIGGERED rather than test-script-driven. Safety-critical: the race +
+/// fence assertions are the no-split-brain guarantee.
+#[cfg(test)]
+mod failover_loop_tests {
+    use super::{LeaseFabric, LOOP_AGENT, NODE_IDS};
+    use crate::failover_detect::DEFAULT_TAKEOVER_GRACE_SECS;
+    use crate::lease::{FenceVerdict, LeaseAuthority};
+    use crate::relay_lease::LEASE_TTL_SECS;
+    use std::collections::BTreeMap;
+
+    /// A distinct, fresh "liveness" agent so a survivor's snapshot is NON-blind (its own healthy,
+    /// heartbeating agent beside the dead peer's stale lease). Non-empty, so it never collides with
+    /// `LOOP_AGENT` (the empty single-agent sentinel = the failover target).
+    const LIVENESS_AGENT: &str = "survivor-self";
+
+    /// Read the real wall-clock `issued_at` the fabric stamped on `LOOP_AGENT`'s latest lease.
+    /// The fabric `claim` stamps `now_secs()` (real wall clock), so the tests anchor their
+    /// detection clock to THIS value and AGE the dead lease backward from it (rather than pushing
+    /// the detection clock far into the future). That keeps the detection clock and the `claim`
+    /// clock aligned at ~real wall-clock, so a takeover lease the fabric freshly claims reads FRESH
+    /// to the next tick (the property single-winner-on-race depends on).
+    fn loop_agent_issued_at(fabric: &LeaseFabric) -> u64 {
+        fabric
+            .observed_snapshot_from_relay()
+            .get(LOOP_AGENT)
+            .expect("LOOP_AGENT lease present in the relay")
+            .issued_at
+    }
+
+    /// The amount we backdate a dead peer's lease so it is CONTINUOUSLY stale past TTL + grace as of
+    /// `now` (with a margin), making it takeover-eligible in a single eligible tick.
+    const STALE_BY: u64 = LEASE_TTL_SECS + DEFAULT_TAKEOVER_GRACE_SECS + 5;
+
+    /// TEST 1 (the WHOLE loop, autonomous): node 1 holds agent A (`LOOP_AGENT`) at term T. KILL
+    /// node 1; its lease ages past TTL + the grace dwell. Node 2's `run_detection_tick`
+    /// AUTONOMOUSLY claims A at T+1 (the fabric decided + acted — no test script told it to).
+    /// Reviving node 1 still believing T, it reads `fence_for(A, T) == Fenced` and NO observed
+    /// boundary ever showed two actives. This is C11's fence arc, now DETECTOR-driven.
+    #[tokio::test]
+    async fn autonomous_detect_takeover_then_revival_is_fenced() {
+        let mut fabric = LeaseFabric::new(&NODE_IDS).expect("build the lease fabric");
+        let term_t = 1u64;
+        let mut two_actives_ever = false;
+
+        // Node 1 claims A at T (the live holder), observed on every live node.
+        fabric.claim(1, term_t).await.expect("node 1 claims A @ T");
+        fabric.sample_actives(&mut two_actives_ever).await;
+        // Anchor the detection clock at the present (the real wall-clock the claim stamped).
+        let now = loop_agent_issued_at(&fabric);
+
+        // KILL node 1: it drops out of the live observer set and stops heartbeating A.
+        fabric.kill(1);
+        fabric.sample_actives(&mut two_actives_ever).await;
+
+        // Node 2 is a healthy survivor: seed its own FRESH liveness lease (issued at `now`, 0s old)
+        // so its observed snapshot is NOT blind — otherwise the single stale agent would correctly
+        // trip the observer-blind fail-safe (proven separately in `observer_blind_tick_claims_nothing`).
+        fabric.seed_liveness(LIVENESS_AGENT, 2, 1, now);
+
+        // A is now stale past TTL + the grace dwell as of `now` (node 1 stopped heartbeating).
+        assert!(fabric.age_lease(LOOP_AGENT, now - STALE_BY), "age A past TTL + grace");
+
+        // FIRST detection tick with a FRESH dwell map: even though A is long stale, this is the
+        // FIRST tick that SEES it stale, so the grace dwell only SEEDS (continuous-staleness = 0) —
+        // the fabric claims NOTHING. This proves the dwell gates a takeover on first sighting.
+        let mut gs_fresh = BTreeMap::new();
+        let claimed = fabric.run_detection_tick(2, now, &mut gs_fresh).await.expect("first-sighting tick");
+        assert!(
+            claimed.is_empty(),
+            "the first tick that sees A stale only seeds the dwell ⇒ NO takeover yet, got {claimed:?}"
+        );
+        assert_eq!(gs_fresh.get(LOOP_AGENT).copied(), Some(now), "the dwell seeded at first-seen-stale");
+        fabric.sample_actives(&mut two_actives_ever).await;
+
+        // SECOND tick, with the dwell ALREADY satisfied (the fabric has seen A continuously stale for
+        // >= the grace window across prior ticks — modeled by a pre-seeded first-seen-stale a full
+        // grace window in the past). Node 2 AUTONOMOUSLY takes A over at T+1 — the fabric's OWN
+        // decision + its OWN real `claim` (the SAME claim the C11 fence arc uses). The takeover lease
+        // is claimed at the present wall clock, so it is fresh (0s old at `now`), not the knife-edge
+        // a far-future detection clock would create.
+        let mut gs_dwelt = BTreeMap::new();
+        gs_dwelt.insert(LOOP_AGENT.to_string(), now - DEFAULT_TAKEOVER_GRACE_SECS);
+        let claimed = fabric.run_detection_tick(2, now, &mut gs_dwelt).await.expect("post-dwell tick");
+        assert_eq!(
+            claimed,
+            vec![(LOOP_AGENT.to_string(), term_t + 1)],
+            "node 2 must AUTONOMOUSLY claim A at the OBSERVED term + 1 (T+1) once past the grace dwell"
+        );
+        fabric.sample_actives(&mut two_actives_ever).await;
+
+        // Node 2 is now genuinely the active holder at T+1 (its own fence confirms it; the takeover
+        // lease was claimed at the present wall clock, so it is fresh).
+        let n2 = fabric.authority(2).expect("node 2 authority");
+        assert!(
+            matches!(n2.fence_for(LOOP_AGENT, term_t + 1).await, FenceVerdict::Active { term } if term == term_t + 1),
+            "after the autonomous takeover node 2 holds A @ T+1 (Active)"
+        );
+
+        // REVIVE node 1 still believing T: it catches up on the latest lease (T+1, held by node 2)
+        // and is FENCED — the no-split-brain guarantee, now reached via the detector, not a script.
+        let revived = fabric.revive_stale(1).await.expect("revive node 1 stale");
+        let verdict = revived.fence_for(LOOP_AGENT, term_t).await;
+        assert!(
+            matches!(verdict, FenceVerdict::Fenced { committed_term, committed_holder, believed_term }
+                if committed_term == term_t + 1 && committed_holder == 2 && believed_term == term_t),
+            "the revived node believing T must be FENCED by the T+1 lease node 2 took over (got {verdict:?})"
+        );
+        fabric.sample_actives(&mut two_actives_ever).await;
+
+        assert!(
+            !two_actives_ever,
+            "NO observed boundary may ever show two active nodes (no split-brain across the autonomous failover)"
+        );
+    }
+
+    /// TEST 2 (single-winner-on-race, thundering-herd containment): TWO survivors (nodes 2 and 3)
+    /// BOTH run `run_detection_tick` on the SAME stale agent A in the SAME round. The relay's
+    /// latest-wins (observe-only-forward by strictly-newer term) settles EXACTLY ONE T+1 holder; the
+    /// second survivor's tick observes the winner's FRESH T+1 lease, no longer judges A stale, and
+    /// stands DOWN (the detector's own freshness check, fed by the relay's latest-wins, contains the
+    /// herd). The loser reads `Fenced` and NO observed boundary shows two actives. This is the race
+    /// the spec calls out, contained by the monotonic-term latest-wins.
+    ///
+    /// On the in-process serialization: the fabric's relay is synchronous + shared, so node 3's tick
+    /// observes node 2's claim the instant it lands. The genuine production race (two snapshots taken
+    /// before either claim) is ALSO contained by the SAME mechanism — observe-only-forward rejects
+    /// the second equal-term claim — which `relay_lease`'s `observe_latest_wins_by_monotonic_term`
+    /// proves directly. Here we prove the FABRIC-LEVEL invariant: however many survivors run the loop
+    /// on the same stale agent, exactly ONE T+1 holder emerges and the rest are fenced.
+    #[tokio::test]
+    async fn single_winner_when_two_survivors_race_the_same_stale_agent() {
+        let mut fabric = LeaseFabric::new(&NODE_IDS).expect("build the lease fabric");
+        let term_t = 4u64;
+        let mut two_actives_ever = false;
+
+        fabric.claim(1, term_t).await.expect("node 1 claims A @ T");
+        let now = loop_agent_issued_at(&fabric);
+        fabric.kill(1);
+
+        // A is continuously stale past TTL + grace as of `now`; both survivors are healthy (each has
+        // its own fresh liveness lease at `now`, so neither is observer-blind).
+        assert!(fabric.age_lease(LOOP_AGENT, now - STALE_BY), "age A past TTL + grace");
+        fabric.seed_liveness("survivor-2-self", 2, 1, now);
+        fabric.seed_liveness("survivor-3-self", 3, 1, now);
+
+        // Pre-seed BOTH nodes' dwell so a single same-round tick is eligible to fire — each has
+        // ALREADY seen A continuously stale across the grace window. The race is two READY survivors
+        // acting in the same round, which is exactly what the single-winner rule must contain.
+        let mut gs2 = BTreeMap::new();
+        gs2.insert(LOOP_AGENT.to_string(), now - STALE_BY);
+        let mut gs3 = gs2.clone();
+
+        // Node 2 ticks FIRST: it observes A stale, claims T+1, and (observe-only-forward) becomes the
+        // observed holder at T+1 on every live node. The claim stamps the present wall clock, so the
+        // T+1 lease is FRESH at `now`.
+        let c2 = fabric.run_detection_tick(2, now, &mut gs2).await.expect("node 2 tick");
+        assert_eq!(c2, vec![(LOOP_AGENT.to_string(), term_t + 1)], "node 2 claims A @ T+1 (the takeover)");
+        fabric.sample_actives(&mut two_actives_ever).await;
+
+        // Node 3 ticks in the SAME round: its snapshot now carries node 2's FRESH T+1 lease, so A is
+        // no longer stale to it — the detector stands node 3 DOWN (it claims NOTHING). The relay's
+        // latest-wins is what made A fresh-again for node 3; this is the herd collapsing to one.
+        let c3 = fabric.run_detection_tick(3, now, &mut gs3).await.expect("node 3 tick");
+        assert!(
+            c3.is_empty(),
+            "the second survivor must NOT double-take-over: it observes the winner's fresh T+1 and stands down (got {c3:?})"
+        );
+        fabric.sample_actives(&mut two_actives_ever).await;
+
+        // EXACTLY ONE T+1 holder survives across the live nodes (the single winner). Count nodes that
+        // report Active at T+1; the loser must read Fenced, not Active.
+        let mut active_holders = Vec::new();
+        for &id in &NODE_IDS {
+            if id == 1 {
+                continue; // node 1 was killed
+            }
+            let auth = fabric.authority(id).expect("authority");
+            if let FenceVerdict::Active { term } = auth.fence_for(LOOP_AGENT, term_t + 1).await {
+                active_holders.push((id, term));
+            }
+        }
+        assert_eq!(
+            active_holders.len(),
+            1,
+            "EXACTLY ONE survivor may hold A @ T+1 after the race (single-winner), got {active_holders:?}"
+        );
+        assert_eq!(active_holders[0], (2, term_t + 1), "the first claimer (node 2) is the single winner");
+
+        // The loser (node 3) is FENCED out by node 2's T+1 lease.
+        let loser = fabric.authority(3).expect("node 3 authority");
+        let loser_verdict = loser.fence_for(LOOP_AGENT, term_t + 1).await;
+        assert!(
+            matches!(loser_verdict, FenceVerdict::Fenced { committed_holder, .. } if committed_holder == 2),
+            "the losing survivor must be FENCED by the winner's lease (got {loser_verdict:?})"
+        );
+
+        assert!(
+            !two_actives_ever,
+            "the thundering herd must collapse to ONE active holder — no two actives ever (no split-brain)"
+        );
+    }
+
+    /// TEST 3 (observer-blind carry-through): a node whose observed snapshot has NO fresh lease this
+    /// round (its relay link is, as far as it can tell, down — every lease aged out together) runs
+    /// `run_detection_tick` and claims NOTHING. The fail-safe (enforced inside `detect_takeovers`)
+    /// holds THROUGH the fabric tick: a blind node never mass-false-takes-over the fleet.
+    #[tokio::test]
+    async fn observer_blind_tick_claims_nothing() {
+        let mut fabric = LeaseFabric::new(&NODE_IDS).expect("build the lease fabric");
+        let term_t = 7u64;
+
+        fabric.claim(1, term_t).await.expect("node 1 claims A @ T");
+        let now = loop_agent_issued_at(&fabric);
+        fabric.kill(1);
+
+        // A is stale past TTL + grace, and — crucially — NO liveness lease is seeded, so the ONLY
+        // observed lease (A) is stale: NOTHING is fresh, exactly the signature of THIS node's own
+        // relay link being down. Pre-seed the dwell so that, were the fail-safe absent, A WOULD be
+        // eligible — proving it is the fail-safe (not the dwell) that suppresses the takeover.
+        assert!(fabric.age_lease(LOOP_AGENT, now - STALE_BY), "age A past TTL + grace");
+        let mut gs = BTreeMap::new();
+        gs.insert(LOOP_AGENT.to_string(), now - STALE_BY);
+
+        let claimed = fabric.run_detection_tick(2, now, &mut gs).await.expect("blind tick");
+        assert!(
+            claimed.is_empty(),
+            "an observer-blind tick (no fresh lease anywhere) must claim NOTHING — the fail-safe holds through the fabric (got {claimed:?})"
+        );
+        // The blind tick must leave the grace map UNTOUCHED (a blind tick is not trustworthy
+        // evidence of staleness, so it must neither advance NOR clear the dwell — otherwise a
+        // recovered link would either mass-take-over or have lost its progress). The entry we
+        // pre-seeded is therefore unchanged, NOT cleared.
+        assert_eq!(
+            gs.get(LOOP_AGENT).copied(),
+            Some(now - STALE_BY),
+            "a blind tick must leave the grace map untouched (the pre-seeded dwell is preserved as-is)"
+        );
+
+        // And the blind tick must NOT have created a fresh T+1 holder: node 2's fence still sees no
+        // fresh lease for A (no takeover happened).
+        let n2 = fabric.authority(2).expect("node 2 authority");
+        assert!(
+            matches!(n2.fence_for(LOOP_AGENT, term_t + 1).await, FenceVerdict::Fenced { .. }),
+            "no takeover occurred: node 2 holds no fresh T+1 lease for A"
+        );
     }
 }
