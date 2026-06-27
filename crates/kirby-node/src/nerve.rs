@@ -410,6 +410,26 @@ pub struct PresenceConfig {
     pub stale_after: Duration,
 }
 
+/// Add `relay_url` to `client` with the client-side keepalive ping DISABLED.
+///
+/// `nostr-relay-pool` pings the relay every `PING_INTERVAL` (55s) and self-terminates
+/// the connection with `Error::NotRepliedToPing` if a single ping is unanswered before
+/// the next tick. On a high-latency node (e.g. a far macOS node at ~190ms RTT) a
+/// transient stall across one 55s window self-kills the connection; repeated kills drop
+/// the relay's success rate until the pool terminates it and the presence task exits —
+/// the node then looks dead in the fleet/UI even though its agent is alive. We re-publish
+/// the presence beacon every interval (<=15s), so the 55s keepalive is pure downside;
+/// `reconnect` (default true) still recovers genuine drops. The `Client::add_relay`
+/// shortcut uses default opts (which include PING), so go through the pool to override.
+async fn add_relay_no_ping(client: &Client, relay_url: &str) -> anyhow::Result<()> {
+    client
+        .pool()
+        .add_relay(relay_url, RelayOptions::new().ping(false))
+        .await
+        .with_context(|| format!("add relay {relay_url}"))?;
+    Ok(())
+}
+
 /// Build a connected Nostr [`Client`] for `identity`, add `relay_url`, and connect.
 /// Shared by the presence task and the fleet read path, and reused by the hibernation
 /// wake-request publish path ([`crate::hibernate::wake`]) so it does not duplicate the
@@ -419,10 +439,7 @@ pub(crate) async fn connect_client(
     relay_url: &str,
 ) -> anyhow::Result<Client> {
     let client = Client::builder().signer(identity.keys().clone()).build();
-    client
-        .add_relay(relay_url)
-        .await
-        .with_context(|| format!("add relay {relay_url}"))?;
+    add_relay_no_ping(&client, relay_url).await?;
     client.connect().await;
     Ok(client)
 }
@@ -441,10 +458,7 @@ async fn connect_beacon_client(signer: &BeaconSigner, relay_url: &str) -> anyhow
         // No `.signer(..)`: a FROST beacon is signed by the quorum, never by a local key.
         BeaconSigner::Frost(_) => Client::builder().build(),
     };
-    client
-        .add_relay(relay_url)
-        .await
-        .with_context(|| format!("add relay {relay_url}"))?;
+    add_relay_no_ping(&client, relay_url).await?;
     client.connect().await;
     Ok(client)
 }
@@ -454,10 +468,7 @@ async fn connect_beacon_client(signer: &BeaconSigner, relay_url: &str) -> anyhow
 /// Reused by the hibernation wake-request fetch path ([`crate::hibernate::wake`]).
 pub(crate) async fn connect_reader(relay_url: &str) -> anyhow::Result<Client> {
     let client = Client::builder().signer(Keys::generate()).build();
-    client
-        .add_relay(relay_url)
-        .await
-        .with_context(|| format!("add relay {relay_url}"))?;
+    add_relay_no_ping(&client, relay_url).await?;
     client.connect().await;
     Ok(client)
 }
