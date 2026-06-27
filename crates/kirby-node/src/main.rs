@@ -630,8 +630,10 @@ async fn reconcile_fleet_on_startup(
     // Subscribe to the retained lease events so we learn which agents are still held + by whom.
     let observer = Arc::new(FleetLeaseObserver::new(node_id));
     let client = Client::builder().signer(Keys::generate()).build();
-    client
-        .add_relay(relay_url)
+    // Disable the 55s keepalive ping (nerve::add_relay_no_ping): on a laggy path this
+    // observer would self-kill and go blind, which a failover-detection loop reads as
+    // "every peer is stale" -> mass false takeover.
+    nerve::add_relay_no_ping(&client, relay_url)
         .await
         .with_context(|| format!("add fleet relay {relay_url} for reconcile lease observe"))?;
     client.connect().await;
@@ -786,8 +788,10 @@ async fn run_spawn_control_plane(
     // latest addressable lease per agent, so on connect this node immediately learns which agents
     // its peers already hold.
     let client = Client::builder().signer(Keys::generate()).build();
-    client
-        .add_relay(relay_url)
+    // Disable the 55s keepalive ping (nerve::add_relay_no_ping): this is the fleet's
+    // long-lived lease observer; if it self-kills on a laggy path it goes blind, which a
+    // failover-detection loop reads as "every peer is stale" -> mass false takeover.
+    nerve::add_relay_no_ping(&client, relay_url)
         .await
         .with_context(|| format!("add fleet relay {relay_url} for spawn subscription"))?;
     client.connect().await;
