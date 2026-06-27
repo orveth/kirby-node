@@ -421,7 +421,11 @@ pub struct PresenceConfig {
 /// the presence beacon every interval (<=15s), so the 55s keepalive is pure downside;
 /// `reconnect` (default true) still recovers genuine drops. The `Client::add_relay`
 /// shortcut uses default opts (which include PING), so go through the pool to override.
-async fn add_relay_no_ping(client: &Client, relay_url: &str) -> anyhow::Result<()> {
+///
+/// Shared by every long-lived fleet relay client — the presence beacon, the lease
+/// observer, and the reconcile observer — so none of them self-kills on a laggy path
+/// (a self-killed observer goes blind, which a failover loop reads as "every peer stale").
+pub async fn add_relay_no_ping(client: &Client, relay_url: &str) -> anyhow::Result<()> {
     client
         .pool()
         .add_relay(relay_url, RelayOptions::new().ping(false))
