@@ -103,6 +103,28 @@ struct ObservedLease {
     content: LeaseContent,
 }
 
+/// The LATEST observed lease for an agent, IGNORING the TTL — the read shape the failover
+/// detector needs to distinguish "STALE (we saw a lease, then it went quiet past the TTL)" from
+/// "ABSENT (we never saw a lease at all)". Unlike [`ActiveLease`] (which is only ever produced
+/// from a FRESH, TTL-filtered projection), this carries the SIGNED `issued_at` so the detector
+/// can judge staleness itself at an explicit `now` and beat the OBSERVED `term`.
+///
+/// This is a read-only projection of the observer's internal state. It is NOT a money/security
+/// authority (the occupancy observer does not verify the FROST signature — see
+/// [`FleetLeaseObserver`]); it is the cooperative-fleet hint the steady-state failover
+/// detector reasons over, the same trust level the spawn fence already uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservedLeaseRecord {
+    /// The node that holds the latest observed lease (the authoritative holder named in the
+    /// signed content). On a takeover the detector beats `term`, not this node's own term.
+    pub holder_node_id: LeaseNodeId,
+    /// The MONOTONIC fencing term of the latest observed lease. A takeover claims `term + 1`.
+    pub term: u64,
+    /// Unix seconds the lease was issued (the heartbeat timestamp). Staleness is judged against
+    /// this, exactly as [`is_stale`] does for the fresh projection.
+    pub issued_at: u64,
+}
+
 /// Wall-clock now in unix seconds (the lease freshness clock). A `const fn`-free helper so
 /// the TTL math has one source; tests inject time via [`RelayLeaseAuthority::observe_at`].
 fn now_secs() -> u64 {
@@ -663,6 +685,64 @@ impl FleetLeaseObserver {
         }
         Some(ActiveLease { node_id: c.holder_node_id, term: c.term })
     }
+
+    /// The LATEST observed lease for `agent_id` IGNORING the TTL — its holder, term, and signed
+    /// `issued_at` — or `None` if NO lease has EVER been observed for the agent. This is the
+    /// failover detector's "stale vs absent" distinguisher: [`SpawnFenceView::active_lease_for`]
+    /// already collapses both "never seen" and "seen but stale" to `None`, but a takeover decision
+    /// MUST treat them differently — a stale lease (seen, went quiet) is a takeover candidate,
+    /// while an absent one (never seen) is NOT (we have no evidence the agent exists, so claiming
+    /// it would be inventing an agent, not failing one over). The caller judges staleness itself
+    /// via [`is_stale`] / its own TTL at an explicit `now`.
+    ///
+    /// ADDITIVE + read-only: it does NOT change the existing fresh projection or any other method;
+    /// it just exposes the raw stored `(holder, term, issued_at)` the TTL filter would otherwise
+    /// hide.
+    pub async fn latest_observed_lease(&self, agent_id: &str) -> Option<ObservedLeaseRecord> {
+        let observed = self.observed.read().await;
+        observed.get(agent_id).map(|c| ObservedLeaseRecord {
+            holder_node_id: c.holder_node_id,
+            term: c.term,
+            issued_at: c.issued_at,
+        })
+    }
+
+    /// A point-in-time snapshot of EVERY observed lease (latest-wins, TTL-IGNORED), keyed by
+    /// agent_id — the sync read shape the pure failover-detection decision consumes (mirroring how
+    /// [`crate::fleet_reconcile::LeaseSnapshot`] pre-resolves the async observer into a sync view so
+    /// the pure decision needs no `await`). The detector judges staleness per entry against an
+    /// injected `now` + TTL, and derives the observer-blind fail-safe ("have I seen ANY fresh lease
+    /// within the TTL?") from the SAME snapshot, so the decision is taken over one consistent view.
+    pub async fn observed_snapshot(&self) -> std::collections::BTreeMap<String, ObservedLeaseRecord> {
+        let observed = self.observed.read().await;
+        observed
+            .iter()
+            .map(|(agent_id, c)| {
+                (
+                    agent_id.clone(),
+                    ObservedLeaseRecord {
+                        holder_node_id: c.holder_node_id,
+                        term: c.term,
+                        issued_at: c.issued_at,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Whether this node has observed AT LEAST ONE lease (for ANY agent) that is still FRESH (its
+    /// `issued_at` is within the TTL) as of `now`. This is the observer-blind FAIL-SAFE signal the
+    /// steady-state failover detector stands down on: a node whose relay link is down (e.g. the
+    /// 55s keepalive-ping self-kill the reconcile wiring disables, main.rs) stops receiving ALL
+    /// lease events, so EVERY observed lease ages past the TTL together — which is
+    /// indistinguishable, per-agent, from real peer deaths. If NOTHING is fresh, the silence is far
+    /// more likely OUR blindness than a simultaneous fleet-wide death, so the detector emits ZERO
+    /// takeovers (see [`crate::failover_detect::detect_takeovers`]). Conversely, even one fresh
+    /// lease proves the relay link is delivering, so a stale peer beside it is a genuine candidate.
+    pub async fn has_fresh_lease_within_ttl(&self, now: u64) -> bool {
+        let observed = self.observed.read().await;
+        observed.values().any(|c| !is_stale(c.issued_at, now))
+    }
 }
 
 #[async_trait::async_trait]
@@ -766,5 +846,63 @@ mod observer_tests {
         // A non-lease kind is dropped.
         let wrong = EventBuilder::new(Kind::from(1u16), "{}").sign_with_keys(&Keys::generate()).unwrap();
         assert!(!obs.observe_occupancy(&wrong).await);
+    }
+
+    /// The ADDITIVE accessor `latest_observed_lease` exposes the raw stored lease IGNORING the TTL,
+    /// so a caller can tell STALE (seen, went quiet) apart from ABSENT (never seen) — the
+    /// distinction the failover detector needs but the TTL-filtered fresh projection collapses.
+    #[tokio::test]
+    async fn latest_observed_lease_distinguishes_stale_from_absent() {
+        let obs = FleetLeaseObserver::new(1);
+        // A NEVER-seen agent is None on BOTH the fresh projection and the raw accessor.
+        assert!(obs.latest_observed_lease("ghost").await.is_none(), "never-observed => absent (None)");
+        // Observe a lease for "a" at term 4, issued_at 1000.
+        assert!(obs.observe_occupancy(&lease_event("a", 2, 4, 1000, "a")).await);
+        // FAR past the TTL, the FRESH projection collapses to None (looks the same as absent)...
+        assert!(obs.fresh_active_lease_at("a", 1000 + LEASE_TTL_SECS + 100).await.is_none());
+        // ...but the raw accessor STILL returns the observed lease (holder/term/issued_at intact),
+        // so the detector can see it is STALE (seen) rather than ABSENT (never seen).
+        let raw = obs.latest_observed_lease("a").await.expect("a stale lease is still observed");
+        assert_eq!(
+            raw,
+            ObservedLeaseRecord { holder_node_id: 2, term: 4, issued_at: 1000 },
+            "the raw accessor must carry holder + the OBSERVED term + the signed issued_at, TTL-ignored"
+        );
+    }
+
+    /// The observer-blind FAIL-SAFE signal `has_fresh_lease_within_ttl`: true only while AT LEAST
+    /// one observed lease is still fresh at `now`. When the relay link drops, all observed leases
+    /// age past the TTL together and this goes false — the detector's stand-down trigger.
+    #[tokio::test]
+    async fn has_fresh_lease_within_ttl_tracks_freshness() {
+        let obs = FleetLeaseObserver::new(1);
+        // No observations yet => nothing fresh (a brand-new, not-yet-synced observer is "blind").
+        assert!(!obs.has_fresh_lease_within_ttl(1000).await, "no observations => not fresh");
+        // Two leases observed at issued_at 1000.
+        assert!(obs.observe_occupancy(&lease_event("a", 2, 1, 1000, "a")).await);
+        assert!(obs.observe_occupancy(&lease_event("b", 3, 1, 1000, "b")).await);
+        // Within the TTL at least one is fresh => the link is delivering.
+        assert!(obs.has_fresh_lease_within_ttl(1000 + LEASE_TTL_SECS).await, "within TTL => a fresh lease exists");
+        // Past the TTL for BOTH (the signature of a dropped link): nothing fresh => stand-down signal.
+        assert!(
+            !obs.has_fresh_lease_within_ttl(1000 + LEASE_TTL_SECS + 1).await,
+            "all leases aged past TTL => no fresh lease => observer-blind"
+        );
+    }
+
+    /// `observed_snapshot` drains EVERY observed lease (TTL-ignored, latest-wins) into the sync view
+    /// the pure detector consumes — so the decision is taken over one consistent point-in-time
+    /// snapshot rather than racing per-agent reads against the live map.
+    #[tokio::test]
+    async fn observed_snapshot_drains_all_latest_observed_leases() {
+        let obs = FleetLeaseObserver::new(1);
+        assert!(obs.observe_occupancy(&lease_event("a", 2, 1, 1000, "a")).await);
+        assert!(obs.observe_occupancy(&lease_event("b", 3, 5, 2000, "b")).await);
+        // A later takeover of "a" at term 2 by node 9 (latest-wins by term) is what the snapshot shows.
+        assert!(obs.observe_occupancy(&lease_event("a", 9, 2, 1500, "a")).await);
+        let snap = obs.observed_snapshot().await;
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap["a"], ObservedLeaseRecord { holder_node_id: 9, term: 2, issued_at: 1500 });
+        assert_eq!(snap["b"], ObservedLeaseRecord { holder_node_id: 3, term: 5, issued_at: 2000 });
     }
 }
