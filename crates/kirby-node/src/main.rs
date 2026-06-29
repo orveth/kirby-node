@@ -737,7 +737,7 @@ async fn reconcile_fleet_on_startup(
 /// tenants on a tick so a spawned-agent death frees capacity for the next spawn. Runs until
 /// killed (a spawn host is long-lived; it does NOT auto-exit when its static tenants die).
 async fn run_spawn_control_plane(
-    mut supervisor: kirby_node::fleet_supervisor::FleetSupervisor,
+    supervisor: kirby_node::fleet_supervisor::FleetSupervisor,
     node_id: kirby_node::lease::LeaseNodeId,
     spawn_cfg: kirby_node::config::SpawnConfig,
     relay_url: &str,
@@ -811,6 +811,25 @@ async fn run_spawn_control_plane(
         .context("subscribe to KIND_KIRBY_SPAWN_REQUEST + KIND_KIRBY_LEASE")?;
     let mut notifications = client.notifications();
     println!("FLEET spawn control-plane: listening for spawn requests + leases on {relay_url}");
+
+    // Attach the READ-AFTER-WRITE LAUNCH FENCE (failover finding G-1, the double-LAUNCH): a relay
+    // re-reader over a CLONE of this control-plane's already-connected client. The supervisor
+    // consults it AFTER a takeover claims the lease and BEFORE it launches the VM, re-reading the
+    // agent's surviving latest lease with a real round-trip so it launches ONLY if THIS node won
+    // the term race (the loser of a two-survivor race aborts + releases its allocation; a later
+    // tick re-settles). Wired HERE (not in `run_fleet_supervisor_cmd`) because the read needs the
+    // connected relay client, which is built in this loop; the static-tenant `launch_all` ran
+    // earlier with no confirmer (a node's own first launch does not race a peer — the spawn fence
+    // covers cross-node spawns). A SHORT fetch timeout bounds the confirm so it never holds the
+    // single-takeover-per-tick slot hostage to a slow relay (a timeout reads as empty -> fail closed).
+    let lease_reader = Arc::new(kirby_node::relay_lease::RelayLeaseReader::new(
+        client.clone(),
+        Duration::from_secs(3),
+    ));
+    let mut supervisor = supervisor.with_lease_confirmer(
+        lease_reader,
+        kirby_node::fleet_supervisor::DEFAULT_LAUNCH_CONFIRM_SETTLE,
+    );
 
     // The node's representative pre-staged image (the image a TAKEOVER would relaunch the agent on
     // — the node's OWN configured image, never attacker-supplied). Used by the failover admission
@@ -966,10 +985,21 @@ async fn run_spawn_control_plane(
                 // (3) ACT (the side-effect at the edge): claim the lease at `beat_term` + launch the
                 //     agent through the supervisor's EXISTING launch path (`launch_one_at_term`
                 //     claims `beat_term` via the relay-lease grantor, then launches — the same
-                //     allocate/provision/launch path a spawn uses, only the term differs). No-split-
-                //     brain + single-winner are already guaranteed by the monotonic-term lease
-                //     (proven); we are only the new CALLER. A launch failure releases its allocation
-                //     inside `launch_one_at_term`; we log and let the next tick retry.
+                //     allocate/provision/launch path a spawn uses, only the term differs).
+                //
+                //     SINGLE-WINNER ON THE LAUNCH PATH is enforced by the READ-AFTER-WRITE LAUNCH
+                //     FENCE inside `provision_and_launch`: after the claim publishes, the supervisor
+                //     re-reads the agent's surviving latest lease from the relay (the
+                //     `RelayLeaseReader` attached above) and launches ONLY if THIS node holds it at
+                //     `beat_term`. The monotonic-term lease ALONE does NOT prevent two survivors that
+                //     both pass `detect_takeovers` from both claiming `beat_term` and both launching
+                //     (it only fences the dead holder if it revives, and the equal-term cross-node
+                //     tiebreak is otherwise unresolved); the relay's latest-wins collapse of the two
+                //     same-Q addressable claims to ONE surviving holder, read back here, is what
+                //     decides the winner — the loser's confirm DENIES its launch, releasing its
+                //     allocation. A launch failure (including a denied confirm) releases its
+                //     allocation inside `launch_one_at_term`; we back it off and let the next tick
+                //     re-settle.
                 if let Some((agent_id, beat_term)) = admitted {
                     let tenant = kirby_node::config::TenantConfig {
                         agent_id: agent_id.clone(),
