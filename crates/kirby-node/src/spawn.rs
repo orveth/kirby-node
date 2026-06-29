@@ -179,6 +179,58 @@ pub enum SpawnSkip {
     AlreadyClaimedElsewhere { holder: LeaseNodeId, term: u64 },
 }
 
+/// Why an AUTOMATIC FAILOVER takeover (G-4) was SUPPRESSED before any claim/launch. A takeover is
+/// a NEW money/safety entry point (it launches a VM + FROST-claims a lease), so it MUST pass the
+/// SAME admission gates a fresh spawn passes — default-deny. These are the reasons
+/// [`SpawnConsumer::admit_takeover`] declines a [`crate::failover_detect::TakeoverVerdict`] the
+/// pure detector emitted. (A `Rejected`-style attacker class does not apply: the verdict is the
+/// node's OWN cooperative-fleet decision, not an attacker-controlled event — so there is no
+/// signature/authz/funding gate here; those guard the spawn-REQUEST entry point.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeoverSkip {
+    /// This node does NOT hold the agent's FROST quorum (its keystore is absent or partial), so it
+    /// cannot sign the agent's `term + 1` lease or its voice. This is the CROSS-MACHINE BOUNDARY
+    /// (finding G-2): same-host takeover works; cross-machine takeover is correctly skipped until
+    /// distributed shares land, NEVER mis-claimed under a key this node does not hold. FIRST gate.
+    KeystoreNotLoadable,
+    /// At/over the per-host tenant ceiling — taking over another agent would exceed capacity.
+    OverCapacity,
+    /// The node's configured genome image (what a takeover would relaunch the agent on) is not in
+    /// this node's pre-staged image allowlist (default-deny — the node is not configured to run it).
+    UnknownImage(String),
+    /// ANOTHER node holds a FRESH lease for the agent (the no-double-host fence, the SAME G-1 fence
+    /// a fresh spawn consults). Between the detector's snapshot and this admit a peer re-claimed
+    /// (a heartbeat, or a competing survivor's takeover), so backing off here prevents a double-host.
+    AlreadyClaimedElsewhere { holder: LeaseNodeId, term: u64 },
+}
+
+impl std::fmt::Display for TakeoverSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TakeoverSkip::KeystoreNotLoadable => {
+                write!(f, "this node does not hold the agent's FROST quorum (cross-machine boundary)")
+            }
+            TakeoverSkip::OverCapacity => write!(f, "at the per-host tenant ceiling"),
+            TakeoverSkip::UnknownImage(i) => {
+                write!(f, "the node's image {i:?} is not in the pre-staged allowlist")
+            }
+            TakeoverSkip::AlreadyClaimedElsewhere { holder, term } => {
+                write!(f, "another node ({holder}) holds a fresh lease at term {term}")
+            }
+        }
+    }
+}
+
+/// The decision [`SpawnConsumer::admit_takeover`] returns for one takeover verdict: ADMIT it (all
+/// gates passed — the caller may claim `beat_term` + launch) or SKIP it (a gate suppressed it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeoverAdmission {
+    /// Every admission gate passed: the caller may FROST-claim the lease at `beat_term` and launch.
+    Admit,
+    /// A gate suppressed the takeover (default-deny); no claim/launch.
+    Skip(TakeoverSkip),
+}
+
 /// The outcome of handling one spawn event.
 #[derive(Debug)]
 pub enum SpawnOutcome {
@@ -674,6 +726,73 @@ impl SpawnConsumer {
             return Err(SpawnReject::RequesterMismatch);
         }
         Ok(req)
+    }
+
+    /// AUTOMATIC FAILOVER ADMISSION (G-4): gate ONE takeover verdict the pure detector
+    /// ([`crate::failover_detect::detect_takeovers`]) emitted, REUSING the SAME admission policy a
+    /// fresh spawn passes — capacity (`max_tenants`), image allowlist, and the no-double-host fence
+    /// (`SpawnFenceView`) — so a takeover (a NEW VM-launch + FROST-claim entry point) can never slip
+    /// a tenant past a gate a `handle_event` spawn enforces. DEFAULT-DENY, gates checked in the
+    /// REQUIRED order:
+    ///   (a) `keystore_loadable` — does THIS node hold the agent's FROST quorum? (the cross-machine
+    ///       boundary; the caller computes it via
+    ///       [`crate::keyset_provisioning::keystore_loadable_at`] and passes it so the consumer
+    ///       stays free of keystore-path knowledge). FIRST: a node that cannot sign as the agent
+    ///       must do nothing else.
+    ///   (b) capacity — `tenant_count >= max_tenants` => skip (cannot host another).
+    ///   (c) image — `node_image` (what a takeover relaunches on, the node's OWN configured image —
+    ///       never attacker-supplied) must be in the pre-staged allowlist (default-deny).
+    ///   (d) no-double-host fence — a FRESH lease naming ANOTHER node => skip (a peer re-claimed
+    ///       between the detector's snapshot and now; the SAME G-1 fence the spawn path uses).
+    ///
+    /// This is the GATE ONLY (a pure decision over its inputs + the fence read) — the side effects
+    /// (claim `beat_term`, launch) are the caller's, at the edge, so the gating is unit-testable
+    /// with no relay/VM. NOTE: unlike `handle_event` there is deliberately NO durable `reserve`
+    /// here — the durable spawned-set keys "this node already LAUNCHED agent X from a spawn request"
+    /// and a takeover is a DIFFERENT lifecycle (the agent was spawned ELSEWHERE; this node is
+    /// adopting it). The single-winner + no-split-brain guarantees come from the monotonic-term
+    /// lease (proven), and the duplicate-on-THIS-node guard is the detector's `hosted` exclusion
+    /// (the caller passes `live_agent_ids()`); the fence (d) guards the cross-node duplicate.
+    pub async fn admit_takeover(
+        &self,
+        agent_id: &str,
+        keystore_loadable: bool,
+        node_image: &str,
+        tenant_count: usize,
+    ) -> TakeoverAdmission {
+        // (a) KEYSTORE-LOADABLE FIRST: a node that does not hold the agent's quorum cannot FROST-
+        //     sign its lease/voice, so it must take no further action (the cross-machine boundary,
+        //     finding G-2 — same-host works, cross-machine without distributed shares is skipped).
+        if !keystore_loadable {
+            return TakeoverAdmission::Skip(TakeoverSkip::KeystoreNotLoadable);
+        }
+        // (b) CAPACITY: do not exceed the per-host ceiling (the SAME check `handle_event` step 7
+        //     applies). Checked before the fence so an over-capacity node does no fence I/O.
+        if tenant_count >= self.max_tenants {
+            return TakeoverAdmission::Skip(TakeoverSkip::OverCapacity);
+        }
+        // (c) IMAGE ALLOWLIST: the node relaunches the agent on its OWN configured image; default-
+        //     deny an image this node is not staged to run (the SAME check `handle_event` step 4
+        //     applies, here over the node's image rather than a request body field).
+        if !self.image_allowlist.contains(node_image) {
+            return TakeoverAdmission::Skip(TakeoverSkip::UnknownImage(node_image.to_string()));
+        }
+        // (d) NO-DOUBLE-HOST FENCE: re-check at claim-time that no peer holds a FRESH lease (the
+        //     SAME G-1 fence `handle_event` step 7.5 consults). The detector already required the
+        //     observed lease to be STALE, but a peer could have re-claimed (a heartbeat, or a
+        //     competing survivor's takeover) since the snapshot; backing off here prevents the
+        //     cross-node double-host. A lease naming THIS node, or none, proceeds.
+        if let Some(fence) = &self.fence {
+            if let Some(lease) = fence.active_lease_for(agent_id).await {
+                if lease.node_id != fence.node_id() {
+                    return TakeoverAdmission::Skip(TakeoverSkip::AlreadyClaimedElsewhere {
+                        holder: lease.node_id,
+                        term: lease.term,
+                    });
+                }
+            }
+        }
+        TakeoverAdmission::Admit
     }
 }
 
@@ -1254,5 +1373,140 @@ mod tests {
             "node 2 must back off once node 1 holds the lease, got {out2:?}"
         );
         assert_eq!(launches1.load(Ordering::SeqCst) + launches2.load(Ordering::SeqCst), 1, "exactly one launch across the fleet");
+    }
+
+    // ---- the FAILOVER TAKEOVER admission gates (G-4): default-deny, REUSING the spawn chain ----
+    //
+    // A takeover is a NEW VM-launch + FROST-claim entry point, so `admit_takeover` MUST suppress a
+    // verdict that fails ANY gate a fresh spawn enforces. These prove each of the four gates
+    // (keystore-loadable / capacity / image / no-double-host fence) suppresses on its own, plus the
+    // all-pass ADMIT, with the SAME mocks the spawn-chain tests use. (`admit_takeover` is the pure
+    // GATE — the claim/launch is the daemon's side-effect at the edge, covered by the in-process
+    // loop proof in full_loop_run.rs; here we exercise the admission policy with no relay/VM.)
+
+    /// Build a consumer wired with a fence, for the takeover-admission tests. `op`/`max_per_window`
+    /// are irrelevant to `admit_takeover` (no authz/funding on the takeover path), so fixed.
+    fn takeover_consumer(max_tenants: usize, fence: Arc<MockFence>) -> SpawnConsumer {
+        consumer_with(max_tenants, Arc::new(MemLedger::default()), "op-unused", 100).with_fence(fence)
+    }
+
+    /// G-4-ADMIT (all gates pass): keystore loadable + under capacity + the node's image is
+    /// allowlisted + no peer holds a fresh lease => ADMIT (the caller may claim + launch).
+    #[tokio::test]
+    async fn takeover_admitted_when_all_gates_pass() {
+        let consumer = takeover_consumer(16, Arc::new(MockFence::new(1)));
+        let a = consumer.admit_takeover("kirby-dead", true, "img", 0).await;
+        assert_eq!(a, TakeoverAdmission::Admit, "all gates pass => admit, got {a:?}");
+    }
+
+    /// G-4 GATE (a) — KEYSTORE NOT LOADABLE (the cross-machine boundary): a node that does NOT hold
+    /// the agent's FROST quorum must NOT take it over, even with every other gate green. This is the
+    /// FIRST gate (a node that cannot sign as the agent does nothing else).
+    #[tokio::test]
+    async fn takeover_suppressed_when_keystore_not_loadable() {
+        let consumer = takeover_consumer(16, Arc::new(MockFence::new(1)));
+        // loadable = false; capacity/image/fence are all otherwise-passing.
+        let a = consumer.admit_takeover("kirby-peer", false, "img", 0).await;
+        assert_eq!(
+            a,
+            TakeoverAdmission::Skip(TakeoverSkip::KeystoreNotLoadable),
+            "a node without the agent's quorum must skip (cross-machine boundary), got {a:?}"
+        );
+    }
+
+    /// G-4 GATE (b) — OVER CAPACITY: a node at its per-host tenant ceiling must NOT take over more
+    /// (the SAME capacity gate the spawn path enforces). `tenant_count == max_tenants` => skip.
+    #[tokio::test]
+    async fn takeover_suppressed_when_over_capacity() {
+        let consumer = takeover_consumer(2, Arc::new(MockFence::new(1))); // ceiling = 2
+        let a = consumer.admit_takeover("kirby-dead", true, "img", 2).await; // already hosting 2
+        assert_eq!(
+            a,
+            TakeoverAdmission::Skip(TakeoverSkip::OverCapacity),
+            "a node at capacity must skip a takeover, got {a:?}"
+        );
+    }
+
+    /// G-4 GATE (c) — IMAGE NOT ALLOWLISTED: the node's configured image (what a takeover would
+    /// relaunch on) must be in the pre-staged allowlist; an unstaged image is default-denied (the
+    /// SAME default-deny the spawn path applies). The allowlist here is `{"img"}` (consumer_with).
+    #[tokio::test]
+    async fn takeover_suppressed_when_image_not_allowlisted() {
+        let consumer = takeover_consumer(16, Arc::new(MockFence::new(1)));
+        let a = consumer.admit_takeover("kirby-dead", true, "not-staged", 0).await;
+        assert_eq!(
+            a,
+            TakeoverAdmission::Skip(TakeoverSkip::UnknownImage("not-staged".to_string())),
+            "an image not in the allowlist must suppress the takeover, got {a:?}"
+        );
+        // And the empty-image (image-incapable node: empty allowlist => "") case is also denied.
+        let a_empty = consumer.admit_takeover("kirby-dead", true, "", 0).await;
+        assert!(
+            matches!(a_empty, TakeoverAdmission::Skip(TakeoverSkip::UnknownImage(_))),
+            "an empty node image (no staged image) must suppress, got {a_empty:?}"
+        );
+    }
+
+    /// G-4 GATE (d) — NO-DOUBLE-HOST FENCE: a FRESH lease naming ANOTHER node (a peer re-claimed
+    /// between the detector's snapshot and now) must suppress the takeover — the SAME G-1 fence the
+    /// spawn path consults, preventing a cross-node double-host. A lease naming THIS node, or none,
+    /// must NOT suppress (this node taking over its own / a free agent is fine).
+    #[tokio::test]
+    async fn takeover_suppressed_when_a_fresh_peer_lease_exists() {
+        // THIS node is 1; a FRESH lease names node 2 => skip.
+        let fence = Arc::new(MockFence::new(1));
+        fence.record("kirby-dead", ActiveLease { node_id: 2, term: 7 });
+        let consumer = takeover_consumer(16, fence);
+        let a = consumer.admit_takeover("kirby-dead", true, "img", 0).await;
+        assert_eq!(
+            a,
+            TakeoverAdmission::Skip(TakeoverSkip::AlreadyClaimedElsewhere { holder: 2, term: 7 }),
+            "a fresh peer lease must suppress (no double-host), got {a:?}"
+        );
+
+        // A lease naming THIS node (1) does NOT suppress (admit) — same-node is not a double-host.
+        let fence_self = Arc::new(MockFence::new(1));
+        fence_self.record("kirby-dead", ActiveLease { node_id: 1, term: 7 });
+        let consumer_self = takeover_consumer(16, fence_self);
+        let a_self = consumer_self.admit_takeover("kirby-dead", true, "img", 0).await;
+        assert_eq!(a_self, TakeoverAdmission::Admit, "a same-node lease must not suppress, got {a_self:?}");
+    }
+
+    /// MUTATION-CHECK (the gates have teeth): with EVERY other gate green, flipping each single gate
+    /// to its failing input flips ADMIT -> the matching Skip. This is the "remove a gate => a
+    /// suppression test fails" guard in one place: each gate is INDEPENDENTLY load-bearing (none is
+    /// masked by another), so deleting any one gate's check would turn its line here from Skip(..)
+    /// back into Admit and fail the assertion.
+    #[tokio::test]
+    async fn each_gate_independently_flips_admit_to_skip() {
+        // Baseline: all green => Admit (proves the failing inputs below are what cause each Skip).
+        let base = takeover_consumer(16, Arc::new(MockFence::new(1)));
+        assert_eq!(base.admit_takeover("kirby-dead", true, "img", 0).await, TakeoverAdmission::Admit);
+
+        // (a) only keystore flipped.
+        assert!(matches!(
+            base.admit_takeover("kirby-dead", false, "img", 0).await,
+            TakeoverAdmission::Skip(TakeoverSkip::KeystoreNotLoadable)
+        ));
+        // (b) only capacity flipped (ceiling 16, count 16).
+        assert!(matches!(
+            base.admit_takeover("kirby-dead", true, "img", 16).await,
+            TakeoverAdmission::Skip(TakeoverSkip::OverCapacity)
+        ));
+        // (c) only image flipped.
+        assert!(matches!(
+            base.admit_takeover("kirby-dead", true, "nope", 0).await,
+            TakeoverAdmission::Skip(TakeoverSkip::UnknownImage(_))
+        ));
+        // (d) only the fence flipped (a fresh peer lease).
+        let fenced = {
+            let f = Arc::new(MockFence::new(1));
+            f.record("kirby-dead", ActiveLease { node_id: 2, term: 1 });
+            takeover_consumer(16, f)
+        };
+        assert!(matches!(
+            fenced.admit_takeover("kirby-dead", true, "img", 0).await,
+            TakeoverAdmission::Skip(TakeoverSkip::AlreadyClaimedElsewhere { holder: 2, .. })
+        ));
     }
 }

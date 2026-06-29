@@ -1460,6 +1460,7 @@ impl LeaseFabric {
             now,
             LEASE_TTL_SECS,
             crate::failover_detect::DEFAULT_TAKEOVER_GRACE_SECS,
+            crate::failover_detect::DEFAULT_FAILOVER_MAX_LEASE_AGE_SECS,
             grace_state,
         );
         let mut claimed = Vec::new();

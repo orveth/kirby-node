@@ -23,7 +23,7 @@ use crate::meter::HostProcessMeterConfig;
 use crate::meter::MeterConfig;
 use crate::meter::{Meter, MeterOutcome};
 use crate::nerve;
-use crate::sandbox::MeterSource;
+use crate::sandbox::{MeterSource, SandboxInstance};
 use crate::treasury::DebitOutcome;
 
 /// The lifecycle phase carried in a periodic 31000 agent-state emission DURING a
@@ -222,7 +222,9 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
 
     // Boot the VM and serve the gateway (C-2 path); get the shared treasury so
     // the meter debits the SAME counter the gateway uses (D-9).
-    let (vm, outcome, treasury, _events, _serve_guard) =
+    // `vm` is `mut` so the metering loop can poll `is_alive(&mut self)` to detect an
+    // externally-killed/crashed guest (G-4 failover bug 1); it is still moved into `halt()` below.
+    let (mut vm, outcome, treasury, _events, _serve_guard) =
         boot::boot_and_observe(config.boot).await?;
     if !outcome.reached_running {
         vm.halt().await;
@@ -334,7 +336,10 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
     // loop so a non-burning genome cannot hang the run. The optional agent-state
     // emitter publishes the LIVE treasury + runway on its cadence (best-effort
     // observability only; the money/meter path is unchanged).
-    let meter_outcome = match tick_until_exhausted(&mut meter, max_run, agent_state.as_ref()).await {
+    // Pass the live VM so the loop can detect an externally-killed/crashed guest and end the run
+    // (G-4 failover bug 1). `vm` is otherwise untouched during the loop; the borrow ends when
+    // `tick_until_exhausted` returns, before the `vm.halt()` teardown below.
+    let meter_outcome = match tick_until_exhausted(&mut meter, Some(&mut *vm), max_run, agent_state.as_ref()).await {
         Ok(outcome) => outcome,
         Err(e) => {
             vm.halt().await;
@@ -361,7 +366,10 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
             (Terminated::BudgetExhausted, remaining_at_halt)
         }
         MeterOutcome::Stopped { remaining, .. } => {
-            tracing::warn!("metered run hit the safety ceiling before exhausting the budget");
+            // Two ways to reach Stopped: the safety ceiling (`max_run`) elapsed, OR the guest VMM
+            // exited and the loop ended the run early (G-4 failover bug 1 — logged distinctly at
+            // the detection point above). Either way the daemon halts + records terminated:stopped.
+            tracing::warn!("metered run ended before budget exhaustion (safety ceiling reached, or the guest VMM exited — see the prior log line)");
             (Terminated::Stopped, remaining)
         }
     };
@@ -396,6 +404,7 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
 /// emission is best-effort and additive: it reads the meter, never the money path.
 async fn tick_until_exhausted(
     meter: &mut Meter,
+    mut vm: Option<&mut dyn SandboxInstance>,
     max_run: Duration,
     agent_state: Option<&AgentStateEmitter>,
 ) -> anyhow::Result<MeterOutcome> {
@@ -409,6 +418,29 @@ async fn tick_until_exhausted(
 
     loop {
         tokio::time::sleep(tick).await;
+
+        // G-4 failover bug 1 (proactive agent-death detection): end the run if the guest VMM has
+        // EXITED (crashed or was killed externally). Without this the loop keeps ticking ~0 burn
+        // until the budget/ceiling while the fleet supervisor heartbeats the dead agent's lease
+        // every ~10s forever, so its lease never goes stale and no peer ever fails it over. Ending
+        // the run makes the `kirby agent` process exit, which the supervisor's child-liveness reap
+        // observes → it stops heartbeating → the lease goes stale → G-4 takes the agent over.
+        // `vm` is `None` only in the in-process tick tests (no real VM to watch), where the loop
+        // behaves exactly as before. The probe is a cheap cgroup-procs read (Firecracker).
+        if let Some(inst) = vm.as_deref_mut() {
+            if !inst.is_alive() {
+                tracing::warn!(
+                    ticks = meter.ticks(),
+                    burned_sats = meter.burned_sats(),
+                    "metered run: the guest VMM has EXITED (no live process in its cgroup); ending the run so the supervisor reaps this tenant and its lease goes stale (G-4 failover)"
+                );
+                return Ok(MeterOutcome::Stopped {
+                    burned_sats: meter.burned_sats(),
+                    remaining: meter.treasury_remaining_best_effort(),
+                    ticks: meter.ticks(),
+                });
+            }
+        }
 
         let (remaining, exhausted) = match meter.tick_once()? {
             DebitOutcome::Debited { remaining, .. } => {
@@ -660,7 +692,7 @@ mod tests {
         let (treasury, drained) = drained_treasury();
         let mut meter = Meter::attach_mock(treasury, zero_rent, tick, 0, 0);
         meter.set_halt_floor(floor);
-        let outcome = tick_until_exhausted(&mut meter, max_run, None)
+        let outcome = tick_until_exhausted(&mut meter, None, max_run, None)
             .await
             .expect("the meter loop runs");
         match outcome {
@@ -701,7 +733,7 @@ mod tests {
         let (treasury, drained) = drained_treasury();
         let mut meter = Meter::attach_mock(treasury, zero_rent, tick, 0, 0);
         meter.set_halt_floor(0);
-        let outcome = tick_until_exhausted(&mut meter, max_run, None)
+        let outcome = tick_until_exhausted(&mut meter, None, max_run, None)
             .await
             .expect("the meter loop runs");
         match outcome {
@@ -726,5 +758,99 @@ mod tests {
                  ceiling (Stopped), not halt on a budget/floor"
             ),
         }
+    }
+
+    /// FIX 4 (G-4 failover bug 1, the REAL-KILL meter branch): a [`SandboxInstance`] whose
+    /// `is_alive()` flips FALSE after N ticks (the live-VM-death the cgroup probe detects in
+    /// production) drives `tick_until_exhausted` to return [`MeterOutcome::Stopped`] via the
+    /// dead-VM early exit — DISTINCT from the existing `None` (no VM) and budget-exhaust arms. This
+    /// is the branch that makes the `kirby agent` process exit so the supervisor reaps the tenant
+    /// and its lease goes stale (→ G-4 takes it over). Proven with a pure stub (no VM, non-gated).
+    #[tokio::test(start_paused = true)]
+    async fn dead_vm_is_alive_false_ends_the_run_as_stopped() {
+        use crate::meter::BurnRates;
+        use crate::treasury::Treasury;
+
+        /// A stub VM that reports ALIVE for the first `alive_for` `is_alive()` polls, then DEAD.
+        /// Only `is_alive` is exercised by the meter loop; the other trait methods are never
+        /// reached on this path, so they are left `unimplemented!`.
+        struct StubInstance {
+            polls: u64,
+            alive_for: u64,
+        }
+        #[async_trait::async_trait]
+        impl SandboxInstance for StubInstance {
+            fn is_running(&mut self) -> bool {
+                true
+            }
+            fn is_alive(&mut self) -> bool {
+                self.polls += 1;
+                // Alive for the first `alive_for` polls; the (alive_for+1)-th poll sees it dead
+                // (the external VMM kill the production cgroup probe would observe).
+                self.polls <= self.alive_for
+            }
+            fn gateway_transport(&self) -> crate::sandbox::GatewayTransport {
+                unimplemented!("not reached on the dead-VM meter path")
+            }
+            fn meter_source(&self) -> MeterSource {
+                unimplemented!("not reached on the dead-VM meter path")
+            }
+            fn egress_control(&self) -> Option<&dyn crate::sandbox::EgressControl> {
+                None
+            }
+            fn stream_console(&mut self) {}
+            async fn snapshot(&mut self) -> anyhow::Result<crate::sandbox::SnapshotArtifact> {
+                unimplemented!("not reached on the dead-VM meter path")
+            }
+            async fn halt(self: Box<Self>) {}
+        }
+
+        // rent=0 + no floor + an ample budget + a generous safety ceiling: the ONLY way this run
+        // ends before the ceiling is the dead-VM branch (is_alive == false). If the kill branch
+        // were absent, the run would idle to `ceiling_ticks` instead of stopping at the kill tick.
+        let zero_rent = BurnRates {
+            cpu_sats_per_usec_num: 0,
+            cpu_sats_per_usec_den: 1,
+            mem_sats_per_mib_sec: 0,
+            egress_sats_per_byte_num: 0,
+            egress_sats_per_byte_den: 1,
+        };
+        let tick = Duration::from_millis(10);
+        let max_run = Duration::from_millis(1_000); // ceiling = 100 ticks
+        let ceiling_ticks = (max_run.as_millis() / tick.as_millis()) as u64;
+        let alive_for = 3u64; // the VM "dies" at the 4th poll, far below the ceiling.
+
+        let treasury = Treasury::open_temporary(1_000_000).expect("treasury opens");
+        let mut meter = Meter::attach_mock(treasury, zero_rent, tick, 0, 0);
+        let mut stub = StubInstance { polls: 0, alive_for };
+
+        let outcome = tick_until_exhausted(&mut meter, Some(&mut stub), max_run, None)
+            .await
+            .expect("the meter loop runs");
+
+        match outcome {
+            MeterOutcome::Stopped { burned_sats, ticks, .. } => {
+                assert_eq!(burned_sats, 0, "rent=0: the meter billed nothing");
+                // The run ended at the kill tick (~alive_for), NOT at the ceiling — proving it was
+                // the dead-VM real-kill branch, not the max_run timeout, that stopped it.
+                assert!(
+                    ticks <= alive_for,
+                    "the run ended at the VM-death tick ({ticks} <= {alive_for}), not by ticking on"
+                );
+                assert!(
+                    ticks < ceiling_ticks,
+                    "the dead-VM branch stopped the run well before the safety ceiling ({ticks} < {ceiling_ticks})"
+                );
+            }
+            other => panic!(
+                "a dead VM (is_alive == false) MUST end the run as Stopped via the real-kill branch, got {other:?}"
+            ),
+        }
+        // The loop polled is_alive until the kill (alive_for live polls + 1 dead poll).
+        assert_eq!(
+            stub.polls,
+            alive_for + 1,
+            "the meter polled is_alive each tick and stopped on the first false"
+        );
     }
 }

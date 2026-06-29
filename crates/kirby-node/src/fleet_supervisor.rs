@@ -47,6 +47,13 @@ use crate::config::{KirbyConfig, TenantConfig};
 use crate::fleet::{AgentId, AllocError, Allocator, TenantAllocation};
 use crate::lease::{LeaseNodeId, LeaseResponse};
 
+/// Default settle window for the READ-AFTER-WRITE LAUNCH FENCE (failover finding G-1): how long
+/// to let a competing peer's claim PROPAGATE to the relay after our own claim publishes, before
+/// the re-read that confirms which survivor won. ~2s is comfortably above a single relay round-trip
+/// yet far inside the 30s lease TTL, so a takeover that pauses here to confirm never re-stales the
+/// lease it just claimed. Applied only when a [`crate::relay_lease::LeaseReader`] is attached.
+pub const DEFAULT_LAUNCH_CONFIRM_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What a launched tenant's resources + grant came out to (the supervisor's record of
 /// one live tenant). Returned per tenant from [`FleetSupervisor::launch_all`] so a test
 /// (and the operator) can inspect the allocation + the lease term it was granted at.
@@ -189,6 +196,21 @@ pub struct FleetSupervisor {
     /// never restarts, and the tests); the real `kirby fleet` wiring swaps in a persisted one via
     /// [`Self::with_launch_registry`]. Recorded on a successful launch, forgotten on a reap.
     launch_registry: crate::fleet_reconcile::LaunchRegistry,
+    /// THE READ-AFTER-WRITE LAUNCH FENCE (failover finding G-1, the double-LAUNCH): a relay
+    /// re-reader consulted in [`Self::provision_and_launch`] AFTER the lease claim publishes and
+    /// BEFORE the VM launches. Two survivors that both pass the failover decision both
+    /// `claim_at(term+1)` under the agent's SAME quorum Q; the relay collapses both addressable
+    /// (kind 31002) claims to ONE surviving event naming ONE holder. Re-reading that survivor
+    /// confirms whether THIS node won — only the winner launches; the loser aborts (releasing its
+    /// allocation) and lets a later tick re-settle. `None` (the default, and every in-process test)
+    /// SKIPS the confirm, so the supervisor's allocation/lifecycle logic is exercised with no relay;
+    /// the live `kirby fleet` control-plane wiring attaches a real reader via
+    /// [`Self::with_lease_confirmer`]. See [`crate::relay_lease::confirm_takeover_win`].
+    lease_confirmer: Option<Arc<dyn crate::relay_lease::LeaseReader>>,
+    /// How long to let a competing peer's claim PROPAGATE to the relay before the read-after-write
+    /// re-read, so a simultaneous racer's claim can arrive and be arbitrated (the launch fence is
+    /// only as good as this settle window). Applied only when `lease_confirmer` is set.
+    confirm_settle: std::time::Duration,
 }
 
 /// One live tenant the supervisor monitors: the lifecycle handle + the record of how it was
@@ -231,6 +253,10 @@ impl FleetSupervisor {
             // In-memory by default (tests / a supervisor that never restarts). The real
             // `kirby fleet` wiring swaps in a persisted registry via `with_launch_registry`.
             launch_registry: crate::fleet_reconcile::LaunchRegistry::in_memory(),
+            // No read-after-write launch fence by default (in-process tests run with no relay);
+            // the live control-plane attaches one via `with_lease_confirmer`.
+            lease_confirmer: None,
+            confirm_settle: DEFAULT_LAUNCH_CONFIRM_SETTLE,
         }
     }
 
@@ -243,6 +269,23 @@ impl FleetSupervisor {
         registry: crate::fleet_reconcile::LaunchRegistry,
     ) -> Self {
         self.launch_registry = registry;
+        self
+    }
+
+    /// Attach the READ-AFTER-WRITE LAUNCH FENCE (failover finding G-1): a relay re-reader that
+    /// [`Self::provision_and_launch`] consults AFTER the lease claim publishes and BEFORE the VM
+    /// launches, so a takeover launches ONLY if THIS node is confirmed to hold the surviving
+    /// latest-term lease (the loser of a two-survivor race aborts and releases its allocation).
+    /// Builder-style: the live `kirby fleet` control-plane attaches a [`crate::relay_lease::RelayLeaseReader`]
+    /// over its connected relay client; the in-memory default leaves the confirm OFF (tests). The
+    /// `settle` window lets a simultaneous peer's claim propagate to the relay before the re-read.
+    pub fn with_lease_confirmer(
+        mut self,
+        confirmer: Arc<dyn crate::relay_lease::LeaseReader>,
+        settle: std::time::Duration,
+    ) -> Self {
+        self.lease_confirmer = Some(confirmer);
+        self.confirm_settle = settle;
         self
     }
 
@@ -308,10 +351,29 @@ impl FleetSupervisor {
         }
     }
 
-    /// Launch ONE tenant: allocate -> derive treasury path -> grant lease -> launch child ->
-    /// track. Releases the allocation on any later failure so no slot leaks. Public so a test
-    /// (and a later spawn control-plane) can launch a single tenant; `launch_all` calls it.
+    /// Launch ONE tenant for the FIRST time (claims the lease at term 1, via
+    /// [`Self::launch_one_at_term`]). Public so a test (and the spawn control-plane) can launch a
+    /// single tenant; `launch_all` calls it.
     pub async fn launch_one(&mut self, tenant: &TenantConfig) -> anyhow::Result<TenantRecord> {
+        // A first launch claims term 1 (the lease's opening epoch). A FAILOVER takeover instead
+        // calls `launch_one_at_term` with the verdict's `beat_term` (the monotonic fencing token
+        // that beats the dead holder's stale lease) so the tenant is RECORDED at the right term and
+        // its heartbeat re-publishes at THAT term, never silently dropping back to term 1.
+        self.launch_one_at_term(tenant, 1).await
+    }
+
+    /// Launch ONE tenant CLAIMING ITS LEASE AT AN EXPLICIT `term`: the SAME allocate -> provision
+    /// keyset -> claim -> launch -> track path as [`Self::launch_one`], but the lease is claimed at
+    /// `term` (term 1 for a first launch; the verdict's `beat_term` for a G-4 failover TAKEOVER —
+    /// the monotonic fencing token that fences out the dead holder if it revives). Recording the
+    /// tenant at `term` is what makes the subsequent [`Self::heartbeat_leases`] re-publish at the
+    /// takeover term rather than reverting to term 1 (which observers would ignore as stale, slowly
+    /// re-staling the lease). Releases the allocation on any later failure so no slot leaks.
+    pub async fn launch_one_at_term(
+        &mut self,
+        tenant: &TenantConfig,
+        term: u64,
+    ) -> anyhow::Result<TenantRecord> {
         // (1) Allocate the distinct resource triple (S0). At-most-once per agent; the
         // allocator rejects a duplicate or an over-cap request without consuming a slot.
         let allocation = match self.allocator.allocate(&tenant.agent_id) {
@@ -325,7 +387,7 @@ impl FleetSupervisor {
         };
 
         // From here on, a failure must RELEASE the allocation so no CID/port slot leaks.
-        let result = self.provision_and_launch(tenant, &allocation).await;
+        let result = self.provision_and_launch(tenant, &allocation, term).await;
         match result {
             Ok(record) => Ok(record),
             Err(e) => {
@@ -335,13 +397,14 @@ impl FleetSupervisor {
         }
     }
 
-    /// The fallible middle of a launch (split out so `launch_one` can release the allocation
-    /// on failure): derive the treasury path, grant the lease, launch the child, and record
-    /// the live tenant.
+    /// The fallible middle of a launch (split out so `launch_one_at_term` can release the
+    /// allocation on failure): derive the treasury path, claim the lease AT `term`, launch the
+    /// child, and record the live tenant.
     async fn provision_and_launch(
         &mut self,
         tenant: &TenantConfig,
         allocation: &TenantAllocation,
+        term: u64,
     ) -> anyhow::Result<TenantRecord> {
         // (2) Per-agent treasury path (DB-per-agent, spec 2.1): each tenant takes its OWN
         // sled exclusive dir lock, so opening tenant A's treasury never blocks on B's
@@ -372,13 +435,51 @@ impl FleetSupervisor {
             })?;
         let frost_npub = frost_identity.npub();
 
-        // (3) Grant the per-agent lease to THIS node at the current term (S1). Touches only
-        // this agent's entry, so granting tenant A never perturbs tenant B's lease.
+        // (3) Claim the per-agent lease for THIS node at `term` (S1): term 1 for a first launch,
+        // the verdict's `beat_term` for a failover takeover. Touches only this agent's entry, so
+        // claiming tenant A never perturbs tenant B's lease.
         let granted = self
             .grantor
-            .grant_for(&tenant.agent_id, self.node_id, &keystore_dir)
+            .claim_at(&tenant.agent_id, self.node_id, term, &keystore_dir)
             .await
-            .map_err(|e| anyhow::anyhow!("fleet supervisor: grant lease for tenant {:?}: {e}", tenant.agent_id))?;
+            .map_err(|e| anyhow::anyhow!("fleet supervisor: claim lease (term {term}) for tenant {:?}: {e}", tenant.agent_id))?;
+
+        // (3b) READ-AFTER-WRITE LAUNCH FENCE (failover finding G-1, the double-LAUNCH). The claim
+        // above FROST-signs + publishes our lease and returns Ok IMMEDIATELY — it does NOT prove we
+        // WON. Two survivors that both pass `detect_takeovers` would both reach here and both claim
+        // `term` under the agent's SAME quorum Q; the monotonic-term lease alone does NOT stop them
+        // both LAUNCHING (it only fences the dead holder if it revives). So, when a confirmer is
+        // attached (the live control-plane), let a competing peer's claim PROPAGATE, then RE-READ the
+        // agent's surviving latest lease from the relay (a real round-trip, not the local cache):
+        // the relay collapses the racing addressable (kind 31002) claims to ONE event naming ONE
+        // holder, so we launch ONLY if that survivor is THIS node at the claimed term. A peer that
+        // won (equal-or-higher term from a different holder), an unconfirmable claim, or a read
+        // failure all FAIL CLOSED — we `bail!`, which releases this allocation in `launch_one_at_term`
+        // and lets a later tick re-settle (the winner keeps the agent; we never double-run it). This
+        // is skipped (confirmer = None) for a first-launch supervisor with no relay (the tests).
+        if let Some(confirmer) = self.lease_confirmer.clone() {
+            // Let a simultaneous racer's claim arrive at the relay before we judge the winner.
+            tokio::time::sleep(self.confirm_settle).await;
+            let surviving = confirmer
+                .latest_lease(&tenant.agent_id)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "fleet supervisor: read-after-write confirm for tenant {:?} at term {term} could not re-read the lease ({e}); aborting the launch (fail closed)",
+                        tenant.agent_id
+                    )
+                })?;
+            if !crate::relay_lease::confirm_takeover_win(surviving, term, self.node_id) {
+                anyhow::bail!(
+                    "fleet supervisor: read-after-write confirm DENIED the launch of tenant {:?} at term {term} — a peer won the term race (surviving latest lease = {surviving:?}); releasing the allocation and standing down (a later tick re-settles)",
+                    tenant.agent_id
+                );
+            }
+            tracing::info!(
+                agent_id = %tenant.agent_id, term,
+                "fleet supervisor: read-after-write confirm — THIS node holds the surviving lease at the claimed term; proceeding to launch"
+            );
+        }
 
         // (4) Launch the child running the existing single-agent path with the allocated
         // resources. Behind the TenantLauncher seam: the real impl spawns `kirby agent`; a
@@ -458,8 +559,24 @@ impl FleetSupervisor {
     /// tick — the TTL tolerates several missed heartbeats, so one bad heartbeat never kills a
     /// lease. Read-only on the supervisor (`&self`): it re-publishes existing leases, it does not
     /// mutate the tenant set.
+    ///
+    /// SKIPS an EXITED tenant (G-4 failover bug 1): a tenant whose child has died is still tracked
+    /// until the next [`Self::reap_dead`] tick, but its lease MUST NOT be refreshed — heartbeating
+    /// a dead agent's lease keeps it fresh forever, so it never goes stale and no peer ever fails
+    /// it over (a crashed agent would be heartbeat-resurrected indefinitely). Letting the dead
+    /// tenant's lease lapse is what unblocks failover; the imminent reap then frees its slot. (A
+    /// LIVE agent keeps heartbeating, so this only ever silences a genuinely dead one.)
     pub async fn heartbeat_leases(&self) {
         for (agent_id, live) in &self.tenants {
+            // Do not refresh a dead tenant's lease — it must be allowed to go stale so a peer can
+            // take the agent over. `reap_dead` (a faster tick) removes it shortly after.
+            if !live.process.is_running() {
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    "FLEET: skipping lease heartbeat for an EXITED tenant (letting its lease go stale so failover can act; it will be reaped)"
+                );
+                continue;
+            }
             let term = live.record.lease_term;
             match self
                 .grantor
@@ -1250,7 +1367,7 @@ mod tests {
         let mut sup = FleetSupervisor::new(1, cfg, allocator, Arc::new(FailingGrantor), launcher.clone());
 
         let err = sup.launch_one(&tenant(&a, 1_000_000)).await.unwrap_err();
-        assert!(err.to_string().contains("grant lease"), "the grant failure surfaces: {err}");
+        assert!(err.to_string().contains("claim lease"), "the claim/grant failure surfaces: {err}");
         // The allocation was released: nothing is tracked, and nothing was launched.
         assert_eq!(sup.tenant_count(), 0);
         assert!(launcher.launched.lock().unwrap().is_empty(), "a failed grant must not launch a child");
@@ -1376,6 +1493,231 @@ mod tests {
         for id in [&a, &b] {
             let _ = std::fs::remove_dir_all(crate::keyset_provisioning::keystore_dir_for(&format!("kirby-{id}")));
         }
+    }
+
+    /// G-4 FAILOVER BUG 1 (the regression guard): a DEAD tenant's lease MUST NOT be heartbeated —
+    /// `heartbeat_leases` skips an EXITED tenant so its lease goes stale and a peer can fail it
+    /// over, while a still-running sibling keeps heartbeating. TEETH: after one tenant dies, a
+    /// heartbeat tick re-claims ONLY the live tenant's lease; the dead tenant's lease is left to
+    /// lapse (the bug was that the supervisor heartbeat-resurrected a crashed agent's lease
+    /// forever, so it never went stale and failover never triggered). The companion `reap_dead`
+    /// then removes the dead tenant.
+    #[tokio::test]
+    async fn heartbeat_skips_a_dead_tenant_so_its_lease_goes_stale() {
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let a = format!("hb-alice-{suffix}");
+        let b = format!("hb-bob-{suffix}");
+        let cfg = base_config_with_tenants(vec![tenant(&a, 1), tenant(&b, 1)]);
+        let allocator = Allocator::new(&cfg.fleet);
+        let grantor = Arc::new(StubGrantor::default());
+        let launcher = Arc::new(StubLauncher::default());
+        let mut sup =
+            FleetSupervisor::new(1, cfg, allocator, grantor.clone(), launcher.clone());
+        sup.launch_all().await.expect("launch all");
+
+        // The launch claimed each tenant's lease once (term 1). Record where the launch grants end
+        // so we can inspect ONLY the grants the heartbeat adds.
+        let grants_after_launch = grantor.grants.lock().unwrap().len();
+        assert_eq!(grants_after_launch, 2, "one launch grant per tenant");
+
+        // alice dies (its child exits); bob stays up.
+        launcher.running_flag(&a).store(false, Ordering::SeqCst);
+
+        // A heartbeat tick: it must refresh ONLY bob's lease (alice is dead → its lease must be
+        // allowed to go stale so a peer fails it over).
+        sup.heartbeat_leases().await;
+
+        let all_grants = grantor.grants.lock().unwrap().clone();
+        let heartbeat_grants: Vec<&AgentId> =
+            all_grants[grants_after_launch..].iter().map(|(id, _)| id).collect();
+        assert!(
+            heartbeat_grants.iter().all(|id| **id == b),
+            "the heartbeat must NOT re-claim the DEAD tenant's lease (got {heartbeat_grants:?})"
+        );
+        assert!(
+            heartbeat_grants.iter().any(|id| **id == b),
+            "the heartbeat MUST still refresh the LIVE tenant's lease"
+        );
+
+        // And the dead tenant is reaped by the companion tick, freeing its slot.
+        let reaped = sup.reap_dead();
+        assert_eq!(reaped.len(), 1, "the dead tenant is reaped");
+        assert_eq!(reaped[0].agent_id, a);
+
+        // Tidy the real keystores this test provisioned.
+        for id in [&a, &b] {
+            let _ = std::fs::remove_dir_all(crate::keyset_provisioning::keystore_dir_for(&format!("kirby-{id}")));
+        }
+    }
+
+    /// A tiny shared addressable "relay" for the read-after-write LAUNCH-FENCE test: it keeps the
+    /// SURVIVING lease per agent the way a real relay keeps the latest addressable (kind 31002)
+    /// replaceable event keyed by `(Q, kind, d=agent_id)`. Two survivors racing the SAME agent
+    /// sign under the SAME Q, so the relay holds exactly ONE event: a strictly-HIGHER term
+    /// overwrites; an EQUAL term keeps the FIRST claimant (the deterministic equal-term tiebreak —
+    /// a real relay breaks an equal-`created_at` addressable tie by lowest event id; "first wins"
+    /// is a faithful deterministic stand-in). The point: after both racers claim, the relay names
+    /// exactly ONE holder, and the read-after-write fence must let only THAT node launch.
+    #[derive(Clone, Default)]
+    struct RaceRelay {
+        // agent_id -> (holder_node_id, term)
+        latest: Arc<std::sync::Mutex<std::collections::HashMap<String, (LeaseNodeId, u64)>>>,
+    }
+    impl RaceRelay {
+        fn publish(&self, agent_id: &str, holder: LeaseNodeId, term: u64) {
+            let mut m = self.latest.lock().unwrap();
+            match m.get(agent_id).copied() {
+                // Strictly higher term replaces; equal term keeps the FIRST holder (tiebreak);
+                // a lower term never moves it backward.
+                Some((_, t)) if term > t => {
+                    m.insert(agent_id.to_string(), (holder, term));
+                }
+                None => {
+                    m.insert(agent_id.to_string(), (holder, term));
+                }
+                Some(_) => {} // equal-or-lower term: the surviving (first/higher) holder stands.
+            }
+        }
+        fn surviving(&self, agent_id: &str) -> Option<(LeaseNodeId, u64)> {
+            self.latest.lock().unwrap().get(agent_id).copied()
+        }
+    }
+
+    /// A grantor that PUBLISHES each claim into the shared `RaceRelay` (modeling the real
+    /// grantor's FROST-sign-and-publish), so the read-after-write re-read sees the LWW survivor.
+    struct RaceGrantor {
+        node_id: LeaseNodeId,
+        relay: RaceRelay,
+    }
+    #[async_trait::async_trait]
+    impl LeaseGrantor for RaceGrantor {
+        async fn claim_at(
+            &self,
+            agent_id: &str,
+            node_id: LeaseNodeId,
+            term: u64,
+            _keystore_dir: &std::path::Path,
+        ) -> anyhow::Result<LeaseResponse> {
+            // A node only claims a lease naming itself (mirrors the real grantor's invariant).
+            assert_eq!(node_id, self.node_id, "a node claims only its own holder id");
+            self.relay.publish(agent_id, node_id, term);
+            Ok(LeaseResponse { node_id, term })
+        }
+    }
+
+    /// The read-after-write CONFIRMER over the shared `RaceRelay`: it returns the surviving
+    /// holder/term the relay kept, exactly as `RelayLeaseReader` returns the surviving relay event.
+    struct RaceConfirmer {
+        relay: RaceRelay,
+    }
+    #[async_trait::async_trait]
+    impl crate::relay_lease::LeaseReader for RaceConfirmer {
+        async fn latest_lease(
+            &self,
+            agent_id: &str,
+        ) -> anyhow::Result<Option<crate::relay_lease::ObservedLeaseRecord>> {
+            Ok(self.relay.surviving(agent_id).map(|(holder, term)| {
+                crate::relay_lease::ObservedLeaseRecord {
+                    holder_node_id: holder,
+                    term,
+                    issued_at: 0,
+                }
+            }))
+        }
+    }
+
+    /// A launcher whose launches all increment ONE shared counter (so a test spanning TWO
+    /// supervisors can assert the TOTAL number of VMs that would be launched across the fleet).
+    #[derive(Clone)]
+    struct CountingLauncher {
+        launches: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl TenantLauncher for CountingLauncher {
+        fn launch(&self, _spec: &TenantLaunchSpec) -> anyhow::Result<Box<dyn TenantProcess>> {
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(StubTenant { running: Arc::new(AtomicBool::new(true)), pid: None }))
+        }
+    }
+
+    /// THE READ-AFTER-WRITE LAUNCH FENCE, end to end at the SUPERVISOR (failover finding G-1, the
+    /// double-LAUNCH). Two SURVIVORS race the SAME stale agent at the SAME takeover term (`term+1`)
+    /// — the exact case `detect_takeovers` alone CANNOT contain (both can pass the decision before
+    /// either's claim has propagated). Each supervisor claims `term+1` (both publish into the shared
+    /// relay, which keeps ONE surviving holder), then runs the read-after-write confirm and launches
+    /// ONLY if it is that survivor. TEETH: EXACTLY ONE of the two supervisors launches a VM; the
+    /// loser's `launch_one_at_term` returns an error AND releases its allocation (no leaked slot).
+    /// This is the assertion the lease-layer race test (`full_loop_run::single_winner_when_two_...`)
+    /// could not make — it had no VM, so it could not catch a double-LAUNCH. Goes RED if the
+    /// read-after-write fence in `provision_and_launch` is removed (both would then launch).
+    #[tokio::test]
+    async fn read_after_write_fence_lets_only_one_of_two_racing_survivors_launch() {
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let agent = format!("raw-fence-{suffix}");
+        let beat_term = 5u64; // both survivors take over the dead holder's lease at the same term.
+
+        let relay = RaceRelay::default();
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let zero_settle = std::time::Duration::ZERO; // deterministic test: no real propagation wait.
+
+        // Build TWO survivor supervisors (node 2 and node 3) over the SAME shared relay + launch
+        // counter, each with the read-after-write confirmer attached. Distinct node ids, distinct
+        // (in-memory) allocators — they are different machines that both decided to take over.
+        let mut sups = Vec::new();
+        for node_id in [2u64, 3u64] {
+            let cfg = base_config_with_tenants(vec![]);
+            let allocator = Allocator::new(&cfg.fleet);
+            let grantor = Arc::new(RaceGrantor { node_id, relay: relay.clone() });
+            let launcher = Arc::new(CountingLauncher { launches: launches.clone() });
+            let confirmer = Arc::new(RaceConfirmer { relay: relay.clone() });
+            let sup = FleetSupervisor::new(node_id, cfg, allocator, grantor, launcher)
+                .with_lease_confirmer(confirmer, zero_settle);
+            sups.push((node_id, sup));
+        }
+
+        // Both survivors take over the SAME agent at the SAME term, in sequence (node 2 first). The
+        // shared relay keeps node 2 as the surviving holder at `beat_term`; node 3's later claim at
+        // the SAME term does not displace it (the equal-term tiebreak).
+        let t = tenant(&agent, 1);
+        let r2 = sups[0].1.launch_one_at_term(&t, beat_term).await;
+        let r3 = sups[1].1.launch_one_at_term(&t, beat_term).await;
+
+        // The relay's single surviving holder is node 2 (claimed first at this term).
+        assert_eq!(
+            relay.surviving(&agent),
+            Some((2, beat_term)),
+            "the relay keeps ONE surviving holder for the raced agent (the first claimant at the term)"
+        );
+
+        // EXACTLY ONE VM launched across the fleet — the single-winner property on the LAUNCH path.
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            1,
+            "exactly ONE of the two racing survivors may launch the agent (read-after-write single-winner)"
+        );
+
+        // The winner (node 2, the surviving holder) launched and is tracking the tenant; the loser
+        // (node 3) aborted with an error and is tracking NOTHING (its allocation was released).
+        assert!(r2.is_ok(), "the surviving-holder node launches (got {r2:?})");
+        assert!(
+            r3.is_err(),
+            "the LOSER's launch must be DENIED by the read-after-write confirm (got {r3:?})"
+        );
+        assert_eq!(sups[0].1.tenant_count(), 1, "the winner tracks the launched tenant");
+        assert_eq!(
+            sups[1].1.tenant_count(),
+            0,
+            "the loser tracks no tenant (it never launched)"
+        );
+
+        // The loser RELEASED its allocation (no leaked CID/port slot): a fresh allocate for the
+        // same agent on the loser succeeds, proving the slot was freed by the aborted takeover.
+        assert!(
+            sups[1].1.allocator.allocate(&agent).is_ok(),
+            "the loser must have RELEASED its allocation on the aborted takeover (no leaked slot)"
+        );
+
+        // Tidy the real keystore this test provisioned (idempotently, by whichever survivor first).
+        let _ = std::fs::remove_dir_all(crate::keyset_provisioning::keystore_dir_for(&format!("kirby-{agent}")));
     }
 
     /// RE-ADOPT/REAP at the SUPERVISOR level (G-3): launching a tenant PERSISTS its child PID to

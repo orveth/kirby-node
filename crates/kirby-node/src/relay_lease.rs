@@ -63,6 +63,19 @@ use kirby_custody::cosign_net::{nip01_event_id_with_tags, NostrEvent};
 /// gudnuf confirms the value. Kept a `const` so the one place to retune it is here.
 pub const LEASE_TTL_SECS: u64 = 30;
 
+/// How many TTLs into the future a freshly-claimed lease's NIP-40 `expiration` is set (G-4
+/// failover bug 2, ghost accumulation). The lease event carries `["expiration", issued_at +
+/// LEASE_EXPIRATION_TTL_MULTIPLE * LEASE_TTL_SECS]`; a NIP-40-aware relay (nostr-rs-relay) DROPS
+/// the addressable lease once that time passes. A LIVE agent heartbeats every ~TTL/3, each
+/// heartbeat re-issuing the lease with a fresh, further-out expiration, so its lease never
+/// expires while it is alive; a DEAD agent's final lease expires `MULTIPLE * TTL` after its last
+/// heartbeat and the relay garbage-collects it — so ancient ghost leases stop accumulating. The
+/// multiple is > 1 (a live agent must survive a few missed heartbeats without its lease being
+/// dropped, exactly as the TTL tolerates them). The client-side age bound in
+/// [`crate::failover_detect::detect_takeovers`] is the backstop for a relay that does NOT honor
+/// NIP-40, so correctness does not depend on relay support.
+pub const LEASE_EXPIRATION_TTL_MULTIPLE: u64 = 4;
+
 /// The NIP-01 `d` tag name (the addressable key). The lease's `d` value is the `agent_id`,
 /// so the relay keeps only the latest lease per `(Q, kind, agent_id)`.
 const TAG_D: &str = "d";
@@ -74,6 +87,9 @@ const TAG_A: &str = "a";
 /// The node-scope tag (`["node",<node_id>]`): which node CLAIMED this lease (informational;
 /// the authoritative holder is the `holder_node_id` in the signed content).
 const TAG_NODE: &str = "node";
+/// The NIP-40 expiration tag (`["expiration",<unix-seconds>]`): a NIP-40-aware relay drops the
+/// event once this passes, so a dead agent's last lease is garbage-collected (failover bug 2).
+const TAG_EXPIRATION: &str = "expiration";
 
 /// The lease event's content JSON (spec 2): who holds the agent, at what monotonic term,
 /// and when the lease was issued (for the TTL). This is signed VERBATIM under Q (the note
@@ -216,7 +232,12 @@ impl RelayLeaseAuthority {
             issued_at,
         };
         let json = serde_json::to_string(&content).context("serialize lease content")?;
-        let tags = lease_tags(agent_id, self.node_id);
+        // NIP-40 expiration (failover bug 2): the relay drops this addressable lease once the
+        // expiration passes, so a DEAD agent's last lease is garbage-collected instead of
+        // lingering as a permanent ghost. A live agent's heartbeat re-issues with a fresh
+        // expiration before this elapses (the same way the TTL is kept fresh).
+        let expiration = issued_at + LEASE_EXPIRATION_TTL_MULTIPLE * LEASE_TTL_SECS;
+        let tags = lease_tags(agent_id, self.node_id, expiration);
 
         // FROST-sign the lease under Q (the SAME ceremony + guardian membrane that signs the
         // beacons). The content is machine JSON -> signed verbatim (the note sanitizer is
@@ -380,14 +401,19 @@ impl LeaseAuthority for RelayLeaseAuthority {
 }
 
 /// The tags every lease event carries: `["d",<agent_id>]` (the addressable key),
-/// `["t","kirby"]`, `["a",<agent_id>]`, `["node",<node_id>]`. The `d` tag makes the event
-/// addressable so the relay keeps only the latest lease per `(Q, kind, agent_id)`.
-fn lease_tags(agent_id: &str, node_id: LeaseNodeId) -> Vec<Vec<String>> {
+/// `["t","kirby"]`, `["a",<agent_id>]`, `["node",<node_id>]`, and the NIP-40
+/// `["expiration",<unix-seconds>]` (failover bug 2: a NIP-40-aware relay drops the lease once
+/// `expiration` passes, so a dead agent's last lease does not linger as a permanent ghost). The
+/// `d` tag makes the event addressable so the relay keeps only the latest lease per
+/// `(Q, kind, agent_id)`. All tags are part of the FROST-signed NIP-01 id, so the expiration is
+/// authentic (an observer re-derives the id over the SAME tags it verifies under Q).
+fn lease_tags(agent_id: &str, node_id: LeaseNodeId, expiration: u64) -> Vec<Vec<String>> {
     vec![
         vec![TAG_D.to_string(), agent_id.to_string()],
         vec![TAG_T.to_string(), TAG_T_KIRBY.to_string()],
         vec![TAG_A.to_string(), agent_id.to_string()],
         vec![TAG_NODE.to_string(), node_id.to_string()],
+        vec![TAG_EXPIRATION.to_string(), expiration.to_string()],
     ]
 }
 
@@ -578,6 +604,126 @@ impl crate::fleet_supervisor::LeaseGrantor for RelayLeaseGrantor {
         keystore_dir: &std::path::Path,
     ) -> anyhow::Result<LeaseResponse> {
         self.claim_for(agent_id, node_id, term, keystore_dir).await
+    }
+}
+
+/// THE READ-AFTER-WRITE CONFIRM seam (failover launch fence, finding G-1 on the LAUNCH path):
+/// re-read an agent's CURRENT latest lease from the relay with a REAL round-trip (NOT a local
+/// cache), so the takeover path can confirm THIS node actually WON the term race before it
+/// launches a VM. Two survivors that both pass `detect_takeovers` would both `claim_at(term+1)`
+/// under the agent's SAME quorum Q; because the lease is an addressable (kind 31002) replaceable
+/// event keyed by `(Q, kind, d=agent_id)`, the relay collapses both claims to exactly ONE
+/// surviving event — and that one event names exactly one `holder_node_id`. Re-reading it after
+/// our own publish settles is therefore both the win-confirmation AND the deterministic equal-term
+/// tiebreak (the relay's latest-wins picks the single winner; the loser sees a holder that is not
+/// itself and stands down). A trait so the production path (a nerve [`nostr_sdk::Client`]) and the
+/// tests (an in-memory relay) share the launch fence without it depending on the concrete wire.
+///
+/// This is a COOPERATIVE-FLEET read at the SAME trust level as [`FleetLeaseObserver`] (structural,
+/// NOT Q-verified — cross-machine the peer's Q is not yet known, finding G-2); it is a launch
+/// SAFETY gate (do not double-run an agent), never a money authority.
+#[async_trait::async_trait]
+pub trait LeaseReader: Send + Sync {
+    /// Re-read `agent_id`'s LATEST lease from the relay with a real round-trip, TTL-ignored
+    /// (the caller judges the win by holder+term, not freshness). `Ok(None)` means the relay
+    /// returned no lease for the agent within the read window; `Err` means the read itself failed
+    /// (the relay was unreachable) — the caller treats BOTH as "could not confirm the win" and
+    /// aborts the launch (fail closed: never launch on an unconfirmed claim).
+    async fn latest_lease(&self, agent_id: &str) -> anyhow::Result<Option<ObservedLeaseRecord>>;
+}
+
+/// The pure read-after-write DECISION (no I/O, exhaustively testable): given the lease that
+/// SURVIVED at the relay after our claim published, did THIS node win the right to launch
+/// `agent_id` at `claimed_term`?
+///
+/// - A survivor at a STRICTLY HIGHER term than we claimed → a peer raced us and bumped the
+///   fencing token past ours; THEY won — stand down.
+/// - A survivor at EXACTLY our term naming THIS node → our claim is the one the relay kept (we
+///   won the latest-wins collapse) → launch.
+/// - A survivor at our term naming a DIFFERENT node → an equal-term race the relay's latest-wins
+///   resolved in the peer's favour; THEY won — stand down. (This is the deterministic equal-term
+///   tiebreak the observer doc flagged as unresolved: the relay arbitrates, the loser self-fences.)
+/// - A survivor at a LOWER term, or NO survivor at all → we cannot confirm our own claim is live
+///   (our publish should have produced a ≥ `claimed_term` lease naming us); FAIL CLOSED and stand
+///   down rather than launch on an unconfirmed claim.
+pub fn confirm_takeover_win(
+    surviving: Option<ObservedLeaseRecord>,
+    claimed_term: u64,
+    this_node: LeaseNodeId,
+) -> bool {
+    match surviving {
+        Some(lease) if lease.term == claimed_term && lease.holder_node_id == this_node => true,
+        // Higher term, equal-term-other-holder, lower term, or absent: not our confirmed win.
+        _ => false,
+    }
+}
+
+/// The production [`LeaseReader`]: re-reads an agent's latest addressable lease (kind 31002,
+/// `#d`=agent_id) from the fleet relay over a [`nostr_sdk::Client`] via a real `fetch_events`
+/// round-trip (the SAME read mechanism the engram rail uses for its addressable head — REQ →
+/// EOSE, never the subscription cache). Shares the control-plane's already-connected client (it
+/// is `Clone`/`Arc`-backed), so the fence reads the same relay the claim published to with no new
+/// connection. The read is STRUCTURAL (decode `LeaseContent`, check the `d` tag agrees with the
+/// signed `agent_id`), matching the cooperative-fleet trust level of [`FleetLeaseObserver`].
+pub struct RelayLeaseReader {
+    client: nostr_sdk::Client,
+    /// How long to wait for the relay to answer the re-read REQ (a fetch that times out yields
+    /// `Ok(empty)` → the caller fails closed). Bounded so the single-takeover-per-tick slot is
+    /// never held hostage by a slow relay.
+    read_timeout: std::time::Duration,
+}
+
+impl RelayLeaseReader {
+    /// Build a reader over a (cloned, already-connected) fleet relay client.
+    pub fn new(client: nostr_sdk::Client, read_timeout: std::time::Duration) -> Self {
+        Self { client, read_timeout }
+    }
+}
+
+#[async_trait::async_trait]
+impl LeaseReader for RelayLeaseReader {
+    async fn latest_lease(&self, agent_id: &str) -> anyhow::Result<Option<ObservedLeaseRecord>> {
+        use nostr_sdk::prelude::*;
+        // Addressable filter: kind 31002 + the `#d` identifier = agent_id. The relay holds at most
+        // one replaceable event per (author Q, kind, d); we defensively reduce by highest
+        // (term, issued_at) in case more than one author key ever appears under the same d.
+        let filter = Filter::new()
+            .kind(Kind::from(kirby_proto::KIND_KIRBY_LEASE))
+            .identifier(agent_id);
+        let events = self
+            .client
+            .fetch_events(filter, self.read_timeout)
+            .await
+            .map_err(|e| anyhow::anyhow!("re-read latest lease for {agent_id}: {e}"))?;
+        let mut best: Option<ObservedLeaseRecord> = None;
+        for event in events.into_iter() {
+            // Structural read (same trust level as the occupancy observer): decode the content and
+            // require the `d` tag to agree with the signed agent_id (drop a mis-addressed event).
+            let content: LeaseContent = match serde_json::from_str(&event.content) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if sdk_d_tag(&event).as_deref() != Some(content.agent_id.as_str())
+                || content.agent_id != agent_id
+            {
+                continue;
+            }
+            let rec = ObservedLeaseRecord {
+                holder_node_id: content.holder_node_id,
+                term: content.term,
+                issued_at: content.issued_at,
+            };
+            // Highest term wins; tie broken by the fresher issued_at (matches the relay's
+            // latest-wins for an addressable replaceable event).
+            let take = match best {
+                None => true,
+                Some(b) => (rec.term, rec.issued_at) > (b.term, b.issued_at),
+            };
+            if take {
+                best = Some(rec);
+            }
+        }
+        Ok(best)
     }
 }
 
@@ -904,5 +1050,51 @@ mod observer_tests {
         assert_eq!(snap.len(), 2);
         assert_eq!(snap["a"], ObservedLeaseRecord { holder_node_id: 9, term: 2, issued_at: 1500 });
         assert_eq!(snap["b"], ObservedLeaseRecord { holder_node_id: 3, term: 5, issued_at: 2000 });
+    }
+
+    /// THE READ-AFTER-WRITE LAUNCH FENCE decision (failover bug G-1 on the launch path). Given the
+    /// lease that SURVIVED at the relay after our `claim_at(term+1)` published, `confirm_takeover_win`
+    /// admits a launch ONLY when this node is the surviving holder at exactly the claimed term —
+    /// every other shape (a peer won at our term, a higher term beat us, a lower term, or no lease
+    /// at all) FAILS CLOSED. This is the predicate that turns two racing survivors into one launcher.
+    #[test]
+    fn confirm_takeover_win_admits_only_the_surviving_holder_at_the_claimed_term() {
+        const ME: LeaseNodeId = 2;
+        let claimed = 5u64;
+        let rec = |holder, term| ObservedLeaseRecord { holder_node_id: holder, term, issued_at: 1000 };
+
+        // WIN: we are the surviving holder at exactly our claimed term -> launch.
+        assert!(
+            confirm_takeover_win(Some(rec(ME, claimed)), claimed, ME),
+            "this node holds the surviving lease at the claimed term => it won the race => launch"
+        );
+
+        // LOSE (equal-term race, the relay's latest-wins kept the PEER): a DIFFERENT holder at our
+        // exact term is the deterministic equal-term tiebreak resolving against us -> stand down.
+        assert!(
+            !confirm_takeover_win(Some(rec(3, claimed)), claimed, ME),
+            "a peer holds the surviving lease at the SAME term (relay latest-wins resolved against us) => abort"
+        );
+
+        // LOSE (a peer bumped the fencing token past ours): a strictly higher term -> stand down.
+        assert!(
+            !confirm_takeover_win(Some(rec(3, claimed + 1)), claimed, ME),
+            "a peer's higher-term lease survived => they won => abort"
+        );
+        // Even if the higher-term holder were somehow US, it is not the term we claimed -> fail closed.
+        assert!(
+            !confirm_takeover_win(Some(rec(ME, claimed + 1)), claimed, ME),
+            "a surviving term that is not the one we claimed cannot confirm THIS claim => abort"
+        );
+
+        // FAIL CLOSED: a lower term, or no lease at all, cannot confirm our own claim is live.
+        assert!(
+            !confirm_takeover_win(Some(rec(ME, claimed - 1)), claimed, ME),
+            "a lower surviving term means our claim is not the latest we can see => abort"
+        );
+        assert!(
+            !confirm_takeover_win(None, claimed, ME),
+            "no surviving lease => the relay could not confirm our claim => fail closed, do not launch"
+        );
     }
 }
