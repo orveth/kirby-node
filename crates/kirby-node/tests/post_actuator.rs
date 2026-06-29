@@ -28,8 +28,8 @@ use kirby_node::rail::{
 use kirby_node::treasury::Treasury;
 use kirby_proto::capability_request::Act;
 use kirby_proto::{
-    Actuate, CapabilityRequest, NostrPublish, Outcome, ACTUATE_KIND_NOSTR_PUBLISH, MAX_NOTE_BYTES,
-    NOSTR_KIND_TEXT_NOTE,
+    Actuate, CapabilityRequest, NostrPublish, Outcome, ACTUATE_KIND_NOSTR_DM_REPLY,
+    ACTUATE_KIND_NOSTR_PUBLISH, MAX_NOTE_BYTES, NOSTR_KIND_TEXT_NOTE,
 };
 use prost::Message;
 
@@ -225,6 +225,24 @@ async fn only_the_exact_allowlisted_kind_passes() {
     let r = svc.authorize_capability(&actuate_req_with_kind("p1", "evil.kind", 64)).await.unwrap();
     assert_eq!(r.outcome, Outcome::DeniedNotAllowlisted as i32, "a non-allowlisted kind is denied");
     assert_eq!(actuator.dispatch_count(), 0, "a non-allowlisted kind dispatches nothing");
+}
+
+#[tokio::test]
+async fn dm_reply_is_denied_without_its_own_allowlist_token() {
+    // Per-kind gating, the DM case (task #12): a workload allowlisted for the PUBLIC voice
+    // (nostr.publish) still cannot send a PRIVATE DM reply -- the private voice is gated by its own
+    // `nostr.dm_reply` token. Denied at the allowlist step, zero dispatched (the actuator never ran).
+    let (svc, actuator) = actuator_gateway(1_000, 1, /* publish_allowed = */ true);
+    let r = svc
+        .authorize_capability(&actuate_req_with_kind("d1", ACTUATE_KIND_NOSTR_DM_REPLY, 64))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.outcome,
+        Outcome::DeniedNotAllowlisted as i32,
+        "nostr.dm_reply without its token is denied even when nostr.publish is allowed"
+    );
+    assert_eq!(actuator.dispatch_count(), 0, "a non-allowlisted DM reply dispatches nothing");
 }
 
 // ---- P2: an allowlisted POST dispatches EXACTLY ONE publish carrying the payload ----

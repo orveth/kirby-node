@@ -457,6 +457,9 @@ fn agent_boot_config(
                 crate::rail::BRAIN_COMPLETION_DESTINATION.to_string(),
                 crate::rail::MEMORY_DESTINATION.to_string(),
                 kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH.to_string(),
+                // The PRIVATE voice token (task #12): only because nostr.dm_reply is on this
+                // allowlist can a capable agent answer a DM (per-kind gating, like nostr.publish).
+                kirby_proto::ACTUATE_KIND_NOSTR_DM_REPLY.to_string(),
             ],
             Some(cfg.brain.clone()),
             Some(pin_diarist_memory_key(&cfg.memory, &cfg.identity)),
@@ -485,6 +488,11 @@ fn agent_boot_config(
             // byte-identical single-key path (G-CLEAN). (Previously hardcoded `None`, so the FROST
             // branch was dead in the real flow — the gap three reviews flagged.)
             frost_keystore_dir: cfg.identity.frost_keystore_dir.clone(),
+            // The NIP-17 DM identity (task #12): a DEDICATED plain keyfile beside the treasury,
+            // SEPARATE from the voice/memory key and from the FROST Q (NIP-44 is ECDH; a threshold
+            // key cannot decrypt). `load_or_create` mints it on first boot. This is the interim;
+            // the fleet's Shamir-shared SK_social (#26) swaps in behind `with_dm_keys` later.
+            dm_key_path: Some(cfg.identity.treasury_dir().join("social.dm.key")),
         }),
         _ => None,
     };

@@ -727,6 +727,23 @@ pub fn validate_nostr_publish(payload: &[u8]) -> Result<String, String> {
     kirby_proto::sanitize_note_for_publish(&np.content)
 }
 
+/// Decode + RE-VALIDATE a `nostr.dm_reply` payload: the DAEMON-SIDE guard, the private sibling of
+/// [`validate_nostr_publish`]. The DM actuator is a NEW entry point eating semi-trusted genome
+/// input, so it NEVER trusts the genome sanitized; it independently (1) decodes the nested-prost
+/// [`NostrDmReply`], (2) PARSES `to_pubkey` into a real x-only [`nostr_sdk::PublicKey`] (a
+/// malformed recipient is a free denial -- the reply could not be addressed), and (3) RE-runs the
+/// SHARED [`kirby_proto::sanitize_dm_for_send`] guard on the text. Returns the parsed recipient +
+/// CLEAN text to wrap, or a reason to refuse. Pure (no network), so it is unit-tested directly.
+/// `pub` so the daemon-side guard teeth live alongside the dispatch teeth.
+pub fn validate_nostr_dm_reply(payload: &[u8]) -> Result<(nostr_sdk::PublicKey, String), String> {
+    let dm = kirby_proto::NostrDmReply::decode(payload)
+        .map_err(|e| format!("nostr.dm_reply payload failed to decode: {e}"))?;
+    let to = nostr_sdk::PublicKey::parse(&dm.to_pubkey)
+        .map_err(|e| format!("nostr.dm_reply refused: recipient pubkey {:?} is invalid: {e}", dm.to_pubkey))?;
+    let text = kirby_proto::sanitize_dm_for_send(&dm.text)?;
+    Ok((to, text))
+}
+
 /// The outward actuator the daemon performs an [`Act::Actuate`] through (the agent's voice).
 /// Mirrors the [`BrainBackend`]/[`MemoryBackend`] seam: the impl holds the host-only credential
 /// (here the node identity key + a connected nostr-sdk client), and the genome reaches it ONLY
@@ -788,6 +805,15 @@ pub struct NostrActuator {
     /// The fixed host cost (sats) of one publish: small + non-zero (clamped to >= 1) so a post is
     /// never free, like a memory write. Configurable per deployment.
     cost_sats: u64,
+    /// The DEDICATED PLAIN DM identity key, for the `nostr.dm_reply` kind (the agent's private
+    /// voice). SEPARATE from the publish identity by design (the voice/money-plane split): NIP-17
+    /// is NIP-44 = ECDH, which a FROST threshold key (`SigningMode::Frost`'s Q) CANNOT do, so DM
+    /// replies are ALWAYS signed by this plain key the daemon holds in full, NEVER by Q. `None`
+    /// when the workload has no DM reply path configured (a `nostr.dm_reply` is then refused
+    /// fail-closed). Holding it as its OWN key (not the publish key, not the memory/engram key)
+    /// means a DM-path compromise costs only DM privacy -- the "new entry point needs its own
+    /// guards" discipline applied to key material.
+    dm_keys: Option<Keys>,
 }
 
 impl NostrActuator {
@@ -814,7 +840,22 @@ impl NostrActuator {
             cost_sats = cost_sats.max(1),
             "NostrActuator connected (single-key, the agent's outward voice)"
         );
-        Ok(NostrActuator { mode: SigningMode::SingleKey(keys), client: Arc::new(client), cost_sats: cost_sats.max(1) })
+        Ok(NostrActuator {
+            mode: SigningMode::SingleKey(keys),
+            client: Arc::new(client),
+            cost_sats: cost_sats.max(1),
+            dm_keys: None,
+        })
+    }
+
+    /// Attach the DEDICATED PLAIN DM identity key (enables the `nostr.dm_reply` kind). Builder
+    /// form so DM replies are an OPT-IN seam wired at boot (when DM is configured) without
+    /// touching the publish-path constructors. The key is a plain `Keys` the daemon holds in
+    /// full -- it is what NIP-44-decrypts inbound DMs and signs NIP-17 reply gift-wraps; it is
+    /// NEVER the FROST money key Q. Returns self so it chains after `connect`/`connect_frost`.
+    pub fn with_dm_keys(mut self, dm_keys: Keys) -> Self {
+        self.dm_keys = Some(dm_keys);
+        self
     }
 
     /// Connect a FROST actuator (S3c, fleet-tenant): the agent has NO node-local signing key; its
@@ -860,6 +901,7 @@ impl NostrActuator {
             mode: SigningMode::Frost { quorum, q_public_key },
             client: Arc::new(client),
             cost_sats: cost_sats.max(1),
+            dm_keys: None,
         })
     }
 
@@ -942,59 +984,129 @@ impl NostrActuator {
             SigningMode::Frost { q_public_key, .. } => *q_public_key,
         }
     }
+
+    /// NIP-17-wrap, SIGN, and publish a DM reply to `to` carrying `text`; return the gift-wrap
+    /// event id hex (the receipt proof). The reply is ALWAYS signed by the DEDICATED PLAIN
+    /// [`Self::dm_keys`] -- NEVER the publish identity, and NEVER the FROST money key Q (a
+    /// threshold key cannot ECDH, and the money plane must never touch the DM plane). The single
+    /// `EventBuilder::private_msg` call builds the kind:14 rumor -> kind:13 seal (signed by the DM
+    /// key) -> kind:1059 gift wrap (signed by a fresh per-message throwaway key, with a randomized
+    /// `created_at` up to ~2 days back, both handled inside the builder for metadata privacy). The
+    /// wrap is a fully-signed, OWNED event, so it publishes via `send_event` and needs NO client
+    /// signer -- which is exactly why this works whether the publish path is single-key OR FROST
+    /// (the FROST client has no signer). `text` is ALREADY validated by [`validate_nostr_dm_reply`].
+    ///
+    /// MVP relay policy: the wrap publishes to the actuator's OWN connected relay set. Correct
+    /// NIP-17 would resolve the recipient's kind:10050 inbox relays and publish there; that
+    /// resolution is a documented follow-up (the live test runs on a shared relay, so own-relay
+    /// publish reaches the recipient).
+    async fn publish_dm_reply(&self, to: nostr_sdk::PublicKey, text: &str) -> anyhow::Result<String> {
+        use anyhow::Context as _;
+        let wrap = self.build_dm_reply_event(to, text).await?;
+        // Publish the pre-signed OWNED wrap (no client signer needed; mirrors the FROST publish).
+        let output = self
+            .client
+            .send_event(&wrap)
+            .await
+            .context("publish the kind:1059 DM reply gift wrap to the relay set")?;
+        Ok(output.val.to_hex())
+    }
+
+    /// Build the NIP-17 reply gift wrap, SIGNED BY THE PLAIN DM KEY (the seal author = the DM npub),
+    /// WITHOUT publishing it -- the factored-out, relay-free half of [`Self::publish_dm_reply`], so an
+    /// in-crate test drives the REAL wrapping code (not a copy) and asserts the DM key signs it (never
+    /// the FROST money key Q). Mirrors how `frost_sign_event` factors `publish_note`'s Frost branch.
+    async fn build_dm_reply_event(
+        &self,
+        to: nostr_sdk::PublicKey,
+        text: &str,
+    ) -> anyhow::Result<Event> {
+        use anyhow::Context as _;
+        let dm_keys = self
+            .dm_keys
+            .as_ref()
+            .context("nostr.dm_reply requested but no DM key is configured (boot-wiring bug)")?;
+        EventBuilder::private_msg(dm_keys, to, text, [])
+            .await
+            .context("NIP-17-wrap the DM reply")
+    }
 }
 
 #[async_trait::async_trait]
 impl Actuator for NostrActuator {
     fn cost(&self, kind: &str) -> u64 {
-        if kind == kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH {
-            self.cost_sats
-        } else {
+        match kind {
+            // The public voice and the private DM reply share one small fixed host cost (the
+            // agent spends to act; the DM is still FREE for the human -- no inbound charge).
+            kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH | kirby_proto::ACTUATE_KIND_NOSTR_DM_REPLY => {
+                self.cost_sats
+            }
             // An unknown kind: refuse it OVER_BUDGET at the gate (fail-closed), never perform.
-            u64::MAX
+            _ => u64::MAX,
         }
     }
 
     fn validate(&self, kind: &str, payload: &[u8]) -> Result<(), String> {
-        if kind != kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH {
-            return Err(format!("unknown actuator kind {kind:?}"));
+        // The shared daemon-side guards (decode + re-sanitize + re-cap). Discard the clean output
+        // here; `actuate` re-runs it to get the content to publish. A free denial on malformed.
+        match kind {
+            kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH => validate_nostr_publish(payload).map(|_| ()),
+            kirby_proto::ACTUATE_KIND_NOSTR_DM_REPLY => validate_nostr_dm_reply(payload).map(|_| ()),
+            _ => Err(format!("unknown actuator kind {kind:?}")),
         }
-        // The shared daemon-side guard (decode + kind=1-only + re-sanitize + re-cap). Discard the
-        // clean content here; `actuate` re-runs it to get the content to publish.
-        validate_nostr_publish(payload).map(|_| ())
     }
 
     async fn actuate(&self, kind: &str, payload: &[u8], cap_sats: u64) -> RailOutcome {
-        if kind != kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH {
-            tracing::warn!(kind, "NostrActuator asked for an unknown actuator kind; refusing");
-            return RailOutcome::UpstreamFailed;
-        }
-        // DEFENSE IN DEPTH (new entry point): decode + restrict the kind + RE-sanitize the content
-        // with the SAME shared rule, never trusting the genome did it. A rejection => refuse + 0.
-        let content = match validate_nostr_publish(payload) {
-            Ok(clean) => clean,
-            Err(reason) => {
-                tracing::warn!(%reason, "nostr.publish refused by the daemon-side guard");
-                return RailOutcome::UpstreamFailed;
-            }
-        };
-        // Sign + publish the kind:1 note (the daemon's own host networking; the VM sees no bytes).
-        match self.publish_note(&content).await {
-            Ok(event_id) => {
-                tracing::info!(
-                    event_id = %event_id,
-                    "published a kind:1 note (the agent's outward voice)"
-                );
-                // D-20: the fixed cost, capped at the gateway-checked estimate. proof = event id.
-                let actual_cost = self.cost_sats.min(cap_sats);
-                RailOutcome::Performed {
-                    actual_cost,
-                    proof: event_id.into_bytes(),
-                    completion: Vec::new(),
+        match kind {
+            kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH => {
+                // DEFENSE IN DEPTH (new entry point): decode + restrict the kind + RE-sanitize the
+                // content with the SAME shared rule, never trusting the genome did it. A rejection
+                // => refuse + 0.
+                let content = match validate_nostr_publish(payload) {
+                    Ok(clean) => clean,
+                    Err(reason) => {
+                        tracing::warn!(%reason, "nostr.publish refused by the daemon-side guard");
+                        return RailOutcome::UpstreamFailed;
+                    }
+                };
+                // Sign + publish the kind:1 note (the daemon's host networking; the VM sees no bytes).
+                match self.publish_note(&content).await {
+                    Ok(event_id) => {
+                        tracing::info!(event_id = %event_id, "published a kind:1 note (the agent's outward voice)");
+                        let actual_cost = self.cost_sats.min(cap_sats);
+                        RailOutcome::Performed { actual_cost, proof: event_id.into_bytes(), completion: Vec::new() }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "nostr.publish failed to reach the relay; debiting nothing");
+                        RailOutcome::UpstreamFailed
+                    }
                 }
             }
-            Err(e) => {
-                tracing::error!(error = %e, "nostr.publish failed to reach the relay; debiting nothing");
+            kirby_proto::ACTUATE_KIND_NOSTR_DM_REPLY => {
+                // DEFENSE IN DEPTH (new entry point): decode + RE-parse the recipient + RE-sanitize
+                // the text, never trusting the genome did it. A rejection => refuse + 0.
+                let (to, text) = match validate_nostr_dm_reply(payload) {
+                    Ok(parsed) => parsed,
+                    Err(reason) => {
+                        tracing::warn!(%reason, "nostr.dm_reply refused by the daemon-side guard");
+                        return RailOutcome::UpstreamFailed;
+                    }
+                };
+                // NIP-17-wrap + sign with the PLAIN DM key (never Q) + publish (host networking).
+                match self.publish_dm_reply(to, &text).await {
+                    Ok(event_id) => {
+                        tracing::info!(event_id = %event_id, recipient = %to.to_hex(), "published a NIP-17 DM reply (the agent's private voice)");
+                        let actual_cost = self.cost_sats.min(cap_sats);
+                        RailOutcome::Performed { actual_cost, proof: event_id.into_bytes(), completion: Vec::new() }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "nostr.dm_reply failed to reach the relay; debiting nothing");
+                        RailOutcome::UpstreamFailed
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(kind, "NostrActuator asked for an unknown actuator kind; refusing");
                 RailOutcome::UpstreamFailed
             }
         }
@@ -2327,5 +2439,98 @@ mod frost_actuator_tests {
             "G-FROST-ACTUATOR-PUBLISHES-QUORUM-SIGNED-EVENT PASS: the actuator's real FROST publish \
              path produced a kind:1 event signed under Q (verifies under Q, rejected under P)"
         );
+    }
+}
+
+#[cfg(test)]
+mod dm_actuator_tests {
+    use super::*;
+    use nostr_sdk::nips::nip59::UnwrappedGift;
+
+    fn dm_payload(to_pubkey: &str, text: &str) -> Vec<u8> {
+        kirby_proto::NostrDmReply { to_pubkey: to_pubkey.to_string(), text: text.to_string() }
+            .encode_to_vec()
+    }
+
+    #[test]
+    fn validate_nostr_dm_reply_parses_a_valid_payload() {
+        let recipient = Keys::generate();
+        let payload = dm_payload(&recipient.public_key().to_hex(), "  hello   there  ");
+        let (to, text) = validate_nostr_dm_reply(&payload).expect("a valid payload parses");
+        assert_eq!(to, recipient.public_key(), "the recipient is parsed from the hex pubkey");
+        assert_eq!(text, "hello there", "the text is sanitized to one clean line");
+    }
+
+    #[test]
+    fn validate_nostr_dm_reply_rejects_a_bad_recipient() {
+        let payload = dm_payload("not-a-pubkey", "hi");
+        assert!(
+            validate_nostr_dm_reply(&payload).is_err(),
+            "an unparseable recipient is refused (a free denial; the reply could not be addressed)"
+        );
+    }
+
+    #[test]
+    fn validate_nostr_dm_reply_rejects_empty_text() {
+        let recipient = Keys::generate();
+        let payload = dm_payload(&recipient.public_key().to_hex(), "   \u{2028}\t  ");
+        assert!(
+            validate_nostr_dm_reply(&payload).is_err(),
+            "text that is empty after sanitizing is refused"
+        );
+    }
+
+    /// THE money/crypto tooth: in FROST mode the agent's PUBLISH identity is the threshold key Q,
+    /// but a DM reply is signed by the DEDICATED PLAIN DM KEY -- NEVER Q (a threshold key cannot
+    /// ECDH/seal a NIP-17 DM, and the money plane must never touch the DM plane). Build a FROST-mode
+    /// actuator (publish = Q), attach a SEPARATE DM key, drive the REAL reply-wrap path (no relay),
+    /// and prove the wrap's seal author is the DM key, not Q.
+    #[tokio::test]
+    async fn dm_reply_is_signed_by_the_dm_key_never_the_money_key() {
+        use crate::quorum_signer::local_quorum_from_keyset;
+        use kirby_custody::generate_dealer_keyset;
+
+        let keyset = generate_dealer_keyset(2, 3).expect("2-of-3 dealer keygen");
+        let quorum = Arc::new(local_quorum_from_keyset(&keyset).expect("build quorum signer"));
+        let q_hex = hex::encode(quorum.q_bytes());
+
+        let dm_keys = Keys::generate(); // the dedicated DM identity (plain, daemon-held)
+        let recipient = Keys::generate(); // the human who DMed the agent
+
+        let actuator = NostrActuator::connect_frost(
+            quorum,
+            std::slice::from_ref(&"ws://127.0.0.1:65535".to_string()),
+            1,
+        )
+        .await
+        .expect("connect FROST actuator")
+        .with_dm_keys(dm_keys.clone());
+
+        // The publish (voice) identity is Q; the DM identity is the SEPARATE plain key.
+        assert_eq!(actuator.public_key().to_hex(), q_hex, "the publish voice is the threshold key Q");
+        assert_ne!(
+            dm_keys.public_key().to_hex(),
+            q_hex,
+            "the DM key MUST be a different key from the money/voice key Q"
+        );
+
+        // Drive the REAL reply-wrap path (the exact code `publish_dm_reply` runs) and unwrap it back
+        // as the recipient would.
+        let wrap = actuator
+            .build_dm_reply_event(recipient.public_key(), "the threshold key never touched this")
+            .await
+            .expect("build the DM reply gift wrap");
+        let unwrapped =
+            UnwrappedGift::from_gift_wrap(&recipient, &wrap).await.expect("the recipient unwraps it");
+
+        // The seal author IS the DM key: the DM was signed by the plain DM key, NEVER by Q.
+        assert_eq!(
+            unwrapped.sender.to_hex(),
+            dm_keys.public_key().to_hex(),
+            "the DM reply is sealed (signed) by the plain DM key"
+        );
+        assert_ne!(unwrapped.sender.to_hex(), q_hex, "the FROST money key Q never signs a DM");
+        assert_eq!(unwrapped.rumor.kind, Kind::PrivateDirectMessage, "the rumor is a kind:14 DM");
+        assert_eq!(unwrapped.rumor.content, "the threshold key never touched this");
     }
 }

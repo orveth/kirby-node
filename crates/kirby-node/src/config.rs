@@ -678,6 +678,15 @@ pub struct SocialConfig {
     /// the byte-identical single-key path: `key_path` is loaded and the actuator signs with it.
     /// A FROST tenant has NO node-local signing key, so `key_path` is unused when this is `Some`.
     pub frost_keystore_dir: Option<PathBuf>,
+    /// The DEDICATED PLAIN DM identity keyfile (task #12). `Some` enables the NIP-17 DM path: the
+    /// daemon loads this plain keypair to NIP-44-DECRYPT inbound gift wraps, sign reply wraps, and
+    /// publish the kind:10050 inbox-relay list, and `build_nostr_actuator` attaches it via
+    /// `with_dm_keys`. It is SEPARATE from `key_path` (the voice/memory key) AND from the FROST Q:
+    /// NIP-17 is ECDH, which a threshold key cannot do, so the DM identity MUST be a plain key the
+    /// daemon holds in full (DM npub != Q in FROST mode, by design). This local keyfile is the
+    /// interim; the fleet's Shamir-shared `SK_social` (reconstruct-on-lease, task #26) swaps in
+    /// behind the SAME `with_dm_keys` seam later. `None` disables the DM path (no queue, no 10050).
+    pub dm_key_path: Option<PathBuf>,
 }
 
 /// The default fixed publish cost (sats): small + non-zero so a post costs the agent (no free

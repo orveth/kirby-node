@@ -944,6 +944,217 @@ pub async fn run_inbound(
     Ok(())
 }
 
+// ============================================================================
+// NIP-17 DM INBOUND (task #12): the agent receives + replies to encrypted DMs.
+//
+// A SECOND attacker-controlled entry point, SEPARATE from the job-request inbound above.
+// NIP-17 wraps a message as kind:14 rumor -> kind:13 seal (NIP-44-enc to the recipient,
+// signed by the sender's REAL key) -> kind:1059 gift wrap (NIP-44-enc, signed by a fresh
+// throwaway key). Decrypting it needs a PLAIN keypair the daemon holds in full (NIP-44 is
+// ECDH), so the DM path is bound to a DEDICATED PLAIN DM key -- NEVER the FROST money key Q
+// (a threshold key cannot ECDH) and (by the "new entry point needs its own guards" rule, as
+// keys) NOT the publish key or the memory/engram key either. A DM-path compromise then costs
+// only DM privacy. The screened DM feeds the SAME bounded `InboundQueue` the gateway drains.
+// ============================================================================
+
+/// The DM trust boundary: verify -> unwrap -> assert-DM -> size-cap -> typed-enqueue for ONE
+/// inbound NIP-17 gift wrap (kind:1059). The SIBLING of [`verify_and_enqueue`], but it holds the
+/// DEDICATED PLAIN DM key to NIP-44-DECRYPT (a gift wrap is opaque without it), so it is async +
+/// key-holding where the job-request path is pure. It is the ONLY way a DM reaches the genome's
+/// inbox and it NEVER panics on hostile input (every failure is a DROP + log). Returns the
+/// assigned `inbox_seq` on accept, `None` on any drop.
+///
+/// Order is load-bearing:
+///   1. `event.verify()` -- cheap reject of a malformed/forged 1059 BEFORE the NIP-44 decrypt.
+///   2. assert `event.kind == GiftWrap` -- the wall re-checks the relay filter, never trusts it.
+///   3. `UnwrappedGift::from_gift_wrap(dm_keys, event)` -- NIP-44-decrypt the wrap -> seal, VERIFY
+///      the seal signature, decrypt -> rumor, and ENFORCE `rumor.pubkey == seal.pubkey`. The
+///      learned `sender` is the SEAL-verified author -- the REAL sender, NEVER the throwaway 1059
+///      pubkey (the whole point of gift-wrap metadata privacy). A decrypt / seal-verify /
+///      sender-mismatch failure (incl. a wrap not addressed to us) => DROP + log.
+///   4. assert `rumor.kind == PrivateDirectMessage` (14) -- a wrap may carry a non-DM rumor; drop it.
+///   5. size-cap the rumor content (drop, never truncate).
+///   6. enqueue as a typed `DIRECT_MESSAGE` with `source_pubkey = sender` (the seal-verified
+///      sender) -- BOTH the screening identity AND the reply-to recipient, so the one value guards
+///      delivery integrity + anti-spoof together.
+pub async fn screen_and_enqueue_dm(
+    queue: &InboundQueue,
+    dm_keys: &Keys,
+    event: &Event,
+) -> Option<u64> {
+    use nostr_sdk::nips::nip59::UnwrappedGift;
+    // (1) Cheap reject: verify the gift-wrap id + signature BEFORE the expensive decrypt.
+    if let Err(e) = event.verify() {
+        tracing::warn!(error = %e, "inbound DM: DROPPED a gift wrap with a bad signature/id");
+        return None;
+    }
+    // (2) The wall re-checks the kind; never trust the relay filter.
+    if event.kind != Kind::GiftWrap {
+        tracing::warn!(
+            relay_kind = event.kind.as_u16(),
+            "inbound DM: DROPPED a non-1059 event on the DM subscription"
+        );
+        return None;
+    }
+    // (3) Unwrap with the PLAIN DM key: decrypt + seal-verify + learn the REAL sender from the seal.
+    let unwrapped = match UnwrappedGift::from_gift_wrap(dm_keys, event).await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "inbound DM: DROPPED a gift wrap that failed to unwrap (decrypt / seal-verify / sender-mismatch / not-for-us)"
+            );
+            return None;
+        }
+    };
+    // (4) Only an actual NIP-17 DM rumor (kind:14) is accepted.
+    if unwrapped.rumor.kind != Kind::PrivateDirectMessage {
+        tracing::warn!(
+            rumor_kind = unwrapped.rumor.kind.as_u16(),
+            "inbound DM: DROPPED a gift wrap whose rumor was not a kind:14 DM"
+        );
+        return None;
+    }
+    // (5) Size-cap the decrypted message (drop, never truncate -- a truncation could sever a
+    // multibyte char, the same discipline as the job-request path).
+    let payload = unwrapped.rumor.content.as_bytes().to_vec();
+    if payload.len() > MAX_INBOUND_PAYLOAD_BYTES {
+        tracing::warn!(
+            len = payload.len(),
+            cap = MAX_INBOUND_PAYLOAD_BYTES,
+            "inbound DM: DROPPED an oversized message"
+        );
+        return None;
+    }
+    // (6) Enqueue with the SEAL-VERIFIED sender as source_pubkey (= the reply-to recipient).
+    let seq = queue.push_typed(
+        InboundKind::DirectMessage,
+        payload,
+        unwrapped.sender.to_hex(),
+        unwrapped.rumor.created_at.as_secs(),
+        event.id.to_hex(),
+    );
+    tracing::info!(
+        inbox_seq = seq,
+        sender = %unwrapped.sender.to_hex(),
+        "inbound DM: VERIFIED + enqueued a NIP-17 DM"
+    );
+    Some(seq)
+}
+
+/// Run the persistent DM INBOUND subscription task to completion (the SIBLING of [`run_inbound`],
+/// for NIP-17 private DMs). It connects a read client, subscribes to kind:1059 gift wraps
+/// `#p`-addressed to the DEDICATED DM identity, and runs `screen_and_enqueue_dm` (the key-holding
+/// unwrap boundary) on every notification, feeding the SAME [`InboundQueue`] the gateway drains
+/// via `PollInbox`. `dm_identity` is the plain DM keypair (NEVER the FROST money key); it both
+/// addresses the subscription and decrypts. Pure host-side network; touches no genome, no VM
+/// socket. Returns on graceful shutdown or an unrecoverable client error.
+pub async fn run_dm_inbound(
+    dm_identity: &NodeIdentity,
+    relays: &[String],
+    queue: InboundQueue,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> anyhow::Result<()> {
+    if relays.is_empty() {
+        anyhow::bail!("run_dm_inbound requires at least one relay (the agent's DM inbox relays)");
+    }
+    let me = dm_identity.public_key();
+    tracing::info!(
+        dm_npub = %dm_identity.npub(),
+        relays = relays.len(),
+        "DM inbound subscription task starting (the NIP-17 inbox)"
+    );
+    // Watch ALL the agent's inbox relays (the same set advertised in its kind:10050), so a DM sent
+    // to any advertised relay is seen. A throwaway client signer (the read client never publishes).
+    let client = Client::builder().signer(Keys::generate()).build();
+    for url in relays {
+        add_relay_no_ping(&client, url).await?;
+    }
+    client.connect().await;
+    // kind:1059 gift wraps addressed to the DM pubkey (#p). The relay filter is a coarse
+    // prefilter; `screen_and_enqueue_dm` is the authoritative wall (verify + unwrap + re-check).
+    let filter = Filter::new().kind(Kind::GiftWrap).pubkey(me);
+    client
+        .subscribe(filter, None)
+        .await
+        .context("subscribe to the NIP-17 DM inbox")?;
+
+    let mut notifications = client.notifications();
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                tracing::info!(dm_npub = %dm_identity.npub(), "DM inbound task shutting down");
+                break;
+            }
+            notif = notifications.recv() => {
+                match notif {
+                    Ok(RelayPoolNotification::Event { event, .. }) => {
+                        // The DM trust boundary: verify -> unwrap -> assert-DM -> size-cap -> enqueue.
+                        screen_and_enqueue_dm(&queue, dm_identity.keys(), &event).await;
+                    }
+                    Ok(RelayPoolNotification::Shutdown) => {
+                        tracing::warn!("relay pool shut down; DM inbound task stopping");
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "DM inbound notifications lagged; some events skipped");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::warn!("DM inbound notification channel closed; task stopping");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    client.disconnect().await;
+    Ok(())
+}
+
+/// Publish this agent's NIP-17 DM-inbox relay list (kind:10050 `InboxRelays`), SIGNED BY THE
+/// DEDICATED DM KEY, then disconnect (a one-shot connect-publish-disconnect like the lifecycle
+/// beacon). This is how a NIP-17 client learns WHERE to reach this agent: it lists the relays the
+/// agent watches for inbound gift wraps (highest-leverage for inbound reach). The list is signed
+/// by the DM key because that is the npub a client DMs -- a 10050 under any other key would point
+/// a sender at the wrong identity. MVP: the inbox relays ARE the agent's own relay set (where it
+/// also runs `run_dm_inbound`). Returns the published event id.
+pub async fn publish_inbox_relay_list(
+    dm_identity: &NodeIdentity,
+    relays: &[String],
+) -> anyhow::Result<EventId> {
+    if relays.is_empty() {
+        anyhow::bail!("cannot publish a kind:10050 inbox relay list with no relays");
+    }
+    let tags: Vec<Tag> = relays
+        .iter()
+        .filter_map(|r| RelayUrl::parse(r).ok().map(|url| TagStandard::Relay(url).into()))
+        .collect();
+    if tags.is_empty() {
+        anyhow::bail!("no valid relay URLs for the kind:10050 inbox relay list");
+    }
+    // Sign the 10050 with the DM key (the npub a NIP-17 client will DM).
+    let client = Client::builder().signer(dm_identity.keys().clone()).build();
+    for r in relays {
+        add_relay_no_ping(&client, r).await?;
+    }
+    client.connect().await;
+    let builder = EventBuilder::new(Kind::InboxRelays, "").tags(tags);
+    let event_id = client
+        .send_event_builder(builder)
+        .await
+        .context("publish the kind:10050 DM-inbox relay list")?
+        .val;
+    client.disconnect().await;
+    tracing::info!(
+        dm_npub = %dm_identity.npub(),
+        event_id = %event_id,
+        relays = relays.len(),
+        "published the kind:10050 DM-inbox relay list"
+    );
+    Ok(event_id)
+}
 
 /// Per-peer tracking state for the live presence task.
 struct PeerState {
@@ -1472,6 +1683,116 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "key file must be 0600, got {mode:o}");
         cleanup(&dir);
+    }
+
+    // ---- NIP-17 DM inbound screening (task #12): the `screen_and_enqueue_dm` trust boundary ----
+
+    /// Build a real NIP-17 gift wrap from `sender` to `recipient` carrying `text` (kind:14 rumor ->
+    /// kind:13 seal -> kind:1059 wrap), exactly as a real client would (a fresh throwaway signs the
+    /// outer wrap; `created_at` is randomized inside the builder).
+    async fn make_dm_wrap(sender: &Keys, recipient: &PublicKey, text: &str) -> Event {
+        EventBuilder::private_msg(sender, *recipient, text, [])
+            .await
+            .expect("build a NIP-17 DM gift wrap")
+    }
+
+    #[tokio::test]
+    async fn dm_round_trip_enqueues_with_the_seal_verified_sender() {
+        let sender = Keys::generate();
+        let dm = Keys::generate(); // the agent's dedicated DM key
+        let wrap = make_dm_wrap(&sender, &dm.public_key(), "hello kirby").await;
+        // The outer 1059 author is a random throwaway, NOT the sender (metadata privacy).
+        assert_ne!(
+            wrap.pubkey,
+            sender.public_key(),
+            "the gift-wrap author must be an ephemeral throwaway, not the sender"
+        );
+
+        let queue = InboundQueue::with_capacity(8);
+        let seq = screen_and_enqueue_dm(&queue, &dm, &wrap).await.expect("a valid DM enqueues");
+        assert_eq!(seq, 1);
+
+        let batch = queue.poll(0, &[InboundKind::DirectMessage], Duration::from_millis(0)).await;
+        assert_eq!(batch.len(), 1, "exactly one DM enqueued");
+        let ev = &batch[0];
+        // TOOTH (keeper): source_pubkey is the SEAL-verified sender (= the reply-to recipient), and
+        // is NEVER the throwaway 1059 author. Screening or replying on the wrap author would be a bug.
+        assert_eq!(
+            ev.source_pubkey,
+            sender.public_key().to_hex(),
+            "the enqueued sender must be the SEAL author (the real sender)"
+        );
+        assert_ne!(
+            ev.source_pubkey,
+            wrap.pubkey.to_hex(),
+            "the enqueued sender must NOT be the throwaway gift-wrap author"
+        );
+        assert_eq!(ev.kind, InboundKind::DirectMessage as i32);
+        assert_eq!(String::from_utf8_lossy(&ev.payload), "hello kirby");
+    }
+
+    #[tokio::test]
+    async fn dm_with_mismatched_rumor_and_seal_sender_is_rejected() {
+        // TOOTH (keeper): a wrap whose rumor claims author A but whose seal is signed by B must be
+        // REJECTED (anti-spoof). Hand-craft it: a rumor authored by `spoofed`, sealed + signed by
+        // `real` -> rumor.pubkey != seal.pubkey -> the library's SenderMismatch -> we drop it.
+        let real = Keys::generate();
+        let spoofed = Keys::generate();
+        let dm = Keys::generate();
+        let rumor =
+            EventBuilder::private_msg_rumor(dm.public_key(), "i am someone else").build(spoofed.public_key());
+        let seal = EventBuilder::seal(&real, &dm.public_key(), rumor)
+            .await
+            .unwrap()
+            .sign_with_keys(&real)
+            .unwrap();
+        let wrap = EventBuilder::gift_wrap_from_seal(&dm.public_key(), &seal, []).unwrap();
+
+        let queue = InboundQueue::with_capacity(8);
+        assert!(
+            screen_and_enqueue_dm(&queue, &dm, &wrap).await.is_none(),
+            "a rumor/seal sender mismatch must be rejected"
+        );
+        assert_eq!(queue.len(), 0, "nothing enqueued for a spoofed sender");
+    }
+
+    #[tokio::test]
+    async fn dm_addressed_to_a_different_key_is_dropped() {
+        // A wrap encrypted to someone ELSE: our DM key cannot NIP-44-decrypt it -> dropped (never a
+        // crash). This is also why FROST's Q can't be the DM identity: no single key to decrypt with.
+        let sender = Keys::generate();
+        let someone_else = Keys::generate();
+        let dm = Keys::generate();
+        let wrap = make_dm_wrap(&sender, &someone_else.public_key(), "not for you").await;
+
+        let queue = InboundQueue::with_capacity(8);
+        assert!(
+            screen_and_enqueue_dm(&queue, &dm, &wrap).await.is_none(),
+            "a wrap addressed to another key must be dropped"
+        );
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dm_wrapping_a_non_dm_rumor_is_dropped() {
+        // A valid gift wrap whose RUMOR is not a kind:14 DM (here a kind:1 note) is dropped at the
+        // assert-DM step -- the DM inbox only accepts actual private direct messages.
+        let sender = Keys::generate();
+        let dm = Keys::generate();
+        let rumor = EventBuilder::new(Kind::TextNote, "i am a note, not a dm").build(sender.public_key());
+        let seal = EventBuilder::seal(&sender, &dm.public_key(), rumor)
+            .await
+            .unwrap()
+            .sign_with_keys(&sender)
+            .unwrap();
+        let wrap = EventBuilder::gift_wrap_from_seal(&dm.public_key(), &seal, []).unwrap();
+
+        let queue = InboundQueue::with_capacity(8);
+        assert!(
+            screen_and_enqueue_dm(&queue, &dm, &wrap).await.is_none(),
+            "a gift wrap whose rumor is not a kind:14 DM must be dropped"
+        );
+        assert_eq!(queue.len(), 0);
     }
 
     #[test]
