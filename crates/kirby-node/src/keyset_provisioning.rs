@@ -387,6 +387,24 @@ pub fn load_quorum_signer_at(keystore_dir: &Path) -> anyhow::Result<QuorumSigner
         .context("build co-located QuorumSigner from the persisted keystore")
 }
 
+/// Load the agent's group taproot key Q (32 x-only bytes) from a keystore dir using ONLY its
+/// PUBLIC `group_pubkeys.json` -- no secret shares. This is the verifying key a lease's FROST
+/// signature is checked under (`event.pubkey == hex(Q)` + the BIP-340 sig verifies under Q).
+///
+/// DISTRIBUTION-AGNOSTIC (cross-machine, finding G-2): the public pubkeys file is present on
+/// every share-holder even once the secret shares are split across machines, so this succeeds
+/// wherever a node holds the agent's keystore at all -- WITHOUT requiring it to hold all 3
+/// shares. Resolving Q via [`load_quorum_signer_at`] would need all 3 shares and so would
+/// fail-closed a legitimate cross-machine takeover; this does not. Used by the read-after-write
+/// launch fence ([`crate::relay_lease`]) to verify the surviving lease before trusting which node
+/// won the term race.
+pub fn load_group_q_at(keystore_dir: &Path) -> anyhow::Result<[u8; 32]> {
+    let identity = FrostIdentity::load(&pubkeys_path(keystore_dir)).with_context(|| {
+        format!("load group pubkeys to derive Q from {}", keystore_dir.display())
+    })?;
+    Ok(identity.q_bytes())
+}
+
 /// Whether THIS node can SIGN AS the agent at `keystore_dir`: the group anchor AND all 3 holder
 /// shares are present and each share deserializes to a well-formed `KeyPackage`. This is the
 /// FAILOVER admission gate (G-4): a node may take over a peer's agent only if it can FROST-sign
@@ -1433,6 +1451,27 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         println!("G-AGENT-SIGNS-WITH-PERSISTENT-Q PASS: keystore-loaded quorum signs verifying-under-persistent-Q");
+    }
+
+    /// LOAD-GROUP-Q-AT: `load_group_q_at` recovers the SAME group taproot key Q the keystore was
+    /// provisioned with, from the PUBLIC pubkeys ALONE (no secret shares) -- the verifying key the
+    /// read-after-write fence checks a lease's FROST signature under. Pubkeys-only is the
+    /// distribution-agnostic property: it must equal the Q a full share-loading signer derives, so
+    /// a node holding only its own share can still verify a lease.
+    #[test]
+    fn load_group_q_at_recovers_q_from_public_pubkeys() {
+        let dir = temp_keystore("group_q");
+        let id = provision_keyset_at(&dir).expect("provision");
+        let q = load_group_q_at(&dir).expect("load Q from the public pubkeys");
+        assert_eq!(q, id.q_bytes(), "load_group_q_at must recover the provisioned Q");
+        // Pubkeys-only Q equals the Q a full (all-shares) signer derives -- it loses nothing.
+        let signer_q = load_quorum_signer_at(&dir).expect("load signer").q_bytes();
+        assert_eq!(q, signer_q, "pubkeys-only Q must equal the full signer's Q");
+        // And it is exactly group_xonly_q over the persisted public pubkeys.
+        let pubkeys = FrostIdentity::load(&pubkeys_path(&dir)).unwrap().pubkeys().clone();
+        assert_eq!(q, group_xonly_q(&pubkeys).expect("direct Q"), "must equal group_xonly_q(pubkeys)");
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("LOAD-GROUP-Q-AT PASS: pubkeys-only Q == provisioned Q == full-signer Q");
     }
 
     /// G-KEYSTORE-PERMS: the holder KeyPackage files are mode 0600 (never world/group
