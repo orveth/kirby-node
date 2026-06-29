@@ -1290,14 +1290,16 @@ async fn connect(
     port: u32,
 ) -> Result<NodeGatewayClient<tonic::transport::Channel>, tonic::transport::Error> {
     let channel = Endpoint::try_from("http://vsock.invalid")?
-        // A per-request deadline so a STALE post-resume call cannot hang forever. After a
-        // snapshot+resume the guest's old vsock connection (to the killed source node) is a
-        // black hole: the host peer is gone and no RST ever reaches the restored guest, so an
-        // RPC on that channel would otherwise block indefinitely and the genome would never
-        // reach its re-dial branch (the post-resume reconnect would silently never fire). The
-        // timeout converts that hang into a `tonic::Status`, so the existing re-dial logic
-        // runs and the genome reconnects to the new active node's gateway.
-        .timeout(Duration::from_secs(5))
+        // A per-request deadline that is a generous BACKSTOP, not the liveness mechanism. A
+        // real metered brain RPC (mint X-Cashu token + POST to Routstr + redeem change)
+        // legitimately takes several seconds, so this must be comfortably larger than a paid
+        // think — 5s was over-tight and timed out every real Routstr completion ("Timeout
+        // expired"), so a capable agent could never think on a real brain. Dead-peer detection
+        // (incl. the post-resume "black hole" where the old vsock peer is gone and no RST ever
+        // reaches the restored guest) is handled by the HTTP/2 keepalive below (2s ping / 4s
+        // timeout → a dead connection surfaces as a `tonic::Status` in ~4-6s regardless of this
+        // deadline), so the existing re-dial logic still fires promptly after a snapshot+resume.
+        .timeout(Duration::from_secs(90))
         // HTTP/2 keepalive PINGs so a dead connection is detected even mid-call.
         .http2_keep_alive_interval(Duration::from_secs(2))
         .keep_alive_timeout(Duration::from_secs(4))
