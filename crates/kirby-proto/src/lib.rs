@@ -17,6 +17,14 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// it) agree on ONE value with no central registry.
 pub const ACTUATE_KIND_NOSTR_PUBLISH: &str = "nostr.publish";
 
+/// The actuator kind (and per-kind allowlist token) for a NIP-17 DM reply: the agent's
+/// PRIVATE voice (its public voice is [`ACTUATE_KIND_NOSTR_PUBLISH`]). The genome sets
+/// `Actuate.kind` to this to reply to an inbound DM; the daemon gift-wraps + signs the reply
+/// with the DEDICATED PLAIN DM KEY (never the FROST money key) and publishes it. A workload
+/// whose allowlist lacks this token issues ZERO DM replies at the gateway allowlist step, so
+/// the private voice is gated independently of the public one (per-kind allowlist).
+pub const ACTUATE_KIND_NOSTR_DM_REPLY: &str = "nostr.dm_reply";
+
 /// The only Nostr event kind the `nostr.publish` actuator may emit in the MVP: 1, a public
 /// text note (NIP-01). The daemon RESTRICTS the publishable kind to this (defense in depth,
 /// the handler is a new entry point); a payload naming any other kind is refused. A `u16`
@@ -42,6 +50,55 @@ pub const MAX_NOTE_BYTES: usize = 512;
 /// sever a multibyte char or post a half-thought). Returns the clean single-line note, or a
 /// human-readable reason. Total: any input either yields a clean line or a reason, never panics.
 pub fn sanitize_note_for_publish(raw: &str) -> Result<String, String> {
+    let clean = collapse_control_to_one_line(raw);
+    if clean.is_empty() {
+        return Err("note text is empty after stripping control characters and whitespace".into());
+    }
+    if clean.len() > MAX_NOTE_BYTES {
+        return Err(format!(
+            "note text exceeds the {MAX_NOTE_BYTES}-byte cap ({} bytes after sanitizing)",
+            clean.len()
+        ));
+    }
+    Ok(clean)
+}
+
+/// The hard byte cap on a single DM reply's text. A DM is private and may run a little longer
+/// than a public one-line note, but it is still ONE bounded message (no unbounded essays in a
+/// single reply). The GENOME caps to this before requesting, and the DAEMON independently
+/// RE-CAPS to it (it never trusts the genome's cap; the handler is a new entry point). Shared
+/// here so the two bounds cannot drift. An over-cap reply is REFUSED, never truncated.
+pub const MAX_DM_BYTES: usize = 2048;
+
+/// Sanitize + validate model-generated DM reply text into ONE safe line: the SHARED dm-reply
+/// guard, the PRIVATE sibling of [`sanitize_note_for_publish`]. Both the GENOME (before it
+/// requests a reply) and the DAEMON (before it wraps + signs + sends, defense in depth as a NEW
+/// entry point) call this INDEPENDENTLY, so the two sides enforce the SAME rule with no drift
+/// while neither trusts the other did it. The control-stripping rule is IDENTICAL to a published
+/// note (every control char + U+2028/U+2029 -> space, collapse runs, trim ends); only the cap
+/// differs ([`MAX_DM_BYTES`]). The result must be non-empty and within the cap; an over-cap reply
+/// is REFUSED (`Err`), never truncated. Total: any input yields a clean line or a reason, never
+/// panics.
+pub fn sanitize_dm_for_send(raw: &str) -> Result<String, String> {
+    let clean = collapse_control_to_one_line(raw);
+    if clean.is_empty() {
+        return Err("DM reply text is empty after stripping control characters and whitespace".into());
+    }
+    if clean.len() > MAX_DM_BYTES {
+        return Err(format!(
+            "DM reply text exceeds the {MAX_DM_BYTES}-byte cap ({} bytes after sanitizing)",
+            clean.len()
+        ));
+    }
+    Ok(clean)
+}
+
+/// The SHARED control-stripping core of the publish-note and dm-reply guards: map every control
+/// character AND the Unicode line/paragraph separators (U+2028 / U+2029, which render as line
+/// breaks but are NOT `char::is_control`) to a space, then collapse whitespace runs and trim the
+/// ends. Non-whitespace content is preserved verbatim. Factored out so the two public guards
+/// enforce the SAME rule with no drift; each applies its own cap + emptiness check.
+fn collapse_control_to_one_line(raw: &str) -> String {
     let spaced: String = raw
         .chars()
         .map(|c| {
@@ -54,17 +111,7 @@ pub fn sanitize_note_for_publish(raw: &str) -> Result<String, String> {
         .collect();
     // `split_whitespace` drops the (now whitespace-only) runs and trims the ends; `join(" ")`
     // re-joins with exactly one space. Non-whitespace content is preserved verbatim.
-    let clean = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    if clean.is_empty() {
-        return Err("note text is empty after stripping control characters and whitespace".into());
-    }
-    if clean.len() > MAX_NOTE_BYTES {
-        return Err(format!(
-            "note text exceeds the {MAX_NOTE_BYTES}-byte cap ({} bytes after sanitizing)",
-            clean.len()
-        ));
-    }
-    Ok(clean)
+    spaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The Nostr event kind for a Kirby node's presence beacon (the "nerve" slice 1).

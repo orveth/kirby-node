@@ -161,11 +161,16 @@ pub type EventStream = tokio::sync::mpsc::UnboundedReceiver<Event>;
 #[must_use = "dropping the ServeGuard aborts the gateway serve task and frees the treasury lock; bind it for the run's lifetime"]
 pub struct ServeGuard {
     handle: tokio::task::AbortHandle,
+    /// Held so the NIP-17 DM inbound task (task #12) shuts down gracefully when the run ends:
+    /// dropping this sender fires `run_dm_inbound`'s shutdown arm, so it disconnects its relay
+    /// client and returns. `None` when the DM path is not enabled (no task was spawned).
+    _dm_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Drop for ServeGuard {
     fn drop(&mut self) {
         self.handle.abort();
+        // `_dm_shutdown` drops with the struct -> the DM inbound task's shutdown arm fires.
     }
 }
 
@@ -297,7 +302,8 @@ async fn build_nostr_actuator(
     // `publish_note` signs via the PERSISTENT Q (the keystore's Q across restarts), the aggregate
     // is published as a pre-signed event. A FROST tenant has no node-local signing key, so
     // `key_path` is intentionally NOT consulted on this branch.
-    if let Some(keystore_dir) = social.frost_keystore_dir.as_deref() {
+    // Build the base actuator (its PUBLISH voice): a FROST quorum (Q signs) OR a single local key.
+    let mut actuator = if let Some(keystore_dir) = social.frost_keystore_dir.as_deref() {
         use anyhow::Context as _;
         let quorum = crate::keyset_provisioning::load_quorum_signer_at(keystore_dir)
             .with_context(|| {
@@ -306,21 +312,28 @@ async fn build_nostr_actuator(
                     keystore_dir.display()
                 )
             })?;
-        let actuator =
-            NostrActuator::connect_frost(Arc::new(quorum), &social.relays, social.cost_sats).await?;
-        return Ok(Arc::new(actuator));
-    }
+        NostrActuator::connect_frost(Arc::new(quorum), &social.relays, social.cost_sats).await?
+    } else {
+        // SINGLE-KEY PATH (byte-identical, G-CLEAN): the node identity keyfile is pinned to the
+        // node identity by run_agent (so a note is signed by the agent's own npub). A missing pin
+        // is a boot-wiring bug: fail loud, not a silent throwaway key (which would publish under an
+        // unfollowable ephemeral identity).
+        let key_path = social.key_path.clone().ok_or_else(|| {
+            anyhow::anyhow!("SocialConfig.key_path must be pinned to the node identity (boot-wiring bug)")
+        })?;
+        let identity = NodeIdentity::load_or_create(&key_path)?;
+        NostrActuator::connect(identity.keys().clone(), &social.relays, social.cost_sats).await?
+    };
 
-    // SINGLE-KEY PATH (byte-identical, G-CLEAN): the node identity keyfile is pinned to the node
-    // identity by run_agent (so a note is signed by the agent's own npub). A missing pin is a
-    // boot-wiring bug: fail loud, not a silent throwaway key (which would publish under an
-    // unfollowable ephemeral identity).
-    let key_path = social.key_path.clone().ok_or_else(|| {
-        anyhow::anyhow!("SocialConfig.key_path must be pinned to the node identity (boot-wiring bug)")
-    })?;
-    let identity = NodeIdentity::load_or_create(&key_path)?;
-    let actuator =
-        NostrActuator::connect(identity.keys().clone(), &social.relays, social.cost_sats).await?;
+    // Attach the DEDICATED PLAIN DM key (task #12) when the DM path is enabled. The DM reply signs
+    // with THIS key, NEVER the publish identity (Q in FROST mode) -- NIP-17 is ECDH, which a
+    // threshold key cannot do, and the money plane must never touch the DM plane. A separate keyfile
+    // = key isolation (a DM-path compromise costs only DM privacy). This local keyfile is the
+    // interim; the fleet's Shamir-shared SK_social (#26) swaps in behind this SAME seam later.
+    if let Some(dm_path) = social.dm_key_path.as_deref() {
+        let dm_identity = NodeIdentity::load_or_create(dm_path)?;
+        actuator = actuator.with_dm_keys(dm_identity.keys().clone());
+    }
     Ok(Arc::new(actuator))
 }
 
@@ -482,16 +495,33 @@ pub async fn boot_and_observe_with_rail(
     // the genome pulls at boot (spec 3.1).
     let treasury_path = treasury_path_for(&config.node_id);
     let treasury = open_treasury_retrying(&treasury_path, config.initial_sats, Duration::from_secs(5)).await?;
+    // The NIP-17 DM path (task #12) is enabled when the social config pins a dedicated DM keyfile.
+    // It allowlists inbound DIRECT_MESSAGE (the inbound mirror of the nostr.dm_reply outbound token)
+    // and attaches an InboundQueue the gateway's PollInbox drains + the run_dm_inbound task feeds.
+    let dm_enabled = config.social.as_ref().and_then(|s| s.dm_key_path.as_ref()).is_some();
     let session = Session {
         task_descriptor: config.task.clone(),
         budget_sats: config.budget_sats,
         allowlisted_destinations: config.allow.clone(),
-        allowlisted_inbound_kinds: Vec::new(),
+        allowlisted_inbound_kinds: if dm_enabled {
+            vec![kirby_proto::InboundKind::DirectMessage]
+        } else {
+            Vec::new()
+        },
     };
     // The meter and the gateway share ONE treasury instance (one authoritative
     // counter, D-9): metered ticks and capability spends debit the same balance.
     let meter_treasury = treasury.clone();
     let mut service = GatewayService::new(treasury, rail, session);
+    // Attach the inbound queue (the consumer side) when DMs are enabled; the run_dm_inbound task
+    // (spawned after the VM is up) feeds the SAME handle.
+    let inbox_queue = if dm_enabled {
+        let queue = crate::nerve::InboundQueue::new();
+        service = service.with_inbound_queue(queue.clone());
+        Some(queue)
+    } else {
+        None
+    };
     if let Some(checkpoint) = config.restore_checkpoint.clone() {
         service = service.with_restore_checkpoint(checkpoint);
     }
@@ -600,12 +630,45 @@ pub async fn boot_and_observe_with_rail(
             tracing::error!(error = %e, "gateway serve loop ended with error");
         }
     });
+    // Spawn the NIP-17 DM inbound subscription (task #12) when DMs are enabled: publish the agent's
+    // kind:10050 inbox-relay list (best-effort -- a relay hiccup must not fail boot), then run the
+    // producer that feeds the gateway's inbox queue. The task is torn down with the run via the
+    // oneshot sender held in the ServeGuard (dropping it fires run_dm_inbound's shutdown arm).
+    let dm_shutdown = match (inbox_queue, config.social.as_ref()) {
+        (Some(queue), Some(social)) => {
+            // `dm_enabled` (which gated `inbox_queue` to `Some`) implies `dm_key_path` is `Some`.
+            let dm_path =
+                social.dm_key_path.as_deref().expect("dm_enabled implies a configured dm_key_path");
+            let dm_identity = NodeIdentity::load_or_create(dm_path)?;
+            tracing::info!(
+                dm_npub = %dm_identity.npub(),
+                "NIP-17 DM identity loaded (the npub a client DMs; a plain key, distinct from the publish voice)"
+            );
+            match crate::nerve::publish_inbox_relay_list(&dm_identity, &social.relays).await {
+                Ok(id) => tracing::info!(event_id = %id, "published the kind:10050 DM-inbox relay list"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "kind:10050 publish failed (continuing; the agent still receives DMs)")
+                }
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let relays = social.relays.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::nerve::run_dm_inbound(&dm_identity, &relays, queue, rx).await {
+                    tracing::error!(error = %e, "DM inbound task ended with error");
+                }
+            });
+            Some(tx)
+        }
+        _ => None,
+    };
+
     // The serve task holds a GatewayService clone (and thus a Treasury Arc, holding
     // the sled lock). It is a listener loop that never returns on its own, so it
     // must be aborted at run-end to release the lock; the ServeGuard does that on
     // drop. The caller binds it for the run's lifetime.
     let serve_guard = ServeGuard {
         handle: serve_task.abort_handle(),
+        _dm_shutdown: dm_shutdown,
     };
 
     // Wait for the genome's boot hello event (session=<task>). This is the G1

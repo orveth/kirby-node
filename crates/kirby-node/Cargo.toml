@@ -97,8 +97,12 @@ cdk-fake-wallet = { workspace = true }
 # mind-state EngramStore (Chunk-2): engrams are NIP-44 self-encrypted (encrypt to
 # the node's OWN pubkey) so memory is private to the agent's key. This is the SAME
 # self-ECDH path cdk's NUT-27 wallet-backup already exercises in-tree, so the lib
-# supports self-pubkey ECDH (the F8 gate).
-nostr-sdk = { version = "0.44", default-features = false, features = ["nip44"] }
+# supports self-pubkey ECDH (the F8 gate). `nip59` (Gift Wrap, which implies nip44)
+# adds the NIP-17 DM path (task #12): the daemon unwraps inbound kind:1059 gift wraps
+# (`UnwrappedGift::from_gift_wrap`) and wraps replies (`EventBuilder::private_msg`),
+# both with the DEDICATED PLAIN DM key. `nip17` module fns (the kind:10050 relay list)
+# are ungated. Still no tor / no other optional NIPs.
+nostr-sdk = { version = "0.44", default-features = false, features = ["nip44", "nip59"] }
 # sha2 content-addresses app-checkpoint blobs for the portable Linux<->macOS
 # resume seam. The blob stays opaque to the daemon; the hash is only the stable
 # reference. It also backs the EngramStore's HMAC d-tag + HKDF key separation.

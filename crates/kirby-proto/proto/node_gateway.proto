@@ -209,6 +209,20 @@ message NostrTag {
   repeated string elements = 1;
 }
 
+// The payload for the "nostr.dm_reply" actuator kind, prost-encoded into Actuate.payload so
+// the genome carries NO JSON. The DAEMON NIP-17-wraps {to_pubkey, text} (kind:14 rumor ->
+// kind:13 seal -> kind:1059 gift wrap, randomized created_at) SIGNED WITH THE DEDICATED PLAIN
+// DM KEY -- NEVER the FROST money key Q (a threshold key cannot ECDH, and the money plane must
+// never touch the DM plane) -- and publishes the wrap. Defense in depth (the handler is a new
+// entry point): the daemon RE-SANITIZES + RE-CAPS `text` and RE-PARSES `to_pubkey`, never
+// trusting the genome. `to_pubkey` is the SEAL-VERIFIED sender of the inbound DM the genome is
+// replying to (hex x-only), threaded through from InboundEvent.source_pubkey -- NEVER the
+// throwaway gift-wrap (kind:1059) author, which is a random per-message ephemeral key.
+message NostrDmReply {
+  string to_pubkey = 1;   // recipient hex x-only pubkey (the inbound DM's seal-verified sender)
+  string text      = 2;   // the reply text (re-sanitized + re-capped daemon-side)
+}
+
 // The earn-loop INBOUND surface (Component 1). The genome's poll request: which
 // inbound kinds it wants to be woken for, its consume cursor, and a long-poll budget.
 message InboxRequest {
