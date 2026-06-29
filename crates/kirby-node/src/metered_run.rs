@@ -23,7 +23,7 @@ use crate::meter::HostProcessMeterConfig;
 use crate::meter::MeterConfig;
 use crate::meter::{Meter, MeterOutcome};
 use crate::nerve;
-use crate::sandbox::MeterSource;
+use crate::sandbox::{MeterSource, SandboxInstance};
 use crate::treasury::DebitOutcome;
 
 /// The lifecycle phase carried in a periodic 31000 agent-state emission DURING a
@@ -222,7 +222,9 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
 
     // Boot the VM and serve the gateway (C-2 path); get the shared treasury so
     // the meter debits the SAME counter the gateway uses (D-9).
-    let (vm, outcome, treasury, _events, _serve_guard) =
+    // `vm` is `mut` so the metering loop can poll `is_alive(&mut self)` to detect an
+    // externally-killed/crashed guest (G-4 failover bug 1); it is still moved into `halt()` below.
+    let (mut vm, outcome, treasury, _events, _serve_guard) =
         boot::boot_and_observe(config.boot).await?;
     if !outcome.reached_running {
         vm.halt().await;
@@ -334,7 +336,10 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
     // loop so a non-burning genome cannot hang the run. The optional agent-state
     // emitter publishes the LIVE treasury + runway on its cadence (best-effort
     // observability only; the money/meter path is unchanged).
-    let meter_outcome = match tick_until_exhausted(&mut meter, max_run, agent_state.as_ref()).await {
+    // Pass the live VM so the loop can detect an externally-killed/crashed guest and end the run
+    // (G-4 failover bug 1). `vm` is otherwise untouched during the loop; the borrow ends when
+    // `tick_until_exhausted` returns, before the `vm.halt()` teardown below.
+    let meter_outcome = match tick_until_exhausted(&mut meter, Some(&mut *vm), max_run, agent_state.as_ref()).await {
         Ok(outcome) => outcome,
         Err(e) => {
             vm.halt().await;
@@ -361,7 +366,10 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
             (Terminated::BudgetExhausted, remaining_at_halt)
         }
         MeterOutcome::Stopped { remaining, .. } => {
-            tracing::warn!("metered run hit the safety ceiling before exhausting the budget");
+            // Two ways to reach Stopped: the safety ceiling (`max_run`) elapsed, OR the guest VMM
+            // exited and the loop ended the run early (G-4 failover bug 1 — logged distinctly at
+            // the detection point above). Either way the daemon halts + records terminated:stopped.
+            tracing::warn!("metered run ended before budget exhaustion (safety ceiling reached, or the guest VMM exited — see the prior log line)");
             (Terminated::Stopped, remaining)
         }
     };
@@ -396,6 +404,7 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
 /// emission is best-effort and additive: it reads the meter, never the money path.
 async fn tick_until_exhausted(
     meter: &mut Meter,
+    mut vm: Option<&mut dyn SandboxInstance>,
     max_run: Duration,
     agent_state: Option<&AgentStateEmitter>,
 ) -> anyhow::Result<MeterOutcome> {
@@ -409,6 +418,29 @@ async fn tick_until_exhausted(
 
     loop {
         tokio::time::sleep(tick).await;
+
+        // G-4 failover bug 1 (proactive agent-death detection): end the run if the guest VMM has
+        // EXITED (crashed or was killed externally). Without this the loop keeps ticking ~0 burn
+        // until the budget/ceiling while the fleet supervisor heartbeats the dead agent's lease
+        // every ~10s forever, so its lease never goes stale and no peer ever fails it over. Ending
+        // the run makes the `kirby agent` process exit, which the supervisor's child-liveness reap
+        // observes → it stops heartbeating → the lease goes stale → G-4 takes the agent over.
+        // `vm` is `None` only in the in-process tick tests (no real VM to watch), where the loop
+        // behaves exactly as before. The probe is a cheap cgroup-procs read (Firecracker).
+        if let Some(inst) = vm.as_deref_mut() {
+            if !inst.is_alive() {
+                tracing::warn!(
+                    ticks = meter.ticks(),
+                    burned_sats = meter.burned_sats(),
+                    "metered run: the guest VMM has EXITED (no live process in its cgroup); ending the run so the supervisor reaps this tenant and its lease goes stale (G-4 failover)"
+                );
+                return Ok(MeterOutcome::Stopped {
+                    burned_sats: meter.burned_sats(),
+                    remaining: meter.treasury_remaining_best_effort(),
+                    ticks: meter.ticks(),
+                });
+            }
+        }
 
         let (remaining, exhausted) = match meter.tick_once()? {
             DebitOutcome::Debited { remaining, .. } => {
@@ -660,7 +692,7 @@ mod tests {
         let (treasury, drained) = drained_treasury();
         let mut meter = Meter::attach_mock(treasury, zero_rent, tick, 0, 0);
         meter.set_halt_floor(floor);
-        let outcome = tick_until_exhausted(&mut meter, max_run, None)
+        let outcome = tick_until_exhausted(&mut meter, None, max_run, None)
             .await
             .expect("the meter loop runs");
         match outcome {
@@ -701,7 +733,7 @@ mod tests {
         let (treasury, drained) = drained_treasury();
         let mut meter = Meter::attach_mock(treasury, zero_rent, tick, 0, 0);
         meter.set_halt_floor(0);
-        let outcome = tick_until_exhausted(&mut meter, max_run, None)
+        let outcome = tick_until_exhausted(&mut meter, None, max_run, None)
             .await
             .expect("the meter loop runs");
         match outcome {

@@ -753,7 +753,7 @@ async fn run_spawn_control_plane(
 
     use std::collections::BTreeMap;
 
-    use kirby_node::failover_detect::detect_takeovers;
+    use kirby_node::failover_detect::{detect_takeovers, drop_backed_off_verdicts};
     use kirby_node::keyset_provisioning::{keystore_dir_for, keystore_loadable_at};
     use kirby_node::relay_lease::{FleetLeaseObserver, LEASE_TTL_SECS};
     use kirby_node::spawn::{
@@ -828,6 +828,17 @@ async fn run_spawn_control_plane(
         "the takeover_grace config default must track LEASE_TTL_SECS (failover_detect::DEFAULT_TAKEOVER_GRACE_SECS)"
     );
 
+    // The G-4 ghost age bound (config dial, default = 10× the TTL): a lease stale longer than this
+    // is an ancient ghost (a dead past-run agent's retained lease) to ignore, not a recoverable
+    // failover — the client-side backstop for the relay-pollution starvation bug (bug 2). A
+    // `debug_assert` guards the config default from drifting from the detector's documented default.
+    let max_lease_age = spawn_cfg.failover_max_lease_age_secs;
+    debug_assert_eq!(
+        kirby_node::config::default_spawn_failover_max_lease_age_secs(),
+        kirby_node::failover_detect::DEFAULT_FAILOVER_MAX_LEASE_AGE_SECS,
+        "the failover_max_lease_age config default must track failover_detect::DEFAULT_FAILOVER_MAX_LEASE_AGE_SECS"
+    );
+
     // The per-agent CONTINUOUS-STALENESS dwell state the failover detector threads across scan
     // ticks (agent_id -> first-seen-stale `now`). OWNED by this loop and passed `&mut` into
     // `detect_takeovers` each tick: a candidate that recovers (goes fresh), becomes hosted, or
@@ -835,6 +846,14 @@ async fn run_spawn_control_plane(
     // tick (so a recovered link does not instantly mass-take-over). Persisting it HERE (not inside
     // the arm) is what makes the dwell measure continuous staleness rather than restarting every tick.
     let mut grace_state: BTreeMap<String, u64> = BTreeMap::new();
+
+    // The takeover-FAILURE backoff map (failover bug 3, allocation spin): agent_id -> the `now` its
+    // last takeover LAUNCH failed. OWNED by this loop and consulted via `drop_backed_off_verdicts`
+    // before selecting which verdict to act on, so one persistently-failing takeover (e.g. the
+    // supervisor's "already allocated" idempotency error for an agent it launched-then-lost) cannot
+    // monopolize the single-takeover-per-tick slot and starve healthy candidates. Pruned each tick.
+    let mut takeover_backoff: BTreeMap<String, u64> = BTreeMap::new();
+    let takeover_backoff_secs = kirby_node::failover_detect::DEFAULT_TAKEOVER_FAIL_BACKOFF_SECS;
 
     // Three cadences: reap dead tenants often (free slots quickly); heartbeat leases within the TTL
     // so a live agent's lease never goes stale (the keystone for the fence AND for failover); and
@@ -886,8 +905,20 @@ async fn run_spawn_control_plane(
                     now,
                     LEASE_TTL_SECS,
                     takeover_grace,
+                    max_lease_age,
                     &mut grace_state,
                 );
+
+                // (1b) BACKOFF FILTER (failover bug 3, allocation spin): drop verdicts for agents
+                //      whose last takeover LAUNCH failed within the backoff window, so a
+                //      persistently-failing takeover (e.g. the supervisor's "already allocated"
+                //      idempotency error) does not monopolize the single-takeover-per-tick slot and
+                //      starve healthy candidates. Prune expired backoff entries first (memory
+                //      hygiene); a backed-off agent is retried once its window elapses.
+                takeover_backoff
+                    .retain(|_, last_fail| now.saturating_sub(*last_fail) < takeover_backoff_secs);
+                let verdicts =
+                    drop_backed_off_verdicts(verdicts, &takeover_backoff, now, takeover_backoff_secs);
 
                 // (2) GATE each verdict through the SAME admission chain a fresh spawn passes
                 //     (default-deny, in order: keystore-loadable -> capacity -> image -> no-double-
@@ -946,6 +977,8 @@ async fn run_spawn_control_plane(
                     };
                     match supervisor.launch_one_at_term(&tenant, beat_term).await {
                         Ok(record) => {
+                            // Success: clear any prior backoff for this agent (it is now hosted).
+                            takeover_backoff.remove(&agent_id);
                             println!(
                                 "FLEET failover: TOOK OVER agent_id={agent_id} at beat_term={beat_term} \
                                  (npub={} cid={} port={})",
@@ -957,9 +990,15 @@ async fn run_spawn_control_plane(
                             );
                         }
                         Err(e) => {
+                            // Record the failure time so a persistently-failing takeover (e.g. the
+                            // supervisor's "already allocated" idempotency error) is BACKED OFF and
+                            // does not starve healthy candidates next tick (failover bug 3). It is
+                            // retried once the backoff window elapses.
+                            takeover_backoff.insert(agent_id.clone(), now);
                             tracing::error!(
                                 agent_id = %agent_id, beat_term, error = %e,
-                                "FLEET failover: takeover launch failed (allocation released; will retry next scan)"
+                                backoff_secs = takeover_backoff_secs,
+                                "FLEET failover: takeover launch failed (allocation released; backing off this agent, will retry after the backoff window)"
                             );
                         }
                     }

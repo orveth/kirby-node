@@ -194,6 +194,16 @@ pub struct SpawnConfig {
     /// stranding against the false-failover rate), so the operator can retune it.
     #[serde(default = "default_spawn_takeover_grace_secs")]
     pub takeover_grace_secs: u64,
+    /// AUTOMATIC FAILOVER (G-4): the UPPER age bound, in seconds, past which a stale lease is treated
+    /// as an ANCIENT GHOST and IGNORED rather than failed over (ghost accumulation, failover bug 2).
+    /// A genuine failover acts shortly after a lease goes stale (≈ TTL + grace, ~60s); a lease stale
+    /// for many multiples of the TTL is a dead past-run agent's retained lease (e.g. on a relay that
+    /// does not honor the NIP-40 `expiration` the lease carries). Default = 300s
+    /// (`failover_detect::DEFAULT_FAILOVER_MAX_LEASE_AGE_SECS`, 10× the TTL): well above a real
+    /// takeover's ~60s, far below the hours an accumulated ghost reaches. Raise it toward `u64::MAX`
+    /// to disable the client-side backstop and rely solely on relay NIP-40 expiry.
+    #[serde(default = "default_spawn_failover_max_lease_age_secs")]
+    pub failover_max_lease_age_secs: u64,
 }
 
 /// Default anti-spam rate: 10 spawns per operator per window.
@@ -220,6 +230,13 @@ pub const fn default_spawn_failover_scan_secs() -> u64 {
 pub const fn default_spawn_takeover_grace_secs() -> u64 {
     30
 }
+/// Default failover age bound: 300s (kept in sync with
+/// `crate::failover_detect::DEFAULT_FAILOVER_MAX_LEASE_AGE_SECS` = 10 × `LEASE_TTL_SECS`). A literal
+/// here so the config block stays self-contained (config must not depend on failover internals); a
+/// `debug_assert` in the failover wiring guards the two from drifting.
+pub const fn default_spawn_failover_max_lease_age_secs() -> u64 {
+    300
+}
 
 impl Default for SpawnConfig {
     fn default() -> Self {
@@ -231,6 +248,7 @@ impl Default for SpawnConfig {
             max_seed_sats: default_spawn_max_seed_sats(),
             failover_scan_secs: default_spawn_failover_scan_secs(),
             takeover_grace_secs: default_spawn_takeover_grace_secs(),
+            failover_max_lease_age_secs: default_spawn_failover_max_lease_age_secs(),
         }
     }
 }

@@ -191,6 +191,46 @@ async fn g_fence_live_per_agent_fenced_gateway_denies_and_debits_zero() {
     assert_eq!(r_b.cost_sats, 100, "the active tenant debited the act cost");
 }
 
+/// G-4 FAILOVER BUG 2 (ghost accumulation): a claimed lease carries a NIP-40 `expiration` tag set
+/// to `issued_at + LEASE_EXPIRATION_TTL_MULTIPLE * LEASE_TTL_SECS`, so a NIP-40-aware relay drops a
+/// dead agent's last lease instead of retaining it forever as a takeover-candidate ghost. TEETH:
+/// the tag is present; its value is exactly the documented multiple past the SIGNED `issued_at`;
+/// it outlasts the staleness TTL (a live agent surviving a few missed heartbeats is never dropped);
+/// and the claim STILL self-verifies under Q — `claim()` re-derives + verifies the NIP-01 id before
+/// returning, so an `Ok` here proves the added expiration tag did not break the FROST signature.
+#[tokio::test]
+async fn claimed_lease_carries_nip40_expiration_tag() {
+    use kirby_node::relay_lease::{LEASE_EXPIRATION_TTL_MULTIPLE, LEASE_TTL_SECS};
+
+    let q = quorum();
+    let h = holder(1, "agent-exp", q);
+    // claim() FROST-signs the lease AND re-verifies it under Q before returning, so this Ok proves
+    // the expiration tag is part of the signed NIP-01 id and the event still verifies.
+    let lease = h.claim("agent-exp", 1).await.expect("claim a lease (self-verifies under Q)");
+
+    let issued_at = {
+        let v: serde_json::Value = serde_json::from_str(&lease.content).expect("lease content JSON");
+        v["issued_at"].as_u64().expect("signed issued_at")
+    };
+    let expiration = lease
+        .tags
+        .iter()
+        .find(|t| t.first().map(String::as_str) == Some("expiration"))
+        .and_then(|t| t.get(1))
+        .expect("the claimed lease must carry a NIP-40 expiration tag")
+        .parse::<u64>()
+        .expect("expiration is a unix-seconds integer");
+    assert_eq!(
+        expiration,
+        issued_at + LEASE_EXPIRATION_TTL_MULTIPLE * LEASE_TTL_SECS,
+        "expiration must be issued_at + MULTIPLE*TTL (a live heartbeat keeps it fresh; a dead lease expires)"
+    );
+    assert!(
+        expiration > issued_at + LEASE_TTL_SECS,
+        "expiration must outlast the staleness TTL so a live agent's lease is never relay-dropped"
+    );
+}
+
 // G-FENCE-LIVE note (#9): the fence is the relay-native latest-term-wins check. A node is
 // active for an agent iff it holds that agent's latest non-stale lease; a node that never
 // claimed the agent's lease (or whose term was superseded, or whose lease went stale) is

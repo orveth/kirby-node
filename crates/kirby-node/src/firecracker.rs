@@ -543,6 +543,16 @@ impl SandboxInstance for BootedVm {
         matches!(self.vm.get_state(), VmState::Running)
     }
 
+    fn is_alive(&mut self) -> bool {
+        // LIVE liveness (G-4 failover bug 1), distinct from the latched `is_running` above:
+        // fctools' `get_state()` is a cached state machine that does NOT transition when the VMM is
+        // killed externally, so it keeps reporting `Running` after a crash/external kill. The VM's
+        // cgroup is the SOURCE OF TRUTH for which processes ARE this VM (the same cgroup `halt`
+        // mass-kills); if it holds no live process the firecracker VMM has exited and the agent must
+        // end so the supervisor reaps the tenant and lets its lease go stale.
+        cgroup_has_live_process(&self.cgroup_rel_path)
+    }
+
     fn gateway_transport(&self) -> GatewayTransport {
         // Firecracker's host-side vsock is a Unix socket; the daemon binds
         // `<uds_base>_<port>` and serves the agnostic gateway there (spec 3.1).
@@ -586,6 +596,21 @@ impl EgressControl for crate::network::VmTap {
     fn drop_counter(&self) -> EgressDropCounter {
         let c = crate::network::VmTap::drop_counter(self);
         EgressDropCounter { packets: c.packets, bytes: c.bytes }
+    }
+}
+
+/// Whether the VM's cgroup still holds at least one live process (G-4 failover bug 1, the live
+/// liveness probe behind [`SandboxInstance::is_alive`] for Firecracker). Reads the SAME
+/// `cgroup.procs` file [`kill_cgroup_processes`] signals: a non-empty list means the firecracker
+/// VMM is still running, an empty list (or a missing/unreadable cgroup — already torn down) means
+/// it has exited (crashed or was killed externally). Best-effort + read-only: any read error is
+/// treated as "not alive" (the cgroup is gone), the safe direction (the agent ends and the
+/// supervisor reaps it rather than heartbeating a dead lease forever).
+fn cgroup_has_live_process(cgroup_rel_path: &Path) -> bool {
+    let procs = Path::new("/sys/fs/cgroup").join(cgroup_rel_path).join("cgroup.procs");
+    match std::fs::read_to_string(&procs) {
+        Ok(contents) => contents.lines().any(|line| line.trim().parse::<i32>().is_ok()),
+        Err(_) => false,
     }
 }
 

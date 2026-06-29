@@ -481,6 +481,23 @@ pub trait SandboxInstance: Send {
     /// evidence the daemon logs).
     fn is_running(&mut self) -> bool;
 
+    /// A LIVE liveness probe: whether the guest's VMM process is STILL alive RIGHT NOW (G-4
+    /// failover bug 1). This is distinct from [`Self::is_running`], which on some backends
+    /// (Firecracker) reports the LATCHED post-boot state from a cached VM state machine that does
+    /// NOT update when the VMM is killed externally — so a crashed/externally-killed VM keeps
+    /// reporting `is_running == true`, the metering loop never ends, and the fleet supervisor keeps
+    /// heartbeating the dead agent's lease so no peer ever fails it over. The metering loop polls
+    /// THIS each tick and ends the run on a `false`, so the agent process exits and the supervisor
+    /// reaps it (its lease then goes stale and G-4 takes the agent over).
+    ///
+    /// The default delegates to [`Self::is_running`], which is correct for backends whose
+    /// `is_running` is already a live process probe (the macOS VZ backend `try_wait`s its helper
+    /// child). The Firecracker backend OVERRIDES this with a cgroup-process probe (its cgroup is the
+    /// source of truth for which processes ARE the VM).
+    fn is_alive(&mut self) -> bool {
+        self.is_running()
+    }
+
     /// The host-side vsock transport the daemon serves the agnostic `NodeGateway`
     /// over for this guest (spec 3.1). The genome dials the gateway over vsock; the
     /// daemon binds the returned transport and serves the same gateway service it

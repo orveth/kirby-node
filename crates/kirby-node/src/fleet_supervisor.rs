@@ -479,8 +479,24 @@ impl FleetSupervisor {
     /// tick — the TTL tolerates several missed heartbeats, so one bad heartbeat never kills a
     /// lease. Read-only on the supervisor (`&self`): it re-publishes existing leases, it does not
     /// mutate the tenant set.
+    ///
+    /// SKIPS an EXITED tenant (G-4 failover bug 1): a tenant whose child has died is still tracked
+    /// until the next [`Self::reap_dead`] tick, but its lease MUST NOT be refreshed — heartbeating
+    /// a dead agent's lease keeps it fresh forever, so it never goes stale and no peer ever fails
+    /// it over (a crashed agent would be heartbeat-resurrected indefinitely). Letting the dead
+    /// tenant's lease lapse is what unblocks failover; the imminent reap then frees its slot. (A
+    /// LIVE agent keeps heartbeating, so this only ever silences a genuinely dead one.)
     pub async fn heartbeat_leases(&self) {
         for (agent_id, live) in &self.tenants {
+            // Do not refresh a dead tenant's lease — it must be allowed to go stale so a peer can
+            // take the agent over. `reap_dead` (a faster tick) removes it shortly after.
+            if !live.process.is_running() {
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    "FLEET: skipping lease heartbeat for an EXITED tenant (letting its lease go stale so failover can act; it will be reaped)"
+                );
+                continue;
+            }
             let term = live.record.lease_term;
             match self
                 .grantor
@@ -1392,6 +1408,61 @@ mod tests {
 
         // A second reap with no dead tenants is a no-op.
         assert!(sup.reap_dead().is_empty(), "no dead tenants => empty reap");
+
+        // Tidy the real keystores this test provisioned.
+        for id in [&a, &b] {
+            let _ = std::fs::remove_dir_all(crate::keyset_provisioning::keystore_dir_for(&format!("kirby-{id}")));
+        }
+    }
+
+    /// G-4 FAILOVER BUG 1 (the regression guard): a DEAD tenant's lease MUST NOT be heartbeated —
+    /// `heartbeat_leases` skips an EXITED tenant so its lease goes stale and a peer can fail it
+    /// over, while a still-running sibling keeps heartbeating. TEETH: after one tenant dies, a
+    /// heartbeat tick re-claims ONLY the live tenant's lease; the dead tenant's lease is left to
+    /// lapse (the bug was that the supervisor heartbeat-resurrected a crashed agent's lease
+    /// forever, so it never went stale and failover never triggered). The companion `reap_dead`
+    /// then removes the dead tenant.
+    #[tokio::test]
+    async fn heartbeat_skips_a_dead_tenant_so_its_lease_goes_stale() {
+        let suffix = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+        let a = format!("hb-alice-{suffix}");
+        let b = format!("hb-bob-{suffix}");
+        let cfg = base_config_with_tenants(vec![tenant(&a, 1), tenant(&b, 1)]);
+        let allocator = Allocator::new(&cfg.fleet);
+        let grantor = Arc::new(StubGrantor::default());
+        let launcher = Arc::new(StubLauncher::default());
+        let mut sup =
+            FleetSupervisor::new(1, cfg, allocator, grantor.clone(), launcher.clone());
+        sup.launch_all().await.expect("launch all");
+
+        // The launch claimed each tenant's lease once (term 1). Record where the launch grants end
+        // so we can inspect ONLY the grants the heartbeat adds.
+        let grants_after_launch = grantor.grants.lock().unwrap().len();
+        assert_eq!(grants_after_launch, 2, "one launch grant per tenant");
+
+        // alice dies (its child exits); bob stays up.
+        launcher.running_flag(&a).store(false, Ordering::SeqCst);
+
+        // A heartbeat tick: it must refresh ONLY bob's lease (alice is dead → its lease must be
+        // allowed to go stale so a peer fails it over).
+        sup.heartbeat_leases().await;
+
+        let all_grants = grantor.grants.lock().unwrap().clone();
+        let heartbeat_grants: Vec<&AgentId> =
+            all_grants[grants_after_launch..].iter().map(|(id, _)| id).collect();
+        assert!(
+            heartbeat_grants.iter().all(|id| **id == b),
+            "the heartbeat must NOT re-claim the DEAD tenant's lease (got {heartbeat_grants:?})"
+        );
+        assert!(
+            heartbeat_grants.iter().any(|id| **id == b),
+            "the heartbeat MUST still refresh the LIVE tenant's lease"
+        );
+
+        // And the dead tenant is reaped by the companion tick, freeing its slot.
+        let reaped = sup.reap_dead();
+        assert_eq!(reaped.len(), 1, "the dead tenant is reaped");
+        assert_eq!(reaped[0].agent_id, a);
 
         // Tidy the real keystores this test provisioned.
         for id in [&a, &b] {

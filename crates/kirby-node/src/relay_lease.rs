@@ -63,6 +63,19 @@ use kirby_custody::cosign_net::{nip01_event_id_with_tags, NostrEvent};
 /// gudnuf confirms the value. Kept a `const` so the one place to retune it is here.
 pub const LEASE_TTL_SECS: u64 = 30;
 
+/// How many TTLs into the future a freshly-claimed lease's NIP-40 `expiration` is set (G-4
+/// failover bug 2, ghost accumulation). The lease event carries `["expiration", issued_at +
+/// LEASE_EXPIRATION_TTL_MULTIPLE * LEASE_TTL_SECS]`; a NIP-40-aware relay (nostr-rs-relay) DROPS
+/// the addressable lease once that time passes. A LIVE agent heartbeats every ~TTL/3, each
+/// heartbeat re-issuing the lease with a fresh, further-out expiration, so its lease never
+/// expires while it is alive; a DEAD agent's final lease expires `MULTIPLE * TTL` after its last
+/// heartbeat and the relay garbage-collects it — so ancient ghost leases stop accumulating. The
+/// multiple is > 1 (a live agent must survive a few missed heartbeats without its lease being
+/// dropped, exactly as the TTL tolerates them). The client-side age bound in
+/// [`crate::failover_detect::detect_takeovers`] is the backstop for a relay that does NOT honor
+/// NIP-40, so correctness does not depend on relay support.
+pub const LEASE_EXPIRATION_TTL_MULTIPLE: u64 = 4;
+
 /// The NIP-01 `d` tag name (the addressable key). The lease's `d` value is the `agent_id`,
 /// so the relay keeps only the latest lease per `(Q, kind, agent_id)`.
 const TAG_D: &str = "d";
@@ -74,6 +87,9 @@ const TAG_A: &str = "a";
 /// The node-scope tag (`["node",<node_id>]`): which node CLAIMED this lease (informational;
 /// the authoritative holder is the `holder_node_id` in the signed content).
 const TAG_NODE: &str = "node";
+/// The NIP-40 expiration tag (`["expiration",<unix-seconds>]`): a NIP-40-aware relay drops the
+/// event once this passes, so a dead agent's last lease is garbage-collected (failover bug 2).
+const TAG_EXPIRATION: &str = "expiration";
 
 /// The lease event's content JSON (spec 2): who holds the agent, at what monotonic term,
 /// and when the lease was issued (for the TTL). This is signed VERBATIM under Q (the note
@@ -216,7 +232,12 @@ impl RelayLeaseAuthority {
             issued_at,
         };
         let json = serde_json::to_string(&content).context("serialize lease content")?;
-        let tags = lease_tags(agent_id, self.node_id);
+        // NIP-40 expiration (failover bug 2): the relay drops this addressable lease once the
+        // expiration passes, so a DEAD agent's last lease is garbage-collected instead of
+        // lingering as a permanent ghost. A live agent's heartbeat re-issues with a fresh
+        // expiration before this elapses (the same way the TTL is kept fresh).
+        let expiration = issued_at + LEASE_EXPIRATION_TTL_MULTIPLE * LEASE_TTL_SECS;
+        let tags = lease_tags(agent_id, self.node_id, expiration);
 
         // FROST-sign the lease under Q (the SAME ceremony + guardian membrane that signs the
         // beacons). The content is machine JSON -> signed verbatim (the note sanitizer is
@@ -380,14 +401,19 @@ impl LeaseAuthority for RelayLeaseAuthority {
 }
 
 /// The tags every lease event carries: `["d",<agent_id>]` (the addressable key),
-/// `["t","kirby"]`, `["a",<agent_id>]`, `["node",<node_id>]`. The `d` tag makes the event
-/// addressable so the relay keeps only the latest lease per `(Q, kind, agent_id)`.
-fn lease_tags(agent_id: &str, node_id: LeaseNodeId) -> Vec<Vec<String>> {
+/// `["t","kirby"]`, `["a",<agent_id>]`, `["node",<node_id>]`, and the NIP-40
+/// `["expiration",<unix-seconds>]` (failover bug 2: a NIP-40-aware relay drops the lease once
+/// `expiration` passes, so a dead agent's last lease does not linger as a permanent ghost). The
+/// `d` tag makes the event addressable so the relay keeps only the latest lease per
+/// `(Q, kind, agent_id)`. All tags are part of the FROST-signed NIP-01 id, so the expiration is
+/// authentic (an observer re-derives the id over the SAME tags it verifies under Q).
+fn lease_tags(agent_id: &str, node_id: LeaseNodeId, expiration: u64) -> Vec<Vec<String>> {
     vec![
         vec![TAG_D.to_string(), agent_id.to_string()],
         vec![TAG_T.to_string(), TAG_T_KIRBY.to_string()],
         vec![TAG_A.to_string(), agent_id.to_string()],
         vec![TAG_NODE.to_string(), node_id.to_string()],
+        vec![TAG_EXPIRATION.to_string(), expiration.to_string()],
     ]
 }
 
