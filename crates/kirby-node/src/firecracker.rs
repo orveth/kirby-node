@@ -599,19 +599,58 @@ impl EgressControl for crate::network::VmTap {
     }
 }
 
+/// The PURE parse predicate behind the cgroup liveness probe (extracted so it is unit-testable
+/// without a real cgroup, FIX 4): does the contents of a `cgroup.procs` file name AT LEAST ONE
+/// live process? A line is a live PID only if it parses as an integer — so a blank file, a file of
+/// only blank lines, and a file of garbage all read as NO live process (the VMM has exited). This
+/// is deliberately STRICTER than `!contents.is_empty()`: cgroup.procs can contain a trailing
+/// newline (or be momentarily whitespace) with no live PID, and treating that as "alive" would
+/// heartbeat a dead lease forever (the G-4 bug). A regression to `!is_empty()` is caught by the
+/// `""`, `"\n"`, and `"not-a-pid\n"` cases in the unit tests.
+fn cgroup_procs_has_live_pid(contents: &str) -> bool {
+    contents.lines().any(|line| line.trim().parse::<i32>().is_ok())
+}
+
 /// Whether the VM's cgroup still holds at least one live process (G-4 failover bug 1, the live
 /// liveness probe behind [`SandboxInstance::is_alive`] for Firecracker). Reads the SAME
-/// `cgroup.procs` file [`kill_cgroup_processes`] signals: a non-empty list means the firecracker
-/// VMM is still running, an empty list (or a missing/unreadable cgroup — already torn down) means
-/// it has exited (crashed or was killed externally). Best-effort + read-only: any read error is
-/// treated as "not alive" (the cgroup is gone), the safe direction (the agent ends and the
-/// supervisor reaps it rather than heartbeating a dead lease forever).
+/// `cgroup.procs` file [`kill_cgroup_processes`] signals: a list with a live PID means the
+/// firecracker VMM is still running; an empty list means it has exited (crashed or killed
+/// externally); a MISSING cgroup (the dir was torn down) likewise means dead.
+///
+/// FIX 5 — classify a `cgroup.procs` read RESULT into a liveness verdict (pure, so the NotFound vs
+/// transient-error distinction is unit-testable without a real cgroup). DO NOT silently reap on a
+/// TRANSIENT read fault: a `NotFound` is the genuine "cgroup is gone → dead" signal (reads as
+/// not-alive, as before). But ANY OTHER IO error (EINTR, a transient permission/IO fault on a
+/// cgroup that still EXISTS) is NOT evidence of death — mapping it to "dead" would reap a FUNDED
+/// LIVE agent on a momentary read hiccup, with zero log. So a non-NotFound error is logged at `warn`
+/// (by the caller, which knows the path) and treated as ALIVE for THIS tick; the next probe
+/// re-reads (a truly dead VM's cgroup then reads NotFound or empty and is reaped). The `&Path` is
+/// for the warn log only.
+fn cgroup_alive_from_read(read: std::io::Result<String>, procs_path: &Path) -> bool {
+    match read {
+        Ok(contents) => cgroup_procs_has_live_pid(&contents),
+        // The cgroup dir/file is gone: the VMM was torn down → dead (the safe reap direction).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // A transient read fault on a cgroup that still exists: NOT proof of death. Log it and
+        // treat the VM as ALIVE this tick (fail toward keeping a possibly-live funded agent up);
+        // the next tick re-probes. Discarding this error (the old `Err(_) => false`) could reap a
+        // live agent on a single EINTR with no trace.
+        Err(e) => {
+            tracing::warn!(
+                cgroup = %procs_path.display(), error = %e,
+                "cgroup liveness probe hit a transient read error (not NotFound); treating the VM as ALIVE for this tick and re-probing next tick (NOT reaping on a transient fault)"
+            );
+            true
+        }
+    }
+}
+
+/// The full cgroup liveness probe: read the VM's `cgroup.procs` and classify it via
+/// [`cgroup_alive_from_read`].
 fn cgroup_has_live_process(cgroup_rel_path: &Path) -> bool {
     let procs = Path::new("/sys/fs/cgroup").join(cgroup_rel_path).join("cgroup.procs");
-    match std::fs::read_to_string(&procs) {
-        Ok(contents) => contents.lines().any(|line| line.trim().parse::<i32>().is_ok()),
-        Err(_) => false,
-    }
+    let read = std::fs::read_to_string(&procs);
+    cgroup_alive_from_read(read, &procs)
 }
 
 /// SIGKILL every process in the VM's cgroup (the daemon-initiated VMM kill).
@@ -1194,4 +1233,71 @@ fn meter_cgroup_parent_rel(uid: u32) -> PathBuf {
     PathBuf::from(format!(
         "user.slice/user-{uid}.slice/user@{uid}.service/kirby"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FIX 4 (G-4 failover bug 1, the cgroup liveness PARSE — load-bearing + previously untested):
+    /// `cgroup_procs_has_live_pid` reports a live process ONLY when `cgroup.procs` contains at least
+    /// one integer PID line. A blank file, a lone newline, and a non-numeric line all read as NO
+    /// live process (the VMM has exited). TEETH: this goes RED if anyone "simplifies" the predicate
+    /// to `!contents.is_empty()` (the `"\n"` and `"not-a-pid\n"` cases would then wrongly read alive,
+    /// which would NEVER reap a dead VM → the lease heartbeats forever and failover never fires).
+    #[test]
+    fn cgroup_procs_parse_detects_a_live_pid_strictly() {
+        // A real cgroup.procs with one or more PIDs => alive.
+        assert!(cgroup_procs_has_live_pid("123\n456\n"), "two PIDs => alive");
+        assert!(cgroup_procs_has_live_pid("123\n"), "one PID => alive");
+        assert!(
+            cgroup_procs_has_live_pid("  789  \n"),
+            "a PID with surrounding whitespace (trimmed) => alive"
+        );
+        // Empty / whitespace-only / garbage => NOT alive (the VMM exited). These are the cases a
+        // naive `!is_empty()` would get WRONG.
+        assert!(!cgroup_procs_has_live_pid(""), "empty file => dead");
+        assert!(!cgroup_procs_has_live_pid("\n"), "a lone newline (no PID) => dead");
+        assert!(!cgroup_procs_has_live_pid("   \n  \n"), "only blank lines => dead");
+        assert!(!cgroup_procs_has_live_pid("not-a-pid\n"), "a non-numeric line => dead");
+    }
+
+    /// FIX 5 (do NOT silently reap on a transient read fault): `cgroup_alive_from_read` maps a
+    /// `NotFound` read error to DEAD (the cgroup is genuinely gone — the same reap-on-teardown
+    /// behavior as before), but maps ANY OTHER IO error (e.g. EINTR / `Interrupted`) to ALIVE so a
+    /// momentary read hiccup on a LIVE cgroup does NOT reap a funded agent. An `Ok` read is parsed
+    /// normally. TEETH: the old `Err(_) => false` would map the transient case to DEAD (reaping a
+    /// live agent); that regression flips the `Interrupted` assertion below to fail.
+    #[test]
+    fn cgroup_read_error_only_reaps_on_notfound_not_on_transient() {
+        use std::io::{Error, ErrorKind};
+        let p = Path::new("u.slice/kirby/jail/cgroup.procs");
+
+        // NotFound: the cgroup is gone -> dead (reap), as before.
+        assert!(
+            !cgroup_alive_from_read(Err(Error::from(ErrorKind::NotFound)), p),
+            "a NotFound read means the cgroup is gone => dead (reap)"
+        );
+
+        // A TRANSIENT error (EINTR / Interrupted, a permission blip, etc.) is NOT proof of death:
+        // treat the VM as ALIVE this tick rather than reaping a possibly-live funded agent.
+        assert!(
+            cgroup_alive_from_read(Err(Error::from(ErrorKind::Interrupted)), p),
+            "a transient (Interrupted) read error must NOT reap a live agent => treated as ALIVE"
+        );
+        assert!(
+            cgroup_alive_from_read(Err(Error::from(ErrorKind::PermissionDenied)), p),
+            "a transient permission fault must NOT reap a live agent => treated as ALIVE"
+        );
+
+        // A successful read is parsed by the live-PID predicate (alive with a PID, dead when empty).
+        assert!(
+            cgroup_alive_from_read(Ok("321\n".to_string()), p),
+            "Ok with a live PID => alive"
+        );
+        assert!(
+            !cgroup_alive_from_read(Ok(String::new()), p),
+            "Ok but empty (no live process) => dead"
+        );
+    }
 }

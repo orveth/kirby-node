@@ -759,4 +759,98 @@ mod tests {
             ),
         }
     }
+
+    /// FIX 4 (G-4 failover bug 1, the REAL-KILL meter branch): a [`SandboxInstance`] whose
+    /// `is_alive()` flips FALSE after N ticks (the live-VM-death the cgroup probe detects in
+    /// production) drives `tick_until_exhausted` to return [`MeterOutcome::Stopped`] via the
+    /// dead-VM early exit — DISTINCT from the existing `None` (no VM) and budget-exhaust arms. This
+    /// is the branch that makes the `kirby agent` process exit so the supervisor reaps the tenant
+    /// and its lease goes stale (→ G-4 takes it over). Proven with a pure stub (no VM, non-gated).
+    #[tokio::test(start_paused = true)]
+    async fn dead_vm_is_alive_false_ends_the_run_as_stopped() {
+        use crate::meter::BurnRates;
+        use crate::treasury::Treasury;
+
+        /// A stub VM that reports ALIVE for the first `alive_for` `is_alive()` polls, then DEAD.
+        /// Only `is_alive` is exercised by the meter loop; the other trait methods are never
+        /// reached on this path, so they are left `unimplemented!`.
+        struct StubInstance {
+            polls: u64,
+            alive_for: u64,
+        }
+        #[async_trait::async_trait]
+        impl SandboxInstance for StubInstance {
+            fn is_running(&mut self) -> bool {
+                true
+            }
+            fn is_alive(&mut self) -> bool {
+                self.polls += 1;
+                // Alive for the first `alive_for` polls; the (alive_for+1)-th poll sees it dead
+                // (the external VMM kill the production cgroup probe would observe).
+                self.polls <= self.alive_for
+            }
+            fn gateway_transport(&self) -> crate::sandbox::GatewayTransport {
+                unimplemented!("not reached on the dead-VM meter path")
+            }
+            fn meter_source(&self) -> MeterSource {
+                unimplemented!("not reached on the dead-VM meter path")
+            }
+            fn egress_control(&self) -> Option<&dyn crate::sandbox::EgressControl> {
+                None
+            }
+            fn stream_console(&mut self) {}
+            async fn snapshot(&mut self) -> anyhow::Result<crate::sandbox::SnapshotArtifact> {
+                unimplemented!("not reached on the dead-VM meter path")
+            }
+            async fn halt(self: Box<Self>) {}
+        }
+
+        // rent=0 + no floor + an ample budget + a generous safety ceiling: the ONLY way this run
+        // ends before the ceiling is the dead-VM branch (is_alive == false). If the kill branch
+        // were absent, the run would idle to `ceiling_ticks` instead of stopping at the kill tick.
+        let zero_rent = BurnRates {
+            cpu_sats_per_usec_num: 0,
+            cpu_sats_per_usec_den: 1,
+            mem_sats_per_mib_sec: 0,
+            egress_sats_per_byte_num: 0,
+            egress_sats_per_byte_den: 1,
+        };
+        let tick = Duration::from_millis(10);
+        let max_run = Duration::from_millis(1_000); // ceiling = 100 ticks
+        let ceiling_ticks = (max_run.as_millis() / tick.as_millis()) as u64;
+        let alive_for = 3u64; // the VM "dies" at the 4th poll, far below the ceiling.
+
+        let treasury = Treasury::open_temporary(1_000_000).expect("treasury opens");
+        let mut meter = Meter::attach_mock(treasury, zero_rent, tick, 0, 0);
+        let mut stub = StubInstance { polls: 0, alive_for };
+
+        let outcome = tick_until_exhausted(&mut meter, Some(&mut stub), max_run, None)
+            .await
+            .expect("the meter loop runs");
+
+        match outcome {
+            MeterOutcome::Stopped { burned_sats, ticks, .. } => {
+                assert_eq!(burned_sats, 0, "rent=0: the meter billed nothing");
+                // The run ended at the kill tick (~alive_for), NOT at the ceiling — proving it was
+                // the dead-VM real-kill branch, not the max_run timeout, that stopped it.
+                assert!(
+                    ticks <= alive_for,
+                    "the run ended at the VM-death tick ({ticks} <= {alive_for}), not by ticking on"
+                );
+                assert!(
+                    ticks < ceiling_ticks,
+                    "the dead-VM branch stopped the run well before the safety ceiling ({ticks} < {ceiling_ticks})"
+                );
+            }
+            other => panic!(
+                "a dead VM (is_alive == false) MUST end the run as Stopped via the real-kill branch, got {other:?}"
+            ),
+        }
+        // The loop polled is_alive until the kill (alive_for live polls + 1 dead poll).
+        assert_eq!(
+            stub.polls,
+            alive_for + 1,
+            "the meter polled is_alive each tick and stopped on the first false"
+        );
+    }
 }
