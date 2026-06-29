@@ -535,10 +535,12 @@ fn feedback_dm_not_permitted() -> String {
         .to_string()
 }
 
-fn feedback_dm_transient() -> String {
-    // Symmetric to feedback_post_transient: an upstream failure may have reserved + debited the
-    // fixed cost before the relay rejected it (at-most-once: the reply did not go out).
-    "your DM_REPLY could not be delivered (an upstream error) and was not confirmed sent."
+fn feedback_dm_upstream_failed() -> String {
+    // NAMED for the SETTLE-on-UpstreamFailed branch (NOT a Transient outcome): an upstream failure
+    // reserved + debited the fixed cost before the relay rejected the wrap (at-most-once: the reply
+    // did not go out and is NOT re-sent -- the reservation is burned). The loud `capable_dm_undelivered`
+    // report (not this feedback) is what makes the drop visible; this just informs the brain's next think.
+    "your DM_REPLY could not be delivered (an upstream error) and was not confirmed sent; it will not be retried."
         .to_string()
 }
 
@@ -1236,8 +1238,31 @@ async fn execute_dm_reply<G: Gateway>(
             ActionOutcome::Done { recorded_write: false, verify: None, feedback: feedback_dm_not_permitted() }
         }
         other => {
-            boot_log(&format!("capable_dm seq={seq} not sent (outcome={other:?}); settling"));
-            ActionOutcome::Done { recorded_write: false, verify: None, feedback: feedback_dm_transient() }
+            // UpstreamFailed (the relay rejected the wrap AFTER the daemon reserved+debited the
+            // fixed cost) / Unspecified / lease fence: the reply did NOT go out. We do NOT pretend
+            // to retry: the daemon BURNS the reservation on UpstreamFailed (gateway.rs
+            // authorize_actuate residual (a) -- the `capable-dm-{seq}` key STAYS recorded), so
+            // reusing this seq would dedupe to a phantom `DuplicateIgnored` with an EMPTY proof
+            // (a fake "sent" that never re-delivers). At-most-once forbids a double-publish, so a
+            // genuine retry is impossible here. We therefore SETTLE -- but the drop must be VISIBLE,
+            // never silent: a human's DM vanished, so we LOUDLY surface a daemon event NAMING the
+            // dropped sender (the seal-verified recipient) so the loss is observable, not buried.
+            // (Symmetric to execute_post's documented at-most-once under-delivery residual; the DM
+            // path differs only in escalating the drop via `report` because the lost message came
+            // from an identified human, not a broadcast.)
+            report(
+                gw,
+                "capable_dm_undelivered",
+                &format!(
+                    "seq={seq} DM_REPLY to {to_pubkey} NOT delivered (outcome={other:?}); the reply was lost (at-most-once: not re-sent) and the fixed cost stays debited"
+                ),
+            )
+            .await;
+            ActionOutcome::Done {
+                recorded_write: false,
+                verify: None,
+                feedback: feedback_dm_upstream_failed(),
+            }
         }
     }
 }
@@ -1937,6 +1962,112 @@ mod tests {
         assert!(busy.is_some(), "the busy-flag is KEPT (the same conversation retries next tick)");
         assert_eq!(busy.as_ref().unwrap().sender, sender, "the kept conversation is the same sender");
         assert_eq!(ack, 0, "the cursor does NOT advance on a transient (the DM is not yet handled)");
+    }
+
+    #[tokio::test]
+    async fn dm_reply_upstream_failure_is_surfaced_not_silently_dropped() {
+        // FIX 2: a daemon-side relay-publish failure returns Outcome::UpstreamFailed (a terminal
+        // receipt, NOT a transport Err). The daemon BURNS the reservation on UpstreamFailed
+        // (gateway.rs authorize_actuate residual (a)), so a retry of capable-dm-{seq} would dedupe
+        // to a phantom "sent" -- at-most-once forbids a genuine re-publish. We therefore SETTLE (so
+        // the agent is never wedged on one sender), but the drop MUST be LOUD: a daemon event NAMING
+        // the dropped sender, so a human's vanished DM is observable, not silently buried.
+        let sender = dm_sender_hex(9);
+        let mut gw = MockGateway::thinking("ACTION: DM_REPLY\nTEXT: hi there").with_dm(1, &sender, "hello?");
+        gw.actuate_outcome = Outcome::UpstreamFailed as i32; // the relay rejected the wrap AFTER reserve+debit
+        let params = test_params();
+        let mut busy: Option<DmConversation> = None;
+        let mut ack: u64 = 0;
+
+        let o =
+            capable_tick_with_inbox(&mut gw, 1, &mut busy, &mut ack, &params, 1_000, 0, None, "").await;
+
+        // It settles (the conversation is NOT wedged): busy clears, cursor advances. The reply WAS
+        // attempted exactly once (at-most-once: not re-sent), and the brain is NOT killed.
+        assert!(matches!(o, TickOutcome::Lived { .. }), "an UpstreamFailed settles the tick (not Dead)");
+        assert!(busy.is_none(), "the busy-flag clears so the agent is never wedged on this sender");
+        assert_eq!(ack, 1, "the cursor advances past the undeliverable DM (no fake retry of a burned key)");
+        assert_eq!(gw.dm_reply_requests(), 1, "the reply was attempted EXACTLY once (at-most-once preserved)");
+
+        // THE BITE: the drop is NON-SILENT -- a `capable_dm_undelivered` daemon event was surfaced
+        // that NAMES the dropped sender. Without FIX 2 this arm only `boot_log`'d (no surfaced event,
+        // and it reused feedback_dm_transient), so the loss was silent -> this assertion goes RED.
+        let undelivered: Vec<&Event> =
+            gw.events.iter().filter(|e| e.kind == "capable_dm_undelivered").collect();
+        assert_eq!(undelivered.len(), 1, "the undeliverable DM is loudly surfaced exactly once");
+        assert!(
+            undelivered[0].detail.contains(&sender),
+            "the loud surface NAMES the dropped sender (the lost message is tied to its human)"
+        );
+    }
+
+    #[tokio::test]
+    async fn dm_non_reply_plan_settles_the_conversation() {
+        // FIX 3(a): the anti-wedge guarantee. A DM-reply tick whose brain returns a NON-DM_REPLY plan
+        // (here NOTE) is a wasted think that must SETTLE the conversation (terminal Lived, 0 sends),
+        // so a message the brain will not answer cannot pin the arm on one sender forever.
+        let sender = dm_sender_hex(3);
+        let mut gw = MockGateway::thinking("ACTION: NOTE").with_dm(1, &sender, "ignore me please");
+        let params = test_params();
+        let mut busy: Option<DmConversation> = None;
+        let mut ack: u64 = 0;
+
+        let o =
+            capable_tick_with_inbox(&mut gw, 1, &mut busy, &mut ack, &params, 1_000, 0, None, "").await;
+
+        assert!(
+            matches!(o, TickOutcome::Lived { action: Action::Note, .. }),
+            "a non-DM_REPLY plan in a DM tick LIVES (settles) carrying the parsed plan"
+        );
+        assert!(busy.is_none(), "the conversation SETTLES (busy clears) -- no permanent wedge on one sender");
+        assert_eq!(ack, 1, "the cursor advances past the DM the brain declined to answer");
+        assert_eq!(gw.dm_reply_requests(), 0, "NO reply is sent for a non-DM_REPLY plan");
+    }
+
+    #[tokio::test]
+    async fn dm_one_at_a_time_holds_the_second_sender_while_the_first_is_in_flight() {
+        // FIX 3(b): the busy.is_none() gate observed HOLDING a 2nd DM back. With TWO DMs queued, force
+        // the 1st reply to stay in-flight (the actuate call errors -> Transient keeps the busy-flag).
+        // Tick 1 must hold sender A; sender B must NOT be picked up; the cursor must not advance.
+        let sender_a = dm_sender_hex(1);
+        let sender_b = dm_sender_hex(2);
+        let mut gw = MockGateway::thinking("ACTION: DM_REPLY\nTEXT: one moment")
+            .with_dm(1, &sender_a, "first")
+            .with_dm(2, &sender_b, "second");
+        gw.actuate_errors = true; // the reply stays in-flight (transport error -> Transient, keeps busy)
+        let params = test_params();
+        let mut busy: Option<DmConversation> = None;
+        let mut ack: u64 = 0;
+
+        let o =
+            capable_tick_with_inbox(&mut gw, 1, &mut busy, &mut ack, &params, 1_000, 0, None, "").await;
+
+        assert!(matches!(o, TickOutcome::Transient), "the in-flight reply is Transient (kept, retried)");
+        assert!(busy.is_some(), "the busy-flag HOLDS while the first reply is in flight");
+        assert_eq!(
+            busy.as_ref().unwrap().sender, sender_a,
+            "the held conversation is the FIRST sender (one at a time)"
+        );
+        assert_eq!(ack, 0, "the cursor does NOT advance: the first DM is not yet settled");
+        // The decisive contention check: sender B was NEVER picked up while A is in flight. Exactly
+        // one reply attempt reached the gateway, and it targeted A, not B. (The actuate call errored
+        // BEFORE the mock decodes into `dm_replies`, so assert against the recorded REQUEST payload.)
+        assert_eq!(gw.dm_reply_requests(), 1, "only the FIRST sender's reply was attempted; B is held back");
+        let dm_targets: Vec<String> = gw
+            .requests
+            .iter()
+            .filter_map(|r| match &r.act {
+                Some(Act::Actuate(a)) if a.kind == ACTUATE_KIND_NOSTR_DM_REPLY => {
+                    NostrDmReply::decode(a.payload.as_slice()).ok().map(|d| d.to_pubkey)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dm_targets,
+            vec![sender_a.clone()],
+            "the single in-flight reply targets sender A; sender B is blocked by the busy gate"
+        );
     }
 
     #[tokio::test]
