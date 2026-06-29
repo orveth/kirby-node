@@ -621,6 +621,17 @@ pub async fn run_presence(
 /// publish-note cap and `capable.rs`'s byte-boundary discipline.
 pub const MAX_INBOUND_PAYLOAD_BYTES: usize = crate::rail::MAX_MEMORY_VALUE_BYTES;
 
+/// The hard byte cap on a single inbound NIP-17 DM's decrypted plaintext content. A SEPARATE,
+/// LOWER bound than [`MAX_INBOUND_PAYLOAD_BYTES`] precisely because the general inbound cap can
+/// NEVER bite on the DM path: nostr's NIP-44 v2 hard-caps an encryptable plaintext at 65_408 B,
+/// and a kind:14 DM rumor is sealed as its FULL JSON (id/pubkey/created_at/kind/tags/content +
+/// base64 framing), so the structurally MAX deliverable DM `content` is only ~40 KB -- already
+/// below the 65_535 general cap, leaving that check dead code on this path. 16 KiB sits well
+/// under that ~40 KB reachable ceiling, so this cap GENUINELY bites a hostile/oversized DM (drop,
+/// never truncate -- a truncation could sever a multibyte char). A DM is a short human message;
+/// 16 KiB is generous for that and bounds the bytes the daemon hands the genome to think on.
+pub const MAX_INBOUND_DM_BYTES: usize = 16_384;
+
 /// The bounded capacity of a per-genome inbound queue. On overflow the daemon drops the
 /// OLDEST queued event and logs (back-pressure that never blocks the relay task and never
 /// OOMs the host). 1024 is generous for a long-poll consumer that drains on every tick.
@@ -1016,12 +1027,15 @@ pub async fn screen_and_enqueue_dm(
         return None;
     }
     // (5) Size-cap the decrypted message (drop, never truncate -- a truncation could sever a
-    // multibyte char, the same discipline as the job-request path).
+    // multibyte char, the same discipline as the job-request path). NOTE: a DEDICATED, LOWER cap
+    // ([`MAX_INBOUND_DM_BYTES`]) -- the general [`MAX_INBOUND_PAYLOAD_BYTES`] (65_535) can never
+    // bite here because NIP-44's ~40 KB structural ceiling on a sealed kind:14 rumor's content
+    // already sits below it (see the constant's doc). A DM is a short human message.
     let payload = unwrapped.rumor.content.as_bytes().to_vec();
-    if payload.len() > MAX_INBOUND_PAYLOAD_BYTES {
+    if payload.len() > MAX_INBOUND_DM_BYTES {
         tracing::warn!(
             len = payload.len(),
-            cap = MAX_INBOUND_PAYLOAD_BYTES,
+            cap = MAX_INBOUND_DM_BYTES,
             "inbound DM: DROPPED an oversized message"
         );
         return None;
@@ -1793,6 +1807,26 @@ mod tests {
             "a gift wrap whose rumor is not a kind:14 DM must be dropped"
         );
         assert_eq!(queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dm_exceeding_the_size_cap_is_dropped() {
+        // A VALID, correctly-sealed DM whose content exceeds the dedicated DM cap is DROPPED at the
+        // size-cap step. 20_000 bytes is constructible (< NIP-44's ~40 KB deliverable ceiling, so
+        // the wrap actually builds) yet > MAX_INBOUND_DM_BYTES (16 KiB), so this cap genuinely
+        // bites -- proving it is NOT dead code (unlike the general 65_535 cap on this path).
+        let sender = Keys::generate();
+        let dm = Keys::generate();
+        let big = "x".repeat(20_000);
+        assert!(big.len() > MAX_INBOUND_DM_BYTES, "the test message must exceed the DM cap");
+        let wrap = make_dm_wrap(&sender, &dm.public_key(), &big).await;
+
+        let queue = InboundQueue::with_capacity(8);
+        assert!(
+            screen_and_enqueue_dm(&queue, &dm, &wrap).await.is_none(),
+            "a valid but oversized DM must be dropped at the size cap"
+        );
+        assert_eq!(queue.len(), 0, "nothing enqueued for an oversized DM");
     }
 
     #[test]
