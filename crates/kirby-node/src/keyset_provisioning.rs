@@ -862,6 +862,386 @@ pub fn load_quorum_signer_from_sinks(
         .context("build QuorumSigner from the distributed (unsealed) sink shares")
 }
 
+// ============================================================================================
+// DISTRIBUTED FROST KEYSETS: provision shares to remote holders + sign via RemoteHolders.
+//
+// The co-located path (`provision_keyset_at` + a `LocalHolders` signer) keeps all 3 shares in one
+// local dir on one host. The distributed path keeps the trusted-dealer split but ships share `i`
+// to a distinct holder host and signs through a threshold ceremony whose holders live off-box, so
+// no single host ever holds enough shares to sign alone. A SELF-DESCRIBING keystore selects which
+// path applies:
+//
+//   * `share_<i>.json` beside the anchor  => CO-LOCATED  (the single-host path)
+//   * `placement.json` beside the anchor  => DISTRIBUTED (shares on remote holders)
+//
+// PROVISION: `provision_keyset_distributed` writes the placement manifest, then ships share `i`
+// to sink `i` (one per holder host) via `provision_keyset_with_sinks`.
+// SIGN: `load_quorum_signer_distributed` builds the agent's `QuorumSigner` from `RemoteHolder`s
+// (one per placement entry, dialed via a `HolderTransportFactory`) -- the same ceremony body, the
+// holders just off-box.
+//
+// THE HARD WALL (the TEE-substitute invariant): the distributed SIGN path builds RemoteHolders and
+// unseals NO share into this process. It MUST NOT use `load_quorum_signer_from_sinks` (which
+// unseals all 3 shares into `LocalHolder`s here -- the shares come home, so a host reading this
+// process's RAM holds a full quorum and the TEE-substitute is gone). At-rest sealed sinks are NOT
+// sign-time remote holders. `distributed_sign_materializes_no_share_in_coordinator` is the
+// executable tooth that fails if the from-sinks path is ever substituted in.
+//
+// The orchestration + dispatcher are built against the `ShareSink` + `HolderTransport` /
+// `HolderTransportFactory` traits; a relay-native transport + a remote `ShareSink` implement those
+// same traits. The holder roster is config-declared via the placement manifest. Re-sharing a live
+// keyset to a NEW holder set (a changed roster) is not supported.
+// ============================================================================================
+
+/// The placement-manifest file name inside a keystore dir. Its PRESENCE marks the keystore
+/// DISTRIBUTED (the self-describing dispatch); its CONTENT is the holder roster the sign path
+/// dials. NOT secret (labels + opaque addresses), but written 0600 for a uniform keystore.
+const PLACEMENT_FILE: &str = "placement.json";
+
+/// Where ONE holder's share lives in a distributed keyset, and how the sign path reaches it.
+/// Persisted (in [`PlacementManifest`]) beside the anchor so the SIGN path -- which runs in the
+/// agent's own process and has only the keystore dir -- can rebuild the `RemoteHolder`s without
+/// re-running discovery on every sign (beacons fire every presence interval; a per-sign relay
+/// round-trip would be far too costly).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct HolderPlacement {
+    /// The FROST identifier (1..=[`SHARE_COUNT`]) whose share this holder holds.
+    pub identifier: u16,
+    /// The stable holder label -- IDENTICAL to the share sink's label (the seal domain
+    /// separator) so provision-side and sign-side name the same holder.
+    pub label: String,
+    /// The transport address the sign path dials to reach this holder's `RemoteHolderServer`.
+    /// OPAQUE to this crate -- interpreted only by the [`crate::remote_holder::HolderTransportFactory`]
+    /// (a relay route in production, a registry key in the in-process tests). The SAME address
+    /// names the remote `ShareSink` provisioning ships share `i` to, so provision + sign agree.
+    pub address: String,
+}
+
+/// The per-agent placement manifest: the full holder roster of a DISTRIBUTED keyset, one entry
+/// per FROST identifier, canonically ordered by identifier 1..=[`SHARE_COUNT`].
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PlacementManifest {
+    /// One placement per holder, ordered by identifier (entry `i` is identifier `i+1`).
+    pub holders: Vec<HolderPlacement>,
+}
+
+impl PlacementManifest {
+    /// Validate the manifest SHAPE (the invariants the sign path relies on): exactly
+    /// [`SHARE_COUNT`] entries, canonically ordered by identifier 1..=[`SHARE_COUNT`] (a
+    /// permutation, no gaps/dupes), and DISTINCT non-empty labels AND addresses. Distinctness is
+    /// load-bearing: two shares to one holder (same label/address) would put >= MIN_SIGNERS shares
+    /// behind one endpoint, collapsing the threshold there -- the co-located hole the distribution
+    /// is meant to close (the TEE-substitute needs each holder below the 2-of-3 threshold; for a
+    /// 2-of-3 that means one share per distinct holder). NOTE: distinct ADDRESSES guarantees
+    /// distinct ENDPOINTS; that those endpoints are distinct PHYSICAL hosts is the operator's
+    /// config-roster responsibility (this layer cannot see physical placement).
+    fn validate_shape(&self) -> anyhow::Result<()> {
+        if self.holders.len() != SHARE_COUNT as usize {
+            anyhow::bail!(
+                "placement manifest needs exactly {SHARE_COUNT} holders (one per share), got {}",
+                self.holders.len()
+            );
+        }
+        for (i, h) in self.holders.iter().enumerate() {
+            let want = (i + 1) as u16;
+            if h.identifier != want {
+                anyhow::bail!(
+                    "placement manifest must be ordered by identifier 1..={SHARE_COUNT}; entry {i} \
+                     has identifier {} (expected {want})",
+                    h.identifier
+                );
+            }
+            if h.label.trim().is_empty() {
+                anyhow::bail!("placement holder {want} has an empty label");
+            }
+            if h.address.trim().is_empty() {
+                anyhow::bail!("placement holder {want} has an empty address");
+            }
+        }
+        for i in 0..self.holders.len() {
+            for j in (i + 1)..self.holders.len() {
+                if self.holders[i].label == self.holders[j].label {
+                    anyhow::bail!(
+                        "placement holders {i} and {j} share label {:?}; each holder MUST be \
+                         distinct (no holder may hold two shares)",
+                        self.holders[i].label
+                    );
+                }
+                if self.holders[i].address == self.holders[j].address {
+                    anyhow::bail!(
+                        "placement holders {i} and {j} share address {:?}; each holder MUST be a \
+                         distinct endpoint (no endpoint may hold two shares)",
+                        self.holders[i].address
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The placement-manifest path inside a keystore dir.
+fn placement_path(keystore_dir: &Path) -> PathBuf {
+    keystore_dir.join(PLACEMENT_FILE)
+}
+
+/// Whether the keystore at `keystore_dir` is DISTRIBUTED: a placement manifest is present. This
+/// is the SELF-DESCRIBING dispatch the sign path keys off (placement.json present = remote
+/// holders; absent = co-located `share_<i>.json`). Side-effect-free, so a load site may call it.
+pub fn is_distributed_keystore(keystore_dir: &Path) -> bool {
+    placement_path(keystore_dir).is_file()
+}
+
+/// Persist a placement manifest 0600 (validating its shape first). The keystore dir must exist.
+fn save_placement(keystore_dir: &Path, manifest: &PlacementManifest) -> anyhow::Result<()> {
+    manifest.validate_shape()?;
+    let json = serde_json::to_vec_pretty(manifest).context("serialize placement manifest")?;
+    write_file_0600(&placement_path(keystore_dir), &json)
+}
+
+/// Load + validate the placement manifest from a keystore dir. Reuses [`read_share_file`]'s
+/// bounded + symlink-safe read (a manifest is small JSON), then validates the shape -- a
+/// malformed manifest is a LOUD error (never a silent fallback to the co-located path, which has
+/// no local shares anyway).
+pub fn load_placement(keystore_dir: &Path) -> anyhow::Result<PlacementManifest> {
+    let path = placement_path(keystore_dir);
+    let bytes = read_share_file(&path)
+        .with_context(|| format!("read placement manifest {}", path.display()))?;
+    let manifest: PlacementManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("deserialize placement manifest {}", path.display()))?;
+    manifest
+        .validate_shape()
+        .with_context(|| format!("placement manifest {} is malformed", path.display()))?;
+    Ok(manifest)
+}
+
+/// Load the placement manifest if present (None if the keystore is co-located).
+fn try_load_placement(keystore_dir: &Path) -> anyhow::Result<Option<PlacementManifest>> {
+    if !is_distributed_keystore(keystore_dir) {
+        return Ok(None);
+    }
+    Ok(Some(load_placement(keystore_dir)?))
+}
+
+/// Provision (or idempotently reload) a per-agent FROST keyset whose 3 shares are DISTRIBUTED to
+/// `sinks` (one per holder host), recording the holder roster in `placement.json` beside the
+/// node-local anchor. Returns the agent's PUBLIC [`FrostIdentity`] (its Q + npub).
+///
+/// This is the spawn-side flip: it wraps the tested [`provision_keyset_with_sinks`] (which keeps
+/// the trusted-dealer split UNCHANGED and the anti-identity-loss invariants) and adds the
+/// placement manifest the SIGN path needs. `placement.holders[i]` MUST describe the holder whose
+/// share `i+1` goes to `sinks[i]` -- the labels must align (cross-checked below), so the address
+/// the sign path later dials names the same holder this provision shipped the share to.
+///
+/// CRASH-SAFETY (placement BEFORE anchor): [`provision_keyset_with_sinks`] writes the identity
+/// ANCHOR last (the "identity established => never regenerate" gate). We write the placement
+/// FIRST, so a SURVIVING ANCHOR implies a PRESENT placement -- the distributed analog of the
+/// co-located shares-then-anchor ordering. A crash before the anchor leaves no anchor => the next
+/// spawn cleanly regenerates (no identity was established), and the agent is never launched
+/// against a half-provisioned keystore (the supervisor launches only after this returns `Ok`).
+///
+/// RE-SHARING TO A NEW HOLDER SET IS NOT SUPPORTED: on a restart with an EXISTING placement that
+/// DIFFERS from the provided roster, this FAILS LOUD rather than silently rewriting it (a rewrite
+/// would point the
+/// sign path at holders that do not hold the shares). A matching placement is an idempotent
+/// no-op; an absent one (first spawn, or healing a pre-anchor crash) is written.
+pub fn provision_keyset_distributed(
+    keystore_dir: &Path,
+    placement: &PlacementManifest,
+    sinks: &[&dyn ShareSink],
+) -> anyhow::Result<FrostIdentity> {
+    placement.validate_shape()?;
+    if sinks.len() != placement.holders.len() {
+        anyhow::bail!(
+            "distributed provisioning needs one sink per placement holder ({} placements, {} sinks)",
+            placement.holders.len(),
+            sinks.len()
+        );
+    }
+    // ALIGNMENT: sink `i` stores identifier `i+1`'s share (the contract of
+    // `provision_keyset_with_sinks`); its label MUST equal `placement.holders[i].label`, so the
+    // share shipped to sink[i] belongs to the holder the sign path will dial at that entry's
+    // address. A misalignment would distribute shares to one set of stores while the sign path
+    // dials another -- reject it before any keygen.
+    for (i, (h, s)) in placement.holders.iter().zip(sinks.iter()).enumerate() {
+        if s.label() != h.label {
+            anyhow::bail!(
+                "placement/sink misalignment at index {i}: placement holder label {:?} != sink \
+                 label {:?} (sink i must store identifier i+1's share for that holder)",
+                h.label,
+                s.label()
+            );
+        }
+    }
+
+    // The anchor dir must exist before we write the placement (placement BEFORE anchor); on first
+    // spawn `provision_keyset_with_sinks` would create it, but we need it now.
+    std::fs::create_dir_all(keystore_dir).with_context(|| {
+        format!("create per-agent FROST keystore dir {}", keystore_dir.display())
+    })?;
+    match try_load_placement(keystore_dir)? {
+        Some(existing) if existing != *placement => anyhow::bail!(
+            "an established placement manifest at {} differs from the provided roster; re-sharing a \
+             distributed keyset to a NEW holder set is not supported. Restore the original roster \
+             or re-provision from scratch.",
+            keystore_dir.display()
+        ),
+        // A matching established placement (idempotent restart): leave it untouched.
+        Some(_) => {}
+        // First spawn (or healing a pre-anchor crash): write the placement before the anchor.
+        None => save_placement(keystore_dir, placement)?,
+    }
+
+    // REMOTE-AWARE RELOAD vs FIRST SPAWN. The identity ANCHOR is the "established Q" gate.
+    //   * anchor PRESENT (idempotent restart): validate every holder ATTESTS its share via
+    //     `has_share` (a boolean attestation, NOT `get_share`) and reload the SAME Q. A real remote
+    //     sink's `get_share` Errs BY DESIGN -- a holder NEVER returns its plaintext share to the
+    //     dealer (that would re-centralize all 3 in dealer RAM and kill the TEE-substitute) -- so
+    //     the distributed reload MUST gate on the attestation, not on reading the secret. This is
+    //     why we do NOT delegate the reload to `provision_keyset_with_sinks`, whose reload branch
+    //     unseals via `get_share` (correct only for the LOCAL sealed sink). A missing attestation
+    //     over an established anchor is a LOUD error, never a silent new Q.
+    //   * anchor ABSENT (first spawn): delegate to the tested primitive. Its first-spawn branch
+    //     does trusted-dealer keygen -> `put_share` to each sink -> writes the anchor LAST; it does
+    //     NOT call `get_share` on first spawn, so a remote sink is fine there.
+    if has_identity_anchor(keystore_dir) {
+        let id = FrostIdentity::load(&pubkeys_path(keystore_dir)).with_context(|| {
+            format!(
+                "reload established distributed FROST identity anchor {} (idempotent restart). The \
+                 anchor (group_pubkeys.json) exists, so a sovereign Q was already minted and MUST \
+                 NOT be regenerated.",
+                keystore_dir.display()
+            )
+        })?;
+        assert_shares_present_across_sinks(sinks).with_context(|| {
+            format!(
+                "established distributed FROST identity at {} is missing or corrupt at a holder. \
+                 The anchor is present, so this agent ALREADY OWNS a sovereign Q -- refusing to \
+                 regenerate (that would mint a NEW key and permanently lose this identity + its \
+                 funds). RESTORE the missing holder's share.",
+                keystore_dir.display()
+            )
+        })?;
+        tracing::info!(
+            npub = %id.npub(),
+            keystore = %keystore_dir.display(),
+            sinks = sinks.len(),
+            "reloaded established DISTRIBUTED per-agent FROST keyset (idempotent; same Q; all holders attested via has_share)"
+        );
+        return Ok(id);
+    }
+
+    // FIRST SPAWN: trusted-dealer keygen + distribute via `put_share` + write the anchor LAST (the
+    // tested primitive; its first-spawn branch never calls `get_share`, so a remote sink is fine).
+    provision_keyset_with_sinks(keystore_dir, sinks)
+}
+
+/// REMOTE-AWARE fail-closed validation: every sink (identifier 1..=n) ATTESTS it holds a loadable
+/// share via [`ShareSink::has_share`] -- a boolean, WITHOUT reading the secret. For a real remote
+/// sink this is a round-trip attestation (the holder unseals + parses locally and replies ok/not),
+/// so `true` <=> loadable WITHOUT moving the share; for a [`LocalSealedSink`] it is the sealed
+/// file's presence. The distributed RELOAD gates on THIS, NOT on [`assert_shares_loadable_from_sinks`]
+/// (which calls `get_share` -> a remote sink Errs by design, since a holder never returns its
+/// plaintext share to the dealer). A missing attestation over an established anchor is a LOUD
+/// error -- never a silent regeneration of a new Q.
+fn assert_shares_present_across_sinks(sinks: &[&dyn ShareSink]) -> anyhow::Result<()> {
+    for (i, sink) in sinks.iter().enumerate() {
+        let idx = (i + 1) as u16;
+        if !sink.has_share(idx) {
+            anyhow::bail!(
+                "holder share {idx} missing or corrupt at sink {:?} (the holder did not attest a \
+                 loadable share)",
+                sink.label()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Build a live [`QuorumSigner`] for a DISTRIBUTED keyset: load the node-local group anchor and
+/// the placement manifest, then build ONE [`crate::remote_holder::RemoteHolder`] per holder,
+/// each dialed via `factory` at its placement address. The SAME `QuorumSigner` ceremony body
+/// drives it -- the holders just live off-box.
+///
+/// THE HARD WALL (the TEE-substitute invariant, asserted by
+/// `distributed_sign_materializes_no_share_in_coordinator`): this builds RemoteHolders and
+/// unseals NO share into this process. A `RemoteHolder` owns no `KeyPackage`/share/nonce -- only
+/// the holder's public identifier + a transport handle. So a host that reads THIS process's RAM
+/// finds nothing signable; each share stays on its holder, which unseals it on its OWN machine,
+/// signs, and returns only the public partial signature. This is why the path MUST NOT reuse
+/// [`load_quorum_signer_from_sinks`] (which unseals every share into a `LocalHolder` HERE -- the
+/// share comes home, and the cross-machine guarantee is gone). Sealed-sinks (at-rest storage) are
+/// NOT remote-holders (sign-time custody): keep the wall hard.
+pub fn load_quorum_signer_distributed(
+    keystore_dir: &Path,
+    factory: &dyn crate::remote_holder::HolderTransportFactory,
+) -> anyhow::Result<QuorumSigner> {
+    // The group anchor (verifying material) is node-local. A placement present WITHOUT an anchor is
+    // a keystore that crashed mid-first-spawn (the agent is never launched in that state) -- fail
+    // closed rather than guess.
+    if !has_identity_anchor(keystore_dir) {
+        anyhow::bail!(
+            "distributed FROST keystore {} has a placement manifest but no group anchor \
+             (group_pubkeys.json); it is not fully provisioned -- refusing to load (fail closed)",
+            keystore_dir.display()
+        );
+    }
+    let identity = FrostIdentity::load(&pubkeys_path(keystore_dir))
+        .with_context(|| format!("load group pubkeys from {}", keystore_dir.display()))?;
+    let pubkeys: PublicKeyPackage = identity.pubkeys().clone();
+
+    let placement = load_placement(keystore_dir)?;
+
+    // ONE RemoteHolder per placement entry. `factory.connect` fails closed on an unreachable
+    // holder; we build the FULL roster (all SHARE_COUNT proxies) and let the QuorumSigner's
+    // any-available-2-of-3 selection pick a reachable subset at sign time.
+    let mut holders: Vec<Box<dyn crate::quorum_signer::Holder>> =
+        Vec::with_capacity(placement.holders.len());
+    for h in &placement.holders {
+        let transport = factory.connect(&h.address).with_context(|| {
+            format!(
+                "connect to remote holder {:?} (identifier {}) at address {:?}",
+                h.label, h.identifier, h.address
+            )
+        })?;
+        let remote = crate::remote_holder::RemoteHolder::new(h.identifier, transport);
+        holders.push(Box::new(remote));
+    }
+
+    QuorumSigner::new(holders, pubkeys).context(
+        "build distributed QuorumSigner from RemoteHolders (each share stays on its holder; \
+         none is unsealed into this process)",
+    )
+}
+
+/// THE SELF-DESCRIBING SIGN-PATH DISPATCHER: build the agent's [`QuorumSigner`] from its keystore
+/// dir, choosing the co-located or distributed loader by the keystore's own shape. This is the
+/// single seam the live sign sites (the voice actuator, the beacon signer, the lease signer) call
+/// so the all-local vs distributed choice lives in ONE place, not three.
+///
+///   * `placement.json` present => DISTRIBUTED: build from `RemoteHolder`s via `factory`. A
+///     distributed keystore with NO factory supplied is a LOUD error (the sign path cannot reach
+///     the remote holders without a transport).
+///   * otherwise               => CO-LOCATED: the byte-identical [`load_quorum_signer_at`] path
+///     (unchanged; the single-box default needs no factory).
+pub fn load_agent_quorum_signer(
+    keystore_dir: &Path,
+    factory: Option<&dyn crate::remote_holder::HolderTransportFactory>,
+) -> anyhow::Result<QuorumSigner> {
+    if is_distributed_keystore(keystore_dir) {
+        let factory = factory.ok_or_else(|| {
+            anyhow::anyhow!(
+                "keystore {} is DISTRIBUTED (placement.json present) but no HolderTransportFactory \
+                 was supplied -- the sign path needs a transport to reach the remote holders",
+                keystore_dir.display()
+            )
+        })?;
+        load_quorum_signer_distributed(keystore_dir, factory)
+    } else {
+        load_quorum_signer_at(keystore_dir)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1521,6 +1901,348 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
         println!("DIST-SINK-HYGIENE PASS: duplicate-label + wrong-count sink sets are rejected before keygen");
+    }
+
+    // ========================================================================================
+    // DISTRIBUTED FROST KEYSETS: placement manifest, distributed-provision orchestration,
+    // distributed sign loader (RemoteHolders), and the self-describing dispatcher.
+    // ========================================================================================
+
+    /// The placement manifest aligned with [`sealed_sinks`] (labels `holder-1/2/3`), giving each
+    /// holder a distinct in-process address the [`InProcessHolderFleet`] registers servers at.
+    fn placement_for_sealed_sinks() -> PlacementManifest {
+        PlacementManifest {
+            holders: (1..=SHARE_COUNT)
+                .map(|id| HolderPlacement {
+                    identifier: id,
+                    label: format!("holder-{id}"),
+                    address: format!("inproc://holder-{id}"),
+                })
+                .collect(),
+        }
+    }
+
+    /// Stand up an in-process "holder fleet": each holder server unseals ITS OWN share from ITS
+    /// OWN sink (modeling a holder host loading its share on its own machine) and is registered at
+    /// the placement address the distributed loader will dial. The coordinator never sees these
+    /// shares -- it only gets `RemoteHolder` proxies back through the factory.
+    fn build_inproc_fleet(
+        anchor: &Path,
+        sinks: &[LocalSealedSink<FixedBinding>],
+    ) -> crate::remote_holder::InProcessHolderFleet {
+        use crate::remote_holder::{InProcessHolderFleet, RemoteHolderServer};
+        let pubkeys = FrostIdentity::load(&pubkeys_path(anchor)).unwrap().pubkeys().clone();
+        let mut fleet = InProcessHolderFleet::new();
+        for (i, sink) in sinks.iter().enumerate() {
+            let idx = (i + 1) as u16;
+            let bytes = sink.get_share(idx).expect("unseal share for the holder's server");
+            let kp: KeyPackage = serde_json::from_slice(&bytes).expect("share is a KeyPackage");
+            let server = std::sync::Arc::new(RemoteHolderServer::new(kp, pubkeys.clone()));
+            fleet.register(format!("inproc://holder-{idx}"), server);
+        }
+        fleet
+    }
+
+    /// Independently verify a signed event's aggregate under the tweaked group Q loaded from the
+    /// anchor.
+    fn assert_event_verifies_under_q(
+        event: &kirby_custody::cosign_net::NostrEvent,
+        anchor: &Path,
+    ) {
+        let pubkeys = FrostIdentity::load(&pubkeys_path(anchor)).unwrap().pubkeys().clone();
+        let (_addr, internal_p) = taproot_address(&pubkeys, KnownHrp::Testnets).expect("address");
+        let secp = Secp256k1::verification_only();
+        let (q_tweaked, _parity) = internal_p.tap_tweak(&secp, None);
+        let q_xonly = q_tweaked.to_x_only_public_key();
+        let event_id = hex::decode(&event.id).expect("event id hex");
+        let msg = Message::from_digest(event_id.as_slice().try_into().expect("32-byte id"));
+        let sig = schnorr::Signature::from_slice(&hex::decode(&event.sig).expect("sig hex"))
+            .expect("parse 64-byte sig");
+        assert!(
+            secp.verify_schnorr(&sig, &msg, &q_xonly).is_ok(),
+            "the distributed aggregate must verify under the tweaked group Q"
+        );
+    }
+
+    /// A distributed spawn lands EXACTLY ONE share per sink across the 3 distinct
+    /// sinks (none co-located), the dealer's keystore dir retains NO share, and the placement
+    /// manifest is written + correct. RED-on-revert: if the orchestration ever wrote shares
+    /// locally (the `provision_keyset_at` path) or skipped the manifest, this fails.
+    #[test]
+    fn distributed_spawn_lands_one_share_per_sink_and_writes_placement() {
+        let (anchor, dirs) = dist_dirs("flip-oneeach");
+        let sinks = sealed_sinks(&dirs);
+        let placement = placement_for_sealed_sinks();
+
+        let id = provision_keyset_distributed(&anchor, &placement, &as_dyn(&sinks))
+            .expect("distributed spawn provisions");
+        assert!(id.npub().starts_with("npub1"), "npub must encode");
+
+        // ONE share per sink, none anywhere else.
+        for (i, sink) in sinks.iter().enumerate() {
+            let idx = (i + 1) as u16;
+            assert!(sink.has_share(idx), "sink {} must hold its own share {idx}", sink.label());
+            let sealed_count = std::fs::read_dir(sink.dir())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".sealed"))
+                .count();
+            assert_eq!(sealed_count, 1, "sink {} must hold exactly ONE sealed share", sink.label());
+        }
+
+        // The keystore (anchor) dir holds the anchor + the placement manifest, and NO share
+        // material (no co-located share_*.json, no *.sealed). The dealer host keeps nothing
+        // signable -- this is the whole point of the flip.
+        assert!(pubkeys_path(&anchor).is_file(), "the group anchor is node-local");
+        assert!(is_distributed_keystore(&anchor), "placement.json marks the keystore distributed");
+        for entry in std::fs::read_dir(&anchor).unwrap().filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with("share_") && !name.ends_with(".sealed"),
+                "the keystore dir must hold NO share material after a distributed spawn, found {name}"
+            );
+        }
+        let anchor_entries: std::collections::BTreeSet<String> = std::fs::read_dir(&anchor)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            anchor_entries,
+            [PUBKEYS_FILE.to_string(), PLACEMENT_FILE.to_string()].into_iter().collect(),
+            "the distributed keystore dir = exactly {{anchor, placement}}"
+        );
+
+        // The placement manifest round-trips to what we provisioned.
+        let loaded = load_placement(&anchor).expect("placement loads");
+        assert_eq!(loaded, placement, "the persisted placement must equal the provisioned roster");
+
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!("FLIP-ONE-SHARE-PER-SINK PASS: distributed spawn ships 1 share/sink across 3 sinks; keystore dir holds only {{anchor, placement}}");
+    }
+
+    /// THE KEYSTONE: a DISTRIBUTED-keystore agent co-signs a Q-valid signature
+    /// via `RemoteHolder`s loaded by `load_quorum_signer_distributed` -- the same ceremony body,
+    /// holders off-box. RED-on-revert: if the loader built `LocalHolder`s or the wrong Q, the
+    /// aggregate would not verify under the persistent distributed Q.
+    #[test]
+    fn distributed_keystore_agent_cosigns_q_valid_via_remote_holders() {
+        let (anchor, dirs) = dist_dirs("flip-sign");
+        let sinks = sealed_sinks(&dirs);
+        let placement = placement_for_sealed_sinks();
+        let id = provision_keyset_distributed(&anchor, &placement, &as_dyn(&sinks)).expect("provision");
+
+        // The holders stand up off-box (each unseals its own share); the coordinator dials them.
+        let fleet = build_inproc_fleet(&anchor, &sinks);
+        let signer = load_quorum_signer_distributed(&anchor, &fleet)
+            .expect("build distributed signer from RemoteHolders");
+        assert_eq!(signer.q_bytes(), id.q_bytes(), "the distributed signer's Q is the agent's Q");
+
+        let event = signer
+            .sign_nostr_event(1, 1_750_000_000, "Sovereign across distinct remote holders.")
+            .expect("the distributed quorum co-signs via RemoteHolders");
+        assert_eq!(event.pubkey, hex::encode(id.q_bytes()), "event pubkey is the agent's Q");
+        assert_event_verifies_under_q(&event, &anchor);
+
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!("FLIP-REMOTE-SIGN PASS: a distributed-keystore agent co-signs a Q-valid note via RemoteHolders (off-box quorum)");
+    }
+
+    /// THE TEE-SUBSTITUTE INVARIANT, AS TEETH: the distributed SIGN path materializes NO
+    /// share in the coordinator process -- it dials the holders and never reads the local sinks.
+    /// We prove it by DELETING every sink's stored share AFTER the holders are stood up, then
+    /// loading + signing through `load_quorum_signer_distributed`: it STILL produces a Q-valid
+    /// signature (the shares live on the holders, not in any sink the coordinator reads). The
+    /// contrast assertion makes the revert explicit: `load_quorum_signer_from_sinks` (the
+    /// shares-come-home path) FAILS once the sinks are gone. So if anyone swaps the distributed
+    /// loader to the from-sinks/unseal path, THIS test goes RED. Sealed-sinks != remote-holders.
+    #[test]
+    fn distributed_sign_materializes_no_share_in_coordinator() {
+        let (anchor, dirs) = dist_dirs("flip-noshare");
+        let sinks = sealed_sinks(&dirs);
+        let placement = placement_for_sealed_sinks();
+        let id = provision_keyset_distributed(&anchor, &placement, &as_dyn(&sinks)).expect("provision");
+
+        // Holders load their shares onto their own "machines" (the servers hold the KeyPackages
+        // in memory now), THEN we remove every share from local storage.
+        let fleet = build_inproc_fleet(&anchor, &sinks);
+        for (i, _sink) in sinks.iter().enumerate() {
+            let idx = (i + 1) as u16;
+            std::fs::remove_file(sealed_share_path(&dirs[i], idx)).expect("delete the local sink share");
+        }
+
+        // CONTRAST (makes the revert RED): the shares-come-home path is now DEAD -- it would read
+        // the (deleted) sinks. A revert of the distributed loader to this path fails here.
+        let sinks_gone = sealed_sinks(&dirs);
+        assert!(
+            load_quorum_signer_from_sinks(&anchor, &as_dyn(&sinks_gone)).is_err(),
+            "with the local sink shares deleted, the from-sinks (shares-come-home) loader MUST fail \
+             -- proving the distributed sign path below does NOT use it"
+        );
+
+        // THE DISTRIBUTED PATH STILL SIGNS: it reads only the anchor + placement and dials the
+        // holders; no share is unsealed into THIS process.
+        let signer = load_quorum_signer_distributed(&anchor, &fleet)
+            .expect("distributed signer builds without touching the (deleted) local sinks");
+        let event = signer
+            .sign_nostr_event(1, 1_750_000_000, "No share comes home.")
+            .expect("the off-box quorum signs despite the local sinks being gone");
+        assert_eq!(event.pubkey, hex::encode(id.q_bytes()));
+        assert_event_verifies_under_q(&event, &anchor);
+
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!("FLIP-NO-SHARE-HOME PASS: distributed sign works with local sinks DELETED (RemoteHolders); the from-sinks path fails -> the TEE-substitute wall holds");
+    }
+
+    /// A fail-closed reload over a missing holder share. An ESTABLISHED
+    /// distributed identity (anchor + placement + 3 sealed sinks) with ONE sink's share DELETED
+    /// must make `provision_keyset_distributed` FAIL LOUD on the next spawn -- never silently mint
+    /// a new Q. The anchor + placement + surviving shares are preserved.
+    #[test]
+    fn distributed_provision_fails_closed_on_missing_share_over_established_identity() {
+        let (anchor, dirs) = dist_dirs("flip-failclosed");
+        let sinks = sealed_sinks(&dirs);
+        let placement = placement_for_sealed_sinks();
+        let id1 = provision_keyset_distributed(&anchor, &placement, &as_dyn(&sinks)).expect("establish");
+        let q1 = id1.q_bytes();
+        let anchor_before = std::fs::read(pubkeys_path(&anchor)).expect("anchor before");
+        let placement_before = std::fs::read(placement_path(&anchor)).expect("placement before");
+
+        // Catastrophe: delete sink 2's share, leaving the anchor + placement intact.
+        std::fs::remove_file(sealed_share_path(&dirs[1], 2)).expect("delete sink 2 share");
+
+        // FAIL-CLOSED: re-provisioning over the established identity with a missing share errors.
+        let sinks2 = sealed_sinks(&dirs);
+        let err = provision_keyset_distributed(&anchor, &placement, &as_dyn(&sinks2))
+            .map(|_| ())
+            .expect_err("a missing holder share over an established distributed identity MUST fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing or corrupt") || msg.to_lowercase().contains("restore"),
+            "the error must tell the operator to restore the holder share, got: {msg}"
+        );
+
+        // Anchor + placement + Q preserved (no regeneration ran).
+        assert_eq!(anchor_before, std::fs::read(pubkeys_path(&anchor)).unwrap(), "anchor untouched");
+        assert_eq!(placement_before, std::fs::read(placement_path(&anchor)).unwrap(), "placement untouched");
+        assert_eq!(
+            FrostIdentity::load(&pubkeys_path(&anchor)).unwrap().q_bytes(),
+            q1,
+            "the original sovereign Q must be preserved (no new key minted)"
+        );
+
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!("FLIP-FAIL-CLOSED PASS: a missing holder share over an established distributed identity errors loudly; anchor/placement/Q preserved");
+    }
+
+    /// The CO-LOCATED default path is unchanged, and the self-describing
+    /// dispatcher routes to it. A `provision_keyset_at` keystore (no placement) is NOT
+    /// distributed, and `load_agent_quorum_signer(dir, None)` (no transport factory) loads the
+    /// co-located signer and signs a Q-valid note -- byte-identical to today.
+    #[test]
+    fn colocated_default_path_unchanged_and_dispatcher_routes_to_it() {
+        let dir = temp_keystore("flip-colocated");
+        let id = provision_keyset_at(&dir).expect("co-located provision (today's default)");
+
+        // NOT distributed: no placement.json; the co-located share files are present.
+        assert!(!is_distributed_keystore(&dir), "a co-located keystore must NOT look distributed");
+        assert!(!placement_path(&dir).exists(), "no placement manifest for a co-located keystore");
+        for idx in 1..=SHARE_COUNT {
+            assert!(share_path(&dir, idx).is_file(), "co-located share_{idx}.json must exist");
+        }
+
+        // The dispatcher routes to the co-located loader WITHOUT a factory (None is fine here).
+        let signer = load_agent_quorum_signer(&dir, None)
+            .expect("dispatcher loads the co-located signer with no transport factory");
+        assert_eq!(signer.q_bytes(), id.q_bytes(), "dispatcher signer Q matches the co-located identity");
+        let event = signer
+            .sign_nostr_event(1, 1_750_000_000, "Co-located default still signs.")
+            .expect("the co-located quorum signs");
+        assert_eq!(event.pubkey, hex::encode(id.q_bytes()));
+        assert_event_verifies_under_q(&event, &dir);
+
+        // And a distributed keystore through the dispatcher with NO factory is a LOUD error (it
+        // cannot reach the remote holders) -- it must never silently fall back to co-located.
+        let (anchor, dirs) = dist_dirs("flip-dispatch-nofactory");
+        let dsinks = sealed_sinks(&dirs);
+        provision_keyset_distributed(&anchor, &placement_for_sealed_sinks(), &as_dyn(&dsinks))
+            .expect("distributed provision");
+        assert!(
+            load_agent_quorum_signer(&anchor, None).is_err(),
+            "a distributed keystore with no transport factory must fail (never silently co-locate)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!("FLIP-COLOCATED-DEFAULT PASS: co-located path unchanged; dispatcher routes co-located w/o factory and refuses a distributed keystore w/o one");
+    }
+
+    /// Placement-manifest SHAPE guards: a wrong count, a non-canonical identifier order, a
+    /// duplicate label, and a duplicate address are each rejected on load (so a corrupt manifest
+    /// is a loud error, never a silently-misrouted sign path).
+    #[test]
+    fn placement_manifest_shape_is_validated() {
+        // Good manifest validates + round-trips through a save/load.
+        let good = placement_for_sealed_sinks();
+        good.validate_shape().expect("a well-formed manifest validates");
+
+        // Wrong count.
+        let short = PlacementManifest { holders: good.holders[..2].to_vec() };
+        assert!(short.validate_shape().is_err(), "fewer than SHARE_COUNT holders is rejected");
+
+        // Non-canonical identifier order (entry 0 not identifier 1).
+        let mut misordered = good.clone();
+        misordered.holders[0].identifier = 3;
+        assert!(misordered.validate_shape().is_err(), "non-canonical identifier order is rejected");
+
+        // Duplicate label.
+        let mut dup_label = good.clone();
+        dup_label.holders[1].label = dup_label.holders[0].label.clone();
+        assert!(dup_label.validate_shape().is_err(), "duplicate holder labels are rejected");
+
+        // Duplicate address.
+        let mut dup_addr = good.clone();
+        dup_addr.holders[1].address = dup_addr.holders[0].address.clone();
+        assert!(dup_addr.validate_shape().is_err(), "duplicate holder addresses are rejected");
+
+        // A save/load round-trip preserves the manifest.
+        let dir = temp_keystore("placement-roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        save_placement(&dir, &good).expect("save placement");
+        assert_eq!(load_placement(&dir).expect("load placement"), good, "placement round-trips");
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("PLACEMENT-SHAPE PASS: wrong-count/misordered/dup-label/dup-address rejected; good manifest round-trips");
+    }
+
+    /// Provision-side ALIGNMENT guard: a placement whose labels do not match the sink labels (the
+    /// share would be shipped to one store while the sign path dials another) is rejected before
+    /// any keygen.
+    #[test]
+    fn distributed_provision_rejects_placement_sink_misalignment() {
+        let (anchor, dirs) = dist_dirs("flip-misalign");
+        let sinks = sealed_sinks(&dirs); // labels holder-1/2/3
+        // A placement whose labels are holderA/B/C -- valid SHAPE, but misaligned with the sinks.
+        let misaligned = PlacementManifest {
+            holders: (1..=SHARE_COUNT)
+                .map(|id| HolderPlacement {
+                    identifier: id,
+                    label: format!("holder-{}", (b'A' + (id as u8 - 1)) as char),
+                    address: format!("inproc://holder-{id}"),
+                })
+                .collect(),
+        };
+        let err = provision_keyset_distributed(&anchor, &misaligned, &as_dyn(&sinks))
+            .map(|_| ())
+            .expect_err("a placement/sink label misalignment must be rejected");
+        assert!(
+            format!("{err:#}").contains("misalignment"),
+            "the error must name the placement/sink misalignment: {err:#}"
+        );
+        // Nothing was provisioned (no anchor minted on the rejection path).
+        assert!(!pubkeys_path(&anchor).is_file(), "a rejected misaligned provision mints no anchor");
+
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!("FLIP-MISALIGN PASS: a placement/sink label misalignment is rejected before keygen (no anchor minted)");
     }
 
     /// A naive subslice search (no extra deps), for the sealed-at-rest assertion.

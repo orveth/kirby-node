@@ -127,6 +127,41 @@ pub trait HolderTransport {
     fn recv(&self) -> anyhow::Result<CoSignEvent>;
 }
 
+/// Box-erasure so a [`RemoteHolder`] can hold a TRANSPORT chosen at run time (a
+/// [`HolderTransportFactory`] returns one `Box<dyn HolderTransport>` per holder address). The
+/// `RemoteHolder<T>` bound is `T: HolderTransport + Send + Sync`, so the boxed form must be
+/// `Box<dyn HolderTransport + Send + Sync>` and must itself implement the trait — this blanket
+/// impl just forwards to the inner transport.
+impl HolderTransport for Box<dyn HolderTransport + Send + Sync> {
+    fn send(&self, event: CoSignEvent) -> anyhow::Result<()> {
+        (**self).send(event)
+    }
+    fn recv(&self) -> anyhow::Result<CoSignEvent> {
+        (**self).recv()
+    }
+}
+
+/// Build a [`HolderTransport`] to the holder reachable at a placement ADDRESS — the seam the
+/// distributed SIGN path uses to turn a per-agent placement manifest into live
+/// [`RemoteHolder`]s WITHOUT changing the [`crate::quorum_signer::QuorumSigner`] ceremony body.
+///
+/// `address` is OPAQUE to the signer (it is interpreted only by the factory): a relay-native
+/// factory maps it to a relay route to the holder's `RemoteHolderServer`; the in-process test
+/// factory keys a registry of stood-up servers on it. The factory returns a boxed transport so a
+/// heterogeneous holder roster (different
+/// addresses, possibly different transports) can be assembled into one quorum signer.
+///
+/// This is the SIGN-side counterpart of the provision-side `ShareSink` seam: provisioning ships
+/// share `i` to a sink at a holder address; signing dials that SAME holder address through this
+/// factory. The placement manifest (`placement.json`) is the durable map of identifier -> address
+/// that both sides share.
+pub trait HolderTransportFactory {
+    /// Connect to the holder reachable at `address`, returning a transport carrying opaque
+    /// [`CoSignEvent`]s. An unreachable/unknown address is an `Err` (the loader fails closed,
+    /// never silently builds an under-strength quorum).
+    fn connect(&self, address: &str) -> anyhow::Result<Box<dyn HolderTransport + Send + Sync>>;
+}
+
 /// The coordinator-side PROXY for a holder whose share lives on another machine.
 ///
 /// It implements [`Holder`] by exchanging opaque [`CoSignEvent`]s with a
@@ -512,6 +547,42 @@ impl HolderTransport for InProcessHolderLink {
             .map_err(|_| anyhow::anyhow!("inbox poisoned"))?
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("no reply queued from the remote holder"))
+    }
+}
+
+/// An IN-PROCESS [`HolderTransportFactory`] for the FAST UNGATED distributed-sign teeth: a
+/// registry of stood-up [`RemoteHolderServer`]s keyed by their placement ADDRESS. `connect`
+/// hands back an [`InProcessHolderLink`] to the matching server, so the distributed loader's
+/// `factory.connect(address)` reaches the right "holder host" without a real relay. It models
+/// the production reality faithfully: each server was built by unsealing ITS OWN share from
+/// ITS OWN sink dir ("its machine"), the coordinator holds only the proxy, and the share never
+/// crosses back. A relay-native factory drops in here unchanged behind the same
+/// `HolderTransportFactory` trait.
+#[cfg(test)]
+pub(crate) struct InProcessHolderFleet {
+    servers: HashMap<String, Arc<RemoteHolderServer>>,
+}
+
+#[cfg(test)]
+impl InProcessHolderFleet {
+    pub(crate) fn new() -> Self {
+        Self { servers: HashMap::new() }
+    }
+
+    /// Register the holder reachable at `address` (the placement manifest's per-holder address).
+    pub(crate) fn register(&mut self, address: impl Into<String>, server: Arc<RemoteHolderServer>) {
+        self.servers.insert(address.into(), server);
+    }
+}
+
+#[cfg(test)]
+impl HolderTransportFactory for InProcessHolderFleet {
+    fn connect(&self, address: &str) -> anyhow::Result<Box<dyn HolderTransport + Send + Sync>> {
+        let server = self
+            .servers
+            .get(address)
+            .ok_or_else(|| anyhow::anyhow!("no in-process holder registered at address {address:?}"))?;
+        Ok(Box::new(InProcessHolderLink::new(Arc::clone(server))))
     }
 }
 
