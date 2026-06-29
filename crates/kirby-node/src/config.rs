@@ -998,6 +998,25 @@ impl KirbyConfig {
                 self.fleet.max_tenants
             );
         }
+        // FAILOVER WINDOW SANITY (G-4): a takeover fires only on a lease that is BOTH stale past
+        // `takeover_grace_secs + LEASE_TTL_SECS` AND younger than `failover_max_lease_age_secs` (the
+        // ancient-ghost upper bound). If the upper bound is at or below the lower bound, the
+        // actionable window is EMPTY and AUTOMATIC FAILOVER SILENTLY NEVER FIRES — a dead peer's
+        // agent is never recovered, with no error to tell the operator. Reject such a config at load
+        // so a money-critical safety feature cannot be turned off by a typo'd dial. (The control
+        // plane always runs, so this is always validated.)
+        let failover_window_floor =
+            self.fleet.spawn.takeover_grace_secs + crate::relay_lease::LEASE_TTL_SECS;
+        if self.fleet.spawn.failover_max_lease_age_secs <= failover_window_floor {
+            anyhow::bail!(
+                "fleet.spawn.failover_max_lease_age_secs ({}) must be GREATER than takeover_grace_secs ({}) + the lease TTL ({}) = {}; \
+                 otherwise the takeover window is empty and automatic failover silently never fires (raise failover_max_lease_age_secs)",
+                self.fleet.spawn.failover_max_lease_age_secs,
+                self.fleet.spawn.takeover_grace_secs,
+                crate::relay_lease::LEASE_TTL_SECS,
+                failover_window_floor,
+            );
+        }
         if self.funding.initial_sats == 0 {
             anyhow::bail!("funding.initial_sats must be > 0 (the agent needs a budget to live)");
         }
@@ -2007,5 +2026,52 @@ mod tests {
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
+    }
+
+    /// FIX 3 (G-4): `validate()` REJECTS a failover config whose `failover_max_lease_age_secs` is at
+    /// or below `takeover_grace_secs + LEASE_TTL_SECS` — an EMPTY takeover window in which automatic
+    /// failover would silently never fire — and ACCEPTS the config one second above that boundary.
+    /// This guards a money-critical safety feature from being turned off by a typo'd dial.
+    #[test]
+    fn failover_window_must_be_non_empty_else_rejected() {
+        use crate::relay_lease::LEASE_TTL_SECS;
+        // A fixed grace; the window floor is grace + the lease TTL.
+        let grace = 30u64;
+        let floor = grace + LEASE_TTL_SECS;
+        let cfg_toml = |max_age: u64| {
+            format!(
+                r#"
+                genome_image = {{ path = "/tmp/k/img" }}
+                [identity]
+                key_path = "/tmp/k/node.key"
+                [relay]
+                url = "ws://127.0.0.1:7777"
+                [fleet.spawn]
+                takeover_grace_secs = {grace}
+                failover_max_lease_age_secs = {max_age}
+            "#
+            )
+        };
+
+        // AT the floor: the window is empty (a lease can never be both old enough to fire and young
+        // enough to not be a ghost) -> REJECT with a message that names the dial to raise.
+        let err = KirbyConfig::from_toml_str(&cfg_toml(floor)).unwrap_err();
+        assert!(
+            err.to_string().contains("failover_max_lease_age_secs")
+                && err.to_string().contains("silently never fires"),
+            "an empty takeover window must be rejected with a clear message, got: {err}"
+        );
+
+        // BELOW the floor: also rejected (the window is negative).
+        assert!(
+            KirbyConfig::from_toml_str(&cfg_toml(floor - 1)).is_err(),
+            "a below-floor max-lease-age must be rejected (empty window)"
+        );
+
+        // ONE SECOND ABOVE the floor: a (minimal) non-empty window -> ACCEPT.
+        let cfg = KirbyConfig::from_toml_str(&cfg_toml(floor + 1))
+            .expect("a failover window of exactly one second must validate (the accept boundary)");
+        assert_eq!(cfg.fleet.spawn.failover_max_lease_age_secs, floor + 1);
+        assert_eq!(cfg.fleet.spawn.takeover_grace_secs, grace);
     }
 }
