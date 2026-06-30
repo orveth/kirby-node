@@ -5,7 +5,10 @@
 //!
 //! 1. Load + validate the config; resolve the backend by platform (unless pinned).
 //! 2. Load-or-mint the node identity ([`crate::nerve::NodeIdentity::load_or_create`]).
-//! 3. Join the fleet: start presence + heartbeat ([`crate::nerve::run_presence`]).
+//! 3. Resolve the ONE signer (the FROST quorum key Q for a tenant, else the node key) that
+//!    signs all the agent's public Nostr output. The agent does NOT beacon node presence —
+//!    the persistent node daemon owns the stable node identity + its presence beacon; the
+//!    agent surfaces via its 9100 lifecycle + 31000 agent-state instead.
 //! 4. bootstrap: fund to born + emit a 9100 `born` ([`crate::nerve::publish_lifecycle`]).
 //!    resume: restore the agent from the latest checkpoint (the app-checkpoint
 //!    restore path), skipping born.
@@ -13,7 +16,7 @@
 //!    path; backend chosen by platform).
 //! 6. Run the v0 app-checkpoint workload. It submits a portable logical checkpoint
 //!    for resume, then stays alive while the host-authoritative meter charges VM
-//!    time. The daemon continues fleet presence on the host side.
+//!    time.
 //! 7. Meter; on budget exhaustion HALT (the existing budget-death path) and emit a
 //!    9100 `died` with reason `broke`. Clean shutdown emits an honest stop reason.
 //!
@@ -33,7 +36,7 @@ use std::time::Duration;
 
 use crate::checkpoint::{CheckpointArtifact, CheckpointStore, LocalDirCheckpointStore};
 use crate::config::{GenomeImage, KirbyConfig, ResolvedBackend, RunMode};
-use crate::nerve::{self, NodeIdentity, PresenceConfig};
+use crate::nerve::{self, NodeIdentity};
 
 /// The default metering tick for the v0 workload's die-when-broke path.
 const DEFAULT_METER_TICK: Duration = Duration::from_millis(100);
@@ -273,43 +276,6 @@ fn beacon_signer(
             Ok(crate::nerve::BeaconSigner::Frost(std::sync::Arc::new(quorum)))
         }
         None => Ok(crate::nerve::BeaconSigner::NodeKey(identity.clone())),
-    }
-}
-
-/// Build the [`PresenceConfig`] for this node from the config.
-fn presence_config(config: &KirbyConfig) -> PresenceConfig {
-    PresenceConfig {
-        relay_url: config.relay.url.clone(),
-        node_id: config.node_id.clone(),
-        endpoint: None,
-        interval: Duration::from_secs(config.relay.presence_interval_secs),
-        stale_after: Duration::from_secs(config.relay.presence_stale_after_secs),
-    }
-}
-
-/// A started presence task plus the shutdown sender held for its lifetime.
-struct PresenceTask {
-    shutdown: tokio::sync::oneshot::Sender<()>,
-    handle: tokio::task::JoinHandle<anyhow::Result<()>>,
-}
-
-/// Start the presence + heartbeat task (the fleet-join step), returning the handle
-/// so the run stops it cleanly at the end. Beacons sign under `signer` (the node key,
-/// or the FROST quorum key Q for a FROST tenant).
-fn start_presence(signer: crate::nerve::BeaconSigner, config: &KirbyConfig) -> PresenceTask {
-    let cfg = presence_config(config);
-    let (shutdown, rx) = tokio::sync::oneshot::channel();
-    let handle = tokio::spawn(nerve::run_presence(signer, cfg, rx));
-    PresenceTask { shutdown, handle }
-}
-
-/// Stop the presence task cleanly.
-async fn stop_presence(task: PresenceTask) {
-    let _ = task.shutdown.send(());
-    match task.handle.await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!(error = %e, "presence task ended with error"),
-        Err(e) => tracing::error!(error = %e, "presence task panicked"),
     }
 }
 
@@ -588,16 +554,14 @@ pub async fn run(mut run: RunAgentConfig) -> anyhow::Result<RunAgentOutcome> {
     let npub = signer.npub();
     tracing::info!(npub = %npub, frost = matches!(signer, crate::nerve::BeaconSigner::Frost(_)), "agent identity ready (beacons + voice sign under this key)");
 
-    // 3. Join the fleet: presence + heartbeat to the relay (signed by `signer`).
-    let presence = start_presence(signer.clone(), &run.config);
-
-    // 4-7. Drive the mode-specific path. Always stop presence at the end.
-    let result = match mode {
+    // 3-7. Drive the mode-specific path. The agent does NOT beacon node presence — that is the
+    // persistent node daemon's job (it owns the stable node identity + its 10100 beacon). The
+    // agent's liveness surfaces via its 31000 agent-state (the live "Kirby face") + its 9100
+    // lifecycle, both signed under `signer` (the agent's FROST quorum key Q for a tenant).
+    match mode {
         RunMode::Bootstrap => run_bootstrap(&run, &signer, backend, npub.clone()).await,
         RunMode::Resume => run_resume(&run, &signer, backend, npub.clone()).await,
-    };
-    stop_presence(presence).await;
-    result
+    }
 }
 
 /// Bootstrap: fund to born (emit 9100 born), boot the agent, run the v0 metered

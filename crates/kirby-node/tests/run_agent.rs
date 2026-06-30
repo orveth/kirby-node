@@ -15,16 +15,15 @@
 //! The relay defaults to `ws://127.0.0.1:7777` when `KIRBY_TEST_RELAY` is unset so a
 //! local relay needs no extra config; lifecycle publishing is best-effort and never
 //! aborts an otherwise-live agent, so a transient relay miss does not fail the boot
-//! gates (G-run-1's relay assertion is the keeper's relay-query step, documented).
+//! gates. Relay-side verification (the agent's 9100 born + 31000 state landing, and the
+//! node's own 10100 presence from the `kirby fleet` daemon) is the keeper's live step.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use kirby_node::config::{
     Backend, FundingConfig, GenomeImage, IdentityConfig, KirbyConfig, RelayConfig, RunMode,
     Workload,
 };
-use kirby_node::nerve;
 use kirby_node::run_agent::{self, EndReason, RunAgentConfig};
 
 /// The image dir, or `None` (skip) when `KIRBY_GENOME_IMAGE` is unset.
@@ -88,19 +87,17 @@ fn bootstrap_config(test: &str, image_dir: PathBuf, funding_sats: u64) -> KirbyC
 }
 
 /// G-run-1: a fresh config mints the identity, boots the agent on the resolved
-/// backend, joins the fleet (presence + heartbeat), and emits a 9100 born. The
-/// one-command sovereign-node BIRTH. (The keeper verifies the relay-side 9100 born
-/// + 10100 presence by querying the relay with `kirby-node presence`; this test
-/// proves the run sequence reaches Running and emits born from the run side.)
+/// backend, and emits a 9100 born — the one-command sovereign-agent BIRTH. The agent
+/// surfaces on the relay via its 9100 lifecycle + 31000 agent-state, NOT a 10100
+/// presence beacon (node presence is the persistent `kirby fleet` daemon's job, not the
+/// agent's). This test proves the run sequence reaches Running and emits born from the
+/// run side.
 #[tokio::test]
 async fn g_run_1_fresh_config_boots_and_is_born() {
     let Some(image_dir) = image_dir_or_skip("g_run_1") else {
         return;
     };
     let config = bootstrap_config("grun1", image_dir, 3_000);
-    let relay_url = config.relay.url.clone();
-    let node_id = config.node_id.clone();
-    let stale_after = config.relay.presence_stale_after_secs;
     let run = RunAgentConfig::from_config(config).expect("build run config");
     let backend = run.backend();
 
@@ -123,19 +120,6 @@ async fn g_run_1_fresh_config_boots_and_is_born() {
         !outcome.npub.is_empty() && outcome.npub.starts_with("npub1"),
         "the node minted/loaded a Nostr identity (npub), got {:?}",
         outcome.npub
-    );
-    let records = nerve::read_fleet_once(
-        &relay_url,
-        Duration::from_secs(stale_after),
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("query relay presence after bootstrap");
-    assert!(
-        records
-            .iter()
-            .any(|record| record.npub == outcome.npub && record.node_id == node_id && record.alive),
-        "the node's 10100 presence must land on the relay; records={records:?}"
     );
     assert!(
         outcome.bootstrap_birth_passed(),

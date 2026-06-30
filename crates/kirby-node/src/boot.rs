@@ -385,7 +385,7 @@ pub fn state_root() -> PathBuf {
 /// The per-node treasury store path (the daemon-owned counter, D-9). A per-node store
 /// under the DURABLE [`state_root`] keeps two node processes distinct on one host AND
 /// survives a reboot (FIX 2: NEVER temp_dir for the treasury counter).
-pub(crate) fn treasury_path_for(node_id: &str) -> PathBuf {
+pub fn treasury_path_for(node_id: &str) -> PathBuf {
     state_root().join(format!("treasury-{node_id}"))
 }
 
