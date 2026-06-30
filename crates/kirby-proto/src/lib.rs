@@ -254,6 +254,42 @@ pub const KIND_KIRBY_LEASE: u16 = 31002;
 /// contract crate so every node and the UI agree on one value with no central registry.
 pub const KIND_KIRBY_SPAWN_REQUEST: u16 = 31003;
 
+/// The Nostr event kind for a cross-machine FROST CO-SIGN frame — one opaque
+/// [`kirby_custody::seam::CoSignEvent`] (a round-1 commit-request/commitment, a round-2
+/// package/share, or a refusal) wrapped in a Nostr event so a coordinator can reach a
+/// share-holder's `RemoteHolderServer` on ANOTHER machine over the shared fleet relay.
+///
+/// EPHEMERAL (20000..30000, per NIP-01): a relay does NOT persist an ephemeral event and
+/// delivers it only to CURRENTLY-CONNECTED matching subscribers. That is exactly right for
+/// these transient request/reply frames — both the holder server (always subscribed while
+/// alive) and the coordinator (subscribed for the duration of the ceremony) are connected,
+/// and NOT persisting the frames shrinks the replay surface (the holder still enforces a
+/// freshness window + per-session dedup; see `relay_transport`). A frame missed because a
+/// subscriber was momentarily disconnected is recovered by the any-available-2-of-3 fallback
+/// (the ceremony errs on that holder and tries another reachable subset).
+///
+/// The frame is signed by the SENDER node's transport key (sender-auth + integrity via
+/// `event.verify()`) and `#p`-addressed to the recipient node's transport key (the relay's
+/// routing primitive). The opaque CoSignEvent rides in the content as public material only
+/// (commitments + partial signature shares + the SigningPackage); NO secret share or nonce
+/// ever crosses (the TEE-substitute invariant, asserted in `remote_holder`). A `u16` so the
+/// musl genome pays no weight; only the daemon (host-side) maps it to a `nostr` `Kind`.
+pub const KIND_KIRBY_COSIGN: u16 = 22000;
+
+/// The Nostr event kind for a cross-machine FROST SHARE-SHIP frame — distributed
+/// provisioning ships holder share `i` (a secret `KeyPackage`) to its holder's machine, or
+/// queries/attests a holder's possession of a loadable share. UNLIKE the co-sign frame, this
+/// carries SECRET material, so the share `KeyPackage` rides as NIP-44 ciphertext encrypted TO
+/// the holder's transport pubkey (only that holder can decrypt; the holder then seals it at
+/// rest via `share_seal`). The event is signed by the DEALER's transport key (sender-auth) so
+/// the holder accepts a share only from an authorized dealer; a typed control byte in the
+/// (plaintext) tag stream distinguishes ship / ship-ack / has-share-query / has-share-reply.
+///
+/// EPHEMERAL (20000..30000): provisioning is an ACTIVE orchestration (the holder is online
+/// when a share is shipped); a holder that is offline makes `put_share` time out → a loud
+/// provisioning failure → retry, never a silent loss. A `u16` for the same reason as above.
+pub const KIND_KIRBY_SHARE: u16 = 22001;
+
 pub mod gateway {
     //! Generated tonic types for `kirby.gateway.v1`.
     tonic::include_proto!("kirby.gateway.v1");
