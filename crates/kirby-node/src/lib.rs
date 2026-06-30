@@ -200,6 +200,11 @@ pub mod quorum_signer;
 // with an in-process mock transport for fast ungated teeth; the real relay transport is a
 // later chunk boundary.
 pub mod remote_holder;
+// S5/S6 keystone: the RELAY-NATIVE HolderTransport + holder-side server loop. The real
+// transport `remote_holder`'s InProcessHolderLink stood in for -- it carries the SAME opaque
+// CoSignEvents over the shared Nostr fleet relay so a coordinator reaches a share-holder on
+// ANOTHER machine. Host-side host network (like `nerve`); NOT cfg-gated.
+pub mod relay_transport;
 // S3d per-agent FROST keyset provisioning at spawn. Connects `frost_identity` (the
 // PUBLIC Q) + `quorum_signer` (the SECRET 2-of-3 signer) into the spawn path: a fleet
 // tenant is born with its OWN durable FROST group key Q (trusted-dealer keygen by the
