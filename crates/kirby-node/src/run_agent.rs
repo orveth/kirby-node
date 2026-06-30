@@ -253,7 +253,7 @@ impl RunAgentConfig {
 fn load_identity(config: &KirbyConfig) -> anyhow::Result<NodeIdentity> {
     let treasury_dir = config.identity.treasury_dir();
     std::fs::create_dir_all(&treasury_dir).ok();
-    let key_path = NodeIdentity::resolve_key_path(Some(&config.identity.key_path), &treasury_dir);
+    let key_path = NodeIdentity::resolve_key_path(config.identity.key_path.as_deref(), &treasury_dir);
     NodeIdentity::load_or_create(&key_path)
 }
 
@@ -383,7 +383,7 @@ fn pin_diarist_memory_key(
     let mut pinned = memory.clone();
     if pinned.key_path.is_none() {
         pinned.key_path = Some(NodeIdentity::resolve_key_path(
-            Some(&identity.key_path),
+            identity.key_path.as_deref(),
             &identity.treasury_dir(),
         ));
     }
@@ -449,7 +449,7 @@ fn agent_boot_config(
         Workload::Capable => Some(crate::config::SocialConfig {
             relays: vec![cfg.relay.url.clone()],
             key_path: Some(NodeIdentity::resolve_key_path(
-                Some(&cfg.identity.key_path),
+                cfg.identity.key_path.as_deref(),
                 &cfg.identity.treasury_dir(),
             )),
             cost_sats: crate::config::DEFAULT_POST_COST_SATS,
@@ -872,7 +872,7 @@ mod tests {
         let root = test_root();
         KirbyConfig {
             identity: IdentityConfig {
-                key_path: root.join("node.key"),
+                key_path: Some(root.join("node.key")),
                 treasury_dir: Some(root.clone()),
                 frost_keystore_dir: None,
             },
@@ -907,7 +907,7 @@ mod tests {
     #[test]
     fn diarist_memory_key_pins_to_identity_when_unset() {
         let identity = crate::config::IdentityConfig {
-            key_path: PathBuf::from("/var/lib/kirby/node.nostr.key"),
+            key_path: Some(PathBuf::from("/var/lib/kirby/node.nostr.key")),
             treasury_dir: None,
             frost_keystore_dir: None,
         };
@@ -917,7 +917,7 @@ mod tests {
         assert!(mem.key_path.is_none(), "the default memory key is unset");
         let pinned = pin_diarist_memory_key(&mem, &identity);
         let expected =
-            NodeIdentity::resolve_key_path(Some(&identity.key_path), &identity.treasury_dir());
+            NodeIdentity::resolve_key_path(identity.key_path.as_deref(), &identity.treasury_dir());
         assert_eq!(
             pinned.key_path,
             Some(expected),

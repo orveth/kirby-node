@@ -55,7 +55,7 @@ fn bootstrap_config(test: &str, image_dir: PathBuf, funding_sats: u64) -> KirbyC
     let state = test_state_dir(test);
     KirbyConfig {
         identity: IdentityConfig {
-            key_path: state.join("node.nostr.key"),
+            key_path: Some(state.join("node.nostr.key")),
             treasury_dir: Some(state.clone()),
             frost_keystore_dir: None,
         },

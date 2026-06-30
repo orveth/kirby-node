@@ -350,9 +350,17 @@ pub struct IdentityConfig {
     /// Path to this node's BIP340 Nostr secret key. Minted (0600) on first run,
     /// loaded thereafter, so the node keeps the SAME npub across restarts. May be a
     /// file path or a directory (the key lands at `<dir>/node.nostr.key`).
-    pub key_path: PathBuf,
+    ///
+    /// Optional (#81): when omitted, the key lands at `<treasury_dir>/node.nostr.key`
+    /// (which itself defaults under the durable state root), so a first
+    /// `kirby agent --config kirby.toml` just works WITHOUT the operator hand-authoring a
+    /// path — the SAME durable default the `kirby run` daemon already uses. Set it to pin
+    /// an explicit location.
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
     /// The persisted treasury directory (the daemon-owned, unforgeable balance,
-    /// D-9). Defaults to the parent dir of `key_path` when omitted.
+    /// D-9). Defaults to the parent of an explicit `key_path`, else the durable state
+    /// root, when omitted (see [`Self::treasury_dir`]).
     #[serde(default)]
     pub treasury_dir: Option<PathBuf>,
     /// FIX 3 (FROST-tenant wiring): the per-agent FROST keystore dir the fleet supervisor
@@ -367,13 +375,17 @@ pub struct IdentityConfig {
 }
 
 impl IdentityConfig {
-    /// The treasury directory, defaulting to the key path's parent when unset.
+    /// The treasury directory. Defaults to the parent of an explicit `key_path` when set
+    /// (the historical behavior, byte-identical), else to the durable state root (#81) —
+    /// the same root the `kirby run` daemon uses, so an unset-`key_path` `kirby agent`
+    /// lands its treasury durably instead of beside a missing path.
     pub fn treasury_dir(&self) -> PathBuf {
-        self.treasury_dir.clone().unwrap_or_else(|| {
-            self.key_path
+        self.treasury_dir.clone().unwrap_or_else(|| match &self.key_path {
+            Some(key_path) => key_path
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."))
+                .unwrap_or_else(|| PathBuf::from(".")),
+            None => crate::boot::state_root(),
         })
     }
 }
@@ -1312,9 +1324,10 @@ mod tests {
         let cfg = KirbyConfig::from_toml_str(minimal_toml()).unwrap();
         assert_eq!(
             cfg.identity.key_path,
-            PathBuf::from("/tmp/kirby/node.nostr.key")
+            Some(PathBuf::from("/tmp/kirby/node.nostr.key"))
         );
-        // treasury_dir defaults to the key path's parent.
+        // With an explicit key_path, treasury_dir still defaults to its parent (#81 keeps the
+        // historical fallback byte-identical for a set key_path).
         assert_eq!(cfg.identity.treasury_dir(), PathBuf::from("/tmp/kirby"));
         assert_eq!(cfg.relay.url, "ws://127.0.0.1:7777");
         assert_eq!(cfg.relay.presence_interval_secs, 15);
@@ -1328,6 +1341,36 @@ mod tests {
         assert_eq!(
             cfg.genome_image,
             GenomeImage::Path(PathBuf::from("/tmp/kirby/genome-image"))
+        );
+    }
+
+    /// #81: a config that OMITS `[identity].key_path` parses (the field is optional), so a
+    /// teammate's first `kirby agent --config kirby.toml` doesn't error just because they
+    /// didn't hand-author a key path. With neither `key_path` nor `treasury_dir` set, the
+    /// treasury (and thus the node key at `<treasury_dir>/node.nostr.key`) defaults under the
+    /// DURABLE state root — the same root the `kirby run` daemon uses, never `temp_dir` — so a
+    /// first run mints a key that survives a reboot.
+    ///
+    /// RED-on-revert: make `key_path` a required field again and the parse fails with
+    /// serde's "missing field `key_path`" — the exact first-run footgun #81 removes.
+    #[test]
+    fn config_without_key_path_parses_and_defaults_to_durable_state_root() {
+        let toml = r#"
+            genome_image = { path = "/tmp/kirby/genome-image" }
+
+            [identity]
+
+            [relay]
+            url = "ws://127.0.0.1:7777"
+        "#;
+        let cfg =
+            KirbyConfig::from_toml_str(toml).expect("a config without key_path must parse (#81)");
+        assert!(cfg.identity.key_path.is_none(), "an omitted key_path deserializes to None");
+        // Both unset => the durable state root, NOT a relative "." or a missing-path parent.
+        assert_eq!(
+            cfg.identity.treasury_dir(),
+            crate::boot::state_root(),
+            "an unset key_path + unset treasury_dir defaults to the durable state root"
         );
     }
 

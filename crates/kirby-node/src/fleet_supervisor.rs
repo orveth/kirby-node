@@ -947,7 +947,7 @@ impl ProcessTenantLauncher {
         // the first tenant fail with EEXIST and exit. A per-instance dir resolves to its own
         // `<dir>/node.nostr.key`, so each tenant gets a distinct npub (and, via the §F3 one-key
         // invariant, its own memory key too).
-        cfg.identity.key_path = self.config_dir.join(format!("keys-{}", spec.allocation.instance_id));
+        cfg.identity.key_path = Some(self.config_dir.join(format!("keys-{}", spec.allocation.instance_id)));
         // FIX 3 (FROST-tenant wiring) — RIGHT ALONGSIDE PR #36's per-tenant `key_path` above:
         // both are per-tenant isolations keyed by instance_id and they COEXIST. The node key_path
         // (above) roots presence/memory; the FROST keystore (here) roots the OUTWARD VOICE. Set
@@ -1946,11 +1946,11 @@ mod tests {
         );
         assert_ne!(
             crate::nerve::NodeIdentity::resolve_key_path(
-                Some(&cfg_a.identity.key_path),
+                cfg_a.identity.key_path.as_deref(),
                 &cfg_a.identity.treasury_dir(),
             ),
             crate::nerve::NodeIdentity::resolve_key_path(
-                Some(&cfg_b.identity.key_path),
+                cfg_b.identity.key_path.as_deref(),
                 &cfg_b.identity.treasury_dir(),
             ),
             "two tenants must resolve to distinct node.nostr.key files"
