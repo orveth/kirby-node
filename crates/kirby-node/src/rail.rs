@@ -1678,6 +1678,60 @@ struct RefundResponse {
     token: String,
 }
 
+/// The prepaid-API-key chat response ([`RoutstrKeyBrain`]): the OpenAI-compat `choices`
+/// PLUS the Routstr cost metadata the node injects into the BODY on the bearer-key path
+/// (there is NO cost HTTP header on that path — cost lives in the body). Every cost field
+/// is optional/defaulted so a node that omits one still deserializes; the cost is then
+/// resolved by [`KeyChatResponse::charged_sats`] (exact `total_msats` first, else the
+/// already-sats `cost_sats`, else — at the call site — the full cap, the safe rule).
+#[derive(serde::Deserialize)]
+struct KeyChatResponse {
+    choices: Vec<ResponseChoice>,
+    #[serde(default)]
+    cost: Option<KeyCost>,
+    #[serde(default)]
+    usage: Option<KeyUsage>,
+}
+
+/// The top-level `cost` object Routstr injects on the bearer-key path. `total_msats` is
+/// the EXACT charge in MILLISATOSHIS (the authoritative figure; `1 sat = 1000 msats`).
+#[derive(serde::Deserialize)]
+struct KeyCost {
+    #[serde(default)]
+    total_msats: Option<u64>,
+}
+
+/// The OpenAI `usage` block, extended by Routstr with `cost_sats` (the charge already in
+/// SATOSHIS, integer-truncated from msats by the node) — the fallback used when the exact
+/// `cost.total_msats` is absent.
+#[derive(serde::Deserialize)]
+struct KeyUsage {
+    #[serde(default)]
+    cost_sats: Option<u64>,
+}
+
+/// The `/v1/balance/info` response (only the field we use). `balance` is the prepaid
+/// key's SPENDABLE balance in MILLISATOSHIS (net of any reserved amount), the node's
+/// authoritative figure. `1 sat = 1000 msats`.
+#[derive(serde::Deserialize)]
+struct BalanceInfo {
+    balance: u64,
+}
+
+impl KeyChatResponse {
+    /// The sats charged for this think, read from the response body: prefer the exact
+    /// `cost.total_msats` (msats -> sats, rounded UP so a sub-sat charge still costs >= 1
+    /// and we never under-debit), else the already-sats `usage.cost_sats`. Returns `None`
+    /// only if the node returned NEITHER cost field (the caller then debits the cap — the
+    /// safe never-under-debit rule, since a served completion was charged something).
+    fn charged_sats(&self) -> Option<u64> {
+        if let Some(msats) = self.cost.as_ref().and_then(|c| c.total_msats) {
+            return Some(msats.div_ceil(1000));
+        }
+        self.usage.as_ref().and_then(|u| u.cost_sats)
+    }
+}
+
 /// The result of the bounded MAIN path (after a successful mint).
 enum MainOutcome {
     /// A usable reply came back; `change_received` is the sats redeemed from the change
@@ -1841,12 +1895,17 @@ impl<E: EcashProvider> RoutstrBrain<E> {
         tokio::time::timeout(self.recovery_timeout, cleanup).await.unwrap_or(0)
     }
 
-    /// The RIP-01 refund: POST the original token to `{node}/v1/wallet/refund` and read
+    /// The RIP-01 refund: POST the original token to `{node}/v1/balance/refund` and read
     /// the returned refund token (from the `X-Cashu` header or a JSON body). Best-effort
     /// (a failure just means we eat the remainder); the token is bearer money, never
     /// logged. Exercised live at Layer C; in CI via the mock node + StubEcash.
+    ///
+    /// The canonical endpoint is `/v1/balance/refund`; the node serves a deprecated
+    /// `/v1/wallet/refund` alias for the SAME handler (it accepts an `x-cashu` header and
+    /// returns the refund token in the `X-Cashu` response header or a `{ "token": … }`
+    /// body), but the `/v1/wallet/*` aliases may be dropped — point at the stable path.
     async fn request_refund(&self, original_token: &str) -> anyhow::Result<String> {
-        let url = format!("{}/v1/wallet/refund", self.node_url.trim_end_matches('/'));
+        let url = format!("{}/v1/balance/refund", self.node_url.trim_end_matches('/'));
         let resp = self
             .http
             .post(&url)
@@ -1939,6 +1998,148 @@ impl<E: EcashProvider> BrainBackend for RoutstrBrain<E> {
                 "routstr failed before the mint stash (no sats spent)"
             )),
         }
+    }
+}
+
+/// The prepaid API-KEY brain (config `backend = "routstr_key"`): real Routstr inference
+/// paid from a CUSTODIAL, node-held balance via a bearer key on the `Authorization`
+/// header. MINT-INDEPENDENT — it touches no Cashu mint, so it keeps thinking when the
+/// treasury wallet's mint is unreachable. It is the resilience fallback that coexists with
+/// the sovereign, self-custody per-request [`RoutstrBrain`] (the default); both impl the
+/// SAME [`BrainBackend`], so selecting one is a config change, not a genome/proto change.
+///
+/// Unlike [`RoutstrBrain`] there is no mint / X-Cashu token / prepare_send / revoke /
+/// refund saga: a think is a single authenticated POST. The money already left at funding
+/// time (the Lightning invoice that minted the key), so a failed POST charges nothing
+/// (there is no token to reclaim) and the cost of a SUCCESS is read straight from the
+/// response body (`cost.total_msats`, exact). The runway still drains and "die-when-broke"
+/// still holds: boot asserts the custodial balance backs the treasury counter, and the
+/// gateway debits the counter by this returned cost on every think (the SAME counter the
+/// Cashu path drains).
+pub struct RoutstrKeyBrain {
+    /// Built ONCE with redirects disabled (a redirect would leak the bearer key to another
+    /// host — the MED-3 concern, identical to the X-Cashu token) and the per-call timeout.
+    http: reqwest::Client,
+    /// The pinned Routstr base URL. The genome/gateway never see this host.
+    node_url: String,
+    /// The prepaid bearer key (`sk-…`). Bearer money — attached via `Authorization` and
+    /// NEVER logged; the struct is intentionally NOT `Debug` so it cannot leak through a
+    /// derived formatter (the same discipline as the wallet seed / dm key).
+    api_key: String,
+}
+
+impl RoutstrKeyBrain {
+    /// Build the brain over a pinned node URL and a prepaid bearer key. The HTTP client is
+    /// constructed once with redirects DISABLED (MED-3: a redirect would leak the bearer
+    /// key to another host) and the per-call request timeout (the kill-window for a think,
+    /// the same role `request_timeout` plays for [`RoutstrBrain`]).
+    pub fn new(
+        node_url: String,
+        api_key: String,
+        request_timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(request_timeout)
+            .build()
+            .map_err(|e| anyhow::anyhow!("build RoutstrKeyBrain HTTP client: {e}"))?;
+        Ok(RoutstrKeyBrain {
+            http,
+            node_url,
+            api_key,
+        })
+    }
+
+    /// Fetch the prepaid key's spendable balance from `{node}/v1/balance/info`, in SATS
+    /// (the node reports MILLISATOSHIS; floor-divide by 1000 — sub-sat dust is not
+    /// spendable for a sat-denominated think). Boot calls this to BOTH validate the key
+    /// works (a bad/empty/unfunded key returns non-2xx, surfaced as an error) AND read the
+    /// custodial balance for the wallet<->counter refuse-to-boot check. The key is bearer
+    /// money, attached via `Authorization` and never logged.
+    pub async fn fetch_balance_sats(&self) -> anyhow::Result<u64> {
+        let url = format!("{}/v1/balance/info", self.node_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("routstr_key balance-info request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!(
+                "routstr_key balance-info returned a non-success status: {status} (is the prepaid api key valid + funded?)"
+            );
+        }
+        let info: BalanceInfo = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("routstr_key balance-info body was malformed: {e}"))?;
+        // msats -> whole spendable sats (1 sat = 1000 msats). Floor: a fractional sat is
+        // not spendable for a sat-denominated think, so it must not inflate the backing check.
+        Ok(info.balance / 1000)
+    }
+}
+
+#[async_trait::async_trait]
+impl BrainBackend for RoutstrKeyBrain {
+    async fn complete(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        max_cost_sats: u64,
+    ) -> anyhow::Result<(Vec<u8>, u64)> {
+        let url = format!("{}/v1/chat/completions", self.node_url.trim_end_matches('/'));
+        let body = ChatCompletionRequest {
+            model,
+            messages: messages
+                .iter()
+                .map(|m| WireMessage {
+                    role: &m.role,
+                    content: &m.content,
+                })
+                .collect(),
+            stream: false,
+        };
+        // The bearer key is attached via `Authorization: Bearer …` and NEVER logged. NO
+        // X-Cashu header: the balance is custodial, charged server-side per request. A
+        // reqwest error renders the URL but not our headers, so the key cannot leak.
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("routstr_key POST failed before a usable response: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            // The custodial balance is debited server-side ONLY on a served completion, so
+            // a non-2xx is a clean no-debit failure (UpstreamFailed/0): no token was spent,
+            // nothing to reclaim. (A 401/403 here means the key is bad/empty — boot's
+            // balance-info probe is what catches that before the VM ever starts.)
+            anyhow::bail!("routstr_key node returned a non-success status: {status}");
+        }
+        let parsed: KeyChatResponse = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("routstr_key response body was malformed/unparseable: {e}"))?;
+        // The node returns the EXACT charge in the body (no cost header on this path).
+        // Resolve it (exact total_msats -> sats rounded up, else the already-sats
+        // cost_sats), falling back to the full cap when the node returned neither (the safe
+        // never-under-debit rule). Clamp to the cap (D-20: a think never debits past the
+        // gateway-checked per-call budget, exactly as the Cashu path's reconcile does).
+        // Computed by an immutable borrow FIRST, so `choices` can then be consumed for the
+        // reply (no clone).
+        let cost_sats = parsed.charged_sats().unwrap_or(max_cost_sats).min(max_cost_sats);
+        let reply = parsed
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content.into_bytes())
+            .ok_or_else(|| anyhow::anyhow!("routstr_key response had no choices/content"))?;
+        Ok((reply, cost_sats))
     }
 }
 

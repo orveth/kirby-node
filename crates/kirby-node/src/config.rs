@@ -525,8 +525,17 @@ pub enum BrainBackendKind {
     /// The deterministic stub backend (default; backcompat).
     #[default]
     Stub,
-    /// The real Cashu-paid Routstr inference backend.
+    /// The real Cashu-paid Routstr inference backend (per-request X-Cashu ecash; the
+    /// sovereign, self-custody default — the agent pays its own way per think).
     Routstr,
+    /// The prepaid Routstr API-KEY backend: a balance-bearing bearer key (funded by
+    /// paying a Lightning invoice to the node, `purpose: "create"`) on the
+    /// `Authorization` header. MINT-INDEPENDENT (no Cashu mint involved), so it serves
+    /// real thinks even when the treasury wallet's mint is unreachable — the resilience
+    /// fallback that coexists with `Routstr` (the sovereign default). The balance is a
+    /// CUSTODIAL one the node holds; the daemon holds only the bearer key. A `refund`
+    /// drains the residual back to ecash, so custody is recoverable, not one-way.
+    RoutstrKey,
 }
 
 /// The `[brain]` config block (brain-stub): the knobs for the MIND workload. The
@@ -575,6 +584,13 @@ pub struct BrainConfig {
     /// `backend = "routstr"`.
     #[serde(default)]
     pub wallet_db_path: String,
+    /// (routstr_key) PATH to the prepaid bearer API key (the file holds the raw
+    /// `sk-…` secret on a single line). The key is bearer money on the `Authorization`
+    /// header, so it is treated like the dm key / wallet seed: it lives in a FILE, NEVER
+    /// inline in the config (which is logged/serialized), and is loaded at boot. Required
+    /// iff `backend = "routstr_key"`; ignored by every other backend.
+    #[serde(default)]
+    pub api_key_path: String,
     /// (routstr) The MAIN-path kill-window seconds (mint -> POST -> parse -> redeem
     /// change). The meter cannot preempt an in-flight call, so this deadline IS the
     /// kill bound for thinking (§5).
@@ -625,6 +641,7 @@ impl Default for BrainConfig {
             node_url: String::new(),
             mint_url: String::new(),
             wallet_db_path: String::new(),
+            api_key_path: String::new(),
             request_timeout_secs: default_brain_request_timeout_secs(),
             recovery_timeout_secs: default_brain_recovery_timeout_secs(),
             fee_headroom_sats: default_brain_fee_headroom_sats(),
@@ -1063,6 +1080,28 @@ impl KirbyConfig {
                 if !is_https_or_localhost(&self.brain.node_url) {
                     anyhow::bail!(
                         "brain.node_url must be https:// for a non-localhost node (the X-Cashu bearer token must not cross plaintext http); got {:?}",
+                        self.brain.node_url
+                    );
+                }
+            }
+            // The prepaid API-KEY backend needs a node and a keyfile, but NO mint/wallet
+            // (the balance is custodial on the node, not local ecash). The bearer key is
+            // money on the `Authorization` header, so the same https-or-loopback rule
+            // applies: a non-local node MUST be https or the key would cross plaintext http.
+            else if self.brain.backend == BrainBackendKind::RoutstrKey {
+                if self.brain.node_url.trim().is_empty() {
+                    anyhow::bail!(
+                        "brain.node_url must be set when brain.backend = \"routstr_key\" (the pinned Routstr node)"
+                    );
+                }
+                if self.brain.api_key_path.trim().is_empty() {
+                    anyhow::bail!(
+                        "brain.api_key_path must be set when brain.backend = \"routstr_key\" (the file holding the prepaid bearer key)"
+                    );
+                }
+                if !is_https_or_localhost(&self.brain.node_url) {
+                    anyhow::bail!(
+                        "brain.node_url must be https:// for a non-localhost node (the prepaid bearer key must not cross plaintext http); got {:?}",
                         self.brain.node_url
                     );
                 }
@@ -1645,6 +1684,102 @@ mod tests {
         let cfg =
             KirbyConfig::from_toml_str(toml).expect("a loopback-http routstr brain must validate");
         assert_eq!(cfg.brain.node_url, "http://127.0.0.1:8181");
+    }
+
+    #[test]
+    fn brain_routstr_key_missing_node_url_is_rejected() {
+        let toml = r#"
+            workload = "capable"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr_key"
+            api_key_path = "/var/lib/kirby/brain-api.key"
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).expect_err("routstr_key without node_url must be rejected");
+        assert!(
+            err.to_string().contains("brain.node_url must be set"),
+            "expected the routstr_key missing-node_url error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn brain_routstr_key_missing_api_key_path_is_rejected() {
+        let toml = r#"
+            workload = "capable"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr_key"
+            node_url = "https://api.routstr.com"
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).expect_err("routstr_key without api_key_path must be rejected");
+        assert!(
+            err.to_string().contains("brain.api_key_path must be set"),
+            "expected the routstr_key missing-api_key_path error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn brain_routstr_key_plain_http_nonloopback_is_rejected() {
+        // The bearer key is money on the Authorization header: a non-loopback node MUST be
+        // https, exactly as the X-Cashu path requires.
+        let toml = r#"
+            workload = "capable"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr_key"
+            node_url = "http://api.routstr.com"
+            api_key_path = "/var/lib/kirby/brain-api.key"
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).expect_err("plain-http non-loopback routstr_key must be rejected");
+        assert!(
+            err.to_string().contains("must be https"),
+            "expected the routstr_key plaintext-http error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn brain_routstr_key_valid_config_needs_no_mint_or_wallet() {
+        // The prepaid-key backend needs only a node + a keyfile — NO mint_url / wallet_db_path
+        // (there is no local wallet). A loopback http node is accepted (the Layer-B test rig).
+        let toml = r#"
+            workload = "capable"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr_key"
+            max_cost_sats = 64
+            node_url = "http://127.0.0.1:8181"
+            api_key_path = "/var/lib/kirby/brain-api.key"
+        "#;
+        let cfg = KirbyConfig::from_toml_str(toml)
+            .expect("a routstr_key brain with a node + keyfile must validate without a mint/wallet");
+        assert_eq!(cfg.brain.backend, BrainBackendKind::RoutstrKey);
+        assert_eq!(cfg.brain.api_key_path, "/var/lib/kirby/brain-api.key");
+        assert!(cfg.brain.mint_url.is_empty(), "no mint is required for the prepaid-key backend");
+        assert!(cfg.brain.wallet_db_path.is_empty(), "no wallet is required for the prepaid-key backend");
     }
 
     #[test]
