@@ -18,7 +18,7 @@ use cdk::wallet::{ReceiveOptions, SendOptions};
 use common::mint_fixture::{FakeMint, TempDir};
 use common::{free_port, MockNode, RedeemHook};
 use kirby_node::boot::assert_wallet_backs_counter;
-use kirby_node::mint_rig::{build_wallet, fund_wallet, open_persistent_wallet};
+use kirby_node::mint_rig::{build_wallet, fund_wallet, open_persistent_wallet, WalletKey};
 use kirby_node::rail::{BrainBackend, CdkEcash, EcashProvider, RoutstrBrain};
 use kirby_proto::ChatMessage;
 
@@ -194,7 +194,7 @@ async fn persistent_wallet_reopen_after_drop_is_spendable() {
     let db_path = dir.path().join("brain-wallet.sqlite");
 
     // First open creates the store + persists a fresh 0600 seed.
-    let w = open_persistent_wallet(&mint_url, &db_path)
+    let w = open_persistent_wallet(&mint_url, &db_path, WalletKey::sibling_seed_of(&db_path))
         .await
         .expect("open persistent wallet");
     fund_wallet(w.clone(), 300).await.expect("fund");
@@ -217,7 +217,7 @@ async fn persistent_wallet_reopen_after_drop_is_spendable() {
     }
 
     // Reopen with the SAME db_path + the persisted seed: balance survives and is spendable.
-    let w2 = open_persistent_wallet(&mint_url, &db_path)
+    let w2 = open_persistent_wallet(&mint_url, &db_path, WalletKey::sibling_seed_of(&db_path))
         .await
         .expect("reopen persistent wallet");
     assert_eq!(balance(&w2).await, 300, "balance survived the reopen (store + seed)");

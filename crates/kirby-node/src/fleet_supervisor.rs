@@ -957,6 +957,32 @@ impl ProcessTenantLauncher {
         // signed with the node key — the FROST branch was dead in the real flow (the gap three
         // reviews flagged). This survives serialization into the child's `kirby.toml`.
         cfg.identity.frost_keystore_dir = Some(spec.frost_keystore_dir.clone());
+        // PER-AGENT MONEY ISOLATION (#74) + the latent dm-key-collision fix, alongside the
+        // per-tenant key_path/frost_keystore_dir rewrites above. Point the child's
+        // `identity.treasury_dir` at its OWN durable per-instance dir (keyed by the same
+        // instance_id). Two coupled effects:
+        //   1. dm-key collision: `treasury_dir()` (config.rs) otherwise falls back to
+        //      `key_path.parent()` = the SHARED per-node config dir, so the child's DM key
+        //      (`treasury_dir()/social.dm.key`, run_agent.rs) resolved to the SAME path for
+        //      EVERY tenant on this host — a cross-tenant key collision (latent: multi-capable
+        //      DM on one host isn't exercised yet). Per-instance gives each its own key home.
+        //   2. it homes the per-agent SOVEREIGN Cashu wallet store (below) + the wallet spend
+        //      key (the P1-b seam), under the durable state root so they survive reap + reboot
+        //      (`reap_orphan` deletes only `keystore-{id}`, never this `agent-{id}` dir).
+        // Supervisor-path-scoped, so a bare `kirby run` is byte-identical (G-CLEAN).
+        let agent_dir = crate::boot::agent_state_dir_for(&spec.allocation.instance_id);
+        // The per-agent SOVEREIGN Cashu wallet store (#74): each tenant opens its OWN
+        // cdk-sqlite wallet (+ its sibling `.seed` spend key) under its per-instance dir, so
+        // two tenants never share one wallet DB. Only the `routstr` (Cashu) backend reads it.
+        // The `routstr_key` backend's `api_key_path` is deliberately NOT rewritten here: it is
+        // a node-shared CUSTODIAL credential (one funded prepaid key), and a path-rewrite would
+        // point each tenant at a key file that does not exist (boot refuses). Per-agent
+        // custodial keys are key PROVISIONING (a later chunk), not a path rewrite.
+        cfg.brain.wallet_db_path = agent_dir
+            .join("wallet.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        cfg.identity.treasury_dir = Some(agent_dir);
         // A tenant child is a plain single-agent `kirby agent`; it must NOT inherit the fleet
         // tenant list (no recursive fleets).
         cfg.fleet = crate::config::FleetConfig::default();
@@ -1878,6 +1904,45 @@ mod tests {
         assert_ne!(
             cfg_a.identity.key_path, cfg_b.identity.key_path,
             "two tenants must derive distinct identity key paths (else they collide on one npub)"
+        );
+
+        // P1-a (#74) + the dm-key-collision fix. Each tenant's `identity.treasury_dir` is its
+        // OWN per-instance durable dir (`agent-<instance_id>`); WITHOUT this it falls back to
+        // the SHARED config_dir and the dm/wallet keys collide across tenants on one host.
+        assert!(
+            cfg_a.identity.treasury_dir.as_ref().unwrap().ends_with("agent-kirby-alice"),
+            "the child's treasury_dir must be its per-instance durable dir agent-<instance_id>"
+        );
+        assert_ne!(
+            cfg_a.identity.treasury_dir, cfg_b.identity.treasury_dir,
+            "two tenants must derive distinct treasury_dirs (the unified per-tenant fix)"
+        );
+        // RED-on-revert for the dm-key collision: the shipped DM key path is
+        // `treasury_dir()/social.dm.key`; reverting the treasury_dir rewrite makes both fall
+        // back to the shared config_dir => identical => this fails.
+        assert_ne!(
+            cfg_a.identity.treasury_dir().join("social.dm.key"),
+            cfg_b.identity.treasury_dir().join("social.dm.key"),
+            "the shipped per-agent DM key path must differ per tenant (no shared-config_dir collision)"
+        );
+        // The per-agent SOVEREIGN wallet store is per-tenant and lives under the tenant's
+        // durable per-instance dir (#74: two tenants never share one wallet sled).
+        assert_ne!(
+            cfg_a.brain.wallet_db_path, cfg_b.brain.wallet_db_path,
+            "two tenants must derive distinct per-agent wallet stores (#74)"
+        );
+        assert!(
+            cfg_a.brain.wallet_db_path.contains("agent-kirby-alice")
+                && cfg_a.brain.wallet_db_path.ends_with("wallet.sqlite"),
+            "the per-agent wallet store lives under the tenant's per-instance durable dir"
+        );
+        // The api_key is a node-SHARED CUSTODIAL credential — NOT rewritten per-tenant (a
+        // path-rewrite would point each tenant at a missing key file and refuse to boot;
+        // per-agent custodial keys are key provisioning, a later chunk). Both inherit the
+        // base verbatim => equal.
+        assert_eq!(
+            cfg_a.brain.api_key_path, cfg_b.brain.api_key_path,
+            "api_key_path is node-shared custodial and must NOT be rewritten per-tenant"
         );
         assert_ne!(
             crate::nerve::NodeIdentity::resolve_key_path(

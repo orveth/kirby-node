@@ -415,6 +415,23 @@ pub fn treasury_path_for_agent(agent_id: &str) -> PathBuf {
     state_root().join(format!("treasury-agent-{agent_id}"))
 }
 
+/// The per-agent DURABLE state directory (fleet-host money isolation, #74): a sibling of
+/// the per-agent treasury counter ([`treasury_path_for`]) and FROST keystore
+/// ([`crate::keyset_provisioning::keystore_dir_for`]) under the same durable [`state_root`],
+/// keyed by the same unique `instance_id`. It homes the per-tenant key/money material that
+/// must SURVIVE A REAP (and a reboot): the sovereign Cashu wallet store + its spend seed,
+/// and the purpose-scoped key material the agent loads onto its planes (the DM key, the
+/// wallet key). The supervisor points the child's `identity.treasury_dir` here in
+/// `derive_tenant_config`; WITHOUT it `treasury_dir()` falls back to `key_path.parent()` =
+/// the shared per-node config dir, so every tenant's dm/wallet key resolved to the SAME
+/// path (a cross-tenant key collision). Distinct PREFIX from the sled-counter dir
+/// (`treasury-{id}`) and the keystore dir (`keystore-{id}`, which `reap_orphan` deletes) —
+/// the only cleanup that touches a per-instance dir under [`state_root`] targets
+/// `keystore-{id}`, so the wallet + keys here are NOT lost on a crash-reap.
+pub fn agent_state_dir_for(instance_id: &str) -> PathBuf {
+    state_root().join(format!("agent-{instance_id}"))
+}
+
 /// The §7.2 wallet<->counter reconcile decision (brain-routstr R2-3/R2-5): the wallet
 /// must back every sat the metabolism counter believes it has, so the gateway never
 /// authorizes a think the wallet can't fund. The invariant is `>=`, NEVER `==` (R2-3:
@@ -462,9 +479,16 @@ async fn build_routstr_brain(
 ) -> anyhow::Result<Arc<dyn BrainBackend>> {
     // 1) Open the PERSISTENT wallet (file store + persisted seed, §7.1). The wallet is
     //    funded out-of-band (§11); boot only opens an already-funded store.
-    let wallet =
-        crate::mint_rig::open_persistent_wallet(&brain.mint_url, Path::new(&brain.wallet_db_path))
-            .await?;
+    let wallet = crate::mint_rig::open_persistent_wallet(
+        &brain.mint_url,
+        Path::new(&brain.wallet_db_path),
+        // Interim wallet spend key: the byte-identical sibling `<db_path>.seed` keyfile
+        // (load-or-create, 0600), per-agent because `wallet_db_path` is per-agent
+        // (derive_tenant_config). THE Phase-2 swap point — the reconstruct-on-lease keyring
+        // replaces this `WalletKey` with no change here.
+        crate::mint_rig::WalletKey::sibling_seed_of(Path::new(&brain.wallet_db_path)),
+    )
+    .await?;
     let ecash = CdkEcash::new(wallet.clone());
 
     // 2) Recover incomplete cdk sagas FIRST (R2-4), BEFORE measuring the balance: a prior

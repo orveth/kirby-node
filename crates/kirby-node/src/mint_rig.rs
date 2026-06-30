@@ -65,17 +65,60 @@ pub async fn fund_wallet(wallet: Arc<Wallet>, amount_sats: u64) -> anyhow::Resul
     Ok(())
 }
 
+/// The source of a wallet's spend key — the 64-byte cdk seed that is spend authority over
+/// the wallet's proofs (HIGH-4). THE Phase-2 seam: the interim variant load-or-creates a
+/// local 0600 keyfile (byte-identical to the pre-seam behavior); the reconstruct-on-lease
+/// keyring (the #26 generalization) drops in as a new variant resolved by [`Self::resolve_seed`]
+/// with NO change to [`open_persistent_wallet`] or its callers. PURPOSE-SCOPED: resolving a
+/// `WalletKey` yields ONLY the wallet seed onto the spend plane — it shares no loader with the
+/// DM key (`with_dm_keys`), so the DM tick can never reach the wallet seed (capability
+/// isolation by construction; the two key seams stay independent).
+pub enum WalletKey {
+    /// Interim host custody: a 64-byte spend-seed keyfile, load-or-create (0600), the
+    /// authority the genome never sees. For a fleet tenant this lands in the per-agent durable
+    /// dir because its `wallet_db_path` is per-agent ([`crate::boot::agent_state_dir_for`]); the
+    /// bare default is the wallet store's sibling `<db_path>.seed` ([`WalletKey::sibling_seed_of`]).
+    Keyfile(std::path::PathBuf),
+    // PHASE-2: `Keyring(Arc<dyn WalletSeedProvider>)` — the reconstruct-on-lease keyring
+    // derives the seed under a fresh lease; it slots in here, resolved by `resolve_seed`,
+    // with no caller change at the swap.
+}
+
+impl WalletKey {
+    /// The interim default for a wallet store at `db_path`: the sibling `<db_path>.seed`
+    /// keyfile. BYTE-IDENTICAL to the pre-seam `open_persistent_wallet`, which always read the
+    /// seed from this exact path — so a bare `kirby run` is unchanged (G-CLEAN), and a fleet
+    /// tenant's seed rides its per-agent `db_path` into the per-agent durable dir.
+    pub fn sibling_seed_of(db_path: &Path) -> Self {
+        WalletKey::Keyfile(db_path.with_extension("seed"))
+    }
+
+    /// Resolve the 64-byte spend seed onto the spend plane. PURPOSE-SCOPED: wallet seed ONLY
+    /// — no DM key, no shared loader.
+    fn resolve_seed(&self) -> anyhow::Result<[u8; 64]> {
+        match self {
+            WalletKey::Keyfile(path) => load_or_create_wallet_seed(path),
+        }
+    }
+}
+
 /// Open a PERSISTENT `cdk::Wallet` (Sat unit) against `mint_url`, backed by a cdk-sqlite
 /// FILE store at `db_path` (NOT the in-memory store [`build_wallet`] uses): a live
 /// RoutstrBrain wallet must survive a reboot, since the agent's whole point is persisting
 /// across sessions (brain-routstr §7.1). The wallet SEED is persisted too (HIGH-4): a
 /// persistent store with a FRESH random seed each boot is still broken, because the seed
 /// is the deterministic key material that can reconstruct/spend the persisted proofs. So
-/// the seed is generated-and-persisted (0600) on first run and reloaded thereafter, at a
-/// sibling `<db_path>.seed` host-only file (spend authority — treat it like the rail
-/// credential the genome never sees). Funding the live wallet is out-of-band (§11); this
-/// only OPENS an already-funded (or fresh) store.
-pub async fn open_persistent_wallet(mint_url: &str, db_path: &Path) -> anyhow::Result<Arc<Wallet>> {
+/// the seed is supplied through the `wallet_key` SEAM (spend authority — treat it like the
+/// rail credential the genome never sees): the interim [`WalletKey::sibling_seed_of`]
+/// load-or-creates (0600) the byte-identical sibling `<db_path>.seed`, and Phase-2's
+/// reconstruct-on-lease keyring resolves the seed there instead with no caller change.
+/// Funding the live wallet is out-of-band (§11); this only OPENS an already-funded (or
+/// fresh) store.
+pub async fn open_persistent_wallet(
+    mint_url: &str,
+    db_path: &Path,
+    wallet_key: WalletKey,
+) -> anyhow::Result<Arc<Wallet>> {
     // The store + seed live in db_path's directory; ensure it exists.
     if let Some(parent) = db_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -84,9 +127,11 @@ pub async fn open_persistent_wallet(mint_url: &str, db_path: &Path) -> anyhow::R
         }
     }
 
-    // Load-or-mint the persistent 64-byte seed (HIGH-4), 0600.
-    let seed_path = db_path.with_extension("seed");
-    let seed = load_or_create_wallet_seed(&seed_path)?;
+    // The wallet's 64-byte spend seed comes through the `wallet_key` seam (HIGH-4). The
+    // interim `WalletKey::Keyfile` is the SAME 0600 load-or-create as before (byte-identical
+    // when the sibling `<db_path>.seed` is used); Phase-2's keyring resolves here instead,
+    // with no change to this function or its callers.
+    let seed = wallet_key.resolve_seed()?;
 
     // The PERSISTENT (file) cdk-sqlite store — `WalletSqliteDatabase::new(path)` opens a
     // file db (memory::empty passes ":memory:"); a file path persists the proofs.

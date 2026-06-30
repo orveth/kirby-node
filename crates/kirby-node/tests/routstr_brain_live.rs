@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use kirby_node::mint_rig::open_persistent_wallet;
+use kirby_node::mint_rig::{open_persistent_wallet, WalletKey};
 use kirby_node::rail::{BrainBackend, CdkEcash, RoutstrBrain};
 use kirby_proto::ChatMessage;
 
@@ -39,9 +39,13 @@ async fn live_one_real_completion_drains_sats() {
     let model = std::env::var("KIRBY_ROUTSTR_MODEL")
         .unwrap_or_else(|_| "anthropic/claude-sonnet-4.6".to_string());
 
-    let wallet = open_persistent_wallet(&mint, std::path::Path::new(&wallet_db))
-        .await
-        .expect("open the funded live wallet");
+    let wallet = open_persistent_wallet(
+        &mint,
+        std::path::Path::new(&wallet_db),
+        WalletKey::sibling_seed_of(std::path::Path::new(&wallet_db)),
+    )
+    .await
+    .expect("open the funded live wallet");
     let before = wallet.total_balance().await.map(u64::from).unwrap_or(0);
     assert!(before > 0, "the live wallet must be funded; balance {before}");
 
