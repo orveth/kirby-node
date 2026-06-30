@@ -145,6 +145,53 @@ mod tests {
         }
     }
 
+    /// A dummy-but-distinct cdk `Proof` for the aggregation teeth, built by deserializing a
+    /// minimal NUT-00 proof JSON: the `C` point is the secp256k1 generator (a valid point), the
+    /// keyset `id` a valid v0 16-hex, and distinctness comes from `secret`. cdk `Proof`'s serde is
+    /// its own tested concern; we only need DISTINCT proofs to exercise aggregate + dedup.
+    fn dummy_proof(secret: &str) -> Proof {
+        let json = format!(
+            r#"{{"amount":1,"id":"00ad268c4d1f5826","secret":"{secret}","C":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"}}"#
+        );
+        serde_json::from_str(&json).expect("dummy proof JSON deserializes")
+    }
+
+    fn tec_with(del: &[&str], proofs: Vec<Proof>) -> TokenEventContent {
+        TokenEventContent {
+            mint: "https://m".to_string(),
+            unit: "sat".to_string(),
+            proofs,
+            del: del.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn token_reconcile_aggregates_real_proofs_across_live_events_and_dedups() {
+        let p1 = dummy_proof("s1");
+        let p2 = dummy_proof("s2");
+        // Two live events with DISTINCT proofs → BOTH aggregate (a head would yield only 1).
+        let evs = vec![
+            ("a".to_string(), tec_with(&[], vec![p1.clone()])),
+            ("b".to_string(), tec_with(&[], vec![p2.clone()])),
+        ];
+        assert_eq!(
+            reconcile_token_set(&evs).len(),
+            2,
+            "proofs from ALL live events aggregate (an lww-head would drop one = money loss)"
+        );
+        // A duplicate of p1 in a third live event → deduped, NOT double-counted.
+        let evs_dup = vec![
+            ("a".to_string(), tec_with(&[], vec![p1.clone()])),
+            ("b".to_string(), tec_with(&[], vec![p2])),
+            ("c".to_string(), tec_with(&[], vec![p1])),
+        ];
+        assert_eq!(
+            reconcile_token_set(&evs_dup).len(),
+            2,
+            "a duplicate proof is deduped (no double-count)"
+        );
+    }
+
     #[test]
     fn token_reconcile_aggregates_all_live_events_not_a_head() {
         // 3 token events, none superseded → ALL 3 live. An LWW head would return 1 and DROP the
