@@ -1645,6 +1645,16 @@ struct ChatCompletionRequest<'a> {
     model: &'a str,
     messages: Vec<WireMessage<'a>>,
     stream: bool,
+    /// The completion-length bound. OMITTED for the Cashu [`RoutstrBrain`] path (`None` ->
+    /// the field is not serialized): the X-Cashu token amount (= the per-call cap) already
+    /// bounds the node's up-front reservation. REQUIRED for the prepaid-key
+    /// [`RoutstrKeyBrain`] path (`Some`): without it Routstr reserves the model's MAX
+    /// completion cost per in-flight request (~17 sats for granite), and the agent's
+    /// concurrent brain/memory/diarist loops STACK those reservations until the key's
+    /// "available" is exhausted -> a persistent 402 even on a fully-funded key. Setting it
+    /// bounds the reservation to `max_tokens x the model's per-token rate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(serde::Serialize)]
@@ -1814,6 +1824,8 @@ impl<E: EcashProvider> RoutstrBrain<E> {
                 })
                 .collect(),
             stream: false,
+            // Omitted on the Cashu path: the X-Cashu token amount (= the cap) bounds the reserve.
+            max_tokens: None,
         };
         // The X-Cashu token is bearer money; it is attached as a header and NEVER logged.
         let resp = match self
@@ -2026,6 +2038,10 @@ pub struct RoutstrKeyBrain {
     /// NEVER logged; the struct is intentionally NOT `Debug` so it cannot leak through a
     /// derived formatter (the same discipline as the wallet seed / dm key).
     api_key: String,
+    /// The `max_tokens` sent on every completion: the completion-length bound that ALSO
+    /// caps Routstr's up-front per-request reservation (without it the node reserves the
+    /// model max, and concurrent loops exhaust the key -> 402). Daemon-side config knob.
+    max_tokens: u32,
 }
 
 impl RoutstrKeyBrain {
@@ -2036,6 +2052,7 @@ impl RoutstrKeyBrain {
     pub fn new(
         node_url: String,
         api_key: String,
+        max_tokens: u32,
         request_timeout: Duration,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
@@ -2048,6 +2065,7 @@ impl RoutstrKeyBrain {
             http,
             node_url,
             api_key,
+            max_tokens,
         })
     }
 
@@ -2101,6 +2119,9 @@ impl BrainBackend for RoutstrKeyBrain {
                 })
                 .collect(),
             stream: false,
+            // REQUIRED on the key path: bounds Routstr's up-front reservation so concurrent
+            // loops can't stack model-max reservations and exhaust the key (the live 402 bug).
+            max_tokens: Some(self.max_tokens),
         };
         // The bearer key is attached via `Authorization: Bearer …` and NEVER logged. NO
         // X-Cashu header: the balance is custodial, charged server-side per request. A

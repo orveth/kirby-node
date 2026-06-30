@@ -591,6 +591,16 @@ pub struct BrainConfig {
     /// iff `backend = "routstr_key"`; ignored by every other backend.
     #[serde(default)]
     pub api_key_path: String,
+    /// (routstr_key) The `max_tokens` the prepaid-key brain sends on every completion. It
+    /// bounds the reply length AND — critically — Routstr's up-front per-request
+    /// RESERVATION: without it the node reserves the model's MAX completion cost per
+    /// in-flight request, and the agent's concurrent brain/memory/diarist loops stack
+    /// those reservations until the key's "available" is exhausted (a 402 on a funded
+    /// key). Default 1024 (ample for the capable loop's small JSON action replies; ~133
+    /// msat reserve on granite vs ~17 000). The Cashu backend ignores it (its X-Cashu
+    /// token amount already bounds the reserve). Must be > 0 iff `backend = "routstr_key"`.
+    #[serde(default = "default_brain_max_tokens")]
+    pub max_tokens: u32,
     /// (routstr) The MAIN-path kill-window seconds (mint -> POST -> parse -> redeem
     /// change). The meter cannot preempt an in-flight call, so this deadline IS the
     /// kill bound for thinking (§5).
@@ -629,6 +639,9 @@ fn default_brain_recovery_timeout_secs() -> u64 {
 fn default_brain_fee_headroom_sats() -> u64 {
     8
 }
+fn default_brain_max_tokens() -> u32 {
+    1024
+}
 
 impl Default for BrainConfig {
     fn default() -> Self {
@@ -642,6 +655,7 @@ impl Default for BrainConfig {
             mint_url: String::new(),
             wallet_db_path: String::new(),
             api_key_path: String::new(),
+            max_tokens: default_brain_max_tokens(),
             request_timeout_secs: default_brain_request_timeout_secs(),
             recovery_timeout_secs: default_brain_recovery_timeout_secs(),
             fee_headroom_sats: default_brain_fee_headroom_sats(),
@@ -1097,6 +1111,11 @@ impl KirbyConfig {
                 if self.brain.api_key_path.trim().is_empty() {
                     anyhow::bail!(
                         "brain.api_key_path must be set when brain.backend = \"routstr_key\" (the file holding the prepaid bearer key)"
+                    );
+                }
+                if self.brain.max_tokens == 0 {
+                    anyhow::bail!(
+                        "brain.max_tokens must be > 0 when brain.backend = \"routstr_key\" (it bounds the reply AND Routstr's per-request reservation; 0 would reserve the model max and 402 under load)"
                     );
                 }
                 if !is_https_or_localhost(&self.brain.node_url) {
@@ -1780,6 +1799,33 @@ mod tests {
         assert_eq!(cfg.brain.api_key_path, "/var/lib/kirby/brain-api.key");
         assert!(cfg.brain.mint_url.is_empty(), "no mint is required for the prepaid-key backend");
         assert!(cfg.brain.wallet_db_path.is_empty(), "no wallet is required for the prepaid-key backend");
+        assert_eq!(cfg.brain.max_tokens, 1024, "max_tokens defaults to 1024 (bounds the reserve)");
+    }
+
+    #[test]
+    fn brain_routstr_key_zero_max_tokens_is_rejected() {
+        // max_tokens=0 would make Routstr reserve the model max per request -> 402 under
+        // the concurrent loops; a zero bound is a config error caught at load.
+        let toml = r#"
+            workload = "capable"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr_key"
+            node_url = "https://api.routstr.com"
+            api_key_path = "/var/lib/kirby/brain-api.key"
+            max_tokens = 0
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).expect_err("max_tokens = 0 must be rejected");
+        assert!(
+            err.to_string().contains("brain.max_tokens must be > 0"),
+            "expected the routstr_key zero-max_tokens error, got: {err}"
+        );
     }
 
     #[test]
