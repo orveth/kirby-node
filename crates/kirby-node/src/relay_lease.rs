@@ -658,6 +658,77 @@ pub fn confirm_takeover_win(
     }
 }
 
+/// Resolve the agent's expected group key Q (32 x-only bytes) from THIS node's LOCAL keystore,
+/// using only the PUBLIC pubkeys (no secret shares -- distribution-agnostic). `None` when this
+/// node holds no keystore for the agent (the cross-machine pure-observer case, finding G-2): the
+/// fence then cannot verify a surviving lease and must fail closed. The keystore is keyed by the
+/// agent's instance id via the SAME `instance_id_for(agent_id) -> keystore_dir_for` derivation the
+/// failover admission gate uses, so Q is resolvable from the `agent_id` alone (no new wiring).
+fn local_expected_q(agent_id: &str) -> Option<[u8; 32]> {
+    let instance_id = crate::fleet::instance_id_for(agent_id);
+    let keystore_dir = crate::keyset_provisioning::keystore_dir_for(&instance_id);
+    crate::keyset_provisioning::load_group_q_at(&keystore_dir).ok()
+}
+
+/// The PURE read-after-write SELECTION over a set of fetched lease events (no I/O, exhaustively
+/// testable -- the verification counterpart of [`confirm_takeover_win`]): keep ONLY the events
+/// whose `d` tag agrees with the signed `agent_id` AND that are validly FROST-signed under the
+/// agent's expected quorum key Q (`event.pubkey == hex(Q)`, the NIP-01 id re-derives, and the
+/// 64-byte BIP-340 signature verifies -- the canonical [`verify_lease_event`]); then return the
+/// highest `(term, issued_at)` among the survivors.
+///
+/// THE FENCE-HARDENING INVARIANT (finding G-2): a forged or relay-injected lease -- signed by any
+/// key that is not the agent's Q, or a genuine lease whose content/tags were tampered -- is
+/// DROPPED here, BEFORE it can reach the `(term, issued_at)` max. This closes BOTH failure modes
+/// of the unverified read:
+///   * a forged lease naming ANOTHER holder at a higher term can no longer make the rightful
+///     winner stand down (liveness / DoS), and
+///   * a forged lease naming THIS node at the claimed term can no longer FALSELY confirm a win
+///     and cause a DOUBLE-LAUNCH (the double-spend the fence exists to prevent).
+///
+/// Returns `None` when no verified lease survives (all forged, or none present) -> the caller
+/// fails closed (does not launch on an unconfirmable claim).
+fn select_verified_latest_lease(
+    events: &[NostrEvent],
+    agent_id: &str,
+    expected_q: &[u8; 32],
+) -> Option<ObservedLeaseRecord> {
+    let mut best: Option<ObservedLeaseRecord> = None;
+    for event in events {
+        // Structural: the content decodes AND the `d` tag agrees with the signed agent_id (drop a
+        // mis-addressed event), matching the existing occupancy read.
+        let content: LeaseContent = match serde_json::from_str(&event.content) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if d_tag(event).as_deref() != Some(content.agent_id.as_str()) || content.agent_id != agent_id
+        {
+            continue;
+        }
+        // Q-VERIFY (the hardening): the lease MUST be validly FROST-signed under the agent's
+        // expected Q. A lease under any other key (a forger / malicious relay) or a tampered one
+        // fails here and is DROPPED -- it never influences the `(term, issued_at)` max below.
+        if verify_lease_event(event, expected_q).is_err() {
+            continue;
+        }
+        let rec = ObservedLeaseRecord {
+            holder_node_id: content.holder_node_id,
+            term: content.term,
+            issued_at: content.issued_at,
+        };
+        // Highest term wins; tie broken by the fresher issued_at (the relay's latest-wins for an
+        // addressable replaceable event) -- now over VERIFIED events only.
+        let take = match best {
+            None => true,
+            Some(b) => (rec.term, rec.issued_at) > (b.term, b.issued_at),
+        };
+        if take {
+            best = Some(rec);
+        }
+    }
+    best
+}
+
 /// The production [`LeaseReader`]: re-reads an agent's latest addressable lease (kind 31002,
 /// `#d`=agent_id) from the fleet relay over a [`nostr_sdk::Client`] via a real `fetch_events`
 /// round-trip (the SAME read mechanism the engram rail uses for its addressable head — REQ →
@@ -695,35 +766,34 @@ impl LeaseReader for RelayLeaseReader {
             .fetch_events(filter, self.read_timeout)
             .await
             .map_err(|e| anyhow::anyhow!("re-read latest lease for {agent_id}: {e}"))?;
-        let mut best: Option<ObservedLeaseRecord> = None;
-        for event in events.into_iter() {
-            // Structural read (same trust level as the occupancy observer): decode the content and
-            // require the `d` tag to agree with the signed agent_id (drop a mis-addressed event).
-            let content: LeaseContent = match serde_json::from_str(&event.content) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            if sdk_d_tag(&event).as_deref() != Some(content.agent_id.as_str())
-                || content.agent_id != agent_id
-            {
-                continue;
+        // Q-VERIFY THE FENCE RE-READ (finding G-2 hardening): resolve the agent's expected quorum
+        // key Q from THIS node's LOCAL keystore (PUBLIC pubkeys only -- distribution-agnostic, so a
+        // node holding only its own share can still verify). If this node holds no keystore for the
+        // agent it CANNOT verify the lease (the cross-machine pure-observer case) -> report NO
+        // confirmable lease so the caller FAILS CLOSED (never launch on an unverifiable claim).
+        let expected_q = match local_expected_q(agent_id) {
+            Some(q) => q,
+            None => {
+                tracing::warn!(
+                    agent_id,
+                    "fence re-read: no local keystore to resolve the agent's Q; cannot verify the \
+                     surviving lease -> reporting none (fail closed)"
+                );
+                return Ok(None);
             }
-            let rec = ObservedLeaseRecord {
-                holder_node_id: content.holder_node_id,
-                term: content.term,
-                issued_at: content.issued_at,
-            };
-            // Highest term wins; tie broken by the fresher issued_at (matches the relay's
-            // latest-wins for an addressable replaceable event).
-            let take = match best {
-                None => true,
-                Some(b) => (rec.term, rec.issued_at) > (b.term, b.issued_at),
-            };
-            if take {
-                best = Some(rec);
-            }
-        }
-        Ok(best)
+        };
+
+        // Re-materialize each live relay event as the transport-free `NostrEvent` the canonical
+        // `verify_lease_event` checks (the SAME NIP-01 JSON shape the publish path round-trips), then
+        // keep ONLY the leases validly FROST-signed under Q and take the latest (see
+        // `select_verified_latest_lease`). A forged / relay-injected lease (any other signing key,
+        // or a tampered one) is dropped before it can sway the takeover decision -- closing BOTH the
+        // false-stand-down and the double-launch holes.
+        let candidates: Vec<NostrEvent> = events
+            .into_iter()
+            .filter_map(|e| serde_json::from_str::<NostrEvent>(&nostr_sdk::JsonUtil::as_json(&e)).ok())
+            .collect();
+        Ok(select_verified_latest_lease(&candidates, agent_id, &expected_q))
     }
 }
 
@@ -1096,5 +1166,169 @@ mod observer_tests {
             !confirm_takeover_win(None, claimed, ME),
             "no surviving lease => the relay could not confirm our claim => fail closed, do not launch"
         );
+    }
+}
+
+/// Q-VERIFICATION of the read-after-write fence (finding G-2 hardening). The fence's surviving-lease
+/// selection must trust ONLY a lease validly FROST-signed under the agent's expected quorum key Q;
+/// a forged / relay-injected lease (any other signing key, or a tampered one) must be DROPPED before
+/// it can sway `confirm_takeover_win`. These teeth exercise the PURE selection
+/// (`select_verified_latest_lease`) so they need no relay -- the verification counterpart of the
+/// pure `confirm_takeover_win` test above. Each is RED on revert (remove the Q-verify and the
+/// forged event wins the `(term, issued_at)` max).
+#[cfg(test)]
+mod fence_qverify_tests {
+    use super::*;
+    use crate::quorum_signer::local_quorum_from_keyset;
+    use kirby_custody::generate_dealer_keyset;
+
+    /// Sign a lease event under `signer`'s quorum key Q with FULLY CONTROLLED fields (holder, term,
+    /// issued_at) -- a GENUINE lease iff `signer`'s Q is the one the verifier expects, a FORGERY when
+    /// `signer` is some OTHER keyset's quorum. Lets a test pin holder/term/issued_at deterministically
+    /// (unlike `RelayLeaseAuthority::claim`, which stamps issued_at = wall clock).
+    fn sign_lease(
+        signer: &QuorumSigner,
+        agent_id: &str,
+        holder: LeaseNodeId,
+        term: u64,
+        issued_at: u64,
+    ) -> NostrEvent {
+        let content = serde_json::to_string(&LeaseContent {
+            agent_id: agent_id.to_string(),
+            holder_node_id: holder,
+            term,
+            issued_at,
+        })
+        .unwrap();
+        let tags = vec![vec![TAG_D.to_string(), agent_id.to_string()]];
+        signer
+            .sign_nostr_event_with_tags(kirby_proto::KIND_KIRBY_LEASE as u32, issued_at, &tags, &content)
+            .expect("sign a lease event under the quorum key Q")
+    }
+
+    /// A fresh 2-of-3 quorum signer over a new dealer keyset (its own Q).
+    fn signer() -> QuorumSigner {
+        local_quorum_from_keyset(&generate_dealer_keyset(2, 3).expect("dealer keyset"))
+            .expect("build quorum signer")
+    }
+
+    /// BASELINE: a genuine Q-signed lease verifies and is selected (the verifier does not reject a
+    /// real lease). Stays GREEN on revert -- it does not depend on the dropping behavior.
+    #[test]
+    fn genuine_q_lease_is_selected() {
+        let s = signer();
+        let q = s.q_bytes();
+        let ev = sign_lease(&s, "agentA", 2, 5, 1000);
+        assert_eq!(
+            select_verified_latest_lease(&[ev], "agentA", &q),
+            Some(ObservedLeaseRecord { holder_node_id: 2, term: 5, issued_at: 1000 }),
+            "a genuine Q-signed lease must verify and be selected"
+        );
+    }
+
+    /// DIRECTION A (liveness / no wrongful stand-down): a forged lease naming ANOTHER holder at a
+    /// HIGHER term must be dropped, so the surviving record still names THIS node (ME) at the claimed
+    /// term and `confirm_takeover_win` lets ME launch. RED on revert: the forged higher-term event
+    /// wins the max -> surviving names OTHER -> confirm == false -> ME wrongly stands down.
+    #[test]
+    fn forged_other_holder_higher_term_dropped_no_wrongful_standdown() {
+        const ME: LeaseNodeId = 2;
+        const OTHER: LeaseNodeId = 9;
+        let claimed = 5u64;
+        let agent = signer(); // holds the real Q
+        let q = agent.q_bytes();
+        let forger = signer(); // a DIFFERENT keyset -> a different Q (the attacker)
+
+        let genuine = sign_lease(&agent, "agentA", ME, claimed, 1000);
+        let forged = sign_lease(&forger, "agentA", OTHER, claimed + 1, 2000); // higher term + fresher
+
+        let got = select_verified_latest_lease(&[genuine, forged], "agentA", &q);
+        assert_eq!(
+            got,
+            Some(ObservedLeaseRecord { holder_node_id: ME, term: claimed, issued_at: 1000 }),
+            "the forged higher-term lease (wrong Q) must be DROPPED; the genuine ME-lease survives"
+        );
+        assert!(
+            confirm_takeover_win(got, claimed, ME),
+            "forgery dropped => ME is the surviving holder at the claimed term => launch (no wrongful stand-down)"
+        );
+    }
+
+    /// DIRECTION B (THE MONEY TEETH -- double-spend): a forged lease naming THIS node (ME) at the
+    /// claimed term, with a FRESHER issued_at, must be dropped when a PEER legitimately holds the
+    /// lease -- so `confirm_takeover_win` keeps ME standing down (the peer keeps the agent; no
+    /// double-launch). RED on revert: the forged ME-lease wins the tie on issued_at -> confirm ==
+    /// true -> ME ALSO launches -> DOUBLE-LAUNCH (the exact double-spend the fence exists to stop).
+    #[test]
+    fn forged_self_named_lease_dropped_no_double_launch() {
+        const ME: LeaseNodeId = 2;
+        const PEER: LeaseNodeId = 9;
+        let claimed = 5u64;
+        let agent = signer();
+        let q = agent.q_bytes();
+        let forger = signer(); // attacker's keyset (not the agent's Q)
+
+        let genuine_peer = sign_lease(&agent, "agentA", PEER, claimed, 1000); // the peer legitimately won
+        let forged_me = sign_lease(&forger, "agentA", ME, claimed, 2000); // attacker: "ME won", fresher
+
+        let got = select_verified_latest_lease(&[genuine_peer, forged_me], "agentA", &q);
+        assert_eq!(
+            got,
+            Some(ObservedLeaseRecord { holder_node_id: PEER, term: claimed, issued_at: 1000 }),
+            "the forged self-named lease (wrong Q) must be DROPPED; the genuine PEER-lease survives"
+        );
+        assert!(
+            !confirm_takeover_win(got, claimed, ME),
+            "forgery dropped => the surviving holder is the PEER => ME stands down (NO double-launch)"
+        );
+    }
+
+    /// A genuine Q-lease that is later TAMPERED (content mutated, original id + sig kept) fails the
+    /// NIP-01 id re-derivation under Q and is dropped -- both alongside a genuine lease and alone.
+    #[test]
+    fn tampered_lease_content_is_dropped() {
+        let s = signer();
+        let q = s.q_bytes();
+        let genuine = sign_lease(&s, "agentA", 2, 5, 1000);
+        let tampered_content = serde_json::to_string(&LeaseContent {
+            agent_id: "agentA".to_string(),
+            holder_node_id: 9,
+            term: 99,
+            issued_at: 9000,
+        })
+        .unwrap();
+        // Tampered ALONGSIDE the genuine: only the genuine (lower term) survives -- the tampered one
+        // claims a far higher term but its id no longer matches its content under Q, so it is dropped.
+        let mut tampered = genuine.clone();
+        tampered.content = tampered_content.clone();
+        assert_eq!(
+            select_verified_latest_lease(&[tampered, genuine.clone()], "agentA", &q),
+            Some(ObservedLeaseRecord { holder_node_id: 2, term: 5, issued_at: 1000 }),
+            "a tampered lease (id != content under Q) must be dropped; the genuine one survives"
+        );
+        // Tampered ALONE: nothing verifies -> None -> the caller fails closed.
+        let mut tampered_only = genuine;
+        tampered_only.content = tampered_content;
+        assert_eq!(
+            select_verified_latest_lease(&[tampered_only], "agentA", &q),
+            None,
+            "a tampered lease alone leaves no verified survivor"
+        );
+    }
+
+    /// ALL-FORGED -> None: when every fetched event is signed under a non-Q key, no verified lease
+    /// survives, so the fence reports None and the launch fails closed (stands down). RED on revert:
+    /// a forged event would be selected -> Some -> a launch on an unverifiable claim.
+    #[test]
+    fn all_forged_yields_none_fail_closed() {
+        let q = signer().q_bytes();
+        let forged1 = sign_lease(&signer(), "agentA", 9, 7, 3000);
+        let forged2 = sign_lease(&signer(), "agentA", 8, 6, 2000);
+        assert_eq!(
+            select_verified_latest_lease(&[forged1, forged2], "agentA", &q),
+            None,
+            "no lease signed under the expected Q => None => the caller fails closed"
+        );
+        assert!(!confirm_takeover_win(None, 7, 2), "None => stand down (no launch)");
     }
 }
