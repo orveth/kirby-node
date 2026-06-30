@@ -85,10 +85,100 @@ impl Nip60Crypto {
     }
 }
 
+/// The event-ids of the LIVE (non-superseded) kind:7375 token events — the AGGREGATE set, NOT
+/// an LWW head.
+///
+/// ⚠️ MONEY-SAFETY: kind:7375 token events are REGULAR + MULTIPLE; a wallet's proofs are spread
+/// across MANY of them. The live set is EVERY non-superseded event (so their proofs all
+/// aggregate), NOT the latest-wins head — a head would drop every other event's proofs = MONEY
+/// LOSS. An LWW head is correct ONLY for the REPLACEABLE kind:17375 wallet CONFIG, never the
+/// 7375 token SET. A token event's `del` names the event-ids it supersedes (a rollover swaps N
+/// inputs for 1 output); any id named in ANY event's `del` is dropped here.
+pub fn live_token_event_ids(events: &[(String, TokenEventContent)]) -> Vec<&str> {
+    let superseded: std::collections::HashSet<&str> = events
+        .iter()
+        .flat_map(|(_, c)| c.del.iter().map(String::as_str))
+        .collect();
+    events
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .filter(|id| !superseded.contains(id))
+        .collect()
+}
+
+/// Reconcile a wallet's kind:7375 token events into its LIVE proof set: AGGREGATE the proofs of
+/// every [`live_token_event_ids`] event (NOT a head — see its money-safety note), deduped by the
+/// serialized proof so a duplicate re-publish can't double-count. The returned set is the
+/// CANDIDATE proofs; NUT-07 check-state (N2) then filters it to UNSPENT before any spend (NIP-60
+/// is portability, not safety — the mint is the source of truth).
+pub fn reconcile_token_set(events: &[(String, TokenEventContent)]) -> Vec<Proof> {
+    let live: std::collections::HashSet<&str> = live_token_event_ids(events).into_iter().collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut proofs = Vec::new();
+    for (id, content) in events {
+        if !live.contains(id.as_str()) {
+            continue;
+        }
+        for proof in &content.proofs {
+            let key = serde_json::to_string(proof).unwrap_or_default();
+            if seen.insert(key) {
+                proofs.push(proof.clone());
+            }
+        }
+    }
+    proofs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::seed_keyring::derive_nip60_event_key;
+
+    /// A token-event content with empty proofs + the given `del` ids. The reconcile money-safety
+    /// teeth turn on the event-id / del-chain logic, not the (cdk-owned) proof internals.
+    fn tec(del: &[&str]) -> TokenEventContent {
+        TokenEventContent {
+            mint: "https://m".to_string(),
+            unit: "sat".to_string(),
+            proofs: Vec::new(),
+            del: del.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn token_reconcile_aggregates_all_live_events_not_a_head() {
+        // 3 token events, none superseded → ALL 3 live. An LWW head would return 1 and DROP the
+        // other 2 events' proofs = MONEY LOSS. This is the kind:7375 money-safety invariant.
+        let evs = vec![
+            ("a".to_string(), tec(&[])),
+            ("b".to_string(), tec(&[])),
+            ("c".to_string(), tec(&[])),
+        ];
+        let mut live = live_token_event_ids(&evs);
+        live.sort_unstable();
+        assert_eq!(
+            live,
+            vec!["a", "b", "c"],
+            "every non-superseded 7375 event is live (AGGREGATE, not a head)"
+        );
+    }
+
+    #[test]
+    fn token_reconcile_applies_the_del_chain() {
+        // A rollover: event c swaps inputs a + b for itself (del = [a, b]) → only c is live.
+        let evs = vec![
+            ("a".to_string(), tec(&[])),
+            ("b".to_string(), tec(&[])),
+            ("c".to_string(), tec(&["a", "b"])),
+        ];
+        assert_eq!(
+            live_token_event_ids(&evs),
+            vec!["c"],
+            "del-superseded inputs are dropped; the rollover output is live"
+        );
+        // Empty-proof events reconcile to an empty set (the proof aggregation rides the live-id logic).
+        assert!(reconcile_token_set(&evs).is_empty());
+    }
 
     #[test]
     fn token_event_roundtrips_through_self_encryption() {
