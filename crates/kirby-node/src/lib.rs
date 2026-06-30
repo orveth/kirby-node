@@ -255,6 +255,7 @@ pub mod mint_rig;
 pub mod nerve;
 #[cfg(target_os = "linux")]
 pub mod network;
+pub mod nip60;
 pub mod prereqs;
 pub mod rail;
 pub mod relay_lease;
