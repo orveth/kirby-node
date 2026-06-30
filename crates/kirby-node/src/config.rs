@@ -105,6 +105,17 @@ pub struct KirbyConfig {
     /// ([`crate::boot::treasury_path_for`], [`crate::keyset_provisioning::keystore_dir_for`]).
     #[serde(default)]
     pub state_root: Option<PathBuf>,
+
+    /// The safety ceiling (seconds) for a metered agent run: a guard so a run that never
+    /// exhausts its budget cannot loop forever. The agent normally dies (die-when-broke)
+    /// well before this. When unset (the default) the ceiling is 600s; RAISE it for a
+    /// long-lived die-when-broke agent that should run until its treasury drains rather than
+    /// being force-stopped at an arbitrary wall-clock cap (the hardcoded-600s footgun, #69).
+    /// `0` is rejected at load (a zero ceiling would stop a run before it does any work) —
+    /// see [`Self::validate`]. The fleet path inherits this per node (it clones the base
+    /// config per tenant), so one knob covers the single-agent and fleet runs alike.
+    #[serde(default)]
+    pub max_run_secs: Option<u64>,
 }
 
 /// The `[fleet]` config block (fleet-host S0): the knobs the fleet supervisor uses
@@ -986,6 +997,14 @@ impl KirbyConfig {
             anyhow::bail!(
                 "relay.url must be a websocket URL (ws:// or wss://), got {:?}",
                 self.relay.url
+            );
+        }
+        // A configured run ceiling of 0 would stop a metered run before it does any work
+        // (the deadline would be `now`); reject it at load so a typo can't silently neuter
+        // every run. Omit `max_run_secs` to use the 600s default (#69).
+        if self.max_run_secs == Some(0) {
+            anyhow::bail!(
+                "max_run_secs must be > 0 (it is the run safety ceiling in seconds; omit it to use the 600s default)"
             );
         }
         // Tenant identifiers feed filesystem treasury paths (treasury_path_for_agent),

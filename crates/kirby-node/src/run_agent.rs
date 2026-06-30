@@ -217,11 +217,19 @@ impl RunAgentConfig {
         // DEFAULT_PORT, so the single-agent path is unchanged (G-CLEAN).
         let guest_cid = env_u32("KIRBY_GUEST_CID").unwrap_or(DEFAULT_CID);
         let gateway_port = env_u32("KIRBY_GATEWAY_PORT").unwrap_or(DEFAULT_PORT);
+        // The metered-run safety ceiling is configurable (#69) so a long-lived die-when-broke
+        // agent isn't force-stopped at the 600s default before its treasury drains. Unset =>
+        // DEFAULT_MAX_RUN; a 0 is rejected by `config.validate()` (called above), so this is
+        // always > 0.
+        let max_run = config
+            .max_run_secs
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_MAX_RUN);
         Ok(RunAgentConfig {
             config,
             image_dir,
             meter_tick: DEFAULT_METER_TICK,
-            max_run: DEFAULT_MAX_RUN,
+            max_run,
             guest_cid,
             gateway_port,
             vcpu_count: DEFAULT_VCPU,
@@ -888,6 +896,7 @@ mod tests {
             node_id: "node-1".to_string(),
             fleet: Default::default(),
             state_root: None,
+            max_run_secs: None,
         }
     }
 
@@ -931,8 +940,39 @@ mod tests {
         assert!(run.image_dir.ends_with("img"));
         assert_eq!(run.meter_tick, DEFAULT_METER_TICK);
         assert_eq!(run.vcpu_count, DEFAULT_VCPU);
+        // An unset max_run_secs falls back to the 600s default ceiling (#69, byte-identical
+        // to the pre-knob behavior).
+        assert_eq!(run.max_run, DEFAULT_MAX_RUN);
         // The checkpoint dir lives under the treasury dir, keyed by the agent id.
         assert!(run.checkpoint_dir.ends_with("checkpoints-agent-0"));
+    }
+
+    /// #69: an explicit `max_run_secs` overrides the hardcoded 600s ceiling — the knob that
+    /// lets a long-lived die-when-broke run reach its treasury-drain instead of being
+    /// force-stopped at the default. RED-on-revert: restore the hardcoded
+    /// `max_run: DEFAULT_MAX_RUN` in `from_config` and the override is ignored → 1234s !=
+    /// 600s and this fails.
+    #[test]
+    fn max_run_secs_overrides_the_default_ceiling() {
+        let mut cfg = test_config(RunMode::Bootstrap);
+        cfg.max_run_secs = Some(1234);
+        let run = RunAgentConfig::from_config(cfg).unwrap();
+        assert_eq!(
+            run.max_run,
+            Duration::from_secs(1234),
+            "an explicit max_run_secs is honored (not the 600s default)"
+        );
+    }
+
+    /// #69: `max_run_secs = 0` is rejected at load — a zero ceiling would stop a run before
+    /// it does any work. `from_config` calls `validate()` first, so the bad config never
+    /// builds a run.
+    #[test]
+    fn max_run_secs_zero_is_rejected() {
+        let mut cfg = test_config(RunMode::Bootstrap);
+        cfg.max_run_secs = Some(0);
+        let err = RunAgentConfig::from_config(cfg).unwrap_err();
+        assert!(err.to_string().contains("max_run_secs must be > 0"), "got: {err}");
     }
 
     #[test]
