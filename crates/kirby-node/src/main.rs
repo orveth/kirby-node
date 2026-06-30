@@ -533,6 +533,41 @@ async fn run_fleet_supervisor_cmd(
     let spawn_relay_url = config.relay.url.clone();
     let spawn_max_tenants = config.fleet.max_tenants as usize;
 
+    // N1 — NODE presence: the persistent daemon beacons its OWN node-level presence (signed by
+    // the durable node identity key, NOT any agent's FROST key) on the fleet relay, on the
+    // presence interval and independent of any agent. This is what makes a node show up as ONE
+    // stable entry across restarts (spawned agents no longer beacon presence; they surface via
+    // their 31000 agent-state). Built from `config` BEFORE it is moved into the supervisor; the
+    // shutdown sender is held until the control-plane loop below returns (the daemon's lifetime),
+    // so the beacon runs for as long as the node does.
+    let node_presence = {
+        let treasury_dir = config.identity.treasury_dir();
+        std::fs::create_dir_all(&treasury_dir).ok();
+        let key_path =
+            nerve::NodeIdentity::resolve_key_path(Some(&config.identity.key_path), &treasury_dir);
+        let identity = nerve::NodeIdentity::load_or_create(&key_path)?;
+        tracing::info!(
+            npub = %identity.npub(),
+            node_id = %config.node_id,
+            relay = %config.relay.url,
+            "starting NODE presence (the persistent fleet node beacon)"
+        );
+        let cfg = nerve::PresenceConfig {
+            relay_url: config.relay.url.clone(),
+            node_id: config.node_id.clone(),
+            endpoint: None,
+            interval: Duration::from_secs(config.relay.presence_interval_secs),
+            stale_after: Duration::from_secs(config.relay.presence_stale_after_secs),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(nerve::run_presence(
+            nerve::BeaconSigner::NodeKey(identity),
+            cfg,
+            shutdown_rx,
+        ));
+        (shutdown_tx, handle)
+    };
+
     let mut supervisor = FleetSupervisor::new(node_id, config, allocator, grantor, launcher)
         .with_launch_registry(launch_registry);
 
@@ -582,7 +617,7 @@ async fn run_fleet_supervisor_cmd(
     // so it hosts spawned agents with no inbound port. Runs until killed; reaps dead tenants on
     // a tick so a spawned-agent death frees capacity. (Static `[fleet.tenants]`, if any, were
     // launched above and are monitored by the same reap tick.)
-    run_spawn_control_plane(
+    let result = run_spawn_control_plane(
         supervisor,
         node_id,
         spawn_cfg,
@@ -590,7 +625,13 @@ async fn run_fleet_supervisor_cmd(
         spawn_max_tenants,
         ledger,
     )
-    .await
+    .await;
+
+    // Stop the node presence beacon cleanly (best-effort; on a hard kill the process just exits).
+    let (presence_shutdown, presence_handle) = node_presence;
+    let _ = presence_shutdown.send(());
+    let _ = presence_handle.await;
+    result
 }
 
 /// RECONCILE the supervisor's persisted state with reality on `kirby fleet` startup
@@ -1199,13 +1240,16 @@ async fn run_daemon(args: RunArgs) -> anyhow::Result<()> {
 
     tracing::info!(node_id = %args.node_id, "kirby-node daemon starting");
 
-    // The node state directory (the treasury dir): also the default home for the
-    // node's Nostr identity key. Default to a per-node directory under the OS temp
-    // dir so two node processes on one host stay distinct (D-13 same-host harness).
+    // The node state directory (the treasury dir): also the default home for the node's Nostr
+    // identity key. When `--treasury-path` is unset, fall back to a reboot-DURABLE per-node dir
+    // under the same state root the boot path uses ($KIRBY_STATE_ROOT / XDG / $HOME, never
+    // temp_dir) — keyed per node_id so two node processes on one host stay distinct (D-13
+    // same-host harness). FIX 2: a key under a tmpfs `/tmp` becomes a NEW npub on the next reboot,
+    // which makes a restarted node look like a brand-new node in the fleet/UI.
     let treasury_path = args
         .treasury_path
         .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("kirby-treasury-{}", args.node_id)));
+        .unwrap_or_else(|| boot::treasury_path_for(&args.node_id));
 
     // --presence-only: just join the fleet over the relay and serve until killed.
     // This is the VM-INDEPENDENT path (no prereqs gate, no KVM/Firecracker, no
