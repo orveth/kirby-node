@@ -15,6 +15,7 @@ use kirby_node::rail::{BrainBackend, RoutstrKeyBrain};
 use kirby_proto::ChatMessage;
 
 const KEY: &str = "sk-test-key-abc123";
+const MAX_TOKENS: u32 = 256;
 
 fn messages() -> Vec<ChatMessage> {
     vec![
@@ -25,7 +26,7 @@ fn messages() -> Vec<ChatMessage> {
 
 /// Build a brain at `node_url` and perform one completion, returning `(reply, cost_sats)`.
 async fn complete_at(node_url: String, cap: u64) -> anyhow::Result<(Vec<u8>, u64)> {
-    let brain = RoutstrKeyBrain::new(node_url, KEY.to_string(), Duration::from_secs(2))
+    let brain = RoutstrKeyBrain::new(node_url, KEY.to_string(), MAX_TOKENS, Duration::from_secs(2))
         .expect("build RoutstrKeyBrain");
     brain
         .complete("anthropic/claude-sonnet-4.6", &messages(), cap)
@@ -54,6 +55,9 @@ async fn request_carries_bearer_and_no_x_cashu() {
     let json: serde_json::Value = serde_json::from_slice(&req.body).expect("body is JSON");
     assert_eq!(json["model"], "anthropic/claude-sonnet-4.6");
     assert_eq!(json["stream"], false);
+    // max_tokens MUST be present on the key path: it bounds Routstr's per-request reserve
+    // so concurrent loops can't stack model-max reservations and exhaust the key (402 bug).
+    assert_eq!(json["max_tokens"], MAX_TOKENS, "the key path must send max_tokens to bound the reserve");
     let msgs = json["messages"].as_array().expect("messages array");
     assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[1]["content"], "what is my next move to survive?");
@@ -123,7 +127,7 @@ async fn missing_choices_is_an_error() {
 async fn fetch_balance_converts_msats_to_sats_flooring() {
     // 2_500_400 msats = 2500.4 sat -> floor to 2500 spendable sats.
     let node = MockNode::balance_msats(2_500_400).await;
-    let brain = RoutstrKeyBrain::new(node.url(), KEY.to_string(), Duration::from_secs(2)).unwrap();
+    let brain = RoutstrKeyBrain::new(node.url(), KEY.to_string(), MAX_TOKENS, Duration::from_secs(2)).unwrap();
     let sats = brain.fetch_balance_sats().await.expect("balance reads");
     assert_eq!(sats, 2500, "msats floor-divide to whole spendable sats");
     // The probe authenticated with the bearer key.
@@ -135,7 +139,7 @@ async fn fetch_balance_converts_msats_to_sats_flooring() {
 async fn fetch_balance_errors_on_non_2xx_unusable_key() {
     // A 401 (bad/empty/unfunded key) surfaces as an error -> boot maps it to refuse-to-boot.
     let node = MockNode::balance_status(401).await;
-    let brain = RoutstrKeyBrain::new(node.url(), KEY.to_string(), Duration::from_secs(2)).unwrap();
+    let brain = RoutstrKeyBrain::new(node.url(), KEY.to_string(), MAX_TOKENS, Duration::from_secs(2)).unwrap();
     let err = brain.fetch_balance_sats().await.expect_err("a 401 balance probe must error");
     assert!(err.to_string().contains("non-success status"), "got: {err}");
 }
