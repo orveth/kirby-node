@@ -58,6 +58,12 @@ pub struct KirbyConfig {
     /// Used only when `workload = "capable"`; defaults so a bare `[memory]` (or none) runs.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// The `[nip60]` knobs for the agent's PORTABLE Cashu wallet (proofs as NIP-44-encrypted
+    /// events on relays, for cross-machine money-continuity). DEDICATED + independent of
+    /// `[memory]`: money durability must not be coupled to the mind-state relay set. Defaults so
+    /// an absent `[nip60]` falls back to the single `[relay].url` (dev-only, not money-durable).
+    #[serde(default)]
+    pub nip60: Nip60Config,
     /// The `[agent]` knobs for the CAPABLE workload (the agentic kernel). Defaults so a
     /// bare `[agent]` (or none) runs. The agent's inference is configured by `[brain]`
     /// and its store by `[memory]` (it REUSES both verbatim); this block carries only the
@@ -768,6 +774,121 @@ impl Default for MemoryConfig {
             write_k: None,
             key_path: None,
         }
+    }
+}
+
+/// The `[nip60]` config: the agent's portable Cashu wallet (NIP-60 — Cashu proofs as
+/// NIP-44-encrypted nostr events on relays, for cross-machine money-continuity). DEDICATED +
+/// independent of `[memory]` (the design's "independent operators" point): money durability must
+/// not be coupled to the mind-state relay set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Nip60Config {
+    /// The relay set the NIP-60 wallet publishes encrypted proof events (+ the per-keyset
+    /// counter mirror) to. EMPTY (the default) falls back to the single node `[relay].url` —
+    /// DEV-ONLY, NOT money-durable. Set >=3 INDEPENDENT relays for production money-safety.
+    #[serde(default)]
+    pub relays: Vec<String>,
+    /// The K-of-N ack threshold a publish must reach to count as durable. `None` => strict
+    /// majority `floor(N/2)+1`, clamped to `[1, N]`.
+    #[serde(default)]
+    pub write_k: Option<usize>,
+}
+
+/// The durability verdict of a resolved NIP-60 relay set (drives the boot money-safety warning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nip60Durability {
+    /// >=3 relays — meets the design's money-durability quorum.
+    Quorum,
+    /// 2 relays — redundant but below the >=3 quorum.
+    BelowQuorum,
+    /// 1 relay (the single-`[relay].url` fallback) — DEV-ONLY, NOT money-durable.
+    SingleRelayDevOnly,
+}
+
+impl Nip60Durability {
+    /// The strong, no-money-loss warning for a sub-quorum relay set (`None` at quorum). The boot
+    /// emits it so a dev/single-relay deploy is LOUD about the gap — the Fork-A per-keyset counter
+    /// mirror rides the SAME relays, so a single-relay drop strands BOTH the proofs AND the
+    /// counter (doubly risky); NUT-13 seed-restore is then the only backstop.
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            Nip60Durability::Quorum => None,
+            Nip60Durability::BelowQuorum => Some(
+                "NIP-60 money on FEWER THAN 3 relays is below the durability quorum — a relay drop \
+                 risks money loss (NUT-13 seed-restore is the only backstop). Set >=3 independent \
+                 relays in [nip60].relays for production money-safety.",
+            ),
+            Nip60Durability::SingleRelayDevOnly => Some(
+                "NIP-60 money on a SINGLE relay is NOT durable (DEV-ONLY) — a relay drop risks money \
+                 loss and strands BOTH the proof events AND the per-keyset counter mirror. NUT-13 \
+                 seed-restore is the only backstop. Set >=3 independent relays in [nip60].relays \
+                 for production money-safety.",
+            ),
+        }
+    }
+}
+
+impl Nip60Config {
+    /// Resolve the effective relay set + K-of-N threshold + durability verdict. With no
+    /// `[nip60].relays`, falls back to the single node relay `fleet_relay` (k=1) — DEV-ONLY. PURE
+    /// (the caller emits [`Nip60Durability::warning`]), so it is unit-testable.
+    pub fn resolve(&self, fleet_relay: &str) -> (Vec<String>, usize, Nip60Durability) {
+        let relays = if self.relays.is_empty() {
+            vec![fleet_relay.to_string()]
+        } else {
+            self.relays.clone()
+        };
+        let n = relays.len();
+        let k = self.write_k.unwrap_or(n / 2 + 1).clamp(1, n);
+        let durability = match n {
+            0 | 1 => Nip60Durability::SingleRelayDevOnly,
+            2 => Nip60Durability::BelowQuorum,
+            _ => Nip60Durability::Quorum,
+        };
+        (relays, k, durability)
+    }
+}
+
+#[cfg(test)]
+mod nip60_config_tests {
+    use super::*;
+
+    #[test]
+    fn empty_relays_falls_back_to_single_fleet_relay_dev_only() {
+        let (relays, k, durability) = Nip60Config::default().resolve("ws://fleet:7777");
+        assert_eq!(relays, vec!["ws://fleet:7777".to_string()]);
+        assert_eq!(k, 1);
+        assert_eq!(durability, Nip60Durability::SingleRelayDevOnly);
+        assert!(
+            durability.warning().is_some(),
+            "the single-relay fallback MUST emit the money-durability warning"
+        );
+    }
+
+    #[test]
+    fn three_relays_meet_quorum_with_majority_k() {
+        let cfg = Nip60Config { relays: vec!["a".into(), "b".into(), "c".into()], write_k: None };
+        let (relays, k, durability) = cfg.resolve("ws://fleet:7777");
+        assert_eq!(relays.len(), 3, "configured relays override the fleet fallback");
+        assert_eq!(k, 2, "default K = strict majority floor(3/2)+1");
+        assert_eq!(durability, Nip60Durability::Quorum);
+        assert!(durability.warning().is_none(), "a >=3 quorum is money-durable, no warning");
+    }
+
+    #[test]
+    fn two_relays_are_below_quorum() {
+        let cfg = Nip60Config { relays: vec!["a".into(), "b".into()], write_k: None };
+        let (_relays, k, durability) = cfg.resolve("ws://fleet:7777");
+        assert_eq!(k, 2);
+        assert_eq!(durability, Nip60Durability::BelowQuorum);
+        assert!(durability.warning().is_some());
+    }
+
+    #[test]
+    fn write_k_clamps_into_range() {
+        let cfg = Nip60Config { relays: vec!["a".into(), "b".into(), "c".into()], write_k: Some(99) };
+        let (_relays, k, _d) = cfg.resolve("ws://fleet:7777");
+        assert_eq!(k, 3, "an over-large write_k clamps to N");
     }
 }
 

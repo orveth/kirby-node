@@ -32,6 +32,10 @@ use serde::{Deserialize, Serialize};
 pub struct TokenEventContent {
     /// The mint URL these proofs are drawn on.
     pub mint: String,
+    /// The Cashu unit these proofs are denominated in (NIP-60 `unit`, e.g. "sat"). kirby is
+    /// sat-only today; carried explicitly for spec-completeness + future multi-unit. Set from
+    /// the wallet's `CurrencyUnit` when the content is built (N1b).
+    pub unit: String,
     /// The Cashu proofs (cdk's serde-serializable `Proof`: amount / id / secret / C / ...).
     pub proofs: Vec<Proof>,
     /// Token-event ids this event supersedes (NIP-09 delete targets). Empty until a rollover.
@@ -92,6 +96,7 @@ mod tests {
         let crypto = Nip60Crypto::from_event_key(&event_key).expect("derived key is a valid secret");
         let content = TokenEventContent {
             mint: "https://mint.example".to_string(),
+            unit: "sat".to_string(),
             // Empty proofs exercise the encrypt/decrypt + serde of the content envelope without
             // hand-constructing a valid Cashu Proof (whose serde is cdk's own tested concern).
             proofs: Vec::new(),
@@ -112,6 +117,7 @@ mod tests {
         let b = Nip60Crypto::from_event_key(&derive_nip60_event_key(&[2u8; 64])).unwrap();
         let content = TokenEventContent {
             mint: "https://m".to_string(),
+            unit: "sat".to_string(),
             proofs: Vec::new(),
             del: Vec::new(),
         };

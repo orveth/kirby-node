@@ -886,6 +886,7 @@ mod tests {
             workload: Workload::AppCheckpoint,
             brain: Default::default(),
             memory: Default::default(),
+            nip60: Default::default(),
             agent: Default::default(),
             meter: Default::default(),
             mode,
