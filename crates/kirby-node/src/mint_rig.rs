@@ -65,6 +65,18 @@ pub async fn fund_wallet(wallet: Arc<Wallet>, amount_sats: u64) -> anyhow::Resul
     Ok(())
 }
 
+/// The Phase-2 wallet-seed provider behind [`WalletKey::Keyring`]: the reconstruct mechanism
+/// (the reconstruct-on-lease keyring, [`crate::seed_keyring`]) sits BEHIND this trait, so the
+/// wallet-open path stays oblivious to HOW the seed is obtained. PURPOSE-SCOPED: an impl
+/// yields ONLY the 64-byte wallet spend seed onto the spend plane — never a FROST key, never
+/// the DM key.
+pub trait WalletSeedProvider: Send + Sync {
+    /// Provide the 64-byte wallet spend seed. The keyring impl reconstructs the master seed
+    /// (gated on a fresh lease) and derives the wallet seed; an error (no fresh lease, too
+    /// few shares) REFUSES to open the wallet (loud + safe).
+    fn wallet_seed(&self) -> anyhow::Result<[u8; 64]>;
+}
+
 /// The source of a wallet's spend key — the 64-byte cdk seed that is spend authority over
 /// the wallet's proofs (HIGH-4). THE Phase-2 seam: the interim variant load-or-creates a
 /// local 0600 keyfile (byte-identical to the pre-seam behavior); the reconstruct-on-lease
@@ -79,9 +91,11 @@ pub enum WalletKey {
     /// dir because its `wallet_db_path` is per-agent ([`crate::boot::agent_state_dir_for`]); the
     /// bare default is the wallet store's sibling `<db_path>.seed` ([`WalletKey::sibling_seed_of`]).
     Keyfile(std::path::PathBuf),
-    // PHASE-2: `Keyring(Arc<dyn WalletSeedProvider>)` — the reconstruct-on-lease keyring
-    // derives the seed under a fresh lease; it slots in here, resolved by `resolve_seed`,
-    // with no caller change at the swap.
+    /// PHASE-2: a [`WalletSeedProvider`] (the reconstruct-on-lease keyring) supplies the seed.
+    /// The reconstruct mechanism sits BEHIND the trait, so the wallet-open hot path doesn't
+    /// move; the variant CHOICE is made at the construction site (`build_routstr_brain`).
+    /// Resolved by `resolve_seed` exactly like `Keyfile`.
+    Keyring(std::sync::Arc<dyn WalletSeedProvider>),
 }
 
 impl WalletKey {
@@ -98,6 +112,7 @@ impl WalletKey {
     fn resolve_seed(&self) -> anyhow::Result<[u8; 64]> {
         match self {
             WalletKey::Keyfile(path) => load_or_create_wallet_seed(path),
+            WalletKey::Keyring(provider) => provider.wallet_seed(),
         }
     }
 }
