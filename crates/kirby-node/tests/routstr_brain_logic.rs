@@ -93,6 +93,9 @@ async fn request_carries_model_messages_stream_false_and_x_cashu_token() {
     let json: serde_json::Value = serde_json::from_slice(&req.body).expect("body is JSON");
     assert_eq!(json["model"], "anthropic/claude-sonnet-4.6");
     assert_eq!(json["stream"], false, "stateless X-Cashu mode pins stream:false");
+    // The Cashu path must NOT send max_tokens (the X-Cashu token amount already bounds the
+    // node's reserve) — its wire stays byte-identical; only the prepaid-key path adds it.
+    assert!(json.get("max_tokens").is_none(), "the Cashu path must omit max_tokens");
     let messages = json["messages"].as_array().expect("messages array");
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0]["role"], "system");

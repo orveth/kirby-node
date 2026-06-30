@@ -511,6 +511,7 @@ async fn build_routstr_key_brain(
     let key_brain = RoutstrKeyBrain::new(
         brain.node_url.clone(),
         api_key,
+        brain.max_tokens,
         Duration::from_secs(brain.request_timeout_secs),
     )?;
 
