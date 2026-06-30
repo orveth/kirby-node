@@ -467,6 +467,40 @@ async fn peek_treasury_remaining(config: &BootConfig) -> anyhow::Result<u64> {
     Ok(remaining)
 }
 
+/// Run boot-time cdk saga recovery under a timeout `budget`, DEGRADING (warn + continue)
+/// instead of hanging when the budget elapses. Saga reconcile (R2-4) recovers proofs
+/// stranded by a prior crash mid send/receive/swap/melt; it is cdk's only network-bound
+/// boot step and cdk's HTTP client carries no request timeout, so an unreachable mint would
+/// otherwise block boot FOREVER — before the agent VM ever launches (#84).
+///
+/// On timeout we boot anyway: the wallet-backs-counter shortfall guard that runs next
+/// ([`assert_wallet_backs_counter`]) reconciles against the LOCAL balance, so a degraded
+/// boot is still conservative (never over-claims) and still REFUSES on a real shortfall. The
+/// stranded proofs persist in the cdk localstore and reconcile on the next boot that reaches
+/// the mint — deferred, not lost. (Saga recovery has a single caller, this boot step; the
+/// runtime per-think reclaim in [`crate::rail::RoutstrBrain`] is a DIFFERENT mechanism — it
+/// recovers the CURRENT think's token, it does not re-run saga reconcile.)
+///
+/// A real saga error from a REACHABLE mint (resolves within the budget) still propagates →
+/// boot refuses, preserving the strict R2-4/R2-5 stance.
+async fn recover_sagas_within<F>(recover: F, budget: Duration) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    match tokio::time::timeout(budget, recover).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            tracing::warn!(
+                budget_secs = budget.as_secs(),
+                "boot saga recovery timed out (mint unreachable?); booting on the \
+                 locally-backed balance — stranded proofs persist and reconcile on the next \
+                 mint-reachable boot, rather than hanging boot forever (#84)"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Build the [`RoutstrBrain`] backend for `backend = "routstr"` (brain-routstr §7): open
 /// the persistent, funded wallet, recover incomplete cdk sagas FIRST (R2-4), then assert
 /// the wallet backs the counter (`wallet_balance >= treasury_remaining`, NOT `==` — the
@@ -493,9 +527,15 @@ async fn build_routstr_brain(
 
     // 2) Recover incomplete cdk sagas FIRST (R2-4), BEFORE measuring the balance: a prior
     //    crash/timeout mid send/receive can strand reserved/pending proofs or leave a
-    //    revocable token; reconciling first would burn budget for recoverable sats.
+    //    revocable token; reconciling first would burn budget for recoverable sats. Bounded
+    //    by `recovery_timeout_secs` and degraded (not failed) on timeout so an unreachable
+    //    mint cannot hang boot before the VM launches (#84); see `recover_sagas_within`.
     use crate::rail::EcashProvider as _;
-    ecash.recover_incomplete_sagas().await?;
+    recover_sagas_within(
+        ecash.recover_incomplete_sagas(),
+        Duration::from_secs(brain.recovery_timeout_secs),
+    )
+    .await?;
 
     // 3) Reconcile: the wallet must back every sat the counter believes it has. REFUSE
     //    TO BOOT on a shortfall (R2-5) — loud and safe — rather than letting the genome
@@ -926,5 +966,54 @@ mod routstr_key_boot_tests {
         let msg = err.to_string();
         assert!(msg.contains("refuses to boot"), "got: {msg}");
         assert!(msg.contains("99") && msg.contains("100"), "names both figures: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod boot_saga_recovery_tests {
+    use super::recover_sagas_within;
+    use std::time::Duration;
+
+    /// #84: an unreachable mint makes cdk saga recovery hang (cdk's HTTP client carries no
+    /// request timeout). The boot wrapper must DEGRADE — return `Ok` within the budget — so
+    /// boot proceeds (onto the local-balance shortfall guard) instead of blocking forever. A
+    /// never-resolving future stands in for the hung network call.
+    ///
+    /// RED-on-revert: drop the `timeout` wrap in `recover_sagas_within` (await the future
+    /// directly) and this test HANGS — the pending future never completes — so the suite
+    /// times out. That hang IS the bug #84 fixes.
+    #[tokio::test]
+    async fn degrades_to_ok_when_recovery_hangs() {
+        let hung = std::future::pending::<anyhow::Result<()>>();
+        let out = recover_sagas_within(hung, Duration::from_millis(50)).await;
+        assert!(
+            out.is_ok(),
+            "a hung (unreachable-mint) saga recovery must degrade to Ok so boot continues"
+        );
+    }
+
+    /// A real saga error from a REACHABLE mint (resolves well within the budget) still
+    /// propagates → boot refuses (the strict R2-4/R2-5 stance is preserved on a mint we
+    /// CAN reach; only unreachability degrades).
+    ///
+    /// RED-on-revert: if the wrapper degraded on the `Ok` arm too (swallowed all errors),
+    /// this would be `Ok` and the assertion fails.
+    #[tokio::test]
+    async fn propagates_a_real_saga_error_within_budget() {
+        let failed = async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("recover_incomplete_sagas: mint rejected swap"))
+        };
+        let out = recover_sagas_within(failed, Duration::from_secs(30)).await;
+        let err = out.expect_err("a real saga error within budget must propagate (refuse to boot)");
+        assert!(err.to_string().contains("mint rejected swap"), "got: {err}");
+    }
+
+    /// A clean recovery (healthy mint, resolves immediately) returns `Ok` and boot proceeds
+    /// — the byte-identical happy path (the timeout is a ceiling, not an added delay).
+    #[tokio::test]
+    async fn passes_through_a_clean_recovery() {
+        let ok = async { Ok::<(), anyhow::Error>(()) };
+        let out = recover_sagas_within(ok, Duration::from_secs(30)).await;
+        assert!(out.is_ok(), "a clean recovery passes through unchanged");
     }
 }
