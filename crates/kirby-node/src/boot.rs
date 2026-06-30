@@ -35,7 +35,7 @@ use crate::gateway::{GatewayService, Session};
 use crate::nerve::NodeIdentity;
 use crate::rail::{
     Actuator, BrainBackend, CdkEcash, CompositeRail, EngramStore, MemoryBackend, MockRail,
-    NostrActuator, Rail, RoutstrBrain, StubBrain, StubMemory,
+    NostrActuator, Rail, RoutstrBrain, RoutstrKeyBrain, StubBrain, StubMemory,
 };
 use crate::sandbox::{GatewayTransport, GuestImage, GuestSpec, SandboxBackend, SandboxInstance};
 use crate::treasury::Treasury;
@@ -252,6 +252,20 @@ pub async fn boot_and_observe(
         Some(brain) if brain.backend == BrainBackendKind::Routstr => {
             let treasury_remaining = peek_treasury_remaining(&config).await?;
             let brain_backend = build_routstr_brain(brain, treasury_remaining).await?;
+            Arc::new(attach_actuator(
+                CompositeRail::new(Arc::new(MockRail::new()), brain_backend),
+                actuator,
+            ))
+        }
+        // The prepaid API-KEY brain (mint-independent fallback): a CompositeRail whose
+        // brain is a RoutstrKeyBrain over a node-held custodial balance. Building it loads
+        // the bearer key and probes /v1/balance/info to (a) validate the key works and (b)
+        // assert the balance backs the treasury counter BEFORE the VM boots (REFUSE-TO-BOOT
+        // on a shortfall or unusable key — the same loud-and-safe stance as the Cashu path).
+        // No wallet/mint/saga: the key is the only credential.
+        Some(brain) if brain.backend == BrainBackendKind::RoutstrKey => {
+            let treasury_remaining = peek_treasury_remaining(&config).await?;
+            let brain_backend = build_routstr_key_brain(brain, treasury_remaining).await?;
             Arc::new(attach_actuator(
                 CompositeRail::new(Arc::new(MockRail::new()), brain_backend),
                 actuator,
@@ -475,6 +489,79 @@ async fn build_routstr_brain(
     )?;
     let backend: Arc<dyn BrainBackend> = Arc::new(routstr);
     Ok(backend)
+}
+
+/// Build the [`RoutstrKeyBrain`] backend for `backend = "routstr_key"` (the prepaid,
+/// mint-independent path): load the bearer key from its keyfile, construct the brain, then
+/// probe `/v1/balance/info` to BOTH validate the key works AND assert the custodial
+/// balance backs the treasury counter (`balance_sats >= treasury_remaining`). REFUSE TO
+/// BOOT on an unusable key (a bad/empty/unfunded key surfaces as a balance-probe error) or
+/// a shortfall — the same loud-and-safe stance as [`build_routstr_brain`]'s wallet
+/// reconcile, mirrored for the custodial balance. No wallet, no mint, no saga recovery:
+/// the key is the only credential, and the money already left at funding time.
+async fn build_routstr_key_brain(
+    brain: &crate::config::BrainConfig,
+    treasury_remaining: u64,
+) -> anyhow::Result<Arc<dyn BrainBackend>> {
+    // 1) Load the bearer key from its FILE (never inline in the logged/serialized config —
+    //    it is bearer money, the same discipline as the wallet seed / dm key).
+    let api_key = load_api_key(&brain.api_key_path)?;
+
+    // 2) Build the brain (HTTP client with redirects disabled + the per-call kill-window).
+    let key_brain = RoutstrKeyBrain::new(
+        brain.node_url.clone(),
+        api_key,
+        Duration::from_secs(brain.request_timeout_secs),
+    )?;
+
+    // 3) Probe the balance: this BOTH validates the key (a bad/empty/unfunded key returns
+    //    non-2xx, surfaced as an error) and reads the custodial balance. REFUSE TO BOOT if
+    //    the probe fails (don't boot a brain that cannot think) ...
+    let balance_sats = key_brain.fetch_balance_sats().await.map_err(|e| {
+        anyhow::anyhow!(
+            "RoutstrKeyBrain refuses to boot: could not read the prepaid key balance from \
+             the node ({e}). The agent cannot think without a working, funded key."
+        )
+    })?;
+    // ... or the custodial balance does not back the counter.
+    assert_balance_backs_counter(balance_sats, treasury_remaining)?;
+
+    let backend: Arc<dyn BrainBackend> = Arc::new(key_brain);
+    Ok(backend)
+}
+
+/// The custodial-balance analog of [`assert_wallet_backs_counter`] for the prepaid
+/// API-key path: the node-held balance must back every sat the metabolism counter believes
+/// it has (`balance_sats >= treasury_remaining`, `>=` NOT `==`), or the brain REFUSES TO
+/// BOOT (loud + safe, the same stance as the Cashu wallet reconcile). There is no fee
+/// reserve to subtract here — the per-think charge is debited server-side from this same
+/// balance, so the whole balance backs the counter.
+pub fn assert_balance_backs_counter(balance_sats: u64, treasury_remaining: u64) -> anyhow::Result<()> {
+    if balance_sats < treasury_remaining {
+        anyhow::bail!(
+            "RoutstrKeyBrain refuses to boot: prepaid key balance ({balance_sats} sat) < \
+             treasury_remaining ({treasury_remaining} sat). The custodial balance must back \
+             every sat the metabolism counter believes it has. Top up the key (POST \
+             /v1/balance/topup) or lower funding.initial_sats before resuming."
+        );
+    }
+    Ok(())
+}
+
+/// Load the prepaid bearer key from its keyfile: read the file, trim surrounding
+/// whitespace/newline (an editor- or `printf`-written key usually has a trailing newline),
+/// and reject an empty result. The key is bearer money — it lives in a FILE (never inline
+/// in the logged/serialized config) and is never logged here.
+fn load_api_key(path: &str) -> anyhow::Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read brain.api_key_path {path:?}: {e}"))?;
+    let key = raw.trim().to_string();
+    if key.is_empty() {
+        anyhow::bail!(
+            "brain.api_key_path {path:?} is empty (expected a prepaid Routstr bearer key, e.g. sk-…)"
+        );
+    }
+    Ok(key)
 }
 
 /// As [`boot_and_observe`], but the caller supplies the [`Rail`] the gateway's
@@ -763,5 +850,56 @@ async fn wait_for_hello(
             Ok(None) => return None, // observer dropped
             Err(_) => return None,   // timed out
         }
+    }
+}
+
+#[cfg(test)]
+mod routstr_key_boot_tests {
+    use super::{assert_balance_backs_counter, load_api_key};
+
+    /// A unique temp path for a test keyfile (no shared `tests/common` here — this is a
+    /// `src` unit test, so we mint our own temp path the same way the harness does).
+    fn temp_key_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("kirby-rk-key-{tag}-{}-{}", std::process::id(), n))
+    }
+
+    #[test]
+    fn load_api_key_reads_and_trims_surrounding_whitespace() {
+        let path = temp_key_path("trim");
+        std::fs::write(&path, "  sk-abc123\n\n").unwrap();
+        let key = load_api_key(path.to_str().unwrap()).expect("a non-empty keyfile loads");
+        assert_eq!(key, "sk-abc123", "surrounding whitespace + trailing newline are trimmed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_api_key_rejects_an_empty_file() {
+        let path = temp_key_path("empty");
+        std::fs::write(&path, "   \n").unwrap();
+        let err = load_api_key(path.to_str().unwrap()).expect_err("a whitespace-only key is rejected");
+        assert!(err.to_string().contains("is empty"), "got: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_api_key_rejects_a_missing_file() {
+        let path = temp_key_path("missing"); // never created
+        let err = load_api_key(path.to_str().unwrap()).expect_err("a missing keyfile errors");
+        assert!(err.to_string().contains("read brain.api_key_path"), "got: {err}");
+    }
+
+    #[test]
+    fn balance_backs_counter_ok_at_or_above_and_refuses_below() {
+        // The `>=` boundary backs the counter; excess is fine (no fee reserve to subtract).
+        assert!(assert_balance_backs_counter(100, 100).is_ok(), "the >= boundary backs the counter");
+        assert!(assert_balance_backs_counter(101, 100).is_ok(), "excess balance is fine");
+        // Short by a single sat: REFUSE TO BOOT, naming both figures.
+        let err = assert_balance_backs_counter(99, 100).expect_err("a shortfall must refuse to boot");
+        let msg = err.to_string();
+        assert!(msg.contains("refuses to boot"), "got: {msg}");
+        assert!(msg.contains("99") && msg.contains("100"), "names both figures: {msg}");
     }
 }

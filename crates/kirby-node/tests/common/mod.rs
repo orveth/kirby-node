@@ -47,8 +47,24 @@ pub enum NodeBehavior {
     Status(u16),
     /// 200 with a body that is NOT valid completion JSON (malformed / missing content).
     Malformed,
+    /// 200 with an arbitrary JSON `body` (the prepaid-API-key path uses this to carry the
+    /// `cost`/`usage` cost metadata Routstr injects into the BODY — there is no X-Cashu on
+    /// that path). The body is returned verbatim as `application/json`.
+    ReplyJson { body: String },
     /// Accept the connection but never respond (a black hole) — the client times out.
     Hang,
+}
+
+/// How the mock answers `GET /v1/balance/info` (the prepaid-key balance probe). The node
+/// reports the balance in MILLISATOSHIS, so [`BalanceBehavior::Msats`] takes msats.
+#[derive(Clone)]
+pub enum BalanceBehavior {
+    /// 404 — the route is not configured (the default; the Cashu-path tests never hit it).
+    NotFound,
+    /// 200 with `{ "balance": <msats> }` (net spendable balance, in millisatoshis).
+    Msats(u64),
+    /// A non-2xx status (e.g. 401 for a bad/empty key) — drives the refuse-to-boot path.
+    Status(u16),
 }
 
 /// An async hook the round-trip mock invokes with the `X-Cashu` bearer token it received,
@@ -59,7 +75,8 @@ pub enum NodeBehavior {
 pub type RedeemHook =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
 
-/// How the mock answers `POST /v1/wallet/refund` (the RIP-01 refund).
+/// How the mock answers `POST /v1/balance/refund` (the RIP-01 refund; the deprecated
+/// `/v1/wallet/refund` alias routes to the same behavior).
 #[derive(Clone)]
 pub enum RefundBehavior {
     /// No refund offered (404) — the recovery falls through to eating the remainder.
@@ -74,6 +91,9 @@ pub struct RecordedRequest {
     pub method: String,
     pub path: String,
     pub x_cashu: Option<String>,
+    /// The `Authorization` header (the prepaid-key path sends `Bearer <sk-…>` here; the
+    /// Cashu path sends none — a test asserts which is present).
+    pub authorization: Option<String>,
     pub content_type: Option<String>,
     pub body: Vec<u8>,
 }
@@ -89,6 +109,17 @@ impl MockNode {
     /// Bind on an ephemeral loopback port and serve `completion` on the completions
     /// endpoint and `refund` on the refund endpoint until dropped.
     pub async fn start(completion: NodeBehavior, refund: RefundBehavior) -> Self {
+        Self::start_with(completion, refund, BalanceBehavior::NotFound).await
+    }
+
+    /// As [`MockNode::start`], plus a `GET /v1/balance/info` behavior (the prepaid-key
+    /// balance probe). The Cashu-path callers use [`MockNode::start`], which defaults the
+    /// balance route to 404 (never hit on that path).
+    pub async fn start_with(
+        completion: NodeBehavior,
+        refund: RefundBehavior,
+        balance: BalanceBehavior,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock node");
         let addr = listener.local_addr().expect("mock node local addr");
         let base_url = format!("http://127.0.0.1:{}", addr.port());
@@ -101,9 +132,10 @@ impl MockNode {
                 };
                 let behavior = completion.clone();
                 let refund = refund.clone();
+                let balance = balance.clone();
                 let recorder = requests_for_task.clone();
                 tokio::spawn(async move {
-                    handle_conn(stream, behavior, refund, recorder).await;
+                    handle_conn(stream, behavior, refund, balance, recorder).await;
                 });
             }
         });
@@ -112,6 +144,38 @@ impl MockNode {
             requests,
             _shutdown: handle,
         }
+    }
+
+    /// Convenience: a 200 node returning an arbitrary JSON `body` (the prepaid-key path
+    /// carries its cost in `cost`/`usage` body fields), no refund, no balance route.
+    pub async fn replying_json(body: &str) -> Self {
+        MockNode::start(
+            NodeBehavior::ReplyJson { body: body.to_string() },
+            RefundBehavior::None,
+        )
+        .await
+    }
+
+    /// Convenience: a node whose `GET /v1/balance/info` returns `balance_msats` (the
+    /// completions endpoint is never exercised — it 500s if hit).
+    pub async fn balance_msats(balance_msats: u64) -> Self {
+        MockNode::start_with(
+            NodeBehavior::Status(500),
+            RefundBehavior::None,
+            BalanceBehavior::Msats(balance_msats),
+        )
+        .await
+    }
+
+    /// Convenience: a node whose `GET /v1/balance/info` returns `status` (e.g. 401 for a
+    /// bad/empty key) — drives the refuse-to-boot probe-failure path.
+    pub async fn balance_status(status: u16) -> Self {
+        MockNode::start_with(
+            NodeBehavior::Status(500),
+            RefundBehavior::None,
+            BalanceBehavior::Status(status),
+        )
+        .await
     }
 
     /// Convenience: a node that returns `reply` + a `change_token` and no refund.
@@ -171,6 +235,7 @@ async fn handle_conn(
     mut stream: tokio::net::TcpStream,
     completion: NodeBehavior,
     refund: RefundBehavior,
+    balance: BalanceBehavior,
     recorder: Arc<Mutex<Vec<RecordedRequest>>>,
 ) {
     // Read until the end of the headers, then drain the Content-Length body so the full
@@ -199,6 +264,7 @@ async fn handle_conn(
     let path = parts.next().unwrap_or("").to_string();
 
     let mut x_cashu = None;
+    let mut authorization = None;
     let mut content_type = None;
     let mut content_length = 0usize;
     for line in lines {
@@ -207,6 +273,7 @@ async fn handle_conn(
             let value = value.trim();
             match name.as_str() {
                 "x-cashu" => x_cashu = Some(value.to_string()),
+                "authorization" => authorization = Some(value.to_string()),
                 "content-type" => content_type = Some(value.to_string()),
                 "content-length" => content_length = value.parse().unwrap_or(0),
                 _ => {}
@@ -230,12 +297,38 @@ async fn handle_conn(
         method,
         path: path.clone(),
         x_cashu,
+        authorization,
         content_type,
         body,
     });
 
-    // Dispatch by endpoint.
-    if path.contains("/v1/wallet/refund") {
+    // The prepaid-key balance probe (`GET /v1/balance/info`).
+    if path.contains("/v1/balance/info") {
+        match balance {
+            BalanceBehavior::NotFound => {
+                write_response(&mut stream, 404, "Not Found", &[], b"").await;
+            }
+            BalanceBehavior::Msats(msats) => {
+                let body = serde_json::json!({ "balance": msats }).to_string();
+                write_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &[("Content-Type", "application/json")],
+                    body.as_bytes(),
+                )
+                .await;
+            }
+            BalanceBehavior::Status(code) => {
+                write_response(&mut stream, code, "Error", &[], b"{\"error\":\"mock\"}").await;
+            }
+        }
+        return;
+    }
+
+    // Dispatch by endpoint. The canonical refund path is `/v1/balance/refund`; the mock
+    // also matches the deprecated `/v1/wallet/refund` alias so older callers still route.
+    if path.contains("/v1/balance/refund") || path.contains("/v1/wallet/refund") {
         match refund {
             RefundBehavior::None => {
                 write_response(&mut stream, 404, "Not Found", &[], b"").await;
@@ -292,6 +385,16 @@ async fn handle_conn(
                 "OK",
                 &[("Content-Type", "application/json")],
                 b"this is not the json you are looking for",
+            )
+            .await;
+        }
+        NodeBehavior::ReplyJson { body } => {
+            write_response(
+                &mut stream,
+                200,
+                "OK",
+                &[("Content-Type", "application/json")],
+                body.as_bytes(),
             )
             .await;
         }

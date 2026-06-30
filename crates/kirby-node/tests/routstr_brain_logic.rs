@@ -206,6 +206,35 @@ async fn non_2xx_with_successful_refund_is_upstream_failed_zero() {
 }
 
 #[tokio::test]
+async fn refund_is_posted_to_the_canonical_balance_refund_path() {
+    // The bug fix: the RIP-01 refund must POST to the canonical /v1/balance/refund, NOT the
+    // deprecated /v1/wallet/refund alias (which the node may drop). A 402 + revoke-fail
+    // forces recovery to fall through to the refund POST. The mock accepts EITHER path, so
+    // this path assertion is what PINS the URL — a regression to /v1/wallet/refund would
+    // still "work" against the mock but is caught here.
+    let node = MockNode::start(NodeBehavior::Status(402), RefundBehavior::Token("ecash:64".into())).await;
+    let _ = perform(node.url(), StubEcash::revoke_fails(), 64).await;
+    let refund = node
+        .requests()
+        .into_iter()
+        .find(|r| r.path.contains("/refund"))
+        .expect("a refund request was sent after the 402 + revoke-fail");
+    assert_eq!(refund.method, "POST");
+    assert!(
+        refund.path.contains("/v1/balance/refund"),
+        "refund must POST to the canonical /v1/balance/refund, got {}",
+        refund.path
+    );
+    assert!(
+        !refund.path.contains("/v1/wallet/refund"),
+        "refund must NOT use the deprecated /v1/wallet/refund alias, got {}",
+        refund.path
+    );
+    // It carries the original token as the X-Cashu bearer (the refund request shape).
+    assert!(refund.x_cashu.is_some(), "the refund posts the original token as X-Cashu");
+}
+
+#[tokio::test]
 async fn server_error_unrecoverable_debits_the_cap() {
     // 500 model error; revoke fails, no refund -> debit cap.
     let node = MockNode::start(NodeBehavior::Status(500), RefundBehavior::None).await;
