@@ -142,8 +142,9 @@ pub struct FleetConfig {
     pub tenants: Vec<TenantConfig>,
     /// The DYNAMIC spawn control-plane (#11): subscribe to signed `KIND_KIRBY_SPAWN_REQUEST`
     /// events on the relay and spawn agents on demand (create an agent on this node from a
-    /// signed event, no node access required). OFF by default, so a fleet that only hosts its
-    /// static `tenants` is unchanged. See [`SpawnConfig`].
+    /// signed event, no node access required). A `kirby fleet` node ALWAYS runs this (there is
+    /// no enable flag); it is gated by the `operators` / `image_allowlist` fields below, not
+    /// toggled off. See [`SpawnConfig`].
     #[serde(default)]
     pub spawn: SpawnConfig,
 }

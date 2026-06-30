@@ -1,16 +1,23 @@
 # AGENTS.md -- running a kirby node
 
 This file is for an agent (or an operator) tasked with **setting up and running a kirby node**.
-It is the ground-truth runbook. Read it top to bottom; do not skip the prereqs gate.
+It is the ground-truth runbook. Read it top to bottom; do not skip the prereqs gate. (If you are a
+coding agent working *in* the repo, start at [`CLAUDE.md`](CLAUDE.md) -- it orients you on the code,
+the build/test loop, and the full subcommand map; this file is the run runbook it points to.)
 
-If a human says *"I want to run a kirby node"*, your job is to: pick the platform, build the
-toolchain and genome image, fill in `kirby.toml`, prove the host with the prereqs gate, then run
-`kirby run`. That single command takes the node from nothing to a live sovereign agent in the
-Nostr fleet.
+**node != agent.** A **node** is what joins the network -- you run one with
+`kirby-node fleet --config kirby.toml`; it beacons node presence and hosts agents. An **agent** is
+one sovereign Kirby that runs on top of a node (declared as a fleet tenant, or spawned remotely).
+The single command `kirby-node agent --config kirby.toml` runs ONE agent end to end -- the fastest
+way to see the loop and smoke-test your host -- but the node you actually deploy is `kirby-node fleet`.
+
+So your job, given a platform, is: build the toolchain and genome image, fill in `kirby.toml`, prove
+the host with the prereqs gate, then run an agent (`kirby-node agent`, to see it work) and/or a node
+(`kirby-node fleet`, to join the network and host agents).
 
 ## First, set expectations
 
-- **Sovereign by default.** `kirby run` provisions the agent its own 2-of-3 **FROST**
+- **Sovereign by default.** `kirby-node agent` provisions the agent its own 2-of-3 **FROST**
   threshold key **Q** on first boot and signs its entire public voice through a live
   in-process quorum; on restart it reloads the *same* Q (idempotent, fail-closed). **Today
   the three shares are co-located on this host** -- the threshold *structure* is real, but
@@ -18,12 +25,16 @@ Nostr fleet.
   yet. `--no-frost` is a dev/test fast-path (plain node key), not the default.
 - **ecash metabolism, no on-chain.** The brokered-act mint is a local CDK fakewallet; the
   agent thinks, acts, and dies against ecash. There is **no on-chain Bitcoin path**.
-- **The run path is one command:** `kirby-node agent --config kirby.toml` (a.k.a. `kirby run`).
-  It runs a single **sovereign** agent joined to a Nostr fleet.
+- **Two entrypoints, one config file.** `kirby-node agent --config kirby.toml` runs one sovereign
+  agent (the taste / smoke). `kirby-node fleet --config kirby.toml` runs the node that joins the
+  network and hosts agents (the deployment). Both read `kirby.toml`.
+- **Watch the command name.** Older docs call the agent keystone "kirby run," but the actual command
+  is `kirby-node agent`. There is also a *separate, legacy* `kirby-node run` subcommand (an early
+  boot demo that just connects a genome and exits) -- do not run that when you mean to run an agent.
 - It runs on **Linux** (Firecracker backend) and **Apple Silicon macOS** (Apple Virtualization
   backend). `backend = "auto"` in the config picks the right one per platform.
 
-## What `kirby run` actually does
+## What `kirby-node agent` does
 
 From a config file to a live agent, composing pieces that already exist:
 
@@ -110,14 +121,56 @@ cargo run -p kirby-node -- prereqs               # must pass first
 cargo run -p kirby-node -- agent --config kirby.toml
 ```
 
-Verify it is alive: it publishes presence to the relay and emits a `9100` born event. Read the
-fleet with `cargo run -p kirby-node -- presence --relay-url <url>` (or `nerve-events`). Start a
-local relay for testing with `nix run .#relay` (defaults to `127.0.0.1:7777`).
+Start a local relay for testing with `nix run .#relay` (it serves `ws://127.0.0.1:7777`).
 
-The surviving subcommands are `prereqs`, `agent` (the run path), `boot`, `app-checkpoint`,
-and `fleet` (the multi-tenant supervisor); run `--help` for each. The standalone per-gate
-demo subcommands have been removed -- the invariants they proved now live in the integration
-test suite (`cargo test --workspace`).
+**What success looks like.** Watch the logs for these lines, in order:
+
+```
+loaded kirby run config
+kirby run: starting the sovereign agent
+agent identity ready (beacons + voice sign under this key)   (npub=...)
+booting genome guest through the sandbox backend
+genome boot hello received (G1 round-trip proven)            <- it reached Running
+published 9100 lifecycle event (the signed birth/death log)  (event=born)
+```
+
+and the final line on **stdout**:
+
+```
+KIRBY-RUN mode=Bootstrap backend=... npub=... reached_running=true born=true died=true ... end=BudgetExhausted
+```
+
+The process **exits 0 iff it reached Running**; dying broke (`end=BudgetExhausted`) is the normal
+terminal state and still exits 0. A bootstrap agent that never goes broke halts at a safety ceiling
+(currently a hardcoded 600s; a config knob is in flight).
+
+**How to verify -- agent vs node.** A single `kirby-node agent` does NOT beacon node presence
+(`10100`); it surfaces as its `9100` lifecycle (born/died) plus live `31000` agent-state, under its
+own npub. So `presence` will not show a bare agent -- verify it from the logs above. The
+`presence` read path shows **nodes**: `cargo run -p kirby-node -- presence --relay-url <url>` lists
+every `kirby-node fleet` node (ALIVE/STALE), which is how you confirm a node joined the network.
+
+The subcommands are `agent` (one sovereign agent), `fleet` (the node + spawn control plane),
+`spawn-request` (the operator spawn trigger), `presence` (read the fleet), `prereqs`, `boot`, and
+`app-checkpoint`; the legacy `run` is an early boot demo (not the agent run). Run `--help` for each,
+or see [`CLAUDE.md`](CLAUDE.md) for the full map. Per-gate invariants live in the integration suite
+(`cargo test --workspace`).
+
+## Run a fleet node (join the network + host agents)
+
+`kirby-node agent` is the taste; the node you deploy is the fleet:
+
+```sh
+cargo run -p kirby-node -- fleet --config kirby.toml
+```
+
+It beacons node presence (`10100`), hosts any static `[[fleet.tenants]]` you declared as child
+agents, and runs the spawn control plane so operators can spawn agents onto it remotely (a
+kind-`31003` `spawn-request`). **Security default to know:** in `[fleet.spawn]`, an empty `operators`
+allowlist means **any signer may spawn an agent on your node** (the accepted MVP DoS vector; it logs
+a loud warning). The empty `image_allowlist` is the backstop (no allowed image = spawn nothing).
+Allowlist the operator keys and images you trust before exposing a node. Every `[fleet]` key is in
+[`docs/config.md`](docs/config.md).
 
 ## macOS specifics
 
@@ -145,7 +198,7 @@ walkthrough on an M-series Mac.
 
 ## Resilience
 
-`kirby run` is one sovereign node that does not die with its hardware:
+A sovereign agent does not die with its hardware:
 
 - **Hibernate + respawn** rehydrate the agent under the **same Q** (`cargo run -p kirby-node
   --example hibernate_roundtrip`); `app-checkpoint` (`mode = "resume"`) is the portable,
