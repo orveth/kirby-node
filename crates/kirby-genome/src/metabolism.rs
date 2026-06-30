@@ -20,6 +20,16 @@ const DEFAULT_BRAIN_MODEL: &str = "anthropic/claude-sonnet-4.6";
 const DEFAULT_BRAIN_MAX_COST_SATS: u64 = 64;
 const DEFAULT_MEMORY_MAX_COST_SATS: u64 = 64;
 
+// The NIP-17 DM conversation knobs (#73). Defaulted so a bare `kirby run` JUST-WORKS; tunable
+// via the cmdline for the test/introspection surface. There is deliberately NO spend-cap knob:
+// gudnuf wants the unbounded behaviour observable, bounded only by `dm_max_reads` per conversation
+// (a think-count cap, not a sat cap) and the prompt char budget (a feasibility/physics bound).
+const DEFAULT_DM_HISTORY_WINDOW: usize = 4;
+const DEFAULT_DM_HISTORY_MAX: usize = 50;
+const DEFAULT_DM_RECALL_COUNT: usize = 5;
+const DEFAULT_DM_MAX_READS: u32 = 3;
+const DEFAULT_DM_PROMPT_CHAR_BUDGET: usize = 8000;
+
 /// The agent's runtime knobs, read from the kernel command line. It REUSES the brain knobs
 /// (model + per-think ceiling) and the memory knob (per-write ceiling), and adds its own
 /// cadence + recall depth; the brain/memory `tick_secs` are unused (the agent has ONE loop).
@@ -38,6 +48,19 @@ pub(crate) struct DiaristParams {
     pub(crate) tick: Duration,
     /// How many recent journal entries to RECALL into each reflection prompt.
     pub(crate) recall_count: usize,
+    /// The DM conversation-history window fed by default (the recent turns); widened to the full
+    /// buffer (`dm_history_max`) after the brain emits READ_MORE (#73).
+    pub(crate) dm_history_window: usize,
+    /// The hard cap on per-sender DM turns retained in RAM (the oldest are evicted past it).
+    pub(crate) dm_history_max: usize,
+    /// How many of the agent's OWN facts to RECALL into a DM-reply prompt (self-grounding, #73).
+    pub(crate) dm_recall_count: usize,
+    /// The cap on READ_MORE widenings per DM conversation: the ONLY DM-think bound (no spend cap).
+    /// Once reached, the brain is told to reply now and a further READ_MORE settles (never infinite).
+    pub(crate) dm_max_reads: u32,
+    /// The feasibility size bound on a DM-reply prompt (chars); the conversation history is
+    /// truncated OLDEST-first to fit. Physics (one think cannot hold infinite context), not policy.
+    pub(crate) dm_prompt_char_budget: usize,
 }
 
 /// Parse the agent knobs from `/proc/cmdline`, falling back to the defaults for any absent
@@ -63,6 +86,22 @@ pub(crate) fn diarist_params_from_cmdline() -> DiaristParams {
     let recall_count = get("kirby.diarist_recall_count=")
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_DIARIST_RECALL_COUNT);
+    // The DM knobs (#73): absent => the defaults, so a bare daemon config still runs DMs.
+    let dm_history_window = get("kirby.dm_history_window=")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_DM_HISTORY_WINDOW);
+    let dm_history_max = get("kirby.dm_history_max=")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_DM_HISTORY_MAX);
+    let dm_recall_count = get("kirby.dm_recall_count=")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_DM_RECALL_COUNT);
+    let dm_max_reads = get("kirby.dm_max_reads=")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_DM_MAX_READS);
+    let dm_prompt_char_budget = get("kirby.dm_prompt_char_budget=")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_DM_PROMPT_CHAR_BUDGET);
     DiaristParams {
         model,
         brain_max_cost,
@@ -70,6 +109,11 @@ pub(crate) fn diarist_params_from_cmdline() -> DiaristParams {
         // At least one second so a misconfigured 0 cannot busy-spin the loop.
         tick: Duration::from_secs(tick_secs.max(1)),
         recall_count,
+        dm_history_window,
+        dm_history_max,
+        dm_recall_count,
+        dm_max_reads,
+        dm_prompt_char_budget,
     }
 }
 
