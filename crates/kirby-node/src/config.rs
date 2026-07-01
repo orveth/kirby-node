@@ -1364,7 +1364,18 @@ impl KirbyConfig {
                 failover_window_floor,
             );
         }
-        if self.funding.initial_sats == 0 {
+        // M5 SEAM — everything below validates the AGENT this config would RUN: its funding, its
+        // brain (affordability + the per-backend money paths), and its memory budget. A
+        // `ConfigRole::FleetHost` runs NO agent from its own top-level config (that config is the
+        // TEMPLATE tenants inherit; each tenant is funded at spawn and its EFFECTIVE config is
+        // re-validated as `Standalone` when the child `kirby agent` boots), and the host holds no
+        // money — so none of the agent-money checks apply to it. Gating them on `role ==
+        // Standalone` is what keeps money validation OFF the money-less host (a bare `kirby-node
+        // fleet` with the zero-config `routstr_key` template + empty `api_key_path` + inert
+        // top-level funding is a VALID host) while still catching every one of them at the real
+        // spender (the tenant child, or a single `kirby-node agent`). Infra/fleet checks above
+        // (relay URL, ids, tenants, failover window, backend match) fire for BOTH roles.
+        if role == ConfigRole::Standalone && self.funding.initial_sats == 0 {
             anyhow::bail!("funding.initial_sats must be > 0 (the agent needs a budget to live)");
         }
         // The capable agent must be able to afford at least one think, or it dies before it
@@ -1372,7 +1383,8 @@ impl KirbyConfig {
         // treasury is always DENIED_INSUFFICIENT_TREASURY (D-20). Its THINK is a `Completion`
         // (the life-gating act) and it reuses `[brain]`, so a capable agent that cannot afford
         // its first think is a config error caught at load, not a born-then-instantly-dead VM.
-        if matches!(self.workload, Workload::Capable) {
+        // (Standalone-only per the M5 seam above — a FleetHost never boots from this brain.)
+        if role == ConfigRole::Standalone && matches!(self.workload, Workload::Capable) {
             if self.brain.max_cost_sats == 0 {
                 anyhow::bail!(
                     "brain.max_cost_sats must be > 0 (a zero per-call cap means every think is DENIED_OVER_BUDGET)"
@@ -1385,20 +1397,12 @@ impl KirbyConfig {
                     self.funding.initial_sats
                 );
             }
-            // M5 SEAM: the per-backend brain MONEY-PATH presence checks (node/mint/wallet/key)
-            // below apply only to a config that will BOOT an agent (`ConfigRole::Standalone`:
-            // `kirby-node agent`, or a fleet tenant's derived effective config at child boot). A
-            // `ConfigRole::FleetHost` never boots an agent from its own `[brain]` — that block is
-            // only the TEMPLATE tenants inherit, funded per-tenant at spawn — so these are
-            // validated on the tenant's effective config, NOT the host (the node holds no money).
-            // The `role == Standalone &&` guard on each arm is that skip; it is what lets the
-            // zero-config `routstr_key` template with an empty `api_key_path` be a valid host.
-            //
             // The real (routstr) backend needs a node, a mint, and a persistent wallet
             // store: a `routstr` brain missing any of these is a config error caught at
             // load, not a runtime panic deep in boot (brain-routstr §6). The stub backend
-            // ignores all of these.
-            if role == ConfigRole::Standalone && self.brain.backend == BrainBackendKind::Routstr {
+            // ignores all of these. (The whole capable block is Standalone-gated above, so the
+            // empty-money-path zero-config `routstr_key` template never trips this on a host.)
+            if self.brain.backend == BrainBackendKind::Routstr {
                 if self.brain.node_url.trim().is_empty() {
                     anyhow::bail!(
                         "brain.node_url must be set when brain.backend = \"routstr\" (the pinned Routstr node)"
@@ -1427,11 +1431,7 @@ impl KirbyConfig {
             // (the balance is custodial on the node, not local ecash). The bearer key is
             // money on the `Authorization` header, so the same https-or-loopback rule
             // applies: a non-local node MUST be https or the key would cross plaintext http.
-            // (Same M5 seam: gated on `role == Standalone` so the empty-`api_key_path` tenant
-            // template on a FleetHost is not tripped — the key is injected per-tenant at spawn.)
-            else if role == ConfigRole::Standalone
-                && self.brain.backend == BrainBackendKind::RoutstrKey
-            {
+            else if self.brain.backend == BrainBackendKind::RoutstrKey {
                 if self.brain.node_url.trim().is_empty() {
                     anyhow::bail!(
                         "brain.node_url must be set when brain.backend = \"routstr_key\" (the pinned Routstr node)"
@@ -1462,7 +1462,12 @@ impl KirbyConfig {
         // memory ceiling check, else every WRITE is DENIED_OVER_BUDGET — a config error).
         // (No <= initial_sats check: reads stay free, so a broke agent still lives; the write
         // cost is host-computed per op.)
-        if matches!(self.workload, Workload::Capable) && self.memory.max_cost_sats == 0 {
+        // Standalone-only per the M5 seam: the memory write budget gates a RUNNING agent, not a
+        // money-less fleet host (whose template's memory config is re-validated per tenant).
+        if role == ConfigRole::Standalone
+            && matches!(self.workload, Workload::Capable)
+            && self.memory.max_cost_sats == 0
+        {
             anyhow::bail!(
                 "memory.max_cost_sats must be > 0 (a zero per-write ceiling means every write is DENIED_OVER_BUDGET)"
             );
@@ -1474,7 +1479,11 @@ impl KirbyConfig {
         // fall below the per-think floor (unable to afford another thought) yet never be halted.
         // Reject the combination cleanly at load rather than silently running that zombie.
         // Metered-resume for the capable agent is a follow-up; lifting this guard is part of it.
-        if matches!(self.workload, Workload::Capable) && self.mode == RunMode::Resume {
+        // Standalone-only per the M5 seam: the run mode gates a RUNNING agent, not a fleet host.
+        if role == ConfigRole::Standalone
+            && matches!(self.workload, Workload::Capable)
+            && self.mode == RunMode::Resume
+        {
             anyhow::bail!(
                 "workload = \"{}\" does not support mode = \"resume\" yet: the capable demo is \
                  bootstrap-only (a resumed agent skips the metered loop and never arms its \

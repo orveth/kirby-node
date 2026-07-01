@@ -230,9 +230,12 @@ enum Command {
     /// config and runs this; everything else defaults. This is the single-agent
     /// sovereign-fleet path, NOT the Raft cluster.
     Agent {
-        /// Path to the `kirby run` config file (TOML, e.g. `kirby.toml`). OPTIONAL: when
-        /// omitted, load `./kirby.toml` if present, else synthesize the zero-config defaults
-        /// (M2). An explicit `--config` that does not exist is an error.
+        /// Path to the config file (TOML, e.g. `kirby.toml`). OPTIONAL: loads `./kirby.toml` if
+        /// present; an explicit `--config` that does not exist is an error. NOTE: unlike
+        /// `kirby-node fleet`, a single agent has no useful zero-config — it needs a FUNDED
+        /// config (validated in full), so with no config it synthesizes the fleet template and
+        /// then fails on the empty `[brain] api_key_path`. Provide a funded config, or run
+        /// `kirby-node fleet` for the zero-config node.
         #[arg(long)]
         config: Option<std::path::PathBuf>,
         /// Escape hatch to the legacy node-key dev signer. By DEFAULT a single-node agent

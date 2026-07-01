@@ -13,6 +13,11 @@ Source of truth: `crates/kirby-node/src/config.rs` (`KirbyConfig`).
 > set of whole-struct defaults (a capable `routstr_key` fleet template, `mem` rent 0, a lifted
 > run wall, the blessed `image_allowlist`, etc.). Those are documented in
 > [`zero-config.md`](./zero-config.md); this page is the per-key reference for an explicit file.
+>
+> **Note:** `relay.url`, `genome_image`, and `[identity]` — previously required — now DEFAULT
+> when omitted. A partial file with no `[relay]` silently joins the shared fleet relay
+> (`$KIRBY_RELAY_URL` else `ws://185.18.221.222:7777`); no `genome_image` uses `$KIRBY_GENOME_IMAGE`
+> / `./result`; no `[identity]` mints a durable node key. Set them explicitly to override.
 
 **TOML ordering rule:** the top-level scalar keys (`backend`, `genome_image`, `workload`, `mode`,
 `agent_id`, `node_id`, `state_root`) MUST appear **before** any `[table]` header.
