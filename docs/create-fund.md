@@ -10,26 +10,28 @@ money is ever baked in.
 The shape of it:
 
 ```
-fund-key create   -->  {invoice_id, bolt11}   (the creator pays the bolt11)
-   -->  fund-key poll   -->  the node mints the sk- on payment
-   -->  the sk- is written to a 0600 keyfile
+fund-key create --key-out K   -->  {bolt11}   (the creator pays the bolt11)
+   -->  fund-key poll --key-out K   -->  the node mints the sk- on payment
+   -->  the sk- is written to a 0600 keyfile (K)
    -->  point an agent at it ([brain] backend = "routstr_key", api_key_path)
    -->  fund-key topup   -->  credit the key's balance to keep it alive.
 ```
 
 The `sk-` is **bearer money**. It only ever lands in a **0600 keyfile** -- never
 printed, never logged, never in a TOML. The HTTP client disables redirects (a
-redirect would leak the `Bearer` header to another host). The `invoice_id` is
-itself a capability on the unauthenticated `create` path (it is what a `poll`
-exchanges for the `sk-`), so it is persisted to a 0600 sidecar and never logged.
+redirect would leak the `Bearer` header to another host), and a bearer `sk-` is
+sent only over `https://` (or a real loopback `http://` for local dev/tests) --
+never plaintext http to a public host. The `invoice_id` is itself a capability
+on the unauthenticated `create` path (it is what a `poll` exchanges for the
+`sk-`), so it is **never printed** -- it is persisted (with the `node_url`) to a
+0600 sidecar beside `--key-out` and `poll` reads it back from there.
 
-> **Live-smoke caveat (C6).** `topup` and `recover` are spec-ready but
-> un-exercised against the live node; and as of this writing `POST
-> /v1/balance/lightning/invoice {purpose:"create"}` has been failing
-> Routstr-side (`{"detail":"Failed to create Lightning invoice"}`) -- the
-> request shape is accepted but invoice creation fails on their end. The flow is
-> tested end-to-end against an offline mock; a live smoke (a few real sats) is
-> the last gate before it is demoable.
+> **Live-smoke caveat (C6).** `topup` is spec-ready but un-exercised against the
+> live node; and as of this writing `POST /v1/balance/lightning/invoice
+> {purpose:"create"}` has been failing Routstr-side (`{"detail":"Failed to
+> create Lightning invoice"}`) -- the request shape is accepted but invoice
+> creation fails on their end. The flow is tested end-to-end against an offline
+> mock; a live smoke (a few real sats) is the last gate before it is demoable.
 
 ## The commands
 
@@ -38,12 +40,18 @@ default `--node-url` is `https://api.routstr.com`.
 
 | Subcommand | Does | Blocks? |
 |---|---|---|
-| `create --amount-sats N --key-out PATH` | Create an invoice (mints a NEW key on payment). Persists the `invoice_id` + binds the `node_url` beside `--key-out`. | no |
-| `poll --key-out PATH` | Poll the created invoice; on payment, write the `sk-` to `--key-out` (0600) and report the probed balance. | yes |
+| `create --amount-sats N --key-out PATH` | Create an invoice (mints a NEW key on payment). Persists the `invoice_id` + `node_url` to a 0600 sidecar beside `--key-out`. Refuses if `--key-out` already exists. | no |
+| `poll --key-out PATH` | Poll the created invoice (invoice_id + node_url from the sidecar); on payment, write the `sk-` to `--key-out` (0600), bind the `node_url` beside it, and report the probed balance. | yes |
 | `provision --amount-sats N --key-out PATH` | One-shot: `create` + emit the bolt11 early + `poll` + write. | yes |
 | `topup --amount-sats N --key-path PATH` | Credit an EXISTING key's balance (authenticated with its `sk-`). | yes |
 | `balance --key-path PATH` | Read an existing key's spendable balance. | no |
-| `recover --bolt11 B11 --key-out PATH --break-glass` | Break-glass: recover a paid-but-lost key from its bolt11 (see [Recover](#recover-break-glass)). | yes |
+
+> **No `recover`.** Recovering a key from its `bolt11` is **deferred** (pending
+> C7): a paid invoice's `bolt11` is public (it is handed to wallets / QR / NWC),
+> so a bolt11-only recover would return bearer money to anyone who saw the
+> invoice, and Routstr's recover-auth is unverified. The 0600 pending-invoice
+> sidecar makes `create -> poll` crash-resumable (re-run `poll --key-out PATH`
+> after a crash), so recover is rarely needed.
 
 ## The primary agent-native path: `create` -> pay -> `poll`
 
@@ -53,7 +61,7 @@ between (the `sk-` only exists *after* payment):
 ```sh
 # 1) Create the invoice (non-blocking). Returns the bolt11 to pay.
 kirby-node fund-key create --amount-sats 2000 --key-out ./agent/brain.key
-# -> {"status":"invoice-created","invoice_id":"…","bolt11":"lnbc…","amount_sats":2000,"expires_at":…,"key_out":"./agent/brain.key"}
+# -> {"status":"invoice-created","bolt11":"lnbc…","amount_sats":2000,"hint":"pay the bolt11, then run: fund-key poll --key-out ./agent/brain.key"}
 
 # 2) Pay the bolt11 from your wallet (NWC, LNC, a QR for a human, …).
 #    kirby does NOT build a payment rail -- paying the invoice is the creator's job.
@@ -63,9 +71,12 @@ kirby-node fund-key poll --key-out ./agent/brain.key --timeout-secs 1200
 # -> {"status":"funded","key_path":"./agent/brain.key","balance_sats":2000}
 ```
 
-`poll` finds the `invoice_id` from the sidecar `create` wrote beside `--key-out`
-(pass `--invoice-id` to override). On a terminal `expired`/`failed` status, or a
-timeout, it exits non-zero and writes no key.
+The `create` output deliberately does **not** carry the `invoice_id` (it is
+bearer-sensitive). `poll` reads the `invoice_id` **and** the `node_url` from the
+0600 sidecar `create` wrote beside `--key-out`, so it always targets the node the
+invoice was created against. (A `--node-url` on `poll` must match that bound
+node_url unless you also pass `--allow-node-url-override`.) On a terminal
+`expired`/`failed` status, or a timeout, `poll` exits non-zero and writes no key.
 
 ## The one-shot: `provision`
 
@@ -75,7 +86,7 @@ driver can pay while it waits:
 
 ```sh
 kirby-node fund-key provision --amount-sats 2000 --key-out ./agent/brain.key
-# line 1 (immediately): {"status":"invoice-created","bolt11":"lnbc…","amount_sats":2000,"expires_at":…}
+# line 1 (immediately): {"status":"invoice-created","bolt11":"lnbc…","amount_sats":2000}
 # line 2 (after payment): {"status":"funded","key_path":"./agent/brain.key","balance_sats":2000}
 ```
 
@@ -152,39 +163,46 @@ it is stable:
 | 6 | `auth-failure` | Bad/empty/unfunded/revoked key (401/403). |
 | 7 | `insufficient-balance` | The custodial balance is too low for the operation. |
 | 8 | `key-write-failure` | Writing the keyfile/sidecar failed (e.g. a DIFFERENT key already exists there). |
-| 9 | `usage-error` | A bad argument caught before any network call (bad amount, node_url mismatch, missing `--break-glass`). |
+| 9 | `usage-error` | A bad argument caught before any network call (bad amount, node_url mismatch, a plaintext non-loopback node_url, an existing `--key-out`, no pending state). |
 
 On a failure the object is `{"status":"<tag>","error":"<message>"}`. The `sk-`
-and `invoice_id` never appear in any JSON line.
+and `invoice_id` never appear in any JSON line, and no error message carries the
+status URL (which would embed the `invoice_id`).
 
-## Recover (break-glass)
+## Recover is deferred (C7)
 
-`recover` re-mints a paid-but-lost key from its `bolt11`. It is gated behind
-`--break-glass` and prints a loud stderr warning, because:
+There is intentionally **no `recover` command** in v1. Recovering a key from its
+`bolt11` returns bearer money to anyone holding that `bolt11`:
 
-> **Routstr's recover-auth is UNVERIFIED (C7).** The `bolt11` is NOT secret (it
-> is handed to wallets / QR / NWC). If the node mints the `sk-` from the `bolt11`
-> alone, anyone who saw the invoice can steal the funded key. Prefer re-`poll`
-> via the persisted `invoice_id` sidecar (which makes recover rarely needed);
-> treat created-invoice bolt11s as sensitive; use `recover` only as a last
-> resort, and verify the node's recover-auth before relying on it.
+> **The `bolt11` is public** (it is handed to wallets / QR / NWC). If the node
+> mints the `sk-` from the `bolt11` alone, anyone who saw the invoice can steal
+> the funded key -- and Routstr's recover-auth is **unverified (C7)**. Recover is
+> deferred until C7 is resolved.
 
-```sh
-kirby-node fund-key recover --bolt11 lnbc… --key-out ./agent/brain.key --break-glass
-```
+You rarely need it: the 0600 pending-invoice sidecar makes `create -> poll`
+crash-resumable. If `poll` (or `provision`) is interrupted after payment but
+before the key is written, just re-run `poll --key-out PATH` -- it reads the
+invoice_id + node_url back from the sidecar and finishes the mint.
 
 ## The keyfile + its sidecars
 
 `--key-out PATH` (the raw `sk-` on one line, 0600) is what `[brain] api_key_path`
 loads; the loader trims the trailing newline. `fund-key` also writes, beside it:
 
-- `PATH.invoice` (0600) -- the persisted `invoice_id` (F2), so `poll` finds it
-  and a crash between create and mint is recoverable. Bearer-sensitive; never
-  logged.
+- `PATH.invoice` (0600) -- the pending-invoice state (F2): JSON holding the
+  `invoice_id` **and** the `node_url` the invoice was created against, so `poll`
+  finds both and a crash between create and mint is recoverable. Bearer-sensitive
+  (the invoice_id is a capability); never logged. It is cleared once the key is
+  written. Even a pre-existing sidecar is forced to mode 0600 on write (never
+  left world-readable), and a symlink at the path is refused (`O_NOFOLLOW`).
 - `PATH.node_url` (0600) -- the bound node URL (F9), so `balance`/`topup` never
-  send the key elsewhere.
+  send the key elsewhere. It is written **only after** the key lands (never a
+  binding without a key beside it).
 
-The write is atomic and hardened (F8): `O_CREAT|O_EXCL|O_NOFOLLOW` + 0600, the
-parent dir is created and `fsync`ed. Writing over an EXISTING key fails unless
-its content fingerprint matches (an idempotent re-provision of the same key
-succeeds; a DIFFERENT key is never silently clobbered).
+The key write is atomic and hardened (F8): `O_CREAT|O_EXCL|O_NOFOLLOW` + 0600, the
+parent dir is created and `fsync`ed, and a partial file is removed if the write or
+`fsync` fails (no empty/partial key ever lingers). Writing over an EXISTING key
+fails unless its content fingerprint matches (an idempotent re-provision of the
+same key succeeds; a DIFFERENT key is never silently clobbered). The
+idempotent-read path opens the existing key `O_RDONLY|O_NOFOLLOW` and requires a
+regular file mode 0600 -- it never follows a symlink or trusts a wrong-mode file.

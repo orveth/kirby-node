@@ -95,9 +95,9 @@ pub struct InvoiceBehavior {
     /// `GET .../invoice/{id}/status`: the ordered `status` values to return across polls (the
     /// last is repeated once exhausted), and whether/when to attach the minted `api_key`.
     pub status_script: Vec<StatusStep>,
-    /// `POST /v1/balance/lightning/recover`: the `api_key` to return (None => `{}`), or a
-    /// status to fail with.
-    pub recover: RecoverResult,
+    /// When `Some(code)`, the status GET returns that HTTP status (e.g. 401/403 for the
+    /// auth-propagation tooth, or 500 for a transient failure) INSTEAD of the scripted JSON.
+    pub status_http: Option<u16>,
     /// A shared step cursor for the status script (advances one per status GET).
     pub step: Arc<AtomicU64>,
     /// A shared spendable balance (millisats) that a poll step can RAISE (the topup-credit
@@ -161,21 +161,6 @@ impl StatusStep {
             mint_key: None,
             raise_balance_msats: Some(raise_to_msats),
         }
-    }
-}
-
-/// The `POST /v1/balance/lightning/recover` mock response.
-#[derive(Clone)]
-pub enum RecoverResult {
-    /// 200 with `{api_key: <key|null>}`.
-    Key(Option<String>),
-    /// A non-2xx status.
-    Status(u16),
-}
-
-impl Default for RecoverResult {
-    fn default() -> Self {
-        RecoverResult::Key(None)
     }
 }
 
@@ -487,6 +472,12 @@ async fn handle_conn(
     // The Lightning FUNDING endpoints (`fund-key`). Order matters: match the status GET
     // (a longer path) before the create POST prefix.
     if path.contains("/v1/balance/lightning/invoice/") && path.contains("/status") {
+        // An HTTP-error override (the auth-propagation / transient-failure teeth): return the
+        // configured status code instead of the scripted JSON.
+        if let Some(code) = invoices.status_http {
+            write_response(&mut stream, code, "Error", &[], b"{\"detail\":\"mock\"}").await;
+            return;
+        }
         let step_idx = invoices.step.fetch_add(1, Ordering::SeqCst) as usize;
         let script = &invoices.status_script;
         let step = if script.is_empty() {
@@ -542,30 +533,6 @@ async fn handle_conn(
         }
         return;
     }
-    if path.contains("/v1/balance/lightning/recover") {
-        match invoices.recover.clone() {
-            RecoverResult::Key(key) => {
-                let body = match key {
-                    Some(k) => serde_json::json!({ "api_key": k }),
-                    None => serde_json::json!({ "api_key": null }),
-                }
-                .to_string();
-                write_response(
-                    &mut stream,
-                    200,
-                    "OK",
-                    &[("Content-Type", "application/json")],
-                    body.as_bytes(),
-                )
-                .await;
-            }
-            RecoverResult::Status(code) => {
-                write_response(&mut stream, code, "Error", &[], b"{\"detail\":\"mock\"}").await;
-            }
-        }
-        return;
-    }
-
     // Dispatch by endpoint. The canonical refund path is `/v1/balance/refund`; the mock
     // also matches the deprecated `/v1/wallet/refund` alias so older callers still route.
     if path.contains("/v1/balance/refund") || path.contains("/v1/wallet/refund") {

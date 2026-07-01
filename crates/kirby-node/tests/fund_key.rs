@@ -10,9 +10,14 @@
 //!   (c) topup without a bearer key is refused (purpose=topup requires api_key);
 //!   (d) balance/topup use the BOUND node_url — a mismatched override without the flag is
 //!       refused (F9);
-//!   (e) the minted `sk-` never appears on stdout/stderr (it only lands in the 0600 keyfile).
-//! Teeth (a) write_key_atomic refuses to overwrite a DIFFERENT key and (b) the keyfile is
-//! 0600 raw sk- (boot.rs compat) are the `src/funding.rs` unit teeth.
+//!   (e) the minted `sk-` never appears on stdout/stderr (it only lands in the 0600 keyfile);
+//!   (#1) the capability invoice_id never appears on stdout from `create`;
+//!   (#4) the BOUND node_url sidecar is written only AFTER the key lands (not at create);
+//!   (#6) an https-or-loopback check refuses a bearer call to a plaintext non-loopback node;
+//!   (#8) `poll` propagates a 401/403 as an auth failure, not a misleading unpaid-timeout.
+//! Teeth (a) write_key_atomic refuses to overwrite a DIFFERENT key, (b) the keyfile is
+//! 0600 raw sk- (boot.rs compat), plus the write_sidecar/idempotent-read/redaction teeth are
+//! the `src/funding.rs` unit teeth.
 
 mod common;
 
@@ -20,7 +25,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{InvoiceBehavior, InvoiceCreate, MockNode, RecoverResult, StatusStep};
+use common::{InvoiceBehavior, InvoiceCreate, MockNode, StatusStep};
 
 /// The compiled `kirby-node` binary under test (cargo sets this env for integration tests).
 fn bin() -> &'static str {
@@ -68,22 +73,39 @@ fn file_mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
+/// Write the 0600 pending-invoice sidecar `create` would write (JSON: invoice_id + node_url),
+/// so a `poll` test can resolve both without a live `create`.
+fn write_pending(key_out: &Path, invoice_id: &str, node_url: &str) {
+    let sidecar = key_out.with_file_name(format!(
+        "{}.invoice",
+        key_out.file_name().unwrap().to_str().unwrap()
+    ));
+    let json = serde_json::json!({ "invoice_id": invoice_id, "node_url": node_url }).to_string();
+    std::fs::write(&sidecar, format!("{json}\n")).unwrap();
+    std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 // ---- create -> poll (the primary agent-native split path) ----------------------------
 
+/// TOOTH (#1 + #4): `create` persists the invoice_id + node_url to a 0600 pending sidecar but
+/// (a) NEVER prints the capability invoice_id on stdout, and (b) does NOT write the BOUND
+/// node_url sidecar (that lands only after `poll` writes the key). Reverting the create handler
+/// to emit `invoice_id` in its JSON makes the #1 assertion RED; reverting it to write the bound
+/// node_url binding at create makes the #4 assertion RED.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_persists_invoice_state_and_binds_node_url() {
+async fn create_persists_pending_state_without_leaking_invoice_id_or_binding() {
     let dir = temp_dir("create");
     let key_out = dir.join("brain.key");
     let node = MockNode::start_with_invoices(InvoiceBehavior {
         create: InvoiceCreate::Ok {
-            invoice_id: "inv-XYZ".into(),
+            invoice_id: "inv-XYZ-CAP".into(),
             bolt11: "lnbcCREATE".into(),
         },
         ..Default::default()
     })
     .await;
 
-    let (code, stdout, _stderr) = run_fund_key(&[
+    let (code, stdout, stderr) = run_fund_key(&[
         "create",
         "--amount-sats",
         "2000",
@@ -101,22 +123,33 @@ async fn create_persists_invoice_state_and_binds_node_url() {
         "the response echoes the requested amount"
     );
 
-    // F2: the invoice_id is persisted to a 0600 sidecar beside key_out (NOT the keyfile).
-    let invoice_sidecar = dir.join("brain.key.invoice");
-    assert_eq!(
-        std::fs::read_to_string(&invoice_sidecar).unwrap().trim(),
-        "inv-XYZ"
+    // (#1) the capability invoice_id is NEVER on stdout/stderr, nor as a JSON field.
+    assert!(
+        j.get("invoice_id").is_none(),
+        "create must NOT carry the invoice_id in its JSON"
     );
+    assert!(
+        !stdout.contains("inv-XYZ-CAP") && !stderr.contains("inv-XYZ-CAP"),
+        "the invoice_id must not leak to stdout/stderr"
+    );
+
+    // F2: the invoice_id + node_url are persisted to a 0600 JSON sidecar beside key_out.
+    let invoice_sidecar = dir.join("brain.key.invoice");
+    let pending: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&invoice_sidecar).unwrap().trim()).unwrap();
+    assert_eq!(pending["invoice_id"], "inv-XYZ-CAP");
+    assert_eq!(pending["node_url"], node.url());
     assert_eq!(
         file_mode(&invoice_sidecar),
         0o600,
-        "the invoice_id sidecar is 0600"
+        "the pending-invoice sidecar is 0600"
     );
-    // F9: the node_url is bound beside the (future) key.
+
+    // (#4) the BOUND node_url sidecar is NOT written at create (only after the key lands).
     let url_sidecar = dir.join("brain.key.node_url");
-    assert_eq!(
-        std::fs::read_to_string(&url_sidecar).unwrap().trim(),
-        node.url()
+    assert!(
+        !url_sidecar.exists(),
+        "the bound node_url sidecar must not exist before the key is written (#4)"
     );
     // The key itself does NOT exist yet (poll writes it).
     assert!(
@@ -127,12 +160,42 @@ async fn create_persists_invoice_state_and_binds_node_url() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `create` refuses to write a NEW invoice onto a path that already holds a key (F7): a usage
+/// error, no network call. Reverting the `key_out.exists()` guard makes this RED (a second
+/// invoice would be created against an already-funded key path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_refuses_an_existing_key_out() {
+    let dir = temp_dir("create-exists");
+    let key_out = dir.join("brain.key");
+    std::fs::write(&key_out, "sk-already-here\n").unwrap();
+    // A closed loopback url: if the guard were reverted the failure would be a NETWORK error
+    // (refused connect), never a live call — but the guard makes it a clean usage refusal first.
+    let (code, stdout, _e) = run_fund_key(&[
+        "create",
+        "--amount-sats",
+        "2000",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--node-url",
+        "http://127.0.0.1:1",
+    ]);
+    assert_eq!(
+        code, 9,
+        "create onto an existing key path is a usage refusal; stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "usage-error");
+    // The existing key is untouched.
+    assert_eq!(
+        std::fs::read_to_string(&key_out).unwrap().trim(),
+        "sk-already-here"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn poll_mints_key_writes_0600_and_probes_balance() {
     let dir = temp_dir("poll");
     let key_out = dir.join("brain.key");
-    // Persist an invoice_id so poll finds it without --invoice-id.
-    std::fs::write(dir.join("brain.key.invoice"), "inv-POLL\n").unwrap();
 
     let node = MockNode::start_with_invoices(InvoiceBehavior {
         // First poll pending, second poll pays + mints the key; balance probes 1234 sats.
@@ -144,13 +207,14 @@ async fn poll_mints_key_writes_0600_and_probes_balance() {
     })
     .await;
     node.set_balance_msats(1_234_000);
+    // Persist the pending sidecar (invoice_id + node_url) so poll finds BOTH — no --invoice-id,
+    // no --node-url.
+    write_pending(&key_out, "inv-POLL", &node.url());
 
     let (code, stdout, stderr) = run_fund_key(&[
         "poll",
         "--key-out",
         key_out.to_str().unwrap(),
-        "--node-url",
-        &node.url(),
         "--timeout-secs",
         "60",
     ]);
@@ -170,6 +234,18 @@ async fn poll_mints_key_writes_0600_and_probes_balance() {
     assert_eq!(raw, "sk-minted-777\n");
     assert_eq!(file_mode(&key_out), 0o600);
 
+    // (#4) the bound node_url sidecar was written (after the key), and the pending sidecar was
+    // cleared once the key landed (the capability is no longer needed).
+    let url_sidecar = dir.join("brain.key.node_url");
+    assert_eq!(
+        std::fs::read_to_string(&url_sidecar).unwrap().trim(),
+        node.url()
+    );
+    assert!(
+        !dir.join("brain.key.invoice").exists(),
+        "the pending-invoice sidecar is cleared once the key is written"
+    );
+
     // (e) the minted sk- NEVER appears on stdout or stderr.
     assert!(
         !stdout.contains("sk-minted-777"),
@@ -183,6 +259,83 @@ async fn poll_mints_key_writes_0600_and_probes_balance() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// TOOTH (#8): `poll` propagates a 401/403 IMMEDIATELY as an auth failure (exit 6), NOT a
+/// misleading unpaid-timeout (exit 2). Reverting `poll_invoice` to swallow every non-Ok status
+/// into a transient-retry-then-UnpaidTimeout makes this RED (it would loop and exit 2). The
+/// status endpoint returns 401 on every poll.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poll_propagates_auth_error_not_timeout() {
+    let dir = temp_dir("poll-auth");
+    let key_out = dir.join("brain.key");
+    let node = MockNode::start_with_invoices(InvoiceBehavior {
+        status_http: Some(401),
+        ..Default::default()
+    })
+    .await;
+    write_pending(&key_out, "inv-AUTH", &node.url());
+
+    let (code, stdout, _stderr) = run_fund_key(&[
+        "poll",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--timeout-secs",
+        "60",
+    ]);
+    assert_eq!(
+        code, 6,
+        "a 401 on the status poll is an auth failure (exit 6), not a timeout; stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "auth-failure");
+    assert!(!key_out.exists(), "no key on an auth failure");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `poll` refuses a `--node-url` that differs from the pending sidecar's node_url unless the
+/// override flag is set (the invoice lives on the node it was created against). Reverting
+/// `resolve_pending_node_url` (using the override unconditionally) makes this RED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poll_refuses_mismatched_node_url_without_override() {
+    let dir = temp_dir("poll-mismatch");
+    let key_out = dir.join("brain.key");
+    // The pending sidecar pins one node; a different --node-url without the flag is refused.
+    write_pending(&key_out, "inv-M", "https://api.routstr.com");
+    let (code, stdout, _e) = run_fund_key(&[
+        "poll",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--node-url",
+        "https://evil.example.com",
+        "--timeout-secs",
+        "60",
+    ]);
+    assert_eq!(
+        code, 9,
+        "a mismatched --node-url without the override is a usage refusal; stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "usage-error");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `poll` with no pending sidecar (and no `create` first) is a usage error, not a crash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poll_without_pending_state_is_usage_error() {
+    let dir = temp_dir("poll-nopending");
+    let key_out = dir.join("brain.key");
+    let (code, stdout, _e) = run_fund_key(&[
+        "poll",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--timeout-secs",
+        "60",
+    ]);
+    assert_eq!(
+        code, 9,
+        "no pending invoice state is a usage error; stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "usage-error");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn poll_expired_maps_to_exit_3() {
     let dir = temp_dir("expired");
@@ -192,14 +345,11 @@ async fn poll_expired_maps_to_exit_3() {
         ..Default::default()
     })
     .await;
+    write_pending(&key_out, "inv-exp", &node.url());
     let (code, stdout, _e) = run_fund_key(&[
         "poll",
-        "--invoice-id",
-        "inv-exp",
         "--key-out",
         key_out.to_str().unwrap(),
-        "--node-url",
-        &node.url(),
         "--timeout-secs",
         "60",
     ]);
@@ -221,14 +371,11 @@ async fn poll_failed_maps_to_exit_4() {
         ..Default::default()
     })
     .await;
+    write_pending(&key_out, "inv-fail", &node.url());
     let (code, stdout, _e) = run_fund_key(&[
         "poll",
-        "--invoice-id",
-        "inv-fail",
         "--key-out",
         key_out.to_str().unwrap(),
-        "--node-url",
-        &node.url(),
         "--timeout-secs",
         "60",
     ]);
@@ -529,95 +676,31 @@ async fn balance_uses_bound_url_and_reads_sats() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// ---- recover (break-glass) -----------------------------------------------------------
+// ---- https-before-bearer enforcement (#6) --------------------------------------------
 
+/// TOOTH (#6): a bearer call to a plaintext NON-loopback node_url is refused (usage error, exit
+/// 9) BEFORE any network call — a bearer `sk-` must never cross plaintext http. Reverting the
+/// `require_secure_node_url` call sites in `funding.rs` makes this RED: `balance` would attempt
+/// the bearer call over plain http (exit != 9). `balance` is the smallest bearer call. The
+/// bound node is a plaintext-http NON-loopback address in TEST-NET-1 (192.0.2.0/24, RFC 5737,
+/// unroutable) so that even a REVERTED build never reaches a real host — the point is the
+/// refusal, and the address is guaranteed to belong to no real service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recover_requires_break_glass_flag() {
-    let dir = temp_dir("recover-gate");
-    let key_out = dir.join("rec.key");
-    // Without --break-glass -> refused (usage), no network call.
-    let (code, stdout, _e) = run_fund_key(&[
-        "recover",
-        "--bolt11",
-        "lnbcRECOVER",
-        "--key-out",
-        key_out.to_str().unwrap(),
-    ]);
+async fn balance_refuses_plaintext_nonloopback_node_url() {
+    let dir = temp_dir("http-refuse");
+    let key_path = dir.join("brain.key");
+    std::fs::write(&key_path, "sk-plaintext-key\n").unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // A plaintext-http NON-loopback host (TEST-NET-1, unroutable — never a real service).
+    std::fs::write(dir.join("brain.key.node_url"), "http://192.0.2.1\n").unwrap();
+
+    let (code, stdout, _e) = run_fund_key(&["balance", "--key-path", key_path.to_str().unwrap()]);
     assert_eq!(
         code, 9,
-        "recover without --break-glass is refused; stdout:\n{stdout}"
+        "a plaintext non-loopback bearer target is a usage refusal; stdout:\n{stdout}"
     );
     assert_eq!(last_json(&stdout)["status"], "usage-error");
-    assert!(!key_out.exists());
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recover_with_break_glass_writes_key_and_warns() {
-    let dir = temp_dir("recover-ok");
-    let key_out = dir.join("rec.key");
-    let node = MockNode::start_with_invoices(InvoiceBehavior {
-        recover: RecoverResult::Key(Some("sk-recovered-key".into())),
-        ..Default::default()
-    })
-    .await;
-    node.set_balance_msats(7_000_000);
-
-    let (code, stdout, stderr) = run_fund_key(&[
-        "recover",
-        "--bolt11",
-        "lnbcRECOVER",
-        "--key-out",
-        key_out.to_str().unwrap(),
-        "--node-url",
-        &node.url(),
-        "--break-glass",
-    ]);
-    assert_eq!(
-        code, 0,
-        "recover with --break-glass writes the key; stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert_eq!(last_json(&stdout)["status"], "funded");
-    // The recovered key landed 0600, raw.
-    assert_eq!(
-        std::fs::read_to_string(&key_out).unwrap(),
-        "sk-recovered-key\n"
-    );
-    assert_eq!(file_mode(&key_out), 0o600);
-    // A loud break-glass warning is on stderr; the key is NOT on stdout/stderr.
-    assert!(
-        stderr.to_lowercase().contains("warning"),
-        "recover warns loudly on stderr"
-    );
-    assert!(!stdout.contains("sk-recovered-key") && !stderr.contains("sk-recovered-key"));
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recover_unrecoverable_maps_to_failed_payment() {
-    let dir = temp_dir("recover-none");
-    let key_out = dir.join("rec.key");
-    let node = MockNode::start_with_invoices(InvoiceBehavior {
-        recover: RecoverResult::Key(None), // node cannot recover it
-        ..Default::default()
-    })
-    .await;
-    let (code, stdout, _e) = run_fund_key(&[
-        "recover",
-        "--bolt11",
-        "lnbcNONE",
-        "--key-out",
-        key_out.to_str().unwrap(),
-        "--node-url",
-        &node.url(),
-        "--break-glass",
-    ]);
-    assert_eq!(
-        code, 4,
-        "an unrecoverable key -> failed-payment (exit 4); stdout:\n{stdout}"
-    );
-    assert_eq!(last_json(&stdout)["status"], "failed-payment");
-    assert!(!key_out.exists());
+    // The bearer key never left the machine (the refusal happens with no network call at all).
     std::fs::remove_dir_all(&dir).ok();
 }
 

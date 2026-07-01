@@ -1071,7 +1071,11 @@ fn default_initial_sats() -> u64 {
 /// (userinfo stripped, true host = evil.com → refused) and also accepts IPv6 loopback
 /// (`http://[::1]:7780`), which the old split mishandled. Unparseable or non-http(s) URLs
 /// fail closed (refused).
-fn is_https_or_localhost(url: &str) -> bool {
+///
+/// This is the single source of truth for the "may I send a bearer secret to this node_url"
+/// rule; the `fund-key` funding client ([`crate::funding`]) calls it before any `sk-` bearer
+/// call or node_url binding, so the CLI and config-load share exactly one policy.
+pub fn is_https_or_localhost(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false; // unparseable → fail closed
     };

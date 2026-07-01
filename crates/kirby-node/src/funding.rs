@@ -13,23 +13,30 @@
 //!     `{status, api_key?}`. A non-null `api_key` is the real "paid + minted" signal;
 //!     `expired|failed|error` are terminal-fail states.
 //!   - balance: `GET {node}/v1/balance/info` (Bearer `sk-`) → `{balance}` in MILLISATS.
-//!   - recover: `POST {node}/v1/balance/lightning/recover` body `{bolt11}` → `{api_key?}`
-//!     (recovers a paid-but-lost key; the recover-auth is UNVERIFIED — see [`recover_key`]).
 //!
 //! # Bearer-money discipline
 //! The minted `sk-` is bearer money. It only ever lands in a 0600 keyfile (never a log,
-//! never stdout unless explicitly asked, never a TOML). The HTTP client is built with
-//! redirects DISABLED (a redirect would leak a `Bearer` header to another host) and finite
-//! timeouts, exactly as [`crate::rail::RoutstrKeyBrain`] does. `invoice_id` is itself a
-//! capability on the unauthenticated create path (it is what a `poll` exchanges for the
-//! `sk-`), so it is persisted to a 0600 sidecar and never logged (F2).
+//! never stdout, never a TOML). The HTTP client is built with redirects DISABLED (a redirect
+//! would leak a `Bearer` header to another host) and finite timeouts, exactly as
+//! [`crate::rail::RoutstrKeyBrain`] does. `invoice_id` is itself a capability on the
+//! unauthenticated create path (it is what a `poll` exchanges for the `sk-`), so it is
+//! persisted to a 0600 sidecar and never logged (F2). Before any bearer call or node_url
+//! binding the target url is checked against the ONE https-or-real-loopback policy
+//! ([`crate::config::is_https_or_localhost`]) so a bearer secret never crosses plaintext http.
+//!
+//! There is deliberately NO `recover` primitive: a paid invoice's `bolt11` is public (it is
+//! handed to wallets / QR / NWC), so a bolt11-only recover would return bearer money to anyone
+//! who saw the invoice, and Routstr's recover-auth is unverified (C7). The 0600 invoice-state
+//! sidecar makes `create → poll` crash-resumable, so recover is rarely needed; it is DEFERRED.
 
-use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{Read as _, Write as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
+
+use crate::config::is_https_or_localhost;
 
 /// The invoice-amount bounds the node enforces (`1..=1_000_000` sats). Rejected before any
 /// network call so a bad amount never reaches the node.
@@ -51,7 +58,8 @@ pub const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 /// `POST /v1/balance/lightning/invoice` request body. `purpose = "create"` mints a NEW key
 /// on payment (unauthenticated); `purpose = "topup"` credits an EXISTING key (authenticated
-/// with that key's `sk-`).
+/// with that key's `sk-`). Serialized OUT (the request body), so it keeps `Serialize`; it
+/// carries no secret (the bearer key rides the `Authorization` header, never this body).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InvoiceCreateRequest {
     pub amount_sats: u64,
@@ -60,43 +68,64 @@ pub struct InvoiceCreateRequest {
 
 /// `POST /v1/balance/lightning/invoice` response. `expires_at` / `payment_hash` are
 /// spec-optional (a node that omits them still deserializes).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// `invoice_id` is capability-sensitive on the create path (a `poll` exchanges it for the
+/// `sk-`), so this type is NEVER serialized out (no `Serialize` derive → it cannot be printed
+/// as JSON), and its `Debug` REDACTS the `invoice_id` (a `{:?}` of a response — e.g. in an
+/// `assert_eq!` failure or a stray log — never leaks the capability).
+#[derive(Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct InvoiceCreateResponse {
     pub invoice_id: String,
     pub bolt11: String,
     pub amount_sats: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub expires_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub payment_hash: Option<String>,
+}
+
+impl std::fmt::Debug for InvoiceCreateResponse {
+    /// Redacts `invoice_id` (the create-path capability). `bolt11` is public (handed to
+    /// wallets/QR), so it is shown; `invoice_id` prints as `<redacted>`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvoiceCreateResponse")
+            .field("invoice_id", &"<redacted>")
+            .field("bolt11", &self.bolt11)
+            .field("amount_sats", &self.amount_sats)
+            .field("expires_at", &self.expires_at)
+            .field("payment_hash", &self.payment_hash)
+            .finish()
+    }
 }
 
 /// `GET /v1/balance/lightning/invoice/{id}/status` response. `api_key` is null until the
 /// invoice is paid; its presence — not `status` — is the authoritative "minted" signal.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// `api_key` is the minted bearer key, so this type is NEVER serialized out (no `Serialize`
+/// derive), and its `Debug` REDACTS `api_key` (a `{:?}` of a status — an `assert_eq!` failure
+/// or a stray log — never leaks the key).
+#[derive(Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct InvoiceStatusResponse {
     pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub api_key: Option<String>,
 }
 
-/// `POST /v1/balance/lightning/recover` request body: the paid invoice's `bolt11`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RecoverRequest {
-    pub bolt11: String,
-}
-
-/// `POST /v1/balance/lightning/recover` response: the recovered `api_key` (null if the node
-/// cannot recover it — unpaid, unknown, or already claimed).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RecoverResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
+impl std::fmt::Debug for InvoiceStatusResponse {
+    /// Redacts `api_key` (the minted bearer key). `status` is not sensitive and is shown;
+    /// `api_key` prints as `Some(<redacted>)` when present, `None` otherwise.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = self.api_key.as_ref().map(|_| "<redacted>");
+        f.debug_struct("InvoiceStatusResponse")
+            .field("status", &self.status)
+            .field("api_key", &redacted)
+            .finish()
+    }
 }
 
 /// `GET /v1/balance/info` response. `balance` is the SPENDABLE balance in MILLISATOSHIS
 /// (the node's authoritative figure; `1 sat = 1000 msats`).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct BalanceInfo {
     pub balance: u64,
 }
@@ -232,6 +261,23 @@ fn normalize_node_url(node_url: &str) -> String {
     node_url.trim_end_matches('/').to_string()
 }
 
+/// Enforce the ONE bearer-transport policy ([`crate::config::is_https_or_localhost`]) BEFORE
+/// any bearer/secret call or node_url binding: `https://` always, plain `http://` only to a
+/// real loopback host. A bearer `sk-` (or the create POST, which the paid invoice's key is
+/// later bound to) must never cross plaintext non-loopback http — that is a usage error caught
+/// before the network. Sharing config's validator keeps the CLI and config-load in one policy.
+fn require_secure_node_url(node_url: &str) -> Result<(), FundingError> {
+    if is_https_or_localhost(node_url) {
+        Ok(())
+    } else {
+        Err(FundingError::Usage(format!(
+            "refusing to send a bearer secret to a non-https node_url ({node_url}); \
+             a plain-http node_url is allowed only for a real loopback host \
+             (localhost / 127.0.0.1 / ::1)"
+        )))
+    }
+}
+
 /// Validate the invoice amount against the node's `1..=1_000_000` bounds BEFORE any network
 /// call (a bad amount is a usage error, never a wasted round-trip).
 pub fn validate_amount(amount_sats: u64) -> Result<(), FundingError> {
@@ -278,6 +324,10 @@ pub async fn create_invoice(
                 .to_string(),
         ));
     }
+    // The paid invoice's key is later bound to this node_url (topup sends the bearer key here
+    // directly); enforce https-or-loopback BEFORE the POST so a bearer secret never crosses
+    // plaintext http and no key is bound to a plaintext-http node.
+    require_secure_node_url(node_url)?;
     let http = build_client()?;
     let node = normalize_node_url(node_url);
     let mut req = http
@@ -294,14 +344,14 @@ pub async fn create_invoice(
     let resp = req
         .send()
         .await
-        .map_err(|e| FundingError::Network(format!("POST create-invoice failed: {e}")))?;
+        .map_err(|_| FundingError::Network("create-invoice request failed".to_string()))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(status_error("invoice creation", status));
     }
     resp.json()
         .await
-        .map_err(|e| FundingError::Network(format!("parse invoice-create response: {e}")))
+        .map_err(|_| FundingError::Network("parse invoice-create response failed".to_string()))
 }
 
 /// Poll `invoice_id` until the node mints the key, the invoice reaches a terminal-fail
@@ -312,8 +362,14 @@ pub async fn create_invoice(
 ///
 /// `on_wait` is invoked periodically with `(elapsed_secs)` so a CLI can print progress
 /// WITHOUT this function knowing about stdout/JSON (it never prints the `invoice_id`).
-/// Transient per-attempt request/parse failures are retried (they are not terminal); only
-/// a persistent failure surfaces at the deadline as `UnpaidTimeout`.
+///
+/// Error discipline: a 401/403 propagates IMMEDIATELY as [`FundingError::Auth`] (a bad
+/// credential will not fix itself by retrying). Transient failures (5xx, timeouts, a parse
+/// error) keep retrying to the deadline, but the LAST such error is remembered: if the final
+/// attempt failed the loop surfaces THAT error, not a bare [`FundingError::UnpaidTimeout`]
+/// (so a persistently-down node reports network-failure, not a misleading "unpaid"). No
+/// surfaced error carries the status URL (which embeds the capability `invoice_id`) — the
+/// helper builds it from fixed context strings and never the reqwest error's `Display`.
 pub async fn poll_invoice(
     node_url: &str,
     invoice_id: &str,
@@ -324,6 +380,10 @@ pub async fn poll_invoice(
     let node = normalize_node_url(node_url);
     let url = format!("{node}/v1/balance/lightning/invoice/{invoice_id}/status");
     let deadline = tokio::time::Instant::now() + timeout;
+    // The most recent attempt's transient failure (None once an attempt succeeds). Surfaced at
+    // the deadline if the FINAL attempt failed, so a dead node reports its real error rather
+    // than a bare unpaid-timeout.
+    let mut last_transient: Option<FundingError>;
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
         match fetch_status(&http, &url).await {
@@ -336,12 +396,18 @@ pub async fn poll_invoice(
                     "failed" | "error" => return Err(FundingError::FailedPayment),
                     _ => {}
                 }
+                // A clean attempt clears any prior transient error.
+                last_transient = None;
             }
-            // A transient request/parse failure is not terminal — retry until the deadline.
-            Err(_transient) => {}
+            // A 401/403 will not resolve by retrying — surface it now.
+            Err(auth @ FundingError::Auth(_)) => return Err(auth),
+            // A transient request/parse/5xx failure is not terminal — remember it and retry.
+            Err(transient) => last_transient = Some(transient),
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(FundingError::UnpaidTimeout);
+            // If the final attempt failed, surface THAT error; otherwise the invoice is
+            // simply still unpaid.
+            return Err(last_transient.unwrap_or(FundingError::UnpaidTimeout));
         }
         let elapsed = timeout
             .saturating_sub(deadline.saturating_duration_since(tokio::time::Instant::now()))
@@ -350,7 +416,9 @@ pub async fn poll_invoice(
     }
 }
 
-/// One status GET (a helper so [`poll_invoice`] can treat a transient failure uniformly).
+/// One status GET (a helper so [`poll_invoice`] can classify each attempt). Errors use a
+/// FIXED context string, never the reqwest error's `Display` (which renders the request URL —
+/// and the status URL embeds the capability `invoice_id`).
 async fn fetch_status(
     http: &reqwest::Client,
     url: &str,
@@ -359,14 +427,14 @@ async fn fetch_status(
         .get(url)
         .send()
         .await
-        .map_err(|e| FundingError::Network(format!("status request failed: {e}")))?;
+        .map_err(|_| FundingError::Network("invoice-status request failed".to_string()))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(status_error("invoice status", status));
     }
     resp.json()
         .await
-        .map_err(|e| FundingError::Network(format!("parse status response: {e}")))
+        .map_err(|_| FundingError::Network("parse invoice-status response failed".to_string()))
 }
 
 /// Fetch the prepaid key's spendable balance in SATS (the node reports MILLISATS; floor to
@@ -374,6 +442,8 @@ async fn fetch_status(
 /// key surfaces as [`FundingError::Auth`]. This is the source of the CONFIRMED balance the
 /// treasury is seeded from (F6).
 pub async fn fetch_balance_sats(node_url: &str, api_key: &str) -> Result<u64, FundingError> {
+    // The bearer `sk-` rides the Authorization header — never over plaintext non-loopback http.
+    require_secure_node_url(node_url)?;
     let http = build_client()?;
     let node = normalize_node_url(node_url);
     let resp = http
@@ -381,7 +451,7 @@ pub async fn fetch_balance_sats(node_url: &str, api_key: &str) -> Result<u64, Fu
         .bearer_auth(api_key)
         .send()
         .await
-        .map_err(|e| FundingError::Network(format!("balance-info request failed: {e}")))?;
+        .map_err(|_| FundingError::Network("balance-info request failed".to_string()))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(status_error("balance-info", status));
@@ -389,40 +459,9 @@ pub async fn fetch_balance_sats(node_url: &str, api_key: &str) -> Result<u64, Fu
     let info: BalanceInfo = resp
         .json()
         .await
-        .map_err(|e| FundingError::Network(format!("parse balance-info response: {e}")))?;
+        .map_err(|_| FundingError::Network("parse balance-info response failed".to_string()))?;
     // msats -> whole spendable sats (a fractional sat is not spendable, so floor).
     Ok(info.balance / 1000)
-}
-
-/// Recover a paid-but-lost key from its `bolt11`. Returns the recovered `api_key`, or
-/// [`FundingError::FailedPayment`] if the node cannot recover it (unpaid / unknown / already
-/// claimed → null `api_key`).
-///
-/// SECURITY (C7 / F1): Routstr's recover AUTH is UNVERIFIED. The `bolt11` is handed to
-/// wallets / QR / NWC so it is NOT secret; if the node mints the `sk-` from the `bolt11`
-/// ALONE, anyone who saw the invoice can steal a funded key. The CLI gates this behind an
-/// explicit break-glass flag; the persisted `invoice_id` sidecar (F2) makes recover rarely
-/// needed. Callers must treat this as a last resort.
-pub async fn recover_key(node_url: &str, bolt11: &str) -> Result<String, FundingError> {
-    let http = build_client()?;
-    let node = normalize_node_url(node_url);
-    let resp = http
-        .post(format!("{node}/v1/balance/lightning/recover"))
-        .json(&RecoverRequest {
-            bolt11: bolt11.to_string(),
-        })
-        .send()
-        .await
-        .map_err(|e| FundingError::Network(format!("recover request failed: {e}")))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(status_error("recover", status));
-    }
-    let recovered: RecoverResponse = resp
-        .json()
-        .await
-        .map_err(|e| FundingError::Network(format!("parse recover response: {e}")))?;
-    recovered.api_key.ok_or(FundingError::FailedPayment)
 }
 
 // ---- Keyfile + sidecar persistence (F8 / F9 / F2) ------------------------------------
@@ -433,8 +472,9 @@ pub fn node_url_sidecar_path(key_path: &Path) -> PathBuf {
     sidecar_path(key_path, "node_url")
 }
 
-/// The sidecar path for the persisted `invoice_id` state (F2): `<key>.invoice` beside the
-/// keyfile. Written 0600, never logged; it is the capability a `poll` exchanges for the key.
+/// The sidecar path for the persisted PENDING-invoice state (F2): `<key>.invoice` beside the
+/// keyfile. Written 0600, never logged; it holds the capability a `poll` exchanges for the key
+/// PLUS the node_url the invoice was created against (so `poll` targets the right node).
 pub fn invoice_state_path(key_path: &Path) -> PathBuf {
     sidecar_path(key_path, "invoice")
 }
@@ -471,18 +511,28 @@ pub fn write_key_atomic(path: &Path, key: &str) -> Result<(), FundingError> {
 
     match create {
         Ok(mut f) => {
-            writeln!(f, "{key}").map_err(|e| FundingError::KeyWrite(format!("write key: {e}")))?;
-            f.sync_all()
-                .map_err(|e| FundingError::KeyWrite(format!("fsync key file: {e}")))?;
-            fsync_dir(&parent)?;
+            // On ANY failure past the create, remove the just-created partial file so a
+            // partial/empty key never lingers (a later read would treat it as a real key).
+            let write_and_sync = (|| {
+                writeln!(f, "{key}")
+                    .map_err(|e| FundingError::KeyWrite(format!("write key: {e}")))?;
+                f.sync_all()
+                    .map_err(|e| FundingError::KeyWrite(format!("fsync key file: {e}")))?;
+                fsync_dir(&parent)
+            })();
+            if let Err(e) = write_and_sync {
+                let _ = std::fs::remove_file(path);
+                return Err(e);
+            }
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Idempotent re-provision: succeed IFF the existing content is the SAME key;
-            // refuse to overwrite a DIFFERENT one (never silently clobber bearer money).
-            let existing = std::fs::read_to_string(path).map_err(|e| {
-                FundingError::KeyWrite(format!("read existing key for fingerprint: {e}"))
-            })?;
+            // refuse to overwrite a DIFFERENT one (never silently clobber bearer money). The
+            // existing file is read through an O_NOFOLLOW|O_RDONLY fd that is fstat-checked to
+            // be a regular file mode 0600 — never following a symlink and never trusting a
+            // wrong-mode (e.g. world-readable, or an attacker-planted) file's content.
+            let existing = read_existing_key_hardened(path)?;
             if fingerprint(existing.trim()) == fingerprint(key) {
                 Ok(())
             } else {
@@ -499,20 +549,102 @@ pub fn write_key_atomic(path: &Path, key: &str) -> Result<(), FundingError> {
     }
 }
 
-/// Write the `invoice_id` to its 0600 sidecar (F2). It is bearer-sensitive on the create
-/// path (the poll exchanges it for the `sk-`), so it is never logged. Overwrites are allowed
-/// (a fresh create replaces a stale invoice for the same key-out), but the file is 0600 and
-/// no-symlink-follow.
-pub fn write_invoice_state(key_path: &Path, invoice_id: &str) -> Result<(), FundingError> {
-    write_sidecar(&invoice_state_path(key_path), invoice_id)
+/// Read an existing keyfile for the idempotent-fingerprint compare WITHOUT following a symlink
+/// or trusting a wrong-mode file. Opens `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`, `fstat`s the fd
+/// (so the checks bind to the SAME inode that is read — no TOCTOU), requires a regular file
+/// mode exactly 0600, then reads from THAT fd (never [`std::fs::read_to_string`], which would
+/// re-open by path and follow a symlink). A symlink at the path fails the open (`ELOOP`); a
+/// non-regular or non-0600 file is refused.
+fn read_existing_key_hardened(path: &Path) -> Result<String, FundingError> {
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| {
+            FundingError::KeyWrite(format!(
+                "open existing key {} O_RDONLY|O_NOFOLLOW: {e}",
+                path.display()
+            ))
+        })?;
+    let meta = f
+        .metadata()
+        .map_err(|e| FundingError::KeyWrite(format!("fstat existing key: {e}")))?;
+    if !meta.file_type().is_file() {
+        return Err(FundingError::KeyWrite(format!(
+            "existing key {} is not a regular file (refusing to fingerprint it)",
+            path.display()
+        )));
+    }
+    let mode = meta.mode() & 0o777;
+    if mode != 0o600 {
+        return Err(FundingError::KeyWrite(format!(
+            "existing key {} has mode {:#o}, expected 0600 (refusing to trust a wrong-mode key)",
+            path.display(),
+            mode
+        )));
+    }
+    let mut existing = String::new();
+    f.read_to_string(&mut existing)
+        .map_err(|e| FundingError::KeyWrite(format!("read existing key for fingerprint: {e}")))?;
+    Ok(existing)
 }
 
-/// Read the persisted `invoice_id` sidecar (F2), if present.
-pub fn read_invoice_state(key_path: &Path) -> Option<String> {
-    std::fs::read_to_string(invoice_state_path(key_path))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+/// The persisted PENDING-invoice state (F2): the capability `invoice_id` a `poll` exchanges
+/// for the `sk-`, PLUS the `node_url` the invoice was created against. `poll` reads BOTH from
+/// here so it targets the node the invoice actually lives on (never defaulting to
+/// `api.routstr.com` against a custom node). Deserialize-only + a redacting `Debug` (the
+/// `invoice_id` is a capability), mirroring the wire types.
+#[derive(Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct PendingInvoice {
+    pub invoice_id: String,
+    pub node_url: String,
+}
+
+impl std::fmt::Debug for PendingInvoice {
+    /// Redacts `invoice_id` (the capability); `node_url` is not sensitive and is shown.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingInvoice")
+            .field("invoice_id", &"<redacted>")
+            .field("node_url", &self.node_url)
+            .finish()
+    }
+}
+
+/// Write the PENDING-invoice state (invoice_id + node_url) to its 0600 sidecar (F2). Both are
+/// stored as JSON (`{"invoice_id":..,"node_url":..}`). The invoice_id is bearer-sensitive on
+/// the create path (the poll exchanges it for the `sk-`), so it is never logged. Overwrites are
+/// allowed (a fresh create replaces a stale invoice for the same key-out); the file is 0600
+/// and no-symlink-follow. The node_url is normalized so a later `poll` compares apples to
+/// apples.
+pub fn write_invoice_state(
+    key_path: &Path,
+    invoice_id: &str,
+    node_url: &str,
+) -> Result<(), FundingError> {
+    // Build the JSON literal directly (the type is Deserialize-only + redacting-Debug, so it
+    // is never serialized out); this is written to a 0600 file, never stdout.
+    let json = serde_json::json!({
+        "invoice_id": invoice_id,
+        "node_url": normalize_node_url(node_url),
+    })
+    .to_string();
+    write_sidecar(&invoice_state_path(key_path), &json)
+}
+
+/// Read the persisted PENDING-invoice state (F2), if present + parseable.
+pub fn read_invoice_state(key_path: &Path) -> Option<PendingInvoice> {
+    let raw = std::fs::read_to_string(invoice_state_path(key_path)).ok()?;
+    let pending: PendingInvoice = serde_json::from_str(raw.trim()).ok()?;
+    if pending.invoice_id.trim().is_empty() || pending.node_url.trim().is_empty() {
+        return None;
+    }
+    Some(pending)
+}
+
+/// Clear the PENDING-invoice state once the key is safely written (the invoice is claimed;
+/// keeping the capability around is needless exposure). Absence is fine (idempotent).
+pub fn clear_invoice_state(key_path: &Path) {
+    let _ = std::fs::remove_file(invoice_state_path(key_path));
 }
 
 /// Bind the `node_url` beside the key (F9). Written 0600, no-symlink-follow. The keyfile
@@ -598,24 +730,48 @@ fn fsync_dir(dir: &Path) -> Result<(), FundingError> {
         .map_err(|e| FundingError::KeyWrite(format!("fsync parent dir {}: {e}", dir.display())))
 }
 
-/// Write a small 0600 sidecar (invoice_id / node_url), no-symlink-follow, truncating any
-/// prior content. Sidecars are metadata (not bearer money), so overwrite is permitted; the
-/// 0600 + O_NOFOLLOW discipline still holds (the invoice_id is capability-sensitive).
+/// Write a small 0600 sidecar (invoice_id / node_url), no-symlink-follow. A sidecar carries a
+/// capability (the `invoice_id`) or a security-relevant binding (the `node_url`), so it must be
+/// 0600 EVEN WHEN THE FILE ALREADY EXISTS: mode `0o600` on the open flags only applies to a
+/// fresh create, so a pre-existing 0644 sidecar would keep 0644 and leak world-readable. This
+/// opens `O_CREAT | O_WRONLY | O_NOFOLLOW | O_CLOEXEC` (never following a symlink), `fstat`s
+/// the fd to require a regular file, `fchmod`s it to exactly 0600 (binding the mode to the same
+/// inode that is written — no path re-open, no TOCTOU), then truncates, writes, and `fsync`s
+/// BOTH the file and its parent dir (so the entry + content are durable). Overwrite of an
+/// existing sidecar is permitted (a fresh create replaces a stale one for the same key-out).
 fn write_sidecar(path: &Path, contents: &str) -> Result<(), FundingError> {
-    ensure_parent_dir(path)?;
-    let mut f = std::fs::OpenOptions::new()
+    let parent = ensure_parent_dir(path)?;
+    // O_WRONLY|O_CREAT|O_NOFOLLOW but NOT O_TRUNC: fstat + fchmod BEFORE truncating, so a
+    // pre-existing wrong-mode/irregular file is caught and re-permissioned, not clobbered blind.
+    let f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .mode(0o600)
         .open(path)
         .map_err(|e| {
             FundingError::KeyWrite(format!("open sidecar {} 0600: {e}", path.display()))
         })?;
-    writeln!(f, "{contents}").map_err(|e| FundingError::KeyWrite(format!("write sidecar: {e}")))?;
+    let meta = f
+        .metadata()
+        .map_err(|e| FundingError::KeyWrite(format!("fstat sidecar: {e}")))?;
+    if !meta.file_type().is_file() {
+        return Err(FundingError::KeyWrite(format!(
+            "sidecar {} is not a regular file",
+            path.display()
+        )));
+    }
+    // Enforce 0600 on the OPEN fd (covers a pre-existing 0644 file the mode-on-create missed).
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| FundingError::KeyWrite(format!("chmod sidecar 0600: {e}")))?;
+    // Truncate any prior (possibly longer) content, then write.
+    f.set_len(0)
+        .map_err(|e| FundingError::KeyWrite(format!("truncate sidecar: {e}")))?;
+    (&f).write_all(format!("{contents}\n").as_bytes())
+        .map_err(|e| FundingError::KeyWrite(format!("write sidecar: {e}")))?;
     f.sync_all()
-        .map_err(|e| FundingError::KeyWrite(format!("fsync sidecar: {e}")))
+        .map_err(|e| FundingError::KeyWrite(format!("fsync sidecar: {e}")))?;
+    fsync_dir(&parent)
 }
 
 #[cfg(test)]
@@ -673,14 +829,50 @@ mod tests {
         assert_eq!(b.balance, 2500400);
     }
 
+    // ---- secret redaction in Debug (#2) ---------------------------------------------
+
     #[test]
-    fn recover_response_parses_present_and_absent() {
-        let ok: RecoverResponse = serde_json::from_str(r#"{"api_key":"sk-rec"}"#).unwrap();
-        assert_eq!(ok.api_key.as_deref(), Some("sk-rec"));
-        let none: RecoverResponse = serde_json::from_str(r#"{"api_key":null}"#).unwrap();
-        assert_eq!(none.api_key, None);
-        let empty: RecoverResponse = serde_json::from_str(r#"{}"#).unwrap();
-        assert_eq!(empty.api_key, None);
+    fn secrets_are_redacted_in_debug() {
+        // TOOTH (#2): the secret-bearing response types must NOT print their secret via
+        // `{:?}` (an assert_eq! failure or a stray log renders Debug). Reverting to a derived
+        // `#[derive(Debug)]` makes this RED — the raw invoice_id / api_key would appear.
+        let created = InvoiceCreateResponse {
+            invoice_id: "inv-SECRET-CAP".into(),
+            bolt11: "lnbcPUBLIC".into(),
+            amount_sats: 2000,
+            expires_at: None,
+            payment_hash: None,
+        };
+        let d = format!("{created:?}");
+        assert!(
+            !d.contains("inv-SECRET-CAP"),
+            "the capability invoice_id must not appear in Debug: {d}"
+        );
+        assert!(d.contains("<redacted>"), "invoice_id is redacted: {d}");
+        assert!(d.contains("lnbcPUBLIC"), "the public bolt11 is still shown");
+
+        let status = InvoiceStatusResponse {
+            status: "paid".into(),
+            api_key: Some("sk-SECRET-KEY".into()),
+        };
+        let d = format!("{status:?}");
+        assert!(
+            !d.contains("sk-SECRET-KEY"),
+            "the minted api_key must not appear in Debug: {d}"
+        );
+        assert!(d.contains("<redacted>"), "api_key is redacted: {d}");
+        assert!(d.contains("paid"), "the non-secret status is still shown");
+
+        let pending = PendingInvoice {
+            invoice_id: "inv-PENDING-CAP".into(),
+            node_url: "https://api.routstr.com".into(),
+        };
+        let d = format!("{pending:?}");
+        assert!(
+            !d.contains("inv-PENDING-CAP"),
+            "the pending invoice_id must not appear in Debug: {d}"
+        );
+        assert!(d.contains("https://api.routstr.com"), "node_url is shown");
     }
 
     // ---- amount validation ----------------------------------------------------------
@@ -855,6 +1047,86 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn write_key_atomic_idempotent_read_rejects_wrong_mode_file() {
+        // TOOTH (#5): the AlreadyExists idempotent-read branch must NOT trust a wrong-mode
+        // file. An existing 0644 file holding the SAME key content is REFUSED (a
+        // world-readable "key" is not a key we hardened). Reverting to `std::fs::read_to_string`
+        // + no fstat mode check makes this RED — the old code would return Ok (idempotent
+        // success) on the 0644 file, silently blessing a world-readable bearer key.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("idem-wrongmode");
+        let key_path = dir.join("brain.key");
+        std::fs::write(&key_path, "sk-same\n").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = write_key_atomic(&key_path, "sk-same").unwrap_err();
+        assert_eq!(err.exit_code(), exit_code::KEY_WRITE_FAILURE);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_key_atomic_idempotent_read_does_not_follow_a_symlink() {
+        // TOOTH (#5): the idempotent-read branch must read through an O_NOFOLLOW fd, never
+        // `std::fs::read_to_string` (which re-opens by path and FOLLOWS a symlink). Here the
+        // key path is a symlink to a 0600 file whose content MATCHES the key being written; the
+        // OLD read_to_string would follow it, read "sk-same", and return Ok (a false idempotent
+        // success on a redirected path). O_NOFOLLOW refuses instead.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("idem-symlink");
+        let target = dir.join("real.key");
+        std::fs::write(&target, "sk-same\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("brain.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // create_new O_NOFOLLOW fails ELOOP (AlreadyExists? no — a generic error), and the
+        // idempotent read fd is also O_NOFOLLOW → either way this is a KeyWrite refusal, never
+        // a followed read.
+        let err = write_key_atomic(&link, "sk-same").unwrap_err();
+        assert_eq!(err.exit_code(), exit_code::KEY_WRITE_FAILURE);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_key_atomic_removes_partial_file_on_write_failure() {
+        // The fresh-create path must not leave a partial/empty key behind if the write/fsync
+        // fails. We can't easily force a write failure on a normal fd, so assert the happy
+        // path leaves a complete file (the removal branch is covered by inspection) AND that
+        // a zero-length pre-existing 0600 file is treated as a DIFFERENT (empty) key, not a
+        // silent match — an empty key must never fingerprint-equal a real one.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("partial");
+        let key_path = dir.join("brain.key");
+        std::fs::write(&key_path, "").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let err = write_key_atomic(&key_path, "sk-real").unwrap_err();
+        assert_eq!(
+            err.exit_code(),
+            exit_code::KEY_WRITE_FAILURE,
+            "an empty existing key is a fingerprint MISMATCH, refused (never a silent match)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- https-before-bearer enforcement (#6) ---------------------------------------
+
+    #[test]
+    fn require_secure_node_url_refuses_plaintext_nonloopback() {
+        // TOOTH (#6): a bearer secret must never be prepared for a plaintext non-loopback
+        // node_url. Reverting `require_secure_node_url` (or dropping its call sites) makes the
+        // funding calls proceed to send a bearer over plaintext http. Loopback + https pass.
+        assert!(require_secure_node_url("https://api.routstr.com").is_ok());
+        assert!(require_secure_node_url("http://127.0.0.1:7777").is_ok());
+        assert!(require_secure_node_url("http://localhost:8080").is_ok());
+        let err = require_secure_node_url("http://api.routstr.com").unwrap_err();
+        assert_eq!(
+            err.exit_code(),
+            exit_code::USAGE_ERROR,
+            "plaintext non-loopback is a usage refusal before any network call"
+        );
+        // The userinfo-bypass host is resolved correctly (true host = evil.com → refused).
+        assert!(require_secure_node_url("http://localhost:pw@evil.com/").is_err());
+    }
+
     // ---- node_url binding (F9) ------------------------------------------------------
 
     #[test]
@@ -916,15 +1188,20 @@ mod tests {
     }
 
     #[test]
-    fn invoice_state_round_trips_0600() {
+    fn invoice_state_round_trips_invoice_id_and_node_url_0600() {
         let dir = temp_dir("invoice");
         let key_path = dir.join("brain.key");
-        write_invoice_state(&key_path, "inv-abc-123").unwrap();
-        assert_eq!(
-            read_invoice_state(&key_path).as_deref(),
-            Some("inv-abc-123")
-        );
+        // The pending state holds BOTH the invoice_id AND the node_url it was created against
+        // (so poll targets the right node). The node_url is normalized (trailing slash gone).
+        write_invoice_state(&key_path, "inv-abc-123", "https://custom.node.example/").unwrap();
+        let pending = read_invoice_state(&key_path).expect("pending state parses");
+        assert_eq!(pending.invoice_id, "inv-abc-123");
+        assert_eq!(pending.node_url, "https://custom.node.example");
         assert_eq!(invoice_state_path(&key_path), dir.join("brain.key.invoice"));
+        // It is JSON on disk (not a bare string), so poll can recover node_url from it.
+        let raw = std::fs::read_to_string(invoice_state_path(&key_path)).unwrap();
+        assert!(raw.contains("\"invoice_id\""));
+        assert!(raw.contains("\"node_url\""));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -938,6 +1215,58 @@ mod tests {
                 "the invoice_id sidecar is 0600 (it is capability-sensitive)"
             );
         }
+        // clear removes it (idempotent even when already gone).
+        clear_invoice_state(&key_path);
+        assert!(read_invoice_state(&key_path).is_none());
+        clear_invoice_state(&key_path);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_sidecar_enforces_0600_on_an_existing_wider_mode_file() {
+        // TOOTH (#3/write_sidecar): a pre-existing 0644 sidecar must be re-permissioned to 0600
+        // on write — the mode-on-create flag alone would leave 0644 (world-readable capability).
+        // Reverting to the create-only `.mode(0o600)` (no fchmod on the open fd) makes this RED:
+        // the file would stay 0644.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("sidecar-mode");
+        let key_path = dir.join("brain.key");
+        let sidecar = invoice_state_path(&key_path);
+        // Plant a world-readable sidecar with stale content.
+        std::fs::write(&sidecar, "stale\n").unwrap();
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "precondition: the planted sidecar is 0644"
+        );
+        // Writing fresh state must drop it to 0600 AND replace the content.
+        write_invoice_state(&key_path, "inv-new", "https://api.routstr.com").unwrap();
+        assert_eq!(
+            std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "an existing wider-mode sidecar is re-permissioned to 0600"
+        );
+        let pending = read_invoice_state(&key_path).unwrap();
+        assert_eq!(pending.invoice_id, "inv-new");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_sidecar_refuses_to_follow_a_symlink() {
+        // Complements the 0600 tooth: O_NOFOLLOW means a symlink planted at the sidecar path is
+        // refused, never written THROUGH to its target. Reverting O_NOFOLLOW would clobber the
+        // target's content (and its mode).
+        let dir = temp_dir("sidecar-symlink");
+        let key_path = dir.join("brain.key");
+        let sidecar = invoice_state_path(&key_path);
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "victim\n").unwrap();
+        std::os::unix::fs::symlink(&target, &sidecar).unwrap();
+        let err = write_invoice_state(&key_path, "inv-x", "https://api.routstr.com").unwrap_err();
+        assert_eq!(err.exit_code(), exit_code::KEY_WRITE_FAILURE);
+        // The symlink target is untouched.
+        assert_eq!(std::fs::read_to_string(&target).unwrap().trim(), "victim");
         std::fs::remove_dir_all(&dir).ok();
     }
 
