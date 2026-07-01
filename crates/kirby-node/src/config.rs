@@ -2735,4 +2735,29 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("kirby-zeroconfig-does-not-exist"), "the error names the missing path: {msg}");
     }
+
+    /// TOOTH (Codex-HIGH #1, belt-and-suspenders): a config FILE that is present but empty parses
+    /// with the OLD field-level defaults (app-checkpoint / stub / mem=1 / no allowlist / wall off) —
+    /// NOT the zero-config template — even validated as a FleetHost. This PROVES the M3 field
+    /// defaults did not leak the zero-config whole-struct defaults onto explicit files (the
+    /// "backcompat drift" Codex flagged as HIGH): ONLY the file-ABSENT synthesis path builds
+    /// `KirbyConfig::default()`. RED-on-revert: move any zero-config value into a field-level
+    /// `#[serde(default)]` and one of these asserts fails.
+    #[test]
+    fn empty_config_file_uses_old_field_defaults_not_the_zero_config_template() {
+        let cfg = KirbyConfig::from_toml_str_for("", ConfigRole::FleetHost)
+            .expect("an empty config file must parse to the field defaults + validate as a fleet host");
+        // The drift-capable fields keep their HISTORICAL defaults (byte-identical to pre-change)...
+        assert_eq!(cfg.workload, Workload::AppCheckpoint);
+        assert_eq!(cfg.brain.backend, BrainBackendKind::Stub);
+        assert_eq!(cfg.meter.mem_sats_per_mib_sec, 1);
+        assert_eq!(cfg.max_run_secs, None);
+        assert!(cfg.fleet.spawn.image_allowlist.is_empty());
+        assert_eq!(cfg.fleet.spawn.request_max_age_secs, None);
+        // ...which is EXACTLY what makes a present-but-empty file differ from the no-file template.
+        let zero_config = KirbyConfig::default();
+        assert_ne!(cfg.workload, zero_config.workload, "empty file must NOT get the zero-config template");
+        assert_ne!(cfg.meter.mem_sats_per_mib_sec, zero_config.meter.mem_sats_per_mib_sec);
+        assert_ne!(cfg.fleet.spawn.image_allowlist, zero_config.fleet.spawn.image_allowlist);
+    }
 }
