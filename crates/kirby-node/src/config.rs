@@ -623,6 +623,17 @@ pub struct BrainConfig {
     /// accepted mint, §11). Required iff `backend = "routstr"`.
     #[serde(default)]
     pub mint_url: String,
+    /// (routstr) EXTRA mint URLs to trust for NIP-60 reconcile beyond `mint_url`. The effective
+    /// allowlist ([`Self::effective_mint_allowlist`]) always includes `mint_url` (the wallet's own
+    /// mint), so this is only for ADDITIONAL trusted mints; empty (the default) = trust only
+    /// `mint_url`. The allowlist is the PRIMARY NIP-60 theft-guard: reconcile drops relay-stored
+    /// proofs drawn on a mint not in it, so a rogue relay/event cannot make the wallet adopt (and
+    /// later swap at) an attacker's mint. Conscious consequence of the `[mint_url]` default: the
+    /// agent accepts ONLY its own mint's proofs — a payer paying from a DIFFERENT mint is dropped
+    /// (safe-by-default). Cross-mint RECEIVE (accept-foreign-then-swap-to-trusted, where the
+    /// mint-swap re-introduces its own guard) is the earn-loop's future concern, not this filter.
+    #[serde(default)]
+    pub mint_allowlist: Vec<String>,
     /// (routstr) The PERSISTENT wallet store path (cdk-sqlite file). The wallet SEED
     /// persists alongside it (§7.1); funded proofs survive a reboot. Required iff
     /// `backend = "routstr"`.
@@ -687,6 +698,25 @@ fn default_brain_max_tokens() -> u32 {
     1024
 }
 
+impl BrainConfig {
+    /// The effective NIP-60 mint-allowlist: the wallet's own `mint_url` (always trusted, first)
+    /// plus any operator-configured [`Self::mint_allowlist`] extras, deduped. An empty configured
+    /// list = trust only `mint_url`; a blank `mint_url` (e.g. a non-routstr backend, no wallet) is
+    /// omitted. This is what the NIP-60 reconcile filters relay-stored proofs against.
+    pub fn effective_mint_allowlist(&self) -> Vec<String> {
+        let mut allow: Vec<String> = Vec::with_capacity(self.mint_allowlist.len() + 1);
+        if !self.mint_url.is_empty() {
+            allow.push(self.mint_url.clone());
+        }
+        for mint in &self.mint_allowlist {
+            if !allow.contains(mint) {
+                allow.push(mint.clone());
+            }
+        }
+        allow
+    }
+}
+
 impl Default for BrainConfig {
     fn default() -> Self {
         BrainConfig {
@@ -697,6 +727,7 @@ impl Default for BrainConfig {
             backend: BrainBackendKind::default(),
             node_url: String::new(),
             mint_url: String::new(),
+            mint_allowlist: Vec::new(),
             wallet_db_path: String::new(),
             api_key_path: String::new(),
             max_tokens: default_brain_max_tokens(),
@@ -1506,6 +1537,43 @@ mod tests {
             cfg.identity.treasury_dir(),
             crate::boot::state_root(),
             "an unset key_path + unset treasury_dir defaults to the durable state root"
+        );
+    }
+
+    #[test]
+    fn effective_mint_allowlist_always_includes_the_wallet_mint() {
+        // Empty configured list → trust ONLY the wallet's own mint.
+        let mut brain = BrainConfig {
+            mint_url: "https://mint.trusted".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            brain.effective_mint_allowlist(),
+            vec!["https://mint.trusted".to_string()],
+            "empty allowlist → trust only mint_url"
+        );
+        // Operator extras are appended; mint_url stays present (first); a dup of it collapses.
+        brain.mint_allowlist = vec![
+            "https://mint.extra".to_string(),
+            "https://mint.trusted".to_string(),
+        ];
+        assert_eq!(
+            brain.effective_mint_allowlist(),
+            vec![
+                "https://mint.trusted".to_string(),
+                "https://mint.extra".to_string()
+            ],
+            "mint_url is always trusted (first) + operator extras, deduped"
+        );
+        // A blank mint_url (a non-routstr backend, no wallet) is omitted.
+        let stub = BrainConfig {
+            mint_url: String::new(),
+            mint_allowlist: vec!["https://only.this".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            stub.effective_mint_allowlist(),
+            vec!["https://only.this".to_string()]
         );
     }
 

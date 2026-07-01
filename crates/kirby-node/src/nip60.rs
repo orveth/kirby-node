@@ -205,16 +205,39 @@ pub fn live_token_event_ids(events: &[(String, TokenEventContent)]) -> Vec<&str>
 }
 
 /// Reconcile a wallet's kind:7375 token events into its LIVE proof set: AGGREGATE the proofs of
-/// every [`live_token_event_ids`] event (NOT a head — see its money-safety note), deduped by the
-/// serialized proof so a duplicate re-publish can't double-count. The returned set is the
-/// CANDIDATE proofs; NUT-07 check-state (N2) then filters it to UNSPENT before any spend (NIP-60
-/// is portability, not safety — the mint is the source of truth).
-pub fn reconcile_token_set(events: &[(String, TokenEventContent)]) -> Vec<Proof> {
+/// every [`live_token_event_ids`] event (NOT a head — see its money-safety note) whose mint is in
+/// `mint_allowlist`, deduped by the serialized proof so a duplicate re-publish can't double-count.
+///
+/// ⚠️ MONEY-SAFETY (N7 mint-allowlist): a token event drawn on a mint NOT in the allowlist is
+/// DROPPED — a rogue relay/event cannot make the wallet adopt (and later swap at) an attacker's
+/// mint. The allowlist is the PRIMARY theft-guard: it blocks the untrusted-mint entry, the
+/// precondition of the swap-at-attacker's-mint attack (a malicious ALLOWLISTED mint is the
+/// accepted mint-trust SPOF, orthogonal to v0/v1 — so the allowlist subsumes the v0-keyset risk
+/// and we support trusted v0 mints rather than refuse them). The agent's own mint is always in the
+/// effective allowlist. The default `[mint_url]` is intentionally strict: a payer's OTHER-mint
+/// proofs are dropped (safe-by-default) — cross-mint RECEIVE (accept-foreign-then-swap-to-trusted,
+/// with its own guard at the swap) is the earn-loop's future concern, not this filter.
+///
+/// The returned set is the CANDIDATE proofs; NUT-07 check-state (N2) then filters it to UNSPENT
+/// before any spend (NIP-60 is portability, not safety — the mint is the source of truth).
+pub fn reconcile_token_set(
+    events: &[(String, TokenEventContent)],
+    mint_allowlist: &[String],
+) -> Vec<Proof> {
     let live: std::collections::HashSet<&str> = live_token_event_ids(events).into_iter().collect();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut proofs = Vec::new();
     for (id, content) in events {
         if !live.contains(id.as_str()) {
+            continue;
+        }
+        // MONEY-SAFETY (N7): adopt proofs ONLY from an allowlisted mint — the theft-guard.
+        if !mint_allowlist.iter().any(|m| m == &content.mint) {
+            tracing::warn!(
+                mint = %content.mint,
+                event_id = %id,
+                "NIP-60 reconcile: dropping proofs from a non-allowlisted mint"
+            );
             continue;
         }
         for proof in &content.proofs {
@@ -310,6 +333,10 @@ pub struct Nip60Store {
     /// The K-of-N ack threshold a publish must reach to count as durable.
     k: usize,
     read_timeout: Duration,
+    /// The mints whose relay-stored proofs this wallet will adopt on reconcile (N7 theft-guard;
+    /// [`crate::config::BrainConfig::effective_mint_allowlist`]). Always includes the agent's own
+    /// mint. Proofs drawn on any other mint are dropped by [`reconcile_token_set`].
+    mint_allowlist: Vec<String>,
 }
 
 impl Nip60Store {
@@ -322,6 +349,7 @@ impl Nip60Store {
         event_key: &[u8; 32],
         relays: &[String],
         write_k: Option<usize>,
+        mint_allowlist: Vec<String>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !relays.is_empty(),
@@ -345,6 +373,7 @@ impl Nip60Store {
             n,
             k,
             read_timeout: Duration::from_secs(NIP60_READ_TIMEOUT_SECS),
+            mint_allowlist,
         })
     }
 
@@ -356,6 +385,7 @@ impl Nip60Store {
         transport: Arc<dyn Nip60Transport>,
         n: usize,
         k: usize,
+        mint_allowlist: Vec<String>,
     ) -> Self {
         Nip60Store {
             crypto,
@@ -363,6 +393,7 @@ impl Nip60Store {
             n,
             k,
             read_timeout: Duration::from_secs(NIP60_READ_TIMEOUT_SECS),
+            mint_allowlist,
         }
     }
 
@@ -416,7 +447,7 @@ impl Nip60Store {
                 ),
             }
         }
-        Ok(reconcile_token_set(&decoded))
+        Ok(reconcile_token_set(&decoded, &self.mint_allowlist))
     }
 
     /// Publish the kind:17375 wallet-config (mints + per-keyset NUT-13 counters, NIP-44
@@ -480,10 +511,17 @@ impl Nip60Store {
             .context("fetch NIP-60 wallet-config events")?;
         match crate::engram::lww_head(&events) {
             Some(head) => {
-                let config = self
+                let mut config = self
                     .crypto
                     .decrypt_config(&head.content)
                     .context("decrypt the NIP-60 wallet-config lww-head")?;
+                // N7: keep only allowlisted mints in the (informational) mints hint-list. The
+                // self-authored COUNTERS are NOT filtered — they are keyset-keyed in the agent's
+                // OWN signed+encrypted event (unforgeable) and ride the keyset→mint trust; the
+                // theft-guard is the proof-mint-filter in `reconcile_token_set`, not here.
+                config
+                    .mints
+                    .retain(|m| self.mint_allowlist.iter().any(|a| a == m));
                 Ok(Some(config))
             }
             None => Ok(None),
@@ -567,6 +605,13 @@ mod tests {
     use super::*;
     use crate::seed_keyring::derive_nip60_event_key;
 
+    /// The allowlist matching the `tec`/`tec_with` helpers' mint ("https://m"), so the aggregate /
+    /// del-chain / transport teeth exercise their own logic without the N7 mint-filter dropping
+    /// anything. The N7 filter itself has a dedicated tooth (`reconcile_drops_...`).
+    fn allow_m() -> Vec<String> {
+        vec!["https://m".to_string()]
+    }
+
     /// A token-event content with empty proofs + the given `del` ids. The reconcile money-safety
     /// teeth turn on the event-id / del-chain logic, not the (cdk-owned) proof internals.
     fn tec(del: &[&str]) -> TokenEventContent {
@@ -608,7 +653,7 @@ mod tests {
             ("b".to_string(), tec_with(&[], vec![p2.clone()])),
         ];
         assert_eq!(
-            reconcile_token_set(&evs).len(),
+            reconcile_token_set(&evs, &allow_m()).len(),
             2,
             "proofs from ALL live events aggregate (an lww-head would drop one = money loss)"
         );
@@ -619,7 +664,7 @@ mod tests {
             ("c".to_string(), tec_with(&[], vec![p1])),
         ];
         assert_eq!(
-            reconcile_token_set(&evs_dup).len(),
+            reconcile_token_set(&evs_dup, &allow_m()).len(),
             2,
             "a duplicate proof is deduped (no double-count)"
         );
@@ -657,7 +702,31 @@ mod tests {
             "del-superseded inputs are dropped; the rollover output is live"
         );
         // Empty-proof events reconcile to an empty set (the proof aggregation rides the live-id logic).
-        assert!(reconcile_token_set(&evs).is_empty());
+        assert!(reconcile_token_set(&evs, &allow_m()).is_empty());
+    }
+
+    #[test]
+    fn reconcile_drops_proofs_from_a_non_allowlisted_mint() {
+        // Two live events with distinct proofs: one on the TRUSTED mint ("https://m"), one on a
+        // ROGUE mint a relay/event could inject.
+        let trusted = tec_with(&[], vec![dummy_proof("s1")]);
+        let rogue = TokenEventContent {
+            mint: "https://rogue".to_string(),
+            unit: "sat".to_string(),
+            proofs: vec![dummy_proof("s2")],
+            del: Vec::new(),
+        };
+        let evs = vec![("a".to_string(), trusted), ("b".to_string(), rogue)];
+
+        // Allowlist = only the trusted mint → the rogue mint's proof is DROPPED.
+        assert_eq!(
+            reconcile_token_set(&evs, &allow_m()).len(),
+            1,
+            "MONEY-SAFETY: only allowlisted-mint proofs are adopted; a rogue mint's proofs are dropped"
+        );
+        // Sanity: allowlisting BOTH admits both — proving it is the mint filter, not another drop.
+        let allow_both = vec!["https://m".to_string(), "https://rogue".to_string()];
+        assert_eq!(reconcile_token_set(&evs, &allow_both).len(), 2);
     }
 
     #[test]
@@ -844,14 +913,14 @@ mod tests {
         let content = tec(&[]);
         // n=3, k=2. Only 1 ack (< k) → NOT durable → error (proofs not backed up).
         let under = Arc::new(MockTransport::new(1));
-        let store = Nip60Store::with_transport(crypto.clone(), under, 3, 2);
+        let store = Nip60Store::with_transport(crypto.clone(), under, 3, 2, allow_m());
         assert!(
             store.publish_token(&content).await.is_err(),
             "a sub-quorum publish (<k acks) must error — the proofs are NOT durably backed up"
         );
         // 2 acks (== k) → durable → ok.
         let quorum = Arc::new(MockTransport::new(2));
-        let store_ok = Nip60Store::with_transport(crypto, quorum, 3, 2);
+        let store_ok = Nip60Store::with_transport(crypto, quorum, 3, 2, allow_m());
         assert!(
             store_ok.publish_token(&content).await.is_ok(),
             "k-of-n acks → a durable publish"
@@ -866,7 +935,7 @@ mod tests {
 
         // Durable (2 == k): the new token event is published, THEN the old is deleted — in order.
         let durable = Arc::new(MockTransport::new(2));
-        let store = Nip60Store::with_transport(crypto.clone(), durable.clone(), 3, 2);
+        let store = Nip60Store::with_transport(crypto.clone(), durable.clone(), 3, 2, allow_m());
         store
             .rollover("https://m", "sat", Vec::new(), superseded.clone())
             .await
@@ -879,7 +948,7 @@ mod tests {
 
         // Sub-quorum (1 < k): the new event is NOT durable → rollover errors and NEVER deletes.
         let sub = Arc::new(MockTransport::new(1));
-        let store2 = Nip60Store::with_transport(crypto, sub.clone(), 3, 2);
+        let store2 = Nip60Store::with_transport(crypto, sub.clone(), 3, 2, allow_m());
         assert!(
             store2
                 .rollover("https://m", "sat", Vec::new(), superseded)
@@ -902,7 +971,7 @@ mod tests {
         let e1 = signed_token_event(&crypto, tec_with(&[], vec![dummy_proof("s1")]));
         let e2 = signed_token_event(&crypto, tec_with(&[], vec![dummy_proof("s2")]));
         let mock = Arc::new(MockTransport::with_fetch(2, vec![e1, e2]));
-        let store = Nip60Store::with_transport(crypto, mock, 3, 2);
+        let store = Nip60Store::with_transport(crypto, mock, 3, 2, allow_m());
         let proofs = store.reconcile_on_load().await.expect("reconcile");
         assert_eq!(
             proofs.len(),
@@ -916,7 +985,7 @@ mod tests {
         let crypto = Nip60Crypto::from_event_key(&derive_nip60_event_key(&[8u8; 64])).unwrap();
         // No config event → None (a fresh wallet), NOT an error.
         let empty = Arc::new(MockTransport::with_fetch(2, Vec::new()));
-        let fresh = Nip60Store::with_transport(crypto.clone(), empty, 3, 2);
+        let fresh = Nip60Store::with_transport(crypto.clone(), empty, 3, 2, allow_m());
         assert!(
             fresh.load_config().await.expect("load").is_none(),
             "no config event → None (fresh wallet)"
@@ -931,7 +1000,7 @@ mod tests {
             .sign_with_keys(&crypto.signer_keys())
             .unwrap();
         let corrupt = Arc::new(MockTransport::with_fetch(2, vec![head]));
-        let store = Nip60Store::with_transport(crypto, corrupt, 3, 2);
+        let store = Nip60Store::with_transport(crypto, corrupt, 3, 2, allow_m());
         assert!(
             store.load_config().await.is_err(),
             "an undecryptable config head fails CLOSED (never a silent empty floor → no regression)"
