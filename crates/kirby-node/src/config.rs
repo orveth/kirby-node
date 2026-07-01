@@ -475,6 +475,19 @@ impl Default for RelayConfig {
     }
 }
 
+/// Whether a raw config TOML OMITS `[relay] url` — i.e. `relay.url` fell back to
+/// [`default_relay_url`] (the shared prod fleet relay) rather than being set explicitly.
+/// `#[serde(default)]` hides field presence from the deserialized struct, so re-probe the
+/// raw text. Extracted as a pure fn so the #110 "you defaulted onto the prod relay" warning
+/// (emitted by [`KirbyConfig::load_for`] on a present-but-partial file) is unit-testable
+/// without standing up a `tracing` subscriber.
+fn relay_url_was_omitted(raw_toml: &str) -> bool {
+    toml::from_str::<toml::Value>(raw_toml)
+        .ok()
+        .and_then(|v| v.get("relay").and_then(|r| r.get("url")).cloned())
+        .is_none()
+}
+
 /// The sandbox backend selector.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1236,7 +1249,23 @@ impl KirbyConfig {
     pub fn load_for(path: &Path, role: ConfigRole) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read kirby config {}: {e}", path.display()))?;
-        Self::from_toml_str_for(&text, role)
+        let cfg = Self::from_toml_str_for(&text, role)?;
+        // #110: a config FILE that omits `[relay] url` now silently falls back to the shared prod
+        // fleet relay (the M3 default) instead of erroring. Distinguish that "the operator forgot
+        // `[relay]`" case from the intended no-file zero-config join (which logs `using zero-config
+        // defaults` in `load_or_default`, and never reaches here). WARN loudly so a partial
+        // hand-authored config doesn't join the prod relay unnoticed.
+        if relay_url_was_omitted(&text) {
+            tracing::warn!(
+                path = %path.display(),
+                relay = %cfg.relay.url,
+                "config file present but [relay] url omitted — defaulting relay.url ($KIRBY_RELAY_URL \
+                 else the shared fleet relay; see the `relay` field for the resolved value); set \
+                 [relay] url to pin a relay. A bare `kirby-node` with NO config file defaults it \
+                 intentionally; a file that omits it may be a mistake."
+            );
+        }
+        Ok(cfg)
     }
 
     /// Load a config for `role`, SYNTHESIZING the zero-config defaults when no config file is
@@ -2759,5 +2788,103 @@ mod tests {
         assert_ne!(cfg.workload, zero_config.workload, "empty file must NOT get the zero-config template");
         assert_ne!(cfg.meter.mem_sats_per_mib_sec, zero_config.meter.mem_sats_per_mib_sec);
         assert_ne!(cfg.fleet.spawn.image_allowlist, zero_config.fleet.spawn.image_allowlist);
+    }
+
+    /// TOOTH (#110): a config FILE that omits `[relay] url` still parses + validates (the M3
+    /// default), AND the omission is DETECTED so `load_for` can WARN that it silently defaulted
+    /// onto the shared prod fleet relay. A file that SETS `[relay] url` is NOT flagged. This is
+    /// the fiduciary footgun keeper flagged on PR #108: a partial hand-authored config joining
+    /// prod unnoticed. RED-on-revert: make `relay_url_was_omitted` always return false and the
+    /// omitted-case assert fails (the warning would never fire).
+    #[test]
+    fn relay_omitted_from_a_present_file_is_detected_for_the_warning() {
+        // A file that omits [relay] still parses + validates as a fleet host (M3)...
+        let omits_relay = r#"
+            genome_image = { path = "/tmp/k/img" }
+
+            [identity]
+        "#;
+        let cfg = KirbyConfig::from_toml_str_for(omits_relay, ConfigRole::FleetHost)
+            .expect("a config omitting [relay] must still parse + validate");
+        assert_eq!(cfg.relay.url, default_relay_url(), "an omitted relay falls back to the default");
+        // ...and the omission is DETECTED, so `load_for` emits the #110 warning.
+        assert!(relay_url_was_omitted(omits_relay), "an omitted [relay] url must be detected");
+
+        // A file that SETS [relay] url is NOT flagged (no false warning).
+        assert!(!relay_url_was_omitted("[relay]\nurl = \"ws://127.0.0.1:7777\"\n"));
+        assert!(!relay_url_was_omitted(minimal_toml()), "minimal_toml sets [relay] url");
+    }
+
+    /// A `tracing` writer that captures emitted log lines into a shared buffer, so a test can
+    /// assert on the actual WARN a real load path emits (thread-scoped via `with_default`, so
+    /// it is parallel-test-safe). Uses `tracing_subscriber::fmt` (already a crate dep).
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with all tracing captured into a returned String (thread-scoped).
+    fn capture_tracing<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap_or_default();
+        (out, logs)
+    }
+
+    /// TOOTH (#110 wiring, addresses codex-review): the WARN actually fires from the real
+    /// `load_for` file path when `[relay]` is omitted, and does NOT fire when it is set — proven
+    /// by capturing tracing, not just the pure detector. The no-file zero-config path can't warn
+    /// here by construction (`load_or_default(None,..)` builds `KirbyConfig::default()` and never
+    /// calls `load_for`). RED-on-revert: delete the `if relay_url_was_omitted { warn }` block in
+    /// `load_for` and the omit-case assertion fails.
+    #[test]
+    fn load_for_warns_only_when_a_present_file_omits_relay() {
+        let dir = std::env::temp_dir().join("kirby-zeroconfig-110-load-for-wiring");
+        std::fs::create_dir_all(&dir).expect("create the test dir");
+
+        // A present file that OMITS [relay] => load_for parses it AND warns.
+        let omit_path = dir.join("omits-relay.toml");
+        std::fs::write(&omit_path, "genome_image = { path = \"/tmp/k/img\" }\n[identity]\n")
+            .expect("write the omitting config");
+        let (cfg, logs) =
+            capture_tracing(|| KirbyConfig::load_for(&omit_path, ConfigRole::FleetHost).unwrap());
+        assert_eq!(cfg.relay.url, default_relay_url(), "omitted relay falls back to the default");
+        let logs_lc = logs.to_lowercase();
+        assert!(
+            logs_lc.contains("omitted") && logs_lc.contains("relay"),
+            "load_for must WARN on an omitted [relay]; captured: {logs}"
+        );
+
+        // A present file that SETS [relay] url => NO omitted-relay warning.
+        let set_path = dir.join("sets-relay.toml");
+        std::fs::write(
+            &set_path,
+            "genome_image = { path = \"/tmp/k/img\" }\n[relay]\nurl = \"ws://127.0.0.1:7777\"\n",
+        )
+        .expect("write the relay-set config");
+        let (_cfg2, logs2) =
+            capture_tracing(|| KirbyConfig::load_for(&set_path, ConfigRole::FleetHost).unwrap());
+        assert!(
+            !logs2.to_lowercase().contains("omitted"),
+            "load_for must NOT warn when [relay] url is set; captured: {logs2}"
+        );
     }
 }

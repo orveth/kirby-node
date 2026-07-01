@@ -15,8 +15,9 @@ Source of truth: `crates/kirby-node/src/config.rs` (`KirbyConfig`).
 > [`zero-config.md`](./zero-config.md); this page is the per-key reference for an explicit file.
 >
 > **Note:** `relay.url`, `genome_image`, and `[identity]` -- previously required -- now DEFAULT
-> when omitted. A partial file with no `[relay]` silently joins the shared fleet relay
-> (`$KIRBY_RELAY_URL` else `ws://185.18.221.222:7777`); no `genome_image` uses `$KIRBY_GENOME_IMAGE`
+> when omitted. A present config file that omits `[relay]` joins the shared fleet relay
+> (`$KIRBY_RELAY_URL` else `ws://185.18.221.222:7777`) and logs a loud `WARN` (so a forgotten
+> `[relay]` isn't a silent prod-relay join); no `genome_image` uses `$KIRBY_GENOME_IMAGE`
 > / `./result`; no `[identity]` mints a durable node key. Set them explicitly to override.
 
 **TOML ordering rule:** the top-level scalar keys (`backend`, `genome_image`, `workload`, `mode`,
