@@ -591,10 +591,12 @@ async fn build_routstr_brain(
     //    its balance and does not false-die. reconcile_import is NUT-07-gated + FAIL-CLOSED +
     //    NOVEL-ONLY, and restore_from_relay_backup DEGRADES (log + continue) on any error so an
     //    unreachable mint/relay never fails boot — the solvency check (step 4) is the real money
-    //    gate. SAFE without a separate counter fast-forward: step 1 already seeded the NUT-13
-    //    counter to the loaded floor, so receive_proofs derives swap outputs from >= floor (no
-    //    reused-secret collision); the mint-swap is the single-writer arbiter, so a lost
-    //    double-restore race fails-closed (imports nothing) rather than double-spending.
+    //    gate. Counter safety: open_persistent_wallet (step 1) fast-forwards the INNER NUT-13
+    //    derivation counter to the loaded floor (fast_forward_inner_to_floor — the with_counters
+    //    shadow seed alone does NOT move what cdk derives from), so receive_proofs here derives swap
+    //    outputs from >= floor (no reused-secret collision); the mint-swap is the single-writer
+    //    arbiter, so a lost double-restore race fails-closed (imports nothing) rather than
+    //    double-spending.
     if let Some(store) = &nip60_store {
         let _restored = crate::nip60_reconcile::restore_from_relay_backup(
             store.reconcile_on_load().await,
