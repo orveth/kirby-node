@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use cdk::nuts::Proof;
+use cdk::nuts::{Id, Proof};
 use nostr_sdk::nips::nip44::{self, Version};
 use nostr_sdk::prelude::*;
 use serde::de::DeserializeOwned;
@@ -88,6 +88,25 @@ pub struct WalletConfigContent {
     /// for a brand-new wallet that has not yet advanced any counter.
     #[serde(default)]
     pub counters: HashMap<String, u32>,
+}
+
+impl WalletConfigContent {
+    /// Build a config from the decorator's observed counters
+    /// ([`crate::nip60_counter::Nip60CounterDb::keyset_counters`]) + the wallet's mints. Each
+    /// keyset [`Id`] is stringified to its canonical HEX (`Id`'s `Display`) — the exact form
+    /// [`Id::from_str`] reverses, so the reconstruct seed
+    /// ([`crate::nip60_counter::Nip60CounterDb::with_counters`]) re-attributes each counter to the
+    /// SAME keyset. A misattributed or dropped counter here = a reconstructed wallet re-deriving
+    /// the wrong / already-spent secrets, so the round-trip is a money-safety invariant (teeth).
+    pub fn from_counters(counters: HashMap<Id, u32>, mints: Vec<String>) -> Self {
+        Self {
+            mints,
+            counters: counters
+                .into_iter()
+                .map(|(id, counter)| (id.to_string(), counter))
+                .collect(),
+        }
+    }
 }
 
 /// The NIP-60 event-encryption identity: a nostr keypair built from the keyring-derived 32-byte
@@ -343,6 +362,20 @@ impl Nip60Store {
             self.k
         );
         Ok(output.val)
+    }
+
+    /// Publish the wallet-config from the decorator's observed counters + the wallet's mints:
+    /// convert ([`WalletConfigContent::from_counters`]) then [`Self::publish_config`] (≥k-durable).
+    /// This is the counter-carrying publish the boot-push wires to
+    /// [`crate::nip60_counter::Nip60CounterDb::keyset_counters`]; kept parameterized (takes the
+    /// counters directly) so the LOGIC is non-boot and unit-exercised without the wallet handle.
+    pub async fn publish_wallet_config(
+        &self,
+        counters: HashMap<Id, u32>,
+        mints: Vec<String>,
+    ) -> anyhow::Result<EventId> {
+        self.publish_config(&WalletConfigContent::from_counters(counters, mints))
+            .await
     }
 
     /// Load the wallet-config lww-head: fetch every kind:17375 event authored by the event key,
@@ -616,5 +649,38 @@ mod tests {
             b.decrypt_config(&ciphertext).is_err(),
             "a different event key MUST NOT decrypt another agent's wallet config (key-bound)"
         );
+    }
+
+    #[test]
+    fn wallet_config_from_counters_hex_keys_round_trip_to_the_same_keyset() {
+        let id_a: Id = "00ad268c4d1f5826".parse().expect("valid keyset id");
+        let id_b: Id = "009a1f293253e41e".parse().expect("valid keyset id");
+        let config = WalletConfigContent::from_counters(
+            HashMap::from([(id_a, 42u32), (id_b, 7u32)]),
+            vec!["https://m".to_string()],
+        );
+        assert_eq!(config.counters.len(), 2, "every counter is carried");
+        assert_eq!(
+            config.mints,
+            vec!["https://m".to_string()],
+            "mints carried verbatim"
+        );
+        // Each keyset's counter is keyed by its canonical hex AND that hex parses back to the SAME
+        // Id — so the reconstruct (N5) re-attributes each counter to the right keyset. A
+        // non-canonical stringification would break the round-trip = misattributed/dropped counter
+        // = a reconstructed wallet re-deriving the wrong/already-spent secrets (money loss).
+        for (id, expected) in [(id_a, 42u32), (id_b, 7u32)] {
+            let hex = id.to_string();
+            assert_eq!(
+                config.counters.get(&hex).copied(),
+                Some(expected),
+                "counter keyed by the keyset's canonical hex"
+            );
+            let parsed: Id = hex.parse().expect("the hex key parses back to an Id");
+            assert_eq!(
+                parsed, id,
+                "the hex round-trips to the SAME keyset (no counter misattribution on reconstruct)"
+            );
+        }
     }
 }
