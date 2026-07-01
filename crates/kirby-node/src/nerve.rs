@@ -1380,13 +1380,35 @@ pub async fn publish_inbox_relay_list(
     Ok(event_id)
 }
 
+/// Build + SIGN this agent's CANONICAL SOCIAL profile (kind:0 `Metadata`) under the
+/// CANONICAL SOCIAL (DM) KEY -- the SAME npub that signs kind:1 posts, the kind:10050
+/// inbox list, and NIP-17 DMs (P1, #76). `profile_json` is the raw kind:0 content (P1
+/// minimal: `{"name":"<agent_id>"}`). Signing with any other key would name the WRONG
+/// identity, so this is the load-bearing plane assertion of the whole publish path.
+///
+/// Factored out of [`publish_metadata_profile`] (relay-free) so a test can drive the REAL
+/// signer line -- mirroring how `NostrActuator::sign_canonical_note` /
+/// `frost_sign_event` are factored + driven by their teeth. This is what keeps the
+/// `g_metadata_profile_signed_by_canonical` tooth honest against a future wrong-key
+/// regression in the production signer.
+fn build_metadata_profile_event(
+    dm_identity: &NodeIdentity,
+    profile_json: &str,
+) -> anyhow::Result<Event> {
+    EventBuilder::new(Kind::Metadata, profile_json)
+        .sign_with_keys(dm_identity.keys())
+        .context("sign the kind:0 canonical social profile under the DM key")
+}
+
 /// Publish this agent's CANONICAL SOCIAL profile (kind:0 `Metadata`), SIGNED BY THE
 /// CANONICAL SOCIAL (DM) KEY -- the SAME npub that signs kind:1 posts, the kind:10050
 /// inbox list, and NIP-17 DMs (P1, #76). This is how a client puts a human-legible name
 /// on the ONE npub a reader resolves an agent to. `profile_json` is the raw kind:0
 /// content (P1 minimal: `{"name":"<agent_id>"}`). A one-shot connect-publish-disconnect,
-/// mirroring [`publish_inbox_relay_list`]: build a client with the canonical (DM) signer,
-/// add the relays, publish, disconnect. Returns the published event id.
+/// mirroring [`publish_inbox_relay_list`]: sign the event via
+/// [`build_metadata_profile_event`], build a client (no signer needed for a PRE-SIGNED
+/// event), add the relays, publish via `send_event`, disconnect. Returns the published
+/// event id.
 pub async fn publish_metadata_profile(
     dm_identity: &NodeIdentity,
     relays: &[String],
@@ -1397,15 +1419,16 @@ pub async fn publish_metadata_profile(
     }
     // Sign the kind:0 with the canonical social (DM) key -- the npub a client resolves this
     // agent to (posts + profile + DM all share it). A profile under any other key would name
-    // the wrong identity.
-    let client = Client::builder().signer(dm_identity.keys().clone()).build();
+    // the wrong identity. The pre-signed event carries its own signer, so the client holds no
+    // key (mirrors the pre-signed `send_event` publish paths above).
+    let event = build_metadata_profile_event(dm_identity, profile_json)?;
+    let client = Client::builder().build();
     for r in relays {
         add_relay_no_ping(&client, r).await?;
     }
     client.connect().await;
-    let builder = EventBuilder::new(Kind::Metadata, profile_json);
     let event_id = client
-        .send_event_builder(builder)
+        .send_event(&event)
         .await
         .context("publish the kind:0 canonical social profile")?
         .val;
@@ -2554,11 +2577,11 @@ mod tests {
     /// G-METADATA-PROFILE-SIGNED-BY-CANONICAL (P1, #76): the kind:0 profile is signed by the
     /// CANONICAL SOCIAL (DM) key -- the SAME npub that signs kind:1 posts, the kind:10050 inbox
     /// list, and NIP-17 DMs -- so a client that resolves the agent to its social npub sees the
-    /// profile under that ONE identity. This drives the EXACT construction
-    /// `publish_metadata_profile` uses (a `Client` built with the DM signer + an
-    /// `EventBuilder::new(Kind::Metadata, json)`); only the relay transport (send_event_builder over
-    /// a live relay) is not exercised. RED-on-revert: sign with a different key (e.g. a fresh key or
-    /// Q) and the `pubkey == canonical` assertion fails.
+    /// profile under that ONE identity. This DRIVES the production `build_metadata_profile_event`
+    /// (the real signer line `publish_metadata_profile` publishes), so a future wrong-key
+    /// regression in that signer trips this tooth; only the relay transport (`send_event` over a
+    /// live relay) is not exercised. RED-on-revert: make the production builder sign with a
+    /// different key (e.g. a fresh key or Q) and the `pubkey == canonical` assertion fails.
     #[tokio::test]
     async fn g_metadata_profile_signed_by_canonical() {
         // The canonical social (DM) identity: a plain keyfile, loaded exactly as boot does.
@@ -2566,11 +2589,11 @@ mod tests {
         let dm_identity = NodeIdentity::load_or_create(&dir.join("social.dm.key")).expect("dm key");
         let canonical_hex = dm_identity.public_key().to_hex();
 
-        // The EXACT event `publish_metadata_profile` builds + signs (the relay send is the only part
-        // that needs a live relay; the signing is the load-bearing plane assertion).
+        // The EXACT event `publish_metadata_profile` builds + signs, via the production builder (the
+        // relay send is the only part that needs a live relay; the signing is the load-bearing plane
+        // assertion this tooth drives directly).
         let profile_json = serde_json::json!({ "name": "agent-0" }).to_string();
-        let event = EventBuilder::new(Kind::Metadata, &profile_json)
-            .sign_with_keys(dm_identity.keys())
+        let event = build_metadata_profile_event(&dm_identity, &profile_json)
             .expect("sign the kind:0 profile under the canonical social key");
 
         assert_eq!(event.kind, Kind::Metadata, "the profile is a kind:0 Metadata event");
