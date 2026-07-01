@@ -544,7 +544,7 @@ async fn run_fleet_supervisor_cmd(
         let treasury_dir = config.identity.treasury_dir();
         std::fs::create_dir_all(&treasury_dir).ok();
         let key_path =
-            nerve::NodeIdentity::resolve_key_path(Some(&config.identity.key_path), &treasury_dir);
+            nerve::NodeIdentity::resolve_key_path(config.identity.key_path.as_deref(), &treasury_dir);
         let identity = nerve::NodeIdentity::load_or_create(&key_path)?;
         tracing::info!(
             npub = %identity.npub(),
