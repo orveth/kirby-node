@@ -18,10 +18,23 @@
 //! same reconstructed seed decrypts its own proof events. The event key is NEITHER the FROST Q
 //! (which cannot ECDH) NOR the DM key (capability isolation).
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context as _;
 use cdk::nuts::Proof;
 use nostr_sdk::nips::nip44::{self, Version};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
+
+/// The kind of a NIP-60 TOKEN event (the encrypted proofs). REGULAR + MULTIPLE → aggregate,
+/// never lww-head (see [`reconcile_token_set`]). NIP-60 also defines kind:17375 (the REPLACEABLE
+/// wallet config — lww-head, distinct from this 7375 SET) and kind:7376 (spending history);
+/// those layer on in later cuts.
+const KIND_NIP60_TOKEN: u16 = 7375;
+
+/// The relay-set fetch timeout for a reconcile (mirrors EngramStore's read timeout).
+const NIP60_READ_TIMEOUT_SECS: u64 = 4;
 
 /// The plaintext content of a NIP-60 kind:7375 token event (before NIP-44 encryption): the
 /// mint the proofs are drawn on + the proofs themselves + the token-event ids this event
@@ -47,6 +60,7 @@ pub struct TokenEventContent {
 /// wallet-event key. Self-encrypts (sender == recipient == this key — the [`crate::engram`]
 /// `K_self` model), so the same reconstructed key both writes and reads the agent's token
 /// events. Holds the secret; treat it as wallet-plane spend-adjacent material.
+#[derive(Clone)]
 pub struct Nip60Crypto {
     keys: Keys,
 }
@@ -64,6 +78,13 @@ impl Nip60Crypto {
     /// The nostr pubkey these token events are published under and self-encrypted to.
     pub fn public_key(&self) -> PublicKey {
         self.keys.public_key()
+    }
+
+    /// The signing keypair for the NIP-60 relay client (the SAME event key that self-encrypts,
+    /// so the wallet's events are authored by + encrypted to one identity). Cloned for the
+    /// `Client` builder's signer.
+    pub fn signer_keys(&self) -> Keys {
+        self.keys.clone()
     }
 
     /// NIP-44 (v2) self-encrypt a token-event content → the event-content string. Mirrors
@@ -127,6 +148,116 @@ pub fn reconcile_token_set(events: &[(String, TokenEventContent)]) -> Vec<Proof>
         }
     }
     proofs
+}
+
+/// The NIP-60 wallet relay store: publishes the agent's Cashu proofs as NIP-44-encrypted
+/// kind:7375 token events to the [`crate::config::Nip60Config`] relay set (signed by + encrypted
+/// to the event key) and reconciles them back on load. Mirrors [`crate::rail::EngramStore`]'s
+/// publish+reconcile shape — a nostr `Client` over N relays with a K-of-N ack quorum.
+///
+/// The Client round-trip is exercised END-TO-END (the nostr `Client` is not unit-mockable, same
+/// as EngramStore); the pure encode/decode ([`Nip60Crypto`]) + the aggregate reconcile
+/// ([`reconcile_token_set`]) ARE unit-tested. Cheap to clone (an `Arc` over the client).
+#[derive(Clone)]
+pub struct Nip60Store {
+    crypto: Nip60Crypto,
+    client: Arc<Client>,
+    /// The relay-set size N (durability = how many relays a publish reaches).
+    n: usize,
+    /// The K-of-N ack threshold a publish must reach to count as durable.
+    k: usize,
+    read_timeout: Duration,
+}
+
+impl Nip60Store {
+    /// Connect a NIP-60 store: build a nostr client SIGNED by the event key, add the relays,
+    /// connect, and resolve the K-of-N threshold (`write_k` defaults to strict majority
+    /// `floor(N/2)+1`, clamped to `[1, N]`). Mirrors `EngramStore::connect`. The caller resolves
+    /// the relay set + emits the [`crate::config::Nip60Durability`] warning (via
+    /// `Nip60Config::resolve`) before calling this.
+    pub async fn connect(
+        event_key: &[u8; 32],
+        relays: &[String],
+        write_k: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !relays.is_empty(),
+            "Nip60Store requires at least one relay (the [nip60] set, or the [relay].url fallback)"
+        );
+        let crypto = Nip60Crypto::from_event_key(event_key)?;
+        let client = Client::builder().signer(crypto.signer_keys()).build();
+        for url in relays {
+            client
+                .add_relay(url)
+                .await
+                .with_context(|| format!("add NIP-60 wallet relay {url}"))?;
+        }
+        client.connect().await;
+        let n = relays.len();
+        let k = write_k.unwrap_or(n / 2 + 1).clamp(1, n);
+        tracing::info!(npub = %crypto.public_key().to_hex(), n, k, "NIP-60 wallet store connected");
+        Ok(Nip60Store {
+            crypto,
+            client: Arc::new(client),
+            n,
+            k,
+            read_timeout: Duration::from_secs(NIP60_READ_TIMEOUT_SECS),
+        })
+    }
+
+    /// Publish one kind:7375 token event (the proofs, NIP-44 self-encrypted) to the relay set,
+    /// requiring K-of-N acks. Returns the published event id (a rollover's `del` references it,
+    /// cut-2c). Fewer than K acks (or a total send failure) is an error — the write did NOT
+    /// durably land, so the caller must NOT treat those proofs as backed up (money-safety: a
+    /// non-durable publish over a single-relay set is exactly the drop the durability warning is
+    /// about).
+    pub async fn publish_token(&self, content: &TokenEventContent) -> anyhow::Result<EventId> {
+        let ciphertext = self.crypto.encrypt(content)?;
+        let builder = EventBuilder::new(Kind::from(KIND_NIP60_TOKEN), ciphertext);
+        let output = self
+            .client
+            .send_event_builder(builder)
+            .await
+            .map_err(|e| anyhow::anyhow!("publish NIP-60 token event: {e}"))?;
+        let acks = output.success.len();
+        anyhow::ensure!(
+            acks >= self.k,
+            "NIP-60 token publish reached only {acks} of {} relays (need k={}); NOT durable — \
+             refusing to treat the proofs as backed up",
+            self.n,
+            self.k
+        );
+        Ok(output.val)
+    }
+
+    /// Reconcile the wallet's LIVE proof set on load: fetch ALL kind:7375 token events authored
+    /// by the event key across the relay set, decrypt each, and AGGREGATE via
+    /// [`reconcile_token_set`] (NOT an lww head — a head would drop money). An undecryptable
+    /// event (a foreign event under our author) is SKIPPED, not fatal. The returned set is the
+    /// CANDIDATE proofs; NUT-07 check-state (N2) filters it to UNSPENT before any spend (NIP-60
+    /// is portability, not safety — the mint is the source of truth).
+    pub async fn reconcile_on_load(&self) -> anyhow::Result<Vec<Proof>> {
+        let filter = Filter::new()
+            .kind(Kind::from(KIND_NIP60_TOKEN))
+            .author(self.crypto.public_key());
+        let events = self
+            .client
+            .fetch_events(filter, self.read_timeout)
+            .await
+            .map_err(|e| anyhow::anyhow!("fetch NIP-60 token events for reconcile: {e}"))?;
+        let mut decoded: Vec<(String, TokenEventContent)> = Vec::new();
+        for ev in events.into_iter() {
+            match self.crypto.decrypt(&ev.content) {
+                Ok(content) => decoded.push((ev.id.to_hex(), content)),
+                Err(e) => tracing::warn!(
+                    event_id = %ev.id,
+                    error = %e,
+                    "NIP-60 reconcile: skipping an undecryptable token event (foreign under our author)"
+                ),
+            }
+        }
+        Ok(reconcile_token_set(&decoded))
+    }
 }
 
 #[cfg(test)]
