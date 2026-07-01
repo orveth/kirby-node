@@ -5,6 +5,11 @@ It is the ground-truth runbook. Read it top to bottom; do not skip the prereqs g
 coding agent working *in* the repo, start at [`CLAUDE.md`](CLAUDE.md) -- it orients you on the code,
 the build/test loop, and the full subcommand map; this file is the run runbook it points to.)
 
+**Fastest path:** to just get a fleet node up, a bare `kirby-node` (no subcommand, no config
+file) synthesizes working defaults and joins the fleet -- see [`docs/zero-config.md`](docs/zero-config.md).
+The one prerequisite it still needs is the genome image (`nix build .#genome-image`, below). This
+runbook is the full, explicit path; zero-config is the shortcut once your host is prepared.
+
 **node != agent.** A **node** is what joins the network -- you run one with
 `kirby-node fleet --config kirby.toml`; it beacons node presence and hosts agents. An **agent** is
 one sovereign Kirby that runs on top of a node (declared as a fleet tenant, or spawned remotely).

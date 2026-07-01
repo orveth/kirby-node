@@ -37,10 +37,14 @@ The repo ships a headless operator client. Use it as the canonical example:
 kirby-node spawn-request \
   --relay ws://your-fleet-relay:7777 \
   --agent-id my-first-agent \
-  --image-ref <ref-the-node-allowlists> \
+  --image-ref kirby-genome \
   --seed-sats 50000 \
   --operator-key ./operator.nostr.key
 ```
+
+`kirby-genome` is the blessed image token a **zero-config** node allowlists (see
+[zero-config.md](./zero-config.md)); for any other node use whatever string is in
+its `image_allowlist`.
 
 Flags (`run_spawn_request_cmd`, main.rs):
 
@@ -48,7 +52,7 @@ Flags (`run_spawn_request_cmd`, main.rs):
 |---|---|---|---|
 | `--relay` | yes | -- | The fleet's shared relay websocket. |
 | `--agent-id` | yes | -- | Requested agent id. Charset `[A-Za-z0-9._-]`, <= 64 chars (it feeds filesystem paths + host interface names). Becomes the lease key + `d` tag. |
-| `--image-ref` | yes | -- | Which pre-staged genome image to run. MUST match an entry in the node's `image_allowlist`. |
+| `--image-ref` | yes | -- | An **admission token**, not a path: it must match an entry in the node's `image_allowlist` by exact string. The node then boots its OWN configured `genome_image` (the child's config is 100% host-derived), so this names *which* pre-staged image, it does not supply one. A zero-config node's token is `kirby-genome`. |
 | `--seed-sats` | no | 50000 | Declarative funding for the new agent's treasury. A number, NOT a bearer token. |
 | `--operator-key` | no | `operator.nostr.key` | Your signing key (nsec or hex). Minted 0600 on first use. |
 | `--genome-config` | no | -- | Optional JSON. Accepted and size-bounded but currently INERT (see Footguns). |
@@ -71,7 +75,7 @@ a JSON object; authorization is off the event signature, not a body field.
 ```json
 {
   "agent_id": "my-first-agent",
-  "image_ref": "<ref-the-node-allowlists>",
+  "image_ref": "kirby-genome",
   "funding": { "seed_sats": 50000 },
   "genome_config": null,
   "requester_pubkey": ""
@@ -81,7 +85,7 @@ a JSON object; authorization is off the event signature, not a body field.
 | Field | Required | Meaning |
 |---|---|---|
 | `agent_id` | yes | Agent identity label; validated charset/length. |
-| `image_ref` | yes | Genome image; checked against the node's `image_allowlist`. |
+| `image_ref` | yes | Admission **token** (not a path); exact-match against the node's `image_allowlist`. The node boots its own `genome_image`. Zero-config token: `kirby-genome`. |
 | `funding.seed_sats` | yes | Declarative seed sats. Never an ecash token (a token in a plaintext relay event would be redeemable by anyone scraping the relay). |
 | `genome_config` | no | Non-secret task/brain descriptor. Accepted, size-bounded, and currently IGNORED (the child's config is 100% host-derived). |
 | `requester_pubkey` | no | Redundant with the signed `event.pubkey`. If non-empty it MUST equal the signer or the event is rejected. |
@@ -173,13 +177,16 @@ used by the spawn path.)
   `image_allowlist`) before exposing a node.
 - **Empty `image_allowlist` = spawn NOTHING.** A fresh fleet node joins and
   listens but silently rejects every spawn (`UnknownImage`). Easy to mistake
-  for "broken" -- allowlist your image ref.
+  for "broken" -- allowlist your image ref. (This is the *explicit-config* field
+  default; a **zero-config** node ships `image_allowlist = ["kirby-genome"]`, so
+  it admits that one token out of the box -- see [zero-config.md](./zero-config.md).)
 - **No `enabled` flag.** The control-plane runs whenever `kirby-node fleet`
   runs; gate it via `operators` / `image_allowlist`, not a toggle.
 - **31003 is addressable, so the relay RETAINS it -- stale-ghost respawns.**
   After an agent is reaped, a long-parked retained request can redeliver and
   respawn a fresh, fund-burning agent. Mitigation is `request_max_age_secs`,
-  which is OFF by default; long-lived nodes should set it (e.g. 3600).
+  which is OFF in the explicit-config field default; long-lived nodes should set
+  it (e.g. 3600). A **zero-config** node already defaults it to 3600.
 - **`genome_config` is accepted but inert.** Sending task/brain/budget in the
   request is silently ignored; the child's behavior comes entirely from the
   node's base config.

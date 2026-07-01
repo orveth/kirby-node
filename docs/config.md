@@ -7,6 +7,13 @@ single-agent keys. This page documents **every** key, its default, and which ent
 
 Source of truth: `crates/kirby-node/src/config.rs` (`KirbyConfig`).
 
+> **Zero-config vs this page.** The **Default** column below is the *field* default — what a
+> key falls back to when a config *file* is present but omits it (backcompat: existing files are
+> byte-identical). A **bare `kirby-node` with NO config file** synthesizes a different, richer
+> set of whole-struct defaults (a capable `routstr_key` fleet template, `mem` rent 0, a lifted
+> run wall, the blessed `image_allowlist`, etc.). Those are documented in
+> [`zero-config.md`](./zero-config.md); this page is the per-key reference for an explicit file.
+
 **TOML ordering rule:** the top-level scalar keys (`backend`, `genome_image`, `workload`, `mode`,
 `agent_id`, `node_id`, `state_root`) MUST appear **before** any `[table]` header.
 
@@ -19,7 +26,7 @@ each child agent, overriding a few per-tenant paths (noted below).
 | Key | Type | Default | Meaning | Consumed by |
 |---|---|---|---|---|
 | `backend` | `auto` \| `firecracker` \| `vz` | `auto` | Sandbox backend. `auto` = VZ on macOS-aarch64, else Firecracker. | both |
-| `genome_image` | `{ path = "..." }` or `{ url = "..." }` | **required** | The genome image to boot. `path` = a local image dir (the `nix build .#genome-image` output). The `url` form is a stub and errors today. | both |
+| `genome_image` | `{ path = "..." }` or `{ url = "..." }` | `$KIRBY_GENOME_IMAGE`, else `{ path = "result" }` | The genome image to boot. `path` = a local image dir (the `nix build .#genome-image` output). Optional: defaults to the `result` symlink (or `$KIRBY_GENOME_IMAGE`), resolved + arch-checked at boot. The `url` form is a stub and errors today. | both |
 | `workload` | `app-checkpoint` \| `capable` | `app-checkpoint` | `app-checkpoint` = submit a checkpoint then meter VM time. `capable` = the agentic think/act loop (enables `[brain]`/`[memory]`/`[agent]`). | both |
 | `mode` | `bootstrap` \| `resume` | `bootstrap` | `bootstrap` = fund to born. `resume` = restore from the latest checkpoint (skips born). `capable`+`resume` is rejected. | both |
 | `agent_id` | string | `agent-0` | The `["a",X]` lifecycle tag + treasury/metering label. Charset-validated. | both |
@@ -30,7 +37,7 @@ each child agent, overriding a few per-tenant paths (noted below).
 
 | Key | Type | Default | Meaning | Consumed by |
 |---|---|---|---|---|
-| `key_path` | path | **required** | This node's BIP340 Nostr secret key. Minted 0600 on first run, loaded after (stable npub). May be a file or a dir (`<dir>/node.nostr.key`). | both |
+| `key_path` | path | unset (optional, #81) | This node's BIP340 Nostr secret key. Minted 0600 on first run, loaded after (stable npub). May be a file or a dir (`<dir>/node.nostr.key`). Unset => `<treasury_dir>/node.nostr.key` under the durable state root, so `[identity]` can be omitted entirely. | both |
 | `treasury_dir` | path | parent of `key_path` | The daemon-owned treasury directory (also homes the DM key and the per-agent wallet). A per-config override most users leave unset. Note it falls back to `key_path`'s parent, **not** to `state_root`. | both |
 | `frost_keystore_dir` | path | unset | The per-agent FROST keystore. Set, the voice signs under the sovereign 2-of-3 Q; unset, the plain node-key path. **The fleet supervisor sets this programmatically** -- not normally hand-edited. | both (fleet sets) |
 
@@ -38,7 +45,7 @@ each child agent, overriding a few per-tenant paths (noted below).
 
 | Key | Type | Default | Meaning | Consumed by |
 |---|---|---|---|---|
-| `url` | string | **required** | The fleet relay websocket URL. Must start `ws://` or `wss://`. | both |
+| `url` | string | `$KIRBY_RELAY_URL`, else `ws://185.18.221.222:7777` | The fleet relay websocket URL. Must start `ws://` or `wss://`. Optional: defaults to the shared fleet relay (or `$KIRBY_RELAY_URL`), so a config omitting it still joins the fleet. | both |
 | `presence_interval_secs` | u64 | `15` | Seconds between presence beacon re-publishes. | both |
 | `presence_stale_after_secs` | u64 | `45` | Seconds after which a peer with no fresh beacon is presumed STALE. | both |
 | `dm_backfill_secs` | u64 | `30` | Seconds between DM-inbox backfill sweeps: how often the NIP-17 inbox re-fetches stored gift wraps on a **fresh** connection to recover any DM the persistent subscription missed (a half-open socket delivers nothing with the keepalive ping off). Uses no `since` (NIP-17 backdates `created_at` up to 2 days) and dedupes by gift-wrap id. `0` disables it (persistent-subscription only). Only the `capable` (DM-enabled) agent uses it. | agent |

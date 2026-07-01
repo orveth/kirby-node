@@ -19,8 +19,11 @@ use clap::{Parser, Subcommand};
     version
 )]
 struct Cli {
+    /// The subcommand to run. OPTIONAL: a bare `kirby-node` (no subcommand) runs the FLEET
+    /// node (the product), so a zero-config `kirby-node` just works (M1). Pass an explicit
+    /// subcommand for anything else.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -227,9 +230,11 @@ enum Command {
     /// config and runs this; everything else defaults. This is the single-agent
     /// sovereign-fleet path, NOT the Raft cluster.
     Agent {
-        /// Path to the `kirby run` config file (TOML, e.g. `kirby.toml`).
-        #[arg(long, default_value = "kirby.toml")]
-        config: std::path::PathBuf,
+        /// Path to the `kirby run` config file (TOML, e.g. `kirby.toml`). OPTIONAL: when
+        /// omitted, load `./kirby.toml` if present, else synthesize the zero-config defaults
+        /// (M2). An explicit `--config` that does not exist is an error.
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
         /// Escape hatch to the legacy node-key dev signer. By DEFAULT a single-node agent
         /// auto-provisions (or idempotently reloads) its own per-agent 2-of-3 FROST keystore
         /// and signs under its sovereign quorum key Q. `--no-frost` skips that and keeps the
@@ -248,9 +253,11 @@ enum Command {
     /// entries hosts nothing.
     Fleet {
         /// Path to the `kirby run` config file (TOML); its `[fleet]` block declares the
-        /// tenants to host.
-        #[arg(long, default_value = "kirby.toml")]
-        config: std::path::PathBuf,
+        /// tenants to host. OPTIONAL: when omitted, load `./kirby.toml` if present, else
+        /// synthesize the zero-config fleet defaults (M2) — this is the bare `kirby-node`
+        /// path. An explicit `--config` that does not exist is an error.
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
         /// This node's lease id within the agents' cluster (the supervisor grants each
         /// tenant's lease to this id). The MVP forms a single-node lease cluster.
         #[arg(long, default_value_t = 1)]
@@ -301,7 +308,15 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    // M1: a bare `kirby-node` (no subcommand) runs the FLEET node — the product — so a
+    // zero-config `kirby-node` just works. The `fleet` command's own `--config`/`--node-id`
+    // defaults apply (None config => find `./kirby.toml` or synthesize zero-config defaults).
+    let command = cli.command.unwrap_or(Command::Fleet {
+        config: None,
+        node_id: 1,
+    });
+
+    match command {
         Command::Prereqs { json } => {
             let report = prereqs::check();
             if json {
@@ -438,12 +453,19 @@ fn main() -> anyhow::Result<()> {
 /// evidence line. Exits non-zero if the agent never reached Running so the keeper's
 /// harness run fails loudly on a broken boot.
 #[tokio::main]
-async fn run_agent_cmd(config_path: std::path::PathBuf, no_frost: bool) -> anyhow::Result<()> {
-    use kirby_node::config::KirbyConfig;
+async fn run_agent_cmd(
+    config_path: Option<std::path::PathBuf>,
+    no_frost: bool,
+) -> anyhow::Result<()> {
+    use kirby_node::config::{ConfigRole, KirbyConfig};
     use kirby_node::run_agent::{self, RunAgentConfig};
 
-    let config = KirbyConfig::load(&config_path)?;
-    tracing::info!(path = %config_path.display(), "loaded kirby run config");
+    // A single `agent` BOOTS an agent from its own config, so it validates as Standalone (the
+    // full battery, incl. the brain money-path checks). With no --config and no ./kirby.toml it
+    // synthesizes the zero-config default, which fails Standalone validation (the routstr_key
+    // template has no api_key_path) — a single agent needs a funded, explicit config.
+    let config = KirbyConfig::load_or_default(config_path.as_deref(), ConfigRole::Standalone)?;
+    tracing::info!(config = ?config_path, "loaded kirby run config");
     let mut run = RunAgentConfig::from_config(config)?;
     // FROST is the single-node default; `--no-frost` keeps the legacy node-key dev path.
     run.no_frost = no_frost;
@@ -462,21 +484,25 @@ async fn run_agent_cmd(config_path: std::path::PathBuf, no_frost: bool) -> anyho
 /// is invoked, so the single-agent path is byte-identical (G-CLEAN).
 #[tokio::main]
 async fn run_fleet_supervisor_cmd(
-    config_path: std::path::PathBuf,
+    config_path: Option<std::path::PathBuf>,
     node_id: u64,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
 
     use anyhow::Context as _;
-    use kirby_node::config::KirbyConfig;
+    use kirby_node::config::{ConfigRole, KirbyConfig};
     use kirby_node::fleet::Allocator;
     use kirby_node::fleet_reconcile::LaunchRegistry;
     use kirby_node::fleet_supervisor::{FleetSupervisor, ProcessTenantLauncher};
     use kirby_node::relay_lease::{RelayLeaseGrantor, RelayLeasePublisher};
     use kirby_node::spawn::SledSpawnLedger;
 
-    let config = KirbyConfig::load(&config_path)?;
-    tracing::info!(path = %config_path.display(), tenants = config.fleet.tenants.len(), "loaded fleet config");
+    // The fleet HOST holds no money and boots no agent from its own [brain] (that block is the
+    // tenant template), so it validates as FleetHost — skipping the brain money-path presence
+    // checks the zero-config routstr_key template would otherwise trip (M5). With no --config and
+    // no ./kirby.toml, this synthesizes the zero-config fleet defaults (the bare `kirby-node` path).
+    let config = KirbyConfig::load_or_default(config_path.as_deref(), ConfigRole::FleetHost)?;
+    tracing::info!(config = ?config_path, tenants = config.fleet.tenants.len(), "loaded fleet config");
 
     // The relay-native lease grantor (#9): the supervisor CLAIMS each tenant's per-agent lease
     // by FROST-signing a Lease event (under the tenant's OWN quorum Q, loaded from the keystore
