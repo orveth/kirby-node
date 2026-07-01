@@ -4,8 +4,11 @@ You are an AI coding agent dropped into **kirby-node**. This file orients you fa
 what this repo is, the entrypoints, how to build/test/run, and the gotchas. Read it
 before you touch anything.
 
+- **Run a node with ZERO config** (bare `kirby-node` just works -- no subcommand,
+  no config file): [`docs/zero-config.md`](docs/zero-config.md).
 - **To RUN a node or an agent end to end** (prereqs, genome image, config, both
   platforms): the full runbook is [`AGENTS.md`](AGENTS.md).
+- **Spawn an agent over NOSTR** (the kind:31003 control-plane): [`docs/spawn-over-nostr.md`](docs/spawn-over-nostr.md).
 - **Every kirby.toml key**: [`docs/config.md`](docs/config.md).
 - **The spec, gates, and the honest boundary**: [`docs/build-spec.md`](docs/build-spec.md).
 - **What kirby is, in human words**: [`README.md`](README.md).
