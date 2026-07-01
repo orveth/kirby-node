@@ -11,7 +11,7 @@
 # the state paths; everything else defaults.
 #
 # NOTE: top-level scalar keys (backend, genome_image, workload, mode, agent_id,
-# node_id) MUST appear BEFORE any [table] header, per TOML rules.
+# node_id, state_root, max_run_secs) MUST appear BEFORE any [table] header, per TOML rules.
 
 # Which sandbox backend to boot in:
 #   auto        -> VZ on macOS-aarch64, Firecracker on Linux (recommended)
@@ -43,6 +43,10 @@ node_id  = "node-1"
 # $XDG_DATA_HOME/kirby, else $HOME/.local/share/kirby -- never a temp dir. Leave it unset for that
 # default; the explicit ./.kirby paths below also work for a single agent.
 # state_root = "/var/lib/kirby"
+
+# The run safety ceiling in seconds: an agent that never goes broke halts here. A top-level key.
+# Omit for the 600s default; raise it for a long-lived die-when-broke run (0 is rejected).
+# max_run_secs = 600
 
 [identity]
 # This node's BIP340 Nostr secret key. Minted (0600) on first run, loaded after, so
@@ -86,3 +90,6 @@ initial_sats = 1000000
 # operators = ["<operator-pubkey-hex>"]
 # # The pre-staged genome images this node will run. EMPTY = spawn nothing (the safe backstop).
 # image_allowlist = ["<image-ref>"]
+# # OPT-IN: drop spawn requests older than N seconds (sheds stale/parked ones). Omit = off.
+# # Do NOT set 0 to mean off -- 0 rejects ALL spawn requests. Use a positive value.
+# request_max_age_secs = 3600
