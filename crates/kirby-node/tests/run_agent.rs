@@ -83,6 +83,7 @@ fn bootstrap_config(test: &str, image_dir: PathBuf, funding_sats: u64) -> KirbyC
         // FIX 2: pin the durable state root to this test's temp state dir (the gated VM run
         // would otherwise write the treasury under the durable default; tests stay sandboxed).
         state_root: Some(state),
+        max_run_secs: None,
     }
 }
 
