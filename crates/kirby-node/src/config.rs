@@ -37,15 +37,24 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KirbyConfig {
-    /// The node's Nostr identity (mint-if-absent) and treasury directory.
+    /// The node's Nostr identity (mint-if-absent) and treasury directory. Defaults to the
+    /// all-unset [`IdentityConfig`] (mint a fresh node key under the durable state root), so a
+    /// config omitting `[identity]` still comes up with a durable, idempotent npub.
+    #[serde(default)]
     pub identity: IdentityConfig,
-    /// The fleet relay this node beacons and emits lifecycle to.
+    /// The fleet relay this node beacons and emits lifecycle to. Defaults to
+    /// [`RelayConfig::default`] (the [`default_relay_url`] shared fleet relay / `KIRBY_RELAY_URL`
+    /// env), so a config omitting `[relay]` still joins the live fleet (D1).
+    #[serde(default)]
     pub relay: RelayConfig,
     /// Which sandbox backend to boot the agent in. Defaults to [`Backend::Auto`].
     #[serde(default)]
     pub backend: Backend,
     /// The genome image to boot: a local path, or (TODO) a prebuilt-artifact URL to
-    /// fetch and cache. See [`GenomeImage`].
+    /// fetch and cache. See [`GenomeImage`]. Defaults to [`default_genome_image`]
+    /// (`KIRBY_GENOME_IMAGE` env, else the `result` symlink), so a config omitting
+    /// `genome_image` resolves the built image at boot (D8).
+    #[serde(default)]
     pub genome_image: GenomeImage,
     /// The v0 workload the agent runs once alive. Defaults to [`Workload::AppCheckpoint`].
     #[serde(default)]
@@ -365,7 +374,12 @@ impl Default for FleetConfig {
 }
 
 /// The node identity (Nostr key) and treasury directory.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Every field is optional (each resolves a durable default when unset), so
+/// `IdentityConfig::default()` is the all-unset identity the zero-config node uses:
+/// it mints a fresh node key under the durable state root on first run and reloads it
+/// thereafter (idempotent npub). This is what makes a bare `[identity]` (or none) work.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IdentityConfig {
     /// Path to this node's BIP340 Nostr secret key. Minted (0600) on first run,
     /// loaded thereafter, so the node keeps the SAME npub across restarts. May be a
@@ -414,6 +428,12 @@ impl IdentityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayConfig {
     /// The relay websocket URL (e.g. `ws://185.18.221.222:7777`).
+    ///
+    /// Zero-config default (D1): [`default_relay_url`] — the `KIRBY_RELAY_URL` env var when
+    /// set, else the hardcoded shared fleet relay [`DEFAULT_RELAY_URL`]. So a config that
+    /// omits `[relay] url` (or has no `[relay]` block at all) still JOINS the live fleet with
+    /// no setup. Set this to pin a different relay (e.g. `ws://127.0.0.1:7777` for local dev).
+    #[serde(default = "default_relay_url")]
     pub url: String,
     /// Seconds between presence beacon re-publishes (replaceable; bumps last-seen).
     #[serde(default = "default_presence_interval")]
@@ -421,6 +441,57 @@ pub struct RelayConfig {
     /// Seconds after which a peer with no fresh beacon is presumed dead (STALE).
     #[serde(default = "default_presence_stale_after")]
     pub presence_stale_after_secs: u64,
+    /// Seconds between DM-inbox BACKFILL sweeps (#103): how often `run_dm_inbound` re-fetches
+    /// stored kind:1059 gift wraps (`#p` = the DM key) on a FRESH connection to recover any DM
+    /// missed while the persistent subscription's socket was down or silently half-open. With the
+    /// keepalive ping OFF (#54), a long-lived reader cannot detect a half-open socket — it goes
+    /// deaf with no error and never re-REQs — so the live push is only the fast path and this sweep
+    /// is the durable-delivery backstop. NIP-17 backdates a wrap's `created_at` up to 2 days, so
+    /// the sweep uses NO `since` and dedupes by gift-wrap id. `0` disables it (the pre-#103,
+    /// persistent-subscription-only behavior).
+    #[serde(default = "default_dm_backfill_secs")]
+    pub dm_backfill_secs: u64,
+}
+
+/// The hardcoded default fleet relay a zero-config node joins (D1): the live shared fleet
+/// relay, so a bare `kirby-node` JOINS the network with no setup ("node joins the network
+/// with one command"). Overridden by the `KIRBY_RELAY_URL` env var or an explicit
+/// `[relay] url`.
+pub const DEFAULT_RELAY_URL: &str = "ws://185.18.221.222:7777";
+
+/// The default relay URL: the `KIRBY_RELAY_URL` env var when set to a non-empty value (the
+/// env override, D1), else the hardcoded shared fleet relay [`DEFAULT_RELAY_URL`]. Wired as a
+/// `#[serde(default)]` so a config omitting `[relay] url` (or the whole `[relay]` block) still
+/// joins the fleet, and so `RelayConfig::default()` composes into `KirbyConfig::default()`.
+fn default_relay_url() -> String {
+    match std::env::var("KIRBY_RELAY_URL") {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => DEFAULT_RELAY_URL.to_string(),
+    }
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        RelayConfig {
+            url: default_relay_url(),
+            presence_interval_secs: default_presence_interval(),
+            presence_stale_after_secs: default_presence_stale_after(),
+            dm_backfill_secs: default_dm_backfill_secs(),
+        }
+    }
+}
+
+/// Whether a raw config TOML OMITS `[relay] url` — i.e. `relay.url` fell back to
+/// [`default_relay_url`] (the shared prod fleet relay) rather than being set explicitly.
+/// `#[serde(default)]` hides field presence from the deserialized struct, so re-probe the
+/// raw text. Extracted as a pure fn so the #110 "you defaulted onto the prod relay" warning
+/// (emitted by [`KirbyConfig::load_for`] on a present-but-partial file) is unit-testable
+/// without standing up a `tracing` subscriber.
+fn relay_url_was_omitted(raw_toml: &str) -> bool {
+    toml::from_str::<toml::Value>(raw_toml)
+        .ok()
+        .and_then(|v| v.get("relay").and_then(|r| r.get("url")).cloned())
+        .is_none()
 }
 
 /// The sandbox backend selector.
@@ -498,13 +569,54 @@ pub enum GenomeImage {
     Url(String),
 }
 
+/// The conventional `nix build` output symlink the zero-config genome default points at when
+/// `KIRBY_GENOME_IMAGE` is unset. `nix build .#genome-image` (x86_64/Firecracker) or
+/// `.#genome-image-aarch64` (aarch64/VZ) writes the arch-appropriate image dir here.
+const DEFAULT_GENOME_RESULT_LINK: &str = "result";
+
+/// The default genome image (D8): the `KIRBY_GENOME_IMAGE` env var when set (the operator's
+/// built image — arch chosen by which `nix build` they ran), else the conventional `result`
+/// symlink [`DEFAULT_GENOME_RESULT_LINK`] ("build-or-locate result/"). A pure-ish default that
+/// reads env only (no nix I/O), so it composes into `KirbyConfig::default()`. The concrete
+/// image is resolved + arch-checked at BOOT ([`GenomeImage::resolve_local_dir`] +
+/// [`GenomeImage::validate_local_arch`]), which errors clearly if it is missing or the wrong
+/// arch — a bare fleet host with no tenants never boots a genome, so the value is inert there.
+fn default_genome_image() -> GenomeImage {
+    match std::env::var_os("KIRBY_GENOME_IMAGE") {
+        Some(path) if !path.is_empty() => GenomeImage::Path(PathBuf::from(path)),
+        _ => GenomeImage::Path(PathBuf::from(DEFAULT_GENOME_RESULT_LINK)),
+    }
+}
+
+impl Default for GenomeImage {
+    fn default() -> Self {
+        default_genome_image()
+    }
+}
+
 impl GenomeImage {
     /// Resolve to a local image directory, fetching+caching a URL source if needed.
     /// The URL fetch is NOT YET implemented (a documented stub for this milestone),
     /// so a `url` source returns a clear error pointing at the local-path form.
     pub fn resolve_local_dir(&self) -> anyhow::Result<PathBuf> {
         match self {
-            GenomeImage::Path(p) => Ok(p.clone()),
+            GenomeImage::Path(p) => {
+                // A resolved local image dir must EXIST. This is the point the zero-config
+                // default (`result` symlink / `$KIRBY_GENOME_IMAGE`, D8) is turned into a real
+                // directory at boot; a missing one is the single zero-config prerequisite an
+                // operator forgot, so fail with an ACTIONABLE build hint rather than the cryptic
+                // downstream not-found from reading `manifest.env`/`vmlinux` (phase2 Q2b). A bare
+                // fleet host with no tenants never boots a genome, so this never fires there.
+                if !p.exists() {
+                    anyhow::bail!(
+                        "genome image not found at {} — build it with `nix build .#genome-image` \
+                         (x86_64/Firecracker) or `.#genome-image-aarch64` (aarch64/VZ), which \
+                         writes ./result, or set genome_image / $KIRBY_GENOME_IMAGE to an image dir",
+                        p.display()
+                    );
+                }
+                Ok(p.clone())
+            }
             GenomeImage::Url(u) => anyhow::bail!(
                 "genome_image URL fetch is not yet implemented (TODO: fetch+cache the \
                  prebuilt artifact). Set genome_image to a local path = {{ path = \
@@ -957,6 +1069,12 @@ pub struct SocialConfig {
     /// interim; the fleet's Shamir-shared `SK_social` (reconstruct-on-lease, task #26) swaps in
     /// behind the SAME `with_dm_keys` seam later. `None` disables the DM path (no queue, no 10050).
     pub dm_key_path: Option<PathBuf>,
+    /// Seconds between DM-inbox backfill sweeps (#103), copied from `[relay] dm_backfill_secs`: the
+    /// interval `run_dm_inbound` re-fetches stored gift wraps on a fresh connection to recover DMs
+    /// the persistent subscription missed (a half-open socket delivers nothing with the ping off).
+    /// `0` disables the sweep (persistent-subscription-only). Carried here — not re-parsed — the
+    /// same way `relays` is copied from the presence relay (this is a derived runtime carrier).
+    pub dm_backfill_secs: u64,
 }
 
 /// The default fixed publish cost (sats): small + non-zero so a post costs the agent (no free
@@ -1095,6 +1213,10 @@ fn default_node_id() -> String {
 fn default_presence_interval() -> u64 {
     15
 }
+
+fn default_dm_backfill_secs() -> u64 {
+    30
+}
 fn default_presence_stale_after() -> u64 {
     45
 }
@@ -1135,12 +1257,125 @@ fn is_https_or_localhost(url: &str) -> bool {
     }
 }
 
+/// The blessed default genome `image_ref` a zero-config node admits (M4): the stable logical
+/// token an operator names in a spawn request's `--image-ref`. The node boots its OWN
+/// configured `genome_image` regardless (the child's config is 100% host-derived), so this is
+/// purely the admission label — one stable, arch-agnostic value is enough. It is the sole entry
+/// of the zero-config `image_allowlist`, so a bare node spawns ONLY the blessed genome
+/// (default-deny backstop), rate-limited, even with the operators allowlist left OPEN.
+pub const DEFAULT_GENOME_IMAGE_REF: &str = "kirby-genome";
+
+/// The zero-config fleet-tenant run ceiling (M6/D6): 24h. The synthesized zero-config fleet
+/// host template carries this, so spawned tenants inherit a LIFTED wall (they die from real
+/// inference spend, not a 10-minute cap) via `derive_tenant_config`, which clones the base
+/// config per tenant. An explicit single-`agent` config that omits `max_run_secs` still gets
+/// the 600s demo safety (None → `run_agent::DEFAULT_MAX_RUN`); only the zero-config default
+/// lifts it. 24h is a generous safety net far above any real think loop, not an unbounded run.
+pub const DEFAULT_FLEET_MAX_RUN_SECS: u64 = 24 * 60 * 60;
+
+/// The conventional zero-config file name looked for in the cwd when `--config` is omitted.
+pub const DEFAULT_CONFIG_FILENAME: &str = "kirby.toml";
+
+/// Which run a loaded [`KirbyConfig`] drives, selecting the validation battery ([`KirbyConfig::validate_for`]).
+///
+/// The seam that keeps "bare `kirby-node` just works": a fleet HOST holds no money and boots no
+/// agent from its own `[brain]` (that block is only the TEMPLATE tenants inherit, funded
+/// per-tenant at spawn), so its empty brain money paths must NOT fail validation — they are
+/// validated on each tenant's EFFECTIVE config at spawn / child boot instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigRole {
+    /// A config that BOOTS an agent: a single `kirby-node agent`, OR a fleet tenant's derived
+    /// effective config (re-loaded when the child `kirby agent` process starts). The FULL
+    /// battery applies, including the per-backend brain money-path presence checks
+    /// (`node_url` / `mint_url` / `wallet_db_path` / `api_key_path`).
+    Standalone,
+    /// A `kirby-node fleet` HOST config. The node runs no agent and holds no money; its
+    /// top-level `[brain]` is only the tenant template. The per-backend brain money-path
+    /// presence checks are SKIPPED here (validated per-tenant at spawn), so a zero-config
+    /// `routstr_key` template with an empty `api_key_path` is a valid host config.
+    FleetHost,
+}
+
+impl Default for KirbyConfig {
+    /// The ZERO-CONFIG defaults (M1-M7): what a bare `kirby-node` (no subcommand, no config
+    /// file) synthesizes — a pure-infra FLEET HOST that joins the live fleet relay, runs the
+    /// spawn control-plane + G-4 failover under an auto-provisioned node identity, and hosts NO
+    /// agent of its own (money and agents arrive at spawn, never baked into the node).
+    ///
+    /// The `[brain]`/`workload`/`meter`/`max_run_secs` here are the TEMPLATE spawned tenants
+    /// inherit (via `derive_tenant_config`), NOT a workload the host itself runs: `workload =
+    /// capable` + `brain = routstr_key` (endpoint `https://api.routstr.com`, model
+    /// `granite-4.1-8b`) with an EMPTY `api_key_path` (the funding is spawn-provided, M5), a
+    /// zeroed memory rent so an agent dies only from real inference spend (M6), and a lifted 24h
+    /// run ceiling (M6). The host validates as [`ConfigRole::FleetHost`], which skips the brain
+    /// money-path checks the empty template would otherwise trip.
+    ///
+    /// Field-level `#[serde(default)]`s are deliberately UNCHANGED (a partial `kirby.toml` still
+    /// gets `workload = app-checkpoint`, `brain = stub`, `mem_rate = 1`, etc.); these
+    /// zero-config values live ONLY in this whole-struct default, which nothing but the
+    /// file-absent synthesis path ([`KirbyConfig::load_or_default`]) constructs.
+    fn default() -> Self {
+        KirbyConfig {
+            identity: IdentityConfig::default(),
+            relay: RelayConfig::default(),
+            backend: Backend::default(),
+            genome_image: default_genome_image(),
+            // M5: the spawned-tenant template — capable + prepaid-key brain, funded at spawn.
+            workload: Workload::Capable,
+            brain: BrainConfig {
+                backend: BrainBackendKind::RoutstrKey,
+                node_url: "https://api.routstr.com".to_string(),
+                model: "granite-4.1-8b".to_string(),
+                // Per-tenant, spawn-provided (the prepaid key IS the funding); never baked.
+                api_key_path: String::new(),
+                ..BrainConfig::default()
+            },
+            memory: MemoryConfig::default(),
+            agent: AgentConfig::default(),
+            // M6: mem rent = 0 (die only from real inference spend); cpu/egress stay at the
+            // live-config defaults (1/1000, 1/1) — only memory is zeroed.
+            meter: MeterRatesConfig {
+                mem_sats_per_mib_sec: 0,
+                ..MeterRatesConfig::default()
+            },
+            mode: RunMode::default(),
+            funding: FundingConfig::default(),
+            agent_id: default_agent_id(),
+            node_id: default_node_id(),
+            fleet: FleetConfig {
+                spawn: SpawnConfig {
+                    // M4: spawn ONLY the blessed genome (default-deny backstop); operators stay
+                    // EMPTY = OPEN (the accepted MVP posture, with the loud startup warning).
+                    image_allowlist: vec![DEFAULT_GENOME_IMAGE_REF.to_string()],
+                    // M7: drop spawn requests older than 1h (kills the stale-ghost respawn footgun).
+                    request_max_age_secs: Some(3600),
+                    ..SpawnConfig::default()
+                },
+                // M4: tenants EMPTY — pure infra; agents arrive via spawn.
+                ..FleetConfig::default()
+            },
+            // NIP-60 wallet backup is OPT-IN: empty relays → no Nip60Store wired. A pure-infra host
+            // holds no wallet; a spawned tenant that wants the backup configures its own [nip60].
+            nip60: Nip60Config::default(),
+            state_root: None,
+            // M6: lift the 600s wall for the fleet tenants that inherit this template.
+            max_run_secs: Some(DEFAULT_FLEET_MAX_RUN_SECS),
+        }
+    }
+}
+
 impl KirbyConfig {
-    /// Parse a [`KirbyConfig`] from a TOML string.
+    /// Parse a [`KirbyConfig`] from a TOML string (as a [`ConfigRole::Standalone`] config).
     pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
+        Self::from_toml_str_for(s, ConfigRole::Standalone)
+    }
+
+    /// Parse a [`KirbyConfig`] from a TOML string, validating for `role` (the fleet HOST path
+    /// passes [`ConfigRole::FleetHost`] so an empty-money-path tenant template validates, M5).
+    pub fn from_toml_str_for(s: &str, role: ConfigRole) -> anyhow::Result<Self> {
         let cfg: KirbyConfig =
             toml::from_str(s).map_err(|e| anyhow::anyhow!("parse kirby config TOML: {e}"))?;
-        cfg.validate()?;
+        cfg.validate_for(role)?;
         cfg.apply_state_root_env();
         Ok(cfg)
     }
@@ -1159,19 +1394,86 @@ impl KirbyConfig {
         }
     }
 
-    /// Load a [`KirbyConfig`] from a TOML file path.
+    /// Load a [`KirbyConfig`] from a TOML file path (as a [`ConfigRole::Standalone`] config).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("read kirby config {}: {e}", path.display()))?;
-        Self::from_toml_str(&text)
+        Self::load_for(path, ConfigRole::Standalone)
     }
 
-    /// Validate the config against the current host: the relay URL is a websocket,
+    /// Load a [`KirbyConfig`] from a TOML file path, validating for `role` (the fleet HOST path
+    /// passes [`ConfigRole::FleetHost`]).
+    pub fn load_for(path: &Path, role: ConfigRole) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("read kirby config {}: {e}", path.display()))?;
+        let cfg = Self::from_toml_str_for(&text, role)?;
+        // #110: a config FILE that omits `[relay] url` now silently falls back to the shared prod
+        // fleet relay (the M3 default) instead of erroring. Distinguish that "the operator forgot
+        // `[relay]`" case from the intended no-file zero-config join (which logs `using zero-config
+        // defaults` in `load_or_default`, and never reaches here). WARN loudly so a partial
+        // hand-authored config doesn't join the prod relay unnoticed.
+        if relay_url_was_omitted(&text) {
+            tracing::warn!(
+                path = %path.display(),
+                relay = %cfg.relay.url,
+                "config file present but [relay] url omitted — defaulting relay.url ($KIRBY_RELAY_URL \
+                 else the shared fleet relay; see the `relay` field for the resolved value); set \
+                 [relay] url to pin a relay. A bare `kirby-node` with NO config file defaults it \
+                 intentionally; a file that omits it may be a mistake."
+            );
+        }
+        Ok(cfg)
+    }
+
+    /// Load a config for `role`, SYNTHESIZING the zero-config defaults when no config file is
+    /// present (M2). `explicit` is the user's `--config` (None = the flag was omitted):
+    ///
+    /// - `Some(path)` — load exactly that path; a MISSING explicit path is an ERROR (a typo'd
+    ///   `--config` must not silently boot defaults).
+    /// - `None` — if `./kirby.toml` (the [`DEFAULT_CONFIG_FILENAME`]) exists, load it; otherwise
+    ///   synthesize [`KirbyConfig::default`] and log a loud `using zero-config defaults` line.
+    ///
+    /// The synthesized default is validated for `role` (so a [`ConfigRole::FleetHost`]'s empty
+    /// brain money paths pass, M5) and applies its state-root env, exactly like a loaded file.
+    pub fn load_or_default(explicit: Option<&Path>, role: ConfigRole) -> anyhow::Result<Self> {
+        if let Some(path) = explicit {
+            return Self::load_for(path, role);
+        }
+        let default_path = Path::new(DEFAULT_CONFIG_FILENAME);
+        if default_path.exists() {
+            return Self::load_for(default_path, role);
+        }
+        tracing::warn!(
+            relay = %default_relay_url(),
+            "using zero-config defaults: no --config and no ./{DEFAULT_CONFIG_FILENAME} — synthesizing a \
+             bare fleet node (joins the fleet relay, spawn control-plane + G-4 failover on, hosts NO \
+             static agent; drop a {DEFAULT_CONFIG_FILENAME} or pass --config to override)"
+        );
+        let cfg = Self::default();
+        cfg.validate_for(role)?;
+        cfg.apply_state_root_env();
+        Ok(cfg)
+    }
+
+    /// Validate the config against the current host as a [`ConfigRole::Standalone`] run (the
+    /// FULL battery, including the brain money-path presence checks). This is the byte-identical
+    /// pre-seam behavior every existing caller keeps: `kirby-node agent`, the `run_agent`
+    /// re-check, and each fleet tenant's derived effective config when its child process boots.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_for(ConfigRole::Standalone)
+    }
+
+    /// Validate the config against the current host for `role`: the relay URL is a websocket,
     /// the funding is non-zero, and a PINNED backend matches this platform (a `vz`
     /// config on Linux, or a `firecracker` config on macOS, is refused early with a
     /// clear message rather than failing deep in the boot path). `auto` always
     /// passes (it resolves to the native backend).
-    pub fn validate(&self) -> anyhow::Result<()> {
+    ///
+    /// The per-backend brain money-path presence checks (`node_url` / `mint_url` /
+    /// `wallet_db_path` / `api_key_path`) run only for [`ConfigRole::Standalone`] — a
+    /// [`ConfigRole::FleetHost`] never boots an agent from its own `[brain]` (that block is the
+    /// tenant template, funded per-tenant at spawn), so those are validated on each tenant's
+    /// effective config, not the host (the M5 seam that keeps a zero-config `routstr_key`
+    /// template with an empty `api_key_path` a valid host config).
+    pub fn validate_for(&self, role: ConfigRole) -> anyhow::Result<()> {
         if !(self.relay.url.starts_with("ws://") || self.relay.url.starts_with("wss://")) {
             anyhow::bail!(
                 "relay.url must be a websocket URL (ws:// or wss://), got {:?}",
@@ -1246,7 +1548,18 @@ impl KirbyConfig {
                 failover_window_floor,
             );
         }
-        if self.funding.initial_sats == 0 {
+        // M5 SEAM — everything below validates the AGENT this config would RUN: its funding, its
+        // brain (affordability + the per-backend money paths), and its memory budget. A
+        // `ConfigRole::FleetHost` runs NO agent from its own top-level config (that config is the
+        // TEMPLATE tenants inherit; each tenant is funded at spawn and its EFFECTIVE config is
+        // re-validated as `Standalone` when the child `kirby agent` boots), and the host holds no
+        // money — so none of the agent-money checks apply to it. Gating them on `role ==
+        // Standalone` is what keeps money validation OFF the money-less host (a bare `kirby-node
+        // fleet` with the zero-config `routstr_key` template + empty `api_key_path` + inert
+        // top-level funding is a VALID host) while still catching every one of them at the real
+        // spender (the tenant child, or a single `kirby-node agent`). Infra/fleet checks above
+        // (relay URL, ids, tenants, failover window, backend match) fire for BOTH roles.
+        if role == ConfigRole::Standalone && self.funding.initial_sats == 0 {
             anyhow::bail!("funding.initial_sats must be > 0 (the agent needs a budget to live)");
         }
         // The capable agent must be able to afford at least one think, or it dies before it
@@ -1254,7 +1567,8 @@ impl KirbyConfig {
         // treasury is always DENIED_INSUFFICIENT_TREASURY (D-20). Its THINK is a `Completion`
         // (the life-gating act) and it reuses `[brain]`, so a capable agent that cannot afford
         // its first think is a config error caught at load, not a born-then-instantly-dead VM.
-        if matches!(self.workload, Workload::Capable) {
+        // (Standalone-only per the M5 seam above — a FleetHost never boots from this brain.)
+        if role == ConfigRole::Standalone && matches!(self.workload, Workload::Capable) {
             if self.brain.max_cost_sats == 0 {
                 anyhow::bail!(
                     "brain.max_cost_sats must be > 0 (a zero per-call cap means every think is DENIED_OVER_BUDGET)"
@@ -1270,7 +1584,8 @@ impl KirbyConfig {
             // The real (routstr) backend needs a node, a mint, and a persistent wallet
             // store: a `routstr` brain missing any of these is a config error caught at
             // load, not a runtime panic deep in boot (brain-routstr §6). The stub backend
-            // ignores all of these.
+            // ignores all of these. (The whole capable block is Standalone-gated above, so the
+            // empty-money-path zero-config `routstr_key` template never trips this on a host.)
             if self.brain.backend == BrainBackendKind::Routstr {
                 if self.brain.node_url.trim().is_empty() {
                     anyhow::bail!(
@@ -1331,7 +1646,12 @@ impl KirbyConfig {
         // memory ceiling check, else every WRITE is DENIED_OVER_BUDGET — a config error).
         // (No <= initial_sats check: reads stay free, so a broke agent still lives; the write
         // cost is host-computed per op.)
-        if matches!(self.workload, Workload::Capable) && self.memory.max_cost_sats == 0 {
+        // Standalone-only per the M5 seam: the memory write budget gates a RUNNING agent, not a
+        // money-less fleet host (whose template's memory config is re-validated per tenant).
+        if role == ConfigRole::Standalone
+            && matches!(self.workload, Workload::Capable)
+            && self.memory.max_cost_sats == 0
+        {
             anyhow::bail!(
                 "memory.max_cost_sats must be > 0 (a zero per-write ceiling means every write is DENIED_OVER_BUDGET)"
             );
@@ -1343,7 +1663,11 @@ impl KirbyConfig {
         // fall below the per-think floor (unable to afford another thought) yet never be halted.
         // Reject the combination cleanly at load rather than silently running that zombie.
         // Metered-resume for the capable agent is a follow-up; lifting this guard is part of it.
-        if matches!(self.workload, Workload::Capable) && self.mode == RunMode::Resume {
+        // Standalone-only per the M5 seam: the run mode gates a RUNNING agent, not a fleet host.
+        if role == ConfigRole::Standalone
+            && matches!(self.workload, Workload::Capable)
+            && self.mode == RunMode::Resume
+        {
             anyhow::bail!(
                 "workload = \"{}\" does not support mode = \"resume\" yet: the capable demo is \
                  bootstrap-only (a resumed agent skips the metered loop and never arms its \
@@ -2427,11 +2751,20 @@ mod tests {
             err.to_string().contains("not yet implemented"),
             "URL fetch must be a clear TODO stub, got: {err}"
         );
-        // The local-path form resolves cleanly.
-        let local = GenomeImage::Path(PathBuf::from("/tmp/img"));
-        assert_eq!(
-            local.resolve_local_dir().unwrap(),
-            PathBuf::from("/tmp/img")
+        // The local-path form resolves cleanly when the dir EXISTS.
+        let dir = std::env::temp_dir().join("kirby-zeroconfig-genome-resolve-exists");
+        std::fs::create_dir_all(&dir).expect("create the test image dir");
+        let local = GenomeImage::Path(dir.clone());
+        assert_eq!(local.resolve_local_dir().unwrap(), dir);
+
+        // Q2b TOOTH: a MISSING local image dir fails with an ACTIONABLE build hint (not a
+        // cryptic downstream not-found). RED-on-revert: drop the existence check and this
+        // resolves Ok, deferring to a cryptic error deep in the boot path.
+        let missing = GenomeImage::Path(PathBuf::from("/nonexistent/kirby-genome-missing-xyz"));
+        let err = missing.resolve_local_dir().unwrap_err().to_string();
+        assert!(
+            err.contains("nix build .#genome-image"),
+            "a missing genome image must give an actionable build hint, got: {err}"
         );
     }
 
@@ -2520,5 +2853,230 @@ mod tests {
             .expect("a failover window of exactly one second must validate (the accept boundary)");
         assert_eq!(cfg.fleet.spawn.failover_max_lease_age_secs, floor + 1);
         assert_eq!(cfg.fleet.spawn.takeover_grace_secs, grace);
+    }
+
+    // ---- ZERO-CONFIG defaults (M1-M7): the synthesized bare-`kirby-node` fleet host ----
+
+    /// TOOTH (M2/M3/M4/M5/M6/M7): the synthesized zero-config default IS a valid FLEET HOST and
+    /// carries every signed zero-config value. This is what a bare `kirby-node` (no subcommand,
+    /// no config file) comes up as. RED-on-revert: drop the M5 seam (FleetHost runs the brain
+    /// money-path checks) and `validate_for(FleetHost)` fails on the empty `api_key_path`; revert
+    /// `mem_sats_per_mib_sec` to 1, the lifted wall, the allowlist, or the stale filter and the
+    /// matching assert goes red.
+    #[test]
+    fn zero_config_default_is_a_valid_fleet_host() {
+        let cfg = KirbyConfig::default();
+
+        // M3: the three formerly-mandatory fields now default (env-aware where applicable).
+        assert_eq!(cfg.relay.url, default_relay_url(), "relay defaults to the fleet relay / env");
+        assert_eq!(cfg.genome_image, default_genome_image(), "genome defaults to env-or-result");
+        assert_eq!(cfg.identity, IdentityConfig::default(), "identity defaults all-unset (mints a key)");
+
+        // M5: the spawned-tenant TEMPLATE — capable + prepaid-key brain, endpoint set, but the
+        // funding key EMPTY (injected per-tenant at spawn; never baked into the node).
+        assert_eq!(cfg.workload, Workload::Capable);
+        assert_eq!(cfg.brain.backend, BrainBackendKind::RoutstrKey);
+        assert_eq!(cfg.brain.node_url, "https://api.routstr.com");
+        assert_eq!(cfg.brain.model, "granite-4.1-8b");
+        assert!(cfg.brain.api_key_path.is_empty(), "funding is spawn-provided, never baked");
+
+        // M4: spawn ONLY the blessed genome (default-deny backstop); operators OPEN (empty, loud-
+        // warned at startup); tenants EMPTY (pure infra — agents arrive via spawn).
+        assert_eq!(cfg.fleet.spawn.image_allowlist, vec![DEFAULT_GENOME_IMAGE_REF.to_string()]);
+        assert!(cfg.fleet.spawn.operators.is_empty(), "operators OPEN by default");
+        assert!(cfg.fleet.tenants.is_empty(), "a zero-config node hosts no static agent");
+
+        // M6: memory rent zeroed (die from real inference spend only); cpu + egress rates KEPT at
+        // their live-config defaults; the 600s wall lifted for the tenants that inherit this base.
+        assert_eq!(cfg.meter.mem_sats_per_mib_sec, 0, "mem rent zeroed (M6)");
+        assert_eq!(cfg.meter.cpu_sats_per_usec_num, 1);
+        assert_eq!(cfg.meter.cpu_sats_per_usec_den, 1000);
+        assert_eq!(cfg.meter.egress_sats_per_byte_num, 1);
+        assert_eq!(cfg.meter.egress_sats_per_byte_den, 1);
+        assert_eq!(cfg.max_run_secs, Some(DEFAULT_FLEET_MAX_RUN_SECS), "wall lifted to 24h (M6)");
+
+        // M7: stale spawn-request filter on (kills the stale-ghost respawn footgun).
+        assert_eq!(cfg.fleet.spawn.request_max_age_secs, Some(3600));
+
+        // THE TOOTH: the moneyless host validates as a fleet host (the M5 seam skips the empty
+        // brain money path). Without the seam this line fails.
+        cfg.validate_for(ConfigRole::FleetHost)
+            .expect("the zero-config default must validate as a fleet host");
+    }
+
+    /// TOOTH (M5 seam): the SAME config passes `FleetHost` validation but FAILS `Standalone`
+    /// validation on its empty `api_key_path`. This is the host-vs-tenant-effective split:
+    /// a fleet host never boots an agent from its own `[brain]` (skip the money path), but a
+    /// config that WILL boot an agent (a single `agent`, or a tenant's derived effective config
+    /// at child boot) is fail-closed — no funded key, no think. RED-on-revert: drop the
+    /// `role == Standalone &&` guard on the money-path arms and the `FleetHost` assertion fails.
+    #[test]
+    fn validation_seam_fleet_host_skips_but_standalone_enforces_brain_money_paths() {
+        let cfg = KirbyConfig::default();
+        assert!(cfg.brain.api_key_path.is_empty(), "precondition: the template funding key is empty");
+
+        // FleetHost: the node holds no money + boots no agent from [brain] => PASSES.
+        assert!(
+            cfg.validate_for(ConfigRole::FleetHost).is_ok(),
+            "a fleet host must NOT fail on the empty api_key_path of its tenant template (M5 seam)"
+        );
+
+        // Standalone: a config that boots an agent is fail-closed on the missing funding key.
+        let err = cfg
+            .validate_for(ConfigRole::Standalone)
+            .expect_err("a standalone routstr_key config with no api_key_path must be rejected")
+            .to_string();
+        assert!(err.contains("api_key_path"), "expected an api_key_path error, got: {err}");
+    }
+
+    /// TOOTH (backcompat guard): the zero-config values live ONLY in `KirbyConfig::default()`.
+    /// A partial `kirby.toml` still parses with the HISTORICAL per-field serde defaults, so
+    /// existing configs are byte-identical. RED-on-revert: leak any M5/M6/M7 value into a
+    /// field-level `#[serde(default)]` (e.g. flip the `workload`/`meter` field default) and one
+    /// of these asserts fails — the exact backcompat break this guard forbids.
+    #[test]
+    fn field_defaults_stay_backcompat_not_zero_config() {
+        let cfg = KirbyConfig::from_toml_str(minimal_toml()).unwrap();
+        assert_eq!(cfg.workload, Workload::AppCheckpoint, "field default stays app-checkpoint");
+        assert_eq!(cfg.brain.backend, BrainBackendKind::Stub, "field default stays stub");
+        assert_eq!(cfg.meter.mem_sats_per_mib_sec, 1, "field default mem rate stays 1");
+        assert_eq!(cfg.max_run_secs, None, "field default max_run stays None (=> 600s demo wall)");
+        assert!(cfg.fleet.spawn.image_allowlist.is_empty(), "field default allowlist stays empty");
+        assert_eq!(cfg.fleet.spawn.request_max_age_secs, None, "field default stale filter stays off");
+    }
+
+    /// TOOTH (M2): an EXPLICIT `--config` path that does not exist is an ERROR — a typo'd
+    /// `--config` must never silently boot the zero-config defaults. (The file-absent synthesis
+    /// path, exercised only with no `--config`, is covered by the default-is-valid tooth above.)
+    #[test]
+    fn load_or_default_errors_on_an_explicit_missing_config() {
+        let missing = Path::new("/nonexistent/kirby-zeroconfig-does-not-exist.toml");
+        let err = KirbyConfig::load_or_default(Some(missing), ConfigRole::FleetHost)
+            .expect_err("an explicit --config that does not exist must error, not synthesize defaults");
+        let msg = err.to_string();
+        assert!(msg.contains("kirby-zeroconfig-does-not-exist"), "the error names the missing path: {msg}");
+    }
+
+    /// TOOTH (Codex-HIGH #1, belt-and-suspenders): a config FILE that is present but empty parses
+    /// with the OLD field-level defaults (app-checkpoint / stub / mem=1 / no allowlist / wall off) —
+    /// NOT the zero-config template — even validated as a FleetHost. This PROVES the M3 field
+    /// defaults did not leak the zero-config whole-struct defaults onto explicit files (the
+    /// "backcompat drift" Codex flagged as HIGH): ONLY the file-ABSENT synthesis path builds
+    /// `KirbyConfig::default()`. RED-on-revert: move any zero-config value into a field-level
+    /// `#[serde(default)]` and one of these asserts fails.
+    #[test]
+    fn empty_config_file_uses_old_field_defaults_not_the_zero_config_template() {
+        let cfg = KirbyConfig::from_toml_str_for("", ConfigRole::FleetHost)
+            .expect("an empty config file must parse to the field defaults + validate as a fleet host");
+        // The drift-capable fields keep their HISTORICAL defaults (byte-identical to pre-change)...
+        assert_eq!(cfg.workload, Workload::AppCheckpoint);
+        assert_eq!(cfg.brain.backend, BrainBackendKind::Stub);
+        assert_eq!(cfg.meter.mem_sats_per_mib_sec, 1);
+        assert_eq!(cfg.max_run_secs, None);
+        assert!(cfg.fleet.spawn.image_allowlist.is_empty());
+        assert_eq!(cfg.fleet.spawn.request_max_age_secs, None);
+        // ...which is EXACTLY what makes a present-but-empty file differ from the no-file template.
+        let zero_config = KirbyConfig::default();
+        assert_ne!(cfg.workload, zero_config.workload, "empty file must NOT get the zero-config template");
+        assert_ne!(cfg.meter.mem_sats_per_mib_sec, zero_config.meter.mem_sats_per_mib_sec);
+        assert_ne!(cfg.fleet.spawn.image_allowlist, zero_config.fleet.spawn.image_allowlist);
+    }
+
+    /// TOOTH (#110): a config FILE that omits `[relay] url` still parses + validates (the M3
+    /// default), AND the omission is DETECTED so `load_for` can WARN that it silently defaulted
+    /// onto the shared prod fleet relay. A file that SETS `[relay] url` is NOT flagged. This is
+    /// the fiduciary footgun keeper flagged on PR #108: a partial hand-authored config joining
+    /// prod unnoticed. RED-on-revert: make `relay_url_was_omitted` always return false and the
+    /// omitted-case assert fails (the warning would never fire).
+    #[test]
+    fn relay_omitted_from_a_present_file_is_detected_for_the_warning() {
+        // A file that omits [relay] still parses + validates as a fleet host (M3)...
+        let omits_relay = r#"
+            genome_image = { path = "/tmp/k/img" }
+
+            [identity]
+        "#;
+        let cfg = KirbyConfig::from_toml_str_for(omits_relay, ConfigRole::FleetHost)
+            .expect("a config omitting [relay] must still parse + validate");
+        assert_eq!(cfg.relay.url, default_relay_url(), "an omitted relay falls back to the default");
+        // ...and the omission is DETECTED, so `load_for` emits the #110 warning.
+        assert!(relay_url_was_omitted(omits_relay), "an omitted [relay] url must be detected");
+
+        // A file that SETS [relay] url is NOT flagged (no false warning).
+        assert!(!relay_url_was_omitted("[relay]\nurl = \"ws://127.0.0.1:7777\"\n"));
+        assert!(!relay_url_was_omitted(minimal_toml()), "minimal_toml sets [relay] url");
+    }
+
+    /// A `tracing` writer that captures emitted log lines into a shared buffer, so a test can
+    /// assert on the actual WARN a real load path emits (thread-scoped via `with_default`, so
+    /// it is parallel-test-safe). Uses `tracing_subscriber::fmt` (already a crate dep).
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with all tracing captured into a returned String (thread-scoped).
+    fn capture_tracing<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap_or_default();
+        (out, logs)
+    }
+
+    /// TOOTH (#110 wiring, addresses codex-review): the WARN actually fires from the real
+    /// `load_for` file path when `[relay]` is omitted, and does NOT fire when it is set — proven
+    /// by capturing tracing, not just the pure detector. The no-file zero-config path can't warn
+    /// here by construction (`load_or_default(None,..)` builds `KirbyConfig::default()` and never
+    /// calls `load_for`). RED-on-revert: delete the `if relay_url_was_omitted { warn }` block in
+    /// `load_for` and the omit-case assertion fails.
+    #[test]
+    fn load_for_warns_only_when_a_present_file_omits_relay() {
+        let dir = std::env::temp_dir().join("kirby-zeroconfig-110-load-for-wiring");
+        std::fs::create_dir_all(&dir).expect("create the test dir");
+
+        // A present file that OMITS [relay] => load_for parses it AND warns.
+        let omit_path = dir.join("omits-relay.toml");
+        std::fs::write(&omit_path, "genome_image = { path = \"/tmp/k/img\" }\n[identity]\n")
+            .expect("write the omitting config");
+        let (cfg, logs) =
+            capture_tracing(|| KirbyConfig::load_for(&omit_path, ConfigRole::FleetHost).unwrap());
+        assert_eq!(cfg.relay.url, default_relay_url(), "omitted relay falls back to the default");
+        let logs_lc = logs.to_lowercase();
+        assert!(
+            logs_lc.contains("omitted") && logs_lc.contains("relay"),
+            "load_for must WARN on an omitted [relay]; captured: {logs}"
+        );
+
+        // A present file that SETS [relay] url => NO omitted-relay warning.
+        let set_path = dir.join("sets-relay.toml");
+        std::fs::write(
+            &set_path,
+            "genome_image = { path = \"/tmp/k/img\" }\n[relay]\nurl = \"ws://127.0.0.1:7777\"\n",
+        )
+        .expect("write the relay-set config");
+        let (_cfg2, logs2) =
+            capture_tracing(|| KirbyConfig::load_for(&set_path, ConfigRole::FleetHost).unwrap());
+        assert!(
+            !logs2.to_lowercase().contains("omitted"),
+            "load_for must NOT warn when [relay] url is set; captured: {logs2}"
+        );
     }
 }

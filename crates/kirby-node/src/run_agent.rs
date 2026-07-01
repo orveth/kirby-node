@@ -295,6 +295,7 @@ fn agent_state_emitter(
     signer: crate::nerve::BeaconSigner,
     config: &KirbyConfig,
     backend: ResolvedBackend,
+    canonical_npub: Option<String>,
 ) -> crate::metered_run::AgentStateEmitter {
     crate::metered_run::AgentStateEmitter {
         signer,
@@ -304,6 +305,7 @@ fn agent_state_emitter(
         backend: backend.label().to_string(),
         interval: Duration::from_secs(config.relay.presence_interval_secs),
         budget_sats: config.funding.initial_sats,
+        canonical_npub,
     }
 }
 
@@ -318,6 +320,7 @@ async fn emit_agent_state(
     treasury_sats: u64,
     runway_secs: Option<u64>,
     lifecycle: &str,
+    canonical_npub: Option<&str>,
 ) {
     let content = nerve::AgentStateContent::sovereign(
         &config.agent_id,
@@ -326,8 +329,14 @@ async fn emit_agent_state(
         lifecycle,
         backend.label(),
     );
-    if let Err(e) =
-        nerve::publish_agent_state(signer, &config.relay.url, &config.node_id, &content).await
+    if let Err(e) = nerve::publish_agent_state(
+        signer,
+        &config.relay.url,
+        &config.node_id,
+        &content,
+        canonical_npub,
+    )
+    .await
     {
         tracing::warn!(error = %e, lifecycle, "failed to publish 31000 agent-state");
     }
@@ -467,6 +476,9 @@ fn agent_boot_config(
             // key cannot decrypt). `load_or_create` mints it on first boot. This is the interim;
             // the fleet's Shamir-shared SK_social (#26) swaps in behind `with_dm_keys` later.
             dm_key_path: Some(cfg.identity.treasury_dir().join("social.dm.key")),
+            // The DM backfill sweep interval (#103): carried from `[relay]` so the durable-delivery
+            // backstop in `run_dm_inbound` re-fetches missed DMs on a fresh connection.
+            dm_backfill_secs: cfg.relay.dm_backfill_secs,
         }),
         _ => None,
     };
@@ -564,14 +576,50 @@ pub async fn run(mut run: RunAgentConfig) -> anyhow::Result<RunAgentOutcome> {
     let npub = signer.npub();
     tracing::info!(npub = %npub, frost = matches!(signer, crate::nerve::BeaconSigner::Frost(_)), "agent identity ready (beacons + voice sign under this key)");
 
+    // CANONICAL SOCIAL npub (P1, #76): resolve the agent's canonical social key (its DM key --
+    // the SAME npub that signs kind:1 posts, the kind:0 profile, kind:10050, and NIP-17 DMs) as
+    // 32-byte HEX, so every 31000 beacon can carry the `["social",<hex>]` binding under Q and the
+    // UI resolves `agent_id -> the ONE live DM target`. `None` for a non-DM agent (no dm key path)
+    // -> no binding tag, beacon byte-identical to before. This loads/derives the SAME keyfile the
+    // actuator + boot's 10050/kind:0 publish use (`agent_boot_config`'s `SocialConfig.dm_key_path`),
+    // so the binding always points at the live DM identity.
+    let canonical_npub = resolve_canonical_social_hex(&run.config)?;
+    if let Some(hex) = canonical_npub.as_deref() {
+        tracing::info!(canonical_social_hex = %hex, "canonical social npub resolved (binds the 31000 beacon -> the DM target)");
+    }
+
     // 3-7. Drive the mode-specific path. The agent does NOT beacon node presence — that is the
     // persistent node daemon's job (it owns the stable node identity + its 10100 beacon). The
     // agent's liveness surfaces via its 31000 agent-state (the live "Kirby face") + its 9100
     // lifecycle, both signed under `signer` (the agent's FROST quorum key Q for a tenant).
     match mode {
-        RunMode::Bootstrap => run_bootstrap(&run, &signer, backend, npub.clone()).await,
-        RunMode::Resume => run_resume(&run, &signer, backend, npub.clone()).await,
+        RunMode::Bootstrap => {
+            run_bootstrap(&run, &signer, backend, npub.clone(), canonical_npub).await
+        }
+        RunMode::Resume => run_resume(&run, &signer, backend, npub.clone(), canonical_npub).await,
     }
+}
+
+/// Resolve this agent's CANONICAL SOCIAL key as 32-byte HEX (P1, #76): the DM key that also
+/// signs kind:1 posts + the kind:0 profile + kind:10050. Returns `Some(hex)` for a DM-enabled
+/// (capable) agent whose dm keyfile can be loaded/derived, `None` otherwise (a non-DM agent has
+/// no canonical social key -> no `["social",..]` binding on its 31000, byte-identical to before).
+///
+/// This mirrors the SAME source the outward actuator + boot's 10050/kind:0 publish use: the
+/// dm key path is `agent_boot_config`'s `SocialConfig.dm_key_path` (only set for the capable
+/// workload). Loading it here (idempotent `load_or_create`, the same call boot makes) means the
+/// binding tag always points at the exact live DM identity. A load failure is a boot-wiring bug
+/// on a DM-enabled agent, so it fails loud rather than silently omitting the binding.
+fn resolve_canonical_social_hex(config: &KirbyConfig) -> anyhow::Result<Option<String>> {
+    use crate::config::Workload;
+    // Only the capable workload wires a DM identity (see `agent_boot_config`). Every other
+    // workload has no canonical social key.
+    if config.workload != Workload::Capable {
+        return Ok(None);
+    }
+    let dm_path = config.identity.treasury_dir().join("social.dm.key");
+    let dm_identity = NodeIdentity::load_or_create(&dm_path)?;
+    Ok(Some(dm_identity.public_key().to_hex()))
 }
 
 /// Bootstrap: fund to born (emit 9100 born), boot the agent, run the v0 metered
@@ -583,6 +631,7 @@ async fn run_bootstrap(
     signer: &crate::nerve::BeaconSigner,
     backend: ResolvedBackend,
     npub: String,
+    canonical_npub: Option<String>,
 ) -> anyhow::Result<RunAgentOutcome> {
     use crate::metered_run::{self, MeteredRunConfig, Terminated};
 
@@ -602,8 +651,15 @@ async fn run_bootstrap(
         tick: run.meter_tick,
         max_run: run.max_run,
         // Emit the live 31000 "Kirby face" on the presence cadence during the run,
-        // sourcing the live treasury + burn rate from the meter loop.
-        agent_state: Some(agent_state_emitter(signer.clone(), &run.config, backend)),
+        // sourcing the live treasury + burn rate from the meter loop. The canonical social
+        // npub (when the agent has a DM key) rides each beacon as the `["social",<hex>]`
+        // binding so the UI can resolve `agent_id -> the ONE live DM target` (#76).
+        agent_state: Some(agent_state_emitter(
+            signer.clone(),
+            &run.config,
+            backend,
+            canonical_npub.clone(),
+        )),
         // The synthetic VM-rent rates from the `[meter]` block (F4): the deploy tunes the
         // memory rent down so an always-on diarist VM does not rent-death before it thinks.
         rates: crate::meter::BurnRates::from(&run.config.meter),
@@ -660,6 +716,7 @@ async fn run_bootstrap(
         lifecycle_treasury,
         None,
         "dead",
+        canonical_npub.as_deref(),
     )
     .await;
 
@@ -688,6 +745,7 @@ async fn run_resume(
     signer: &crate::nerve::BeaconSigner,
     backend: ResolvedBackend,
     npub: String,
+    canonical_npub: Option<String>,
 ) -> anyhow::Result<RunAgentOutcome> {
     use crate::boot;
 
@@ -723,6 +781,7 @@ async fn run_resume(
         treasury_sats,
         None,
         "running",
+        canonical_npub.as_deref(),
     )
     .await;
 
@@ -734,7 +793,16 @@ async fn run_resume(
     // The terminal 31000 "dead" face, emitted once as the resume demonstration run
     // tears the agent down (alongside the 9100 died below), after which the node
     // stops emitting agent-state.
-    emit_agent_state(signer, &run.config, backend, treasury_sats, None, "dead").await;
+    emit_agent_state(
+        signer,
+        &run.config,
+        backend,
+        treasury_sats,
+        None,
+        "dead",
+        canonical_npub.as_deref(),
+    )
+    .await;
 
     // A resume run ends as "continue", not a budget-death, so it emits died only on
     // its own clean shutdown here (the agent is being torn down at the end of this
@@ -882,6 +950,7 @@ mod tests {
                 url: "ws://127.0.0.1:7777".to_string(),
                 presence_interval_secs: 15,
                 presence_stale_after_secs: 45,
+                dm_backfill_secs: 30,
             },
             backend: Backend::Auto,
             genome_image: GenomeImage::Path(root.join("img")),

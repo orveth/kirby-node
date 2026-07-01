@@ -65,6 +65,11 @@ pub struct AgentStateEmitter {
     pub interval: Duration,
     /// The initial budget, for the "dying" treasury-fraction threshold.
     pub budget_sats: u64,
+    /// The agent's CANONICAL SOCIAL key as 32-byte HEX (P1, #76): the DM/kind:0/kind:10050
+    /// npub a reader resolves this agent to. When `Some`, every emitted 31000 carries the
+    /// `["social",<hex>]` binding tag so the UI can map `agent_id -> the ONE live DM target`.
+    /// `None` for non-DM agents -> no tag, beacon byte-identical to before.
+    pub canonical_npub: Option<String>,
 }
 
 impl AgentStateEmitter {
@@ -95,9 +100,14 @@ impl AgentStateEmitter {
             lifecycle,
             &self.backend,
         );
-        if let Err(e) =
-            nerve::publish_agent_state(&self.signer, &self.relay_url, &self.node_id, &content)
-                .await
+        if let Err(e) = nerve::publish_agent_state(
+            &self.signer,
+            &self.relay_url,
+            &self.node_id,
+            &content,
+            self.canonical_npub.as_deref(),
+        )
+        .await
         {
             tracing::warn!(error = %e, lifecycle, "failed to publish 31000 agent-state (will retry next interval)");
         }
@@ -542,6 +552,7 @@ mod tests {
             backend: "firecracker".to_string(),
             interval: Duration::from_secs(15),
             budget_sats,
+            canonical_npub: None,
         }
     }
 
