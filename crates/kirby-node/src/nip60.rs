@@ -18,6 +18,7 @@
 //! same reconstructed seed decrypts its own proof events. The event key is NEITHER the FROST Q
 //! (which cannot ECDH) NOR the DM key (capability isolation).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,13 +26,20 @@ use anyhow::Context as _;
 use cdk::nuts::Proof;
 use nostr_sdk::nips::nip44::{self, Version};
 use nostr_sdk::prelude::*;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The kind of a NIP-60 TOKEN event (the encrypted proofs). REGULAR + MULTIPLE → aggregate,
-/// never lww-head (see [`reconcile_token_set`]). NIP-60 also defines kind:17375 (the REPLACEABLE
-/// wallet config — lww-head, distinct from this 7375 SET) and kind:7376 (spending history);
-/// those layer on in later cuts.
+/// never lww-head (see [`reconcile_token_set`]). Distinct from the REPLACEABLE wallet config
+/// ([`KIND_NIP60_WALLET_CONFIG`], lww-head); kind:7376 (spending history) layers on later.
 const KIND_NIP60_TOKEN: u16 = 7375;
+
+/// The kind of a NIP-60 WALLET-CONFIG event: REPLACEABLE (10000–19999) → the relay set keeps
+/// only the latest per author, so it is read lww-head ([`crate::engram::lww_head`]), NEVER
+/// aggregated. kirby carries the wallet's mints + the per-keyset NUT-13 counter high-water-mark
+/// here ([`WalletConfigContent`]) so the spend-critical counter survives a cross-machine
+/// reconstruct — the ONE piece of wallet state the mint alone cannot rebuild.
+const KIND_NIP60_WALLET_CONFIG: u16 = 17375;
 
 /// The relay-set fetch timeout for a reconcile (mirrors EngramStore's read timeout).
 const NIP60_READ_TIMEOUT_SECS: u64 = 4;
@@ -59,6 +67,27 @@ pub struct TokenEventContent {
     /// Token-event ids this event supersedes (NIP-09 delete targets). Empty until a rollover.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub del: Vec<String>,
+}
+
+/// The plaintext content of a NIP-60 kind:17375 wallet-config event (before NIP-44 encryption):
+/// the mints the wallet uses + the per-keyset NUT-13 counter high-water-mark. The whole struct is
+/// NIP-44-encrypted into the (REPLACEABLE, lww-head) event, so the keyset ids and counters never
+/// appear in cleartext on a relay.
+///
+/// ⚠️ MONEY-SAFETY: `counters` is the cross-machine floor a reconstruct seeds from
+/// ([`crate::nip60_counter::Nip60CounterDb::with_counters`]) so a restored wallet never re-derives
+/// already-spent NUT-13 secrets. It is keyed by the keyset id's canonical HEX string (`Id`'s
+/// `Display`), NOT `Id` itself — cashu's `Id` serializes as a struct, unusable as a JSON map key;
+/// hex is the portable, cdk-canonical form the publish/load boundary converts at.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WalletConfigContent {
+    /// The mint URLs this wallet draws on (interop + a reconstruct hint). May be empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mints: Vec<String>,
+    /// keyset-id hex → the highest NUT-13 counter the wallet has reached for that keyset. Empty
+    /// for a brand-new wallet that has not yet advanced any counter.
+    #[serde(default)]
+    pub counters: HashMap<String, u32>,
 }
 
 /// The NIP-60 event-encryption identity: a nostr keypair built from the keyring-derived 32-byte
@@ -92,22 +121,45 @@ impl Nip60Crypto {
         self.keys.clone()
     }
 
-    /// NIP-44 (v2) self-encrypt a token-event content → the event-content string. Mirrors
-    /// [`crate::engram`]'s self-encrypt: encrypt to our OWN pubkey via self-ECDH.
-    pub fn encrypt(&self, content: &TokenEventContent) -> anyhow::Result<String> {
+    /// NIP-44 (v2) self-encrypt any serializable content → the event-content string. Mirrors
+    /// [`crate::engram`]'s self-encrypt: encrypt to our OWN pubkey via self-ECDH. Shared by the
+    /// token ([`Self::encrypt`]) and wallet-config ([`Self::encrypt_config`]) events so the crypto
+    /// incantation lives in ONE place.
+    fn encrypt_json<T: Serialize>(&self, content: &T) -> anyhow::Result<String> {
         let json = serde_json::to_string(content)
-            .map_err(|e| anyhow::anyhow!("serialize NIP-60 token content: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("serialize NIP-60 content: {e}"))?;
         nip44::encrypt(self.keys.secret_key(), &self.keys.public_key(), json, Version::V2)
-            .map_err(|e| anyhow::anyhow!("NIP-44 self-encrypt NIP-60 token: {e}"))
+            .map_err(|e| anyhow::anyhow!("NIP-44 self-encrypt NIP-60 content: {e}"))
+    }
+
+    /// NIP-44 self-decrypt an event-content string back to `T`. A wrong key fails the MAC
+    /// (returns `Err`), never silently yields garbage.
+    fn decrypt_json<T: DeserializeOwned>(&self, ciphertext: &str) -> anyhow::Result<T> {
+        let bytes = nip44::decrypt_to_bytes(self.keys.secret_key(), &self.keys.public_key(), ciphertext)
+            .map_err(|e| anyhow::anyhow!("NIP-44 self-decrypt NIP-60 content: {e}"))?;
+        serde_json::from_slice(&bytes).map_err(|e| anyhow::anyhow!("parse NIP-60 content: {e}"))
+    }
+
+    /// NIP-44 (v2) self-encrypt a token-event content → the event-content string.
+    pub fn encrypt(&self, content: &TokenEventContent) -> anyhow::Result<String> {
+        self.encrypt_json(content)
     }
 
     /// NIP-44 self-decrypt an event-content string back to its proofs. A wrong key fails the
     /// MAC (returns `Err`), never silently yields garbage.
     pub fn decrypt(&self, ciphertext: &str) -> anyhow::Result<TokenEventContent> {
-        let bytes = nip44::decrypt_to_bytes(self.keys.secret_key(), &self.keys.public_key(), ciphertext)
-            .map_err(|e| anyhow::anyhow!("NIP-44 self-decrypt NIP-60 token: {e}"))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow::anyhow!("parse NIP-60 token content: {e}"))
+        self.decrypt_json(ciphertext)
+    }
+
+    /// NIP-44 (v2) self-encrypt a wallet-config content → the (kind:17375) event-content string.
+    pub fn encrypt_config(&self, config: &WalletConfigContent) -> anyhow::Result<String> {
+        self.encrypt_json(config)
+    }
+
+    /// NIP-44 self-decrypt a wallet-config event-content string back to its mints + counters. A
+    /// wrong key fails the MAC (returns `Err`).
+    pub fn decrypt_config(&self, ciphertext: &str) -> anyhow::Result<WalletConfigContent> {
+        self.decrypt_json(ciphertext)
     }
 }
 
@@ -262,6 +314,65 @@ impl Nip60Store {
             }
         }
         Ok(reconcile_token_set(&decoded))
+    }
+
+    /// Publish the kind:17375 wallet-config (mints + per-keyset NUT-13 counters, NIP-44
+    /// self-encrypted), requiring K-of-N acks. Being REPLACEABLE, the relay set keeps only the
+    /// latest per author, so a new config supersedes the old with NO NIP-09 delete needed.
+    ///
+    /// ⚠️ MONEY-SAFETY: the counters here are the cross-machine floor a reconstruct seeds from
+    /// ([`crate::nip60_counter::Nip60CounterDb::with_counters`]). They are monotonic (the
+    /// decorator's `max`) and written under the single-live LEASE (N4), so the lww-head never
+    /// regresses in correct operation; a takeover still scans GENEROUSLY past the mirrored value
+    /// (N5) to heal a slightly-stale counter from a mid-mint crash. Same ≥k durability gate as a
+    /// token publish — a sub-quorum config write is NOT durable and errors.
+    pub async fn publish_config(&self, config: &WalletConfigContent) -> anyhow::Result<EventId> {
+        let ciphertext = self.crypto.encrypt_config(config)?;
+        let builder = EventBuilder::new(Kind::from(KIND_NIP60_WALLET_CONFIG), ciphertext);
+        let output = self
+            .client
+            .send_event_builder(builder)
+            .await
+            .map_err(|e| anyhow::anyhow!("publish NIP-60 wallet-config event: {e}"))?;
+        let acks = output.success.len();
+        anyhow::ensure!(
+            acks >= self.k,
+            "NIP-60 wallet-config publish reached only {acks} of {} relays (need k={}); NOT durable \
+             — refusing to treat the counters as backed up",
+            self.n,
+            self.k
+        );
+        Ok(output.val)
+    }
+
+    /// Load the wallet-config lww-head: fetch every kind:17375 event authored by the event key,
+    /// pick the latest ([`crate::engram::lww_head`] — greatest created_at, tombstone-aware), and
+    /// decrypt it. `Ok(None)` when the agent has never published one (a fresh wallet).
+    ///
+    /// ⚠️ Unlike [`Self::reconcile_on_load`] (which SKIPS an undecryptable token event as a
+    /// possible foreign event), an undecryptable config HEAD is a hard error: the counter floor is
+    /// money-critical, so a decrypt failure is surfaced (fail-closed at the caller), NEVER silently
+    /// treated as an empty floor — an empty floor would let a later publish regress the counter.
+    pub async fn load_config(&self) -> anyhow::Result<Option<WalletConfigContent>> {
+        let filter = Filter::new()
+            .kind(Kind::from(KIND_NIP60_WALLET_CONFIG))
+            .author(self.crypto.public_key());
+        let events = self
+            .client
+            .fetch_events(filter, self.read_timeout)
+            .await
+            .map_err(|e| anyhow::anyhow!("fetch NIP-60 wallet-config events: {e}"))?;
+        let events: Vec<Event> = events.into_iter().collect();
+        match crate::engram::lww_head(&events) {
+            Some(head) => {
+                let config = self
+                    .crypto
+                    .decrypt_config(&head.content)
+                    .context("decrypt the NIP-60 wallet-config lww-head")?;
+                Ok(Some(config))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Roll over token events: replace the `superseded` events (their proofs consolidated into
@@ -463,6 +574,47 @@ mod tests {
         assert!(
             b.decrypt(&ciphertext).is_err(),
             "a different event key MUST NOT decrypt another agent's token event (key-bound)"
+        );
+    }
+
+    #[test]
+    fn wallet_config_roundtrips_through_self_encryption() {
+        let crypto =
+            Nip60Crypto::from_event_key(&derive_nip60_event_key(&[7u8; 64])).expect("valid key");
+        let mut counters = HashMap::new();
+        counters.insert("00ad268c4d1f5826".to_string(), 42u32);
+        counters.insert("009a1f293253e41e".to_string(), 7u32);
+        let config = WalletConfigContent {
+            mints: vec!["https://mint.example".to_string()],
+            counters,
+        };
+        let ciphertext = crypto.encrypt_config(&config).expect("encrypt config");
+        assert!(
+            !ciphertext.contains("mint.example") && !ciphertext.contains("00ad268c4d1f5826"),
+            "the mints AND keyset ids must be NIP-44-encrypted, never cleartext on a relay"
+        );
+        let back = crypto.decrypt_config(&ciphertext).expect("decrypt config");
+        assert_eq!(
+            back, config,
+            "the wallet config round-trips through NIP-44 self-encryption (mints + counters)"
+        );
+        // The spend-critical value survives verbatim (a lossy counter = money loss on reconstruct).
+        assert_eq!(back.counters.get("00ad268c4d1f5826").copied(), Some(42));
+        assert_eq!(back.counters.get("009a1f293253e41e").copied(), Some(7));
+    }
+
+    #[test]
+    fn a_different_event_key_cannot_decrypt_wallet_config() {
+        let a = Nip60Crypto::from_event_key(&derive_nip60_event_key(&[1u8; 64])).unwrap();
+        let b = Nip60Crypto::from_event_key(&derive_nip60_event_key(&[2u8; 64])).unwrap();
+        let config = WalletConfigContent {
+            mints: vec!["https://m".to_string()],
+            counters: HashMap::from([("00ad268c4d1f5826".to_string(), 5u32)]),
+        };
+        let ciphertext = a.encrypt_config(&config).unwrap();
+        assert!(
+            b.decrypt_config(&ciphertext).is_err(),
+            "a different event key MUST NOT decrypt another agent's wallet config (key-bound)"
         );
     }
 }
