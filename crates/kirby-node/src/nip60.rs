@@ -36,6 +36,11 @@ const KIND_NIP60_TOKEN: u16 = 7375;
 /// The relay-set fetch timeout for a reconcile (mirrors EngramStore's read timeout).
 const NIP60_READ_TIMEOUT_SECS: u64 = 4;
 
+/// The kind of a NIP-09 event-deletion request (kind:5). ADVISORY — relays MAY ignore it, so a
+/// NIP-60 rollover NEVER trusts it: the `del` chain in the new token event is the authoritative
+/// supersede, and the mint (NUT-07) is the ultimate truth. The delete just helps relays prune.
+const KIND_NIP09_DELETE: u16 = 5;
+
 /// The plaintext content of a NIP-60 kind:7375 token event (before NIP-44 encryption): the
 /// mint the proofs are drawn on + the proofs themselves + the token-event ids this event
 /// supersedes (NIP-09 delete targets, populated only at a confirm-before-delete rollover in
@@ -257,6 +262,71 @@ impl Nip60Store {
             }
         }
         Ok(reconcile_token_set(&decoded))
+    }
+
+    /// Roll over token events: replace the `superseded` events (their proofs consolidated into
+    /// `new_proofs`) with ONE new kind:7375 event, CONFIRM-BEFORE-DELETE.
+    ///
+    /// ⚠️ MONEY-SAFETY ORDERING (design doc point 6): (1) the new event carries `del = superseded`
+    /// — the del-chain, the AUTHORITATIVE supersede honored by [`reconcile_token_set`] even if the
+    /// NIP-09 delete is ignored; (2) it is published and MUST reach >=k relays
+    /// ([`Self::publish_token`] ERRORS otherwise) BEFORE anything is deleted, so a non-durable new
+    /// event leaves the OLD events LIVE (never delete an input until its replacement is durable on
+    /// quorum); (3) ONLY THEN are the old events NIP-09-deleted — best-effort + advisory (relays
+    /// may ignore; the del-chain + the mint are the real supersede/truth), so a delete failure is
+    /// logged, NOT fatal.
+    pub async fn rollover(
+        &self,
+        mint: &str,
+        unit: &str,
+        new_proofs: Vec<Proof>,
+        superseded: Vec<String>,
+    ) -> anyhow::Result<EventId> {
+        let content = TokenEventContent {
+            mint: mint.to_string(),
+            unit: unit.to_string(),
+            proofs: new_proofs,
+            del: superseded.clone(),
+        };
+        // CONFIRM: the new event must be >=k durable before ANYTHING is deleted. `?` returns here
+        // on a sub-quorum publish → nothing is deleted and the old proofs stay live (money-safe).
+        let new_id = self.publish_token(&content).await.context(
+            "rollover: the new token event is NOT durable on >=k relays — deleted NOTHING, the old \
+             proofs stay live",
+        )?;
+        // Only now (the new event is >=k durable) prune the superseded events. Advisory — never
+        // trusted; a failure is logged, not fatal.
+        if !superseded.is_empty() {
+            if let Err(e) = self.delete_events(&superseded).await {
+                tracing::warn!(
+                    error = %e,
+                    "rollover: NIP-09 delete of superseded token events failed (advisory — the \
+                     del-chain still supersedes them and the mint remains the source of truth)"
+                );
+            }
+        }
+        Ok(new_id)
+    }
+
+    /// Publish a NIP-09 (kind:5) deletion for the given token-event ids. ADVISORY: relays MAY
+    /// ignore it and it is NEVER trusted (the del-chain + the mint are authoritative), so this is
+    /// best-effort and does NOT gate on a K-of-N quorum.
+    async fn delete_events(&self, event_ids: &[String]) -> anyhow::Result<()> {
+        let tags: Vec<Tag> = event_ids
+            .iter()
+            .filter_map(|id| EventId::from_hex(id.as_str()).ok().map(Tag::event))
+            .collect();
+        anyhow::ensure!(!tags.is_empty(), "NIP-09 delete: no valid token-event ids to delete");
+        let count = tags.len();
+        let builder = EventBuilder::new(Kind::from(KIND_NIP09_DELETE), "superseded by a NIP-60 rollover")
+            .tags(tags);
+        let output = self
+            .client
+            .send_event_builder(builder)
+            .await
+            .context("publish NIP-09 delete event")?;
+        tracing::debug!(deleted = count, acks = output.success.len(), "NIP-09 delete published (advisory)");
+        Ok(())
     }
 }
 
