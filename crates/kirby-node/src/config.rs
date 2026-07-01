@@ -415,6 +415,16 @@ pub struct RelayConfig {
     /// Seconds after which a peer with no fresh beacon is presumed dead (STALE).
     #[serde(default = "default_presence_stale_after")]
     pub presence_stale_after_secs: u64,
+    /// Seconds between DM-inbox BACKFILL sweeps (#103): how often `run_dm_inbound` re-fetches
+    /// stored kind:1059 gift wraps (`#p` = the DM key) on a FRESH connection to recover any DM
+    /// missed while the persistent subscription's socket was down or silently half-open. With the
+    /// keepalive ping OFF (#54), a long-lived reader cannot detect a half-open socket — it goes
+    /// deaf with no error and never re-REQs — so the live push is only the fast path and this sweep
+    /// is the durable-delivery backstop. NIP-17 backdates a wrap's `created_at` up to 2 days, so
+    /// the sweep uses NO `since` and dedupes by gift-wrap id. `0` disables it (the pre-#103,
+    /// persistent-subscription-only behavior).
+    #[serde(default = "default_dm_backfill_secs")]
+    pub dm_backfill_secs: u64,
 }
 
 /// The sandbox backend selector.
@@ -805,6 +815,12 @@ pub struct SocialConfig {
     /// interim; the fleet's Shamir-shared `SK_social` (reconstruct-on-lease, task #26) swaps in
     /// behind the SAME `with_dm_keys` seam later. `None` disables the DM path (no queue, no 10050).
     pub dm_key_path: Option<PathBuf>,
+    /// Seconds between DM-inbox backfill sweeps (#103), copied from `[relay] dm_backfill_secs`: the
+    /// interval `run_dm_inbound` re-fetches stored gift wraps on a fresh connection to recover DMs
+    /// the persistent subscription missed (a half-open socket delivers nothing with the ping off).
+    /// `0` disables the sweep (persistent-subscription-only). Carried here — not re-parsed — the
+    /// same way `relays` is copied from the presence relay (this is a derived runtime carrier).
+    pub dm_backfill_secs: u64,
 }
 
 /// The default fixed publish cost (sats): small + non-zero so a post costs the agent (no free
@@ -942,6 +958,10 @@ fn default_node_id() -> String {
 }
 fn default_presence_interval() -> u64 {
     15
+}
+
+fn default_dm_backfill_secs() -> u64 {
+    30
 }
 fn default_presence_stale_after() -> u64 {
     45

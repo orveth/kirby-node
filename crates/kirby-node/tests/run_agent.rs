@@ -63,6 +63,7 @@ fn bootstrap_config(test: &str, image_dir: PathBuf, funding_sats: u64) -> KirbyC
             url: test_relay(),
             presence_interval_secs: 5,
             presence_stale_after_secs: 15,
+            dm_backfill_secs: 30,
         },
         // auto resolves to the native backend (Firecracker on Linux, VZ on macOS),
         // so the SAME config drives both the Linux gates here and the Mac G-run-4.

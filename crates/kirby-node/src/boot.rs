@@ -804,8 +804,13 @@ pub async fn boot_and_observe_with_rail(
             }
             let (tx, rx) = tokio::sync::oneshot::channel();
             let relays = social.relays.clone();
+            // #103: the DM backfill sweep interval (0 disables it). Copied out before the move.
+            let dm_backfill_secs = social.dm_backfill_secs;
             tokio::spawn(async move {
-                if let Err(e) = crate::nerve::run_dm_inbound(&dm_identity, &relays, queue, rx).await {
+                if let Err(e) =
+                    crate::nerve::run_dm_inbound(&dm_identity, &relays, queue, dm_backfill_secs, rx)
+                        .await
+                {
                     tracing::error!(error = %e, "DM inbound task ended with error");
                 }
             });

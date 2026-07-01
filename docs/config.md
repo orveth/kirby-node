@@ -41,6 +41,7 @@ each child agent, overriding a few per-tenant paths (noted below).
 | `url` | string | **required** | The fleet relay websocket URL. Must start `ws://` or `wss://`. | both |
 | `presence_interval_secs` | u64 | `15` | Seconds between presence beacon re-publishes. | both |
 | `presence_stale_after_secs` | u64 | `45` | Seconds after which a peer with no fresh beacon is presumed STALE. | both |
+| `dm_backfill_secs` | u64 | `30` | Seconds between DM-inbox backfill sweeps: how often the NIP-17 inbox re-fetches stored gift wraps on a **fresh** connection to recover any DM the persistent subscription missed (a half-open socket delivers nothing with the keepalive ping off). Uses no `since` (NIP-17 backdates `created_at` up to 2 days) and dedupes by gift-wrap id. `0` disables it (persistent-subscription only). Only the `capable` (DM-enabled) agent uses it. | agent |
 
 ## `[funding]`
 
