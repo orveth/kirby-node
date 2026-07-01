@@ -142,6 +142,11 @@ pub enum SpawnReject {
     Unauthorized(String),
     /// The funding seam refused the declarative amount (zero / over the per-spawn ceiling).
     Funding(String),
+    /// The request's `created_at` is older than the node's configured `request_max_age_secs`
+    /// (#78): a stale/parked addressable spawn request the node opts to ignore rather than act
+    /// on (e.g. re-spawning a reaped agent). OFF unless `[fleet.spawn] request_max_age_secs`
+    /// is set; then a request this many seconds stale is dropped instead of launched.
+    Stale { age_secs: u64, max_age_secs: u64 },
 }
 
 impl std::fmt::Display for SpawnReject {
@@ -158,6 +163,10 @@ impl std::fmt::Display for SpawnReject {
             SpawnReject::UnknownImage(i) => write!(f, "image_ref {i:?} not in the pre-staged allowlist"),
             SpawnReject::Unauthorized(why) => write!(f, "unauthorized: {why}"),
             SpawnReject::Funding(why) => write!(f, "funding refused: {why}"),
+            SpawnReject::Stale { age_secs, max_age_secs } => write!(
+                f,
+                "stale spawn request ({age_secs}s old > max {max_age_secs}s); ignoring a parked/retained request"
+            ),
         }
     }
 }
@@ -530,6 +539,11 @@ pub struct SpawnConsumer {
     /// single-node path, and the pure-unit tests that drive the gate logic directly) — same-node
     /// idempotency is always enforced by the durable spawned-set regardless.
     fence: Option<Arc<dyn SpawnFenceView>>,
+    /// OPT-IN stale-request age bound (#78): when `Some`, a spawn request whose `created_at`
+    /// is older than this many seconds is dropped ([`SpawnReject::Stale`]) instead of acted
+    /// on. `None` (the default) = no age filter, byte-identical. Set from
+    /// `[fleet.spawn] request_max_age_secs` via [`Self::with_request_max_age`].
+    request_max_age_secs: Option<u64>,
 }
 
 impl SpawnConsumer {
@@ -544,7 +558,15 @@ impl SpawnConsumer {
         funder: Arc<dyn SpawnFunder>,
         ledger: Arc<dyn SpawnLedger>,
     ) -> Self {
-        SpawnConsumer { max_tenants, image_allowlist, authorizer, funder, ledger, fence: None }
+        SpawnConsumer {
+            max_tenants,
+            image_allowlist,
+            authorizer,
+            funder,
+            ledger,
+            fence: None,
+            request_max_age_secs: None,
+        }
     }
 
     /// Wire the CLAIM-BEFORE-LAUNCH fence (closes G-1). With a fence, before reserving/launching
@@ -554,6 +576,14 @@ impl SpawnConsumer {
     /// [`crate::relay_lease::FleetLeaseObserver`]; tests inject a mock.
     pub fn with_fence(mut self, fence: Arc<dyn SpawnFenceView>) -> Self {
         self.fence = Some(fence);
+        self
+    }
+
+    /// Set the OPT-IN stale-request age bound (#78). `Some(secs)` drops a spawn request whose
+    /// `created_at` is older than `secs` ([`SpawnReject::Stale`]); `None` (the default) keeps
+    /// the byte-identical no-age-filter behavior. Wired from `[fleet.spawn] request_max_age_secs`.
+    pub fn with_request_max_age(mut self, max_age_secs: Option<u64>) -> Self {
+        self.request_max_age_secs = max_age_secs;
         self
     }
 
@@ -574,6 +604,21 @@ impl SpawnConsumer {
                 return SpawnOutcome::Rejected(reject);
             }
         };
+
+        // (3.5) FRESHNESS (#78, OPT-IN): a kind-31003 spawn request is addressable, so the relay
+        // RETAINS it; a parked, long-dead request keeps being re-delivered on reconnect and,
+        // post-reap, would re-spawn a fresh agent. When the node configures a max age, drop a
+        // request older than it (on the signature-verified `created_at`) rather than acting on it.
+        // A `created_at` in the future (clock skew) is never stale (`saturating_add` + `<`).
+        if let Some(max_age_secs) = self.request_max_age_secs {
+            let created = event.created_at.as_secs();
+            if created.saturating_add(max_age_secs) < now_secs {
+                let reject =
+                    SpawnReject::Stale { age_secs: now_secs.saturating_sub(created), max_age_secs };
+                tracing::warn!(reject = %reject, "spawn: DROPPED event");
+                return SpawnOutcome::Rejected(reject);
+            }
+        }
 
         // (4) Image allowlist (default-deny an unknown / un-staged image).
         if !self.image_allowlist.contains(&req.image_ref) {
@@ -1116,6 +1161,70 @@ mod tests {
         let out = consumer.handle_event(&event, 0, &mut sink).await;
         assert!(matches!(out, SpawnOutcome::Launched { .. }), "valid request must launch: {out:?}");
         assert_eq!(launches.load(Ordering::SeqCst), 1, "exactly one launch");
+    }
+
+    /// #78: with an OPT-IN `request_max_age_secs`, a spawn request OLDER than the bound is
+    /// DROPPED (`SpawnReject::Stale`) instead of launched — the parked-ghost filter. The event's
+    /// `created_at` is "now"; we drive `handle_event` with a `now_secs` far enough ahead that the
+    /// request is past the 10s bound. RED-on-revert: delete the freshness block in `handle_event`
+    /// and this LAUNCHES instead of rejecting (the stale ghost re-spawns).
+    #[tokio::test]
+    async fn stale_request_is_dropped_when_max_age_set() {
+        let keys = Keys::generate();
+        let op = keys.public_key().to_hex();
+        let consumer = consumer_with(16, Arc::new(MemLedger::default()), &op, 100)
+            .with_request_max_age(Some(10));
+        let event = build_spawn_request_event(&keys, &req("kirby-a", "img", 5_000)).unwrap();
+        let created = event.created_at.as_secs();
+        let (mut sink, launches) = StubSink::new(0);
+
+        // `now` is 1000s past the event's created_at, well beyond the 10s bound.
+        let out = consumer.handle_event(&event, created + 1_000, &mut sink).await;
+        assert!(
+            matches!(out, SpawnOutcome::Rejected(SpawnReject::Stale { .. })),
+            "a request older than request_max_age_secs must be dropped as Stale: {out:?}"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 0, "a stale request never launches");
+    }
+
+    /// #78: a FRESH request (within the bound) is unaffected by the filter — it proceeds to
+    /// launch. Guards the filter against rejecting legitimate, recent requests.
+    #[tokio::test]
+    async fn fresh_request_passes_the_age_filter() {
+        let keys = Keys::generate();
+        let op = keys.public_key().to_hex();
+        let consumer = consumer_with(16, Arc::new(MemLedger::default()), &op, 100)
+            .with_request_max_age(Some(3_600));
+        let event = build_spawn_request_event(&keys, &req("kirby-a", "img", 5_000)).unwrap();
+        let created = event.created_at.as_secs();
+        let (mut sink, launches) = StubSink::new(0);
+
+        // `now` is only 5s past created_at, well within the 3600s bound.
+        let out = consumer.handle_event(&event, created + 5, &mut sink).await;
+        assert!(matches!(out, SpawnOutcome::Launched { .. }), "a fresh request must launch: {out:?}");
+        assert_eq!(launches.load(Ordering::SeqCst), 1, "a fresh request launches exactly once");
+    }
+
+    /// #78: with NO `request_max_age_secs` configured (the default), the age filter is OFF — even
+    /// a request with a long-past `created_at` launches, byte-identical to pre-#78. The opt-in is
+    /// the only thing that activates the filter (a fresh teammate node is never affected).
+    #[tokio::test]
+    async fn age_filter_off_by_default_launches_old_request() {
+        let keys = Keys::generate();
+        let op = keys.public_key().to_hex();
+        // No `.with_request_max_age` => None => no filter.
+        let consumer = consumer_with(16, Arc::new(MemLedger::default()), &op, 100);
+        let event = build_spawn_request_event(&keys, &req("kirby-a", "img", 5_000)).unwrap();
+        let created = event.created_at.as_secs();
+        let (mut sink, launches) = StubSink::new(0);
+
+        // Even 1,000,000s "later", with no bound set, the request still launches.
+        let out = consumer.handle_event(&event, created + 1_000_000, &mut sink).await;
+        assert!(
+            matches!(out, SpawnOutcome::Launched { .. }),
+            "no age filter => an old request still launches (byte-identical): {out:?}"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 1, "off-by-default launches exactly once");
     }
 
     /// G-SPAWN-IDEMPOTENT: re-delivering the SAME event does NOT launch a second agent (the
