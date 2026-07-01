@@ -8,6 +8,14 @@
 //! (it SKIPs visibly). The fast, ungated teeth for this slice live in
 //! `kirby_node::quorum_signer`'s in-process tests (G-QUORUM-*).
 //!
+//! P1 CANONICAL-NPUB NOTE (#76): the actuator's kind:1 VOICE now signs under the
+//! CANONICAL SOCIAL (DM) key when one is attached (Q stops signing posts). This e2e
+//! builds a FROST actuator WITHOUT a DM key, so it exercises the PRESERVED no-dm_keys
+//! FALLBACK where kind:1 is still Q-signed -- which is exactly what it re-verifies. The
+//! canonical-vs-Q fork itself is proven by the in-crate tooth
+//! `g_frost_actuator_publishes_quorum_signed_event` (both directions, RED-on-revert);
+//! this e2e stays the live-relay Q-signed proof for the fallback path.
+//!
 //! Run manually:
 //!   KIRBY_FROST_RELAY=ws://127.0.0.1:7777 cargo test -p kirby-node --test frost_quorum_publish -- --ignored --nocapture
 
@@ -43,7 +51,9 @@ async fn frost_quorum_signed_note_publishes_and_reverifies_off_relay() {
         Arc::new(local_quorum_from_keyset(&keyset).expect("build quorum signer"));
     let q_bytes = quorum.q_bytes();
 
-    // The FROST actuator publishes the PRE-SIGNED event (no local key).
+    // The FROST actuator publishes the PRE-SIGNED event (no local key). NO `.with_dm_keys(..)`:
+    // this is the P1 no-canonical FALLBACK, where kind:1 is still Q-signed (the path re-verified
+    // below). With a DM key attached, kind:1 would instead sign under the canonical social key.
     let actuator = NostrActuator::connect_frost(quorum.clone(), std::slice::from_ref(&relay), 1)
         .await
         .expect("connect FROST actuator");
