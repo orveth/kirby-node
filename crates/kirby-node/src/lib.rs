@@ -191,6 +191,11 @@ pub mod frost_identity;
 // every holder. Platform-agnostic host-side type (like `frost_identity`), so NOT
 // cfg-gated.
 pub mod quorum_signer;
+// P1 (threshold-ECDH for DMs): the DM/wallet-side ECDH provider. Wraps the co-located
+// FROST keyset and derives NIP-44 conversation keys UNDER Q via the kirby-custody
+// threshold-ECDH primitive (never reconstructing the group secret), so the DM identity
+// is Q -- not a separate plain dm_keys. Host-side type (like `quorum_signer`).
+pub mod quorum_ecdh;
 // S5/S6 (chunk 1): the RemoteHolder -- a `quorum_signer::Holder` whose FROST share lives
 // on ANOTHER machine. It exchanges OPAQUE CoSignEvents with a holder-side server; the
 // secret SigningNonces NEVER crosses the wire (each holder owns its nonce locally) and the
