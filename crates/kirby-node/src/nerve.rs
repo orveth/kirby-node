@@ -1279,6 +1279,14 @@ pub async fn run_dm_inbound(
     let sweep_period = Duration::from_secs(if backfill_secs > 0 { backfill_secs } else { 3600 });
     let mut backfill_tick = tokio::time::interval(sweep_period);
     backfill_tick.tick().await;
+    if backfill.is_some() {
+        tracing::info!(
+            dm_backfill_secs = backfill_secs,
+            "DM inbound: backfill sweep armed (durable-delivery backstop; re-fetches missed DMs on a fresh connection)"
+        );
+    } else {
+        tracing::info!("DM inbound: backfill sweep DISABLED (dm_backfill_secs=0; persistent subscription only)");
+    }
 
     loop {
         tokio::select! {
