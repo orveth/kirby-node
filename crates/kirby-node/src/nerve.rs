@@ -150,6 +150,14 @@ const TAG_A: &str = "a";
 /// The NIP-01 addressable `d` tag. For the 31000 agent-state event the value is the
 /// `agent_id`, so the relay keeps only the latest state per agent (per pubkey/kind).
 const TAG_D: &str = "d";
+/// The CANONICAL SOCIAL binding tag (`["social",<hex>]`) on the Q-signed 31000 beacon
+/// (the discovery spine, #76). Its value is the 32-byte HEX pubkey of the agent's
+/// canonical social key (= the DM key = the kind:0/kind:10050 signer = the NIP-17
+/// recipient). Because the 31000 is signed by the sovereign Q, this binding is
+/// FORGE-PROOF: it lets a reader resolve `agent_id -> the ONE live DM target` under an
+/// authority (Q) the social key cannot self-assert (a canonical-self-signed binding
+/// would be circular/forgeable if the social key leaked). Absent for non-DM agents.
+const TAG_SOCIAL: &str = "social";
 
 /// The node's cryptographic identity: a Nostr (secp256k1/BIP340) keypair. The npub
 /// is the node's stable cluster identity across restarts.
@@ -1170,6 +1178,45 @@ pub async fn publish_inbox_relay_list(
     Ok(event_id)
 }
 
+/// Publish this agent's CANONICAL SOCIAL profile (kind:0 `Metadata`), SIGNED BY THE
+/// CANONICAL SOCIAL (DM) KEY -- the SAME npub that signs kind:1 posts, the kind:10050
+/// inbox list, and NIP-17 DMs (P1, #76). This is how a client puts a human-legible name
+/// on the ONE npub a reader resolves an agent to. `profile_json` is the raw kind:0
+/// content (P1 minimal: `{"name":"<agent_id>"}`). A one-shot connect-publish-disconnect,
+/// mirroring [`publish_inbox_relay_list`]: build a client with the canonical (DM) signer,
+/// add the relays, publish, disconnect. Returns the published event id.
+pub async fn publish_metadata_profile(
+    dm_identity: &NodeIdentity,
+    relays: &[String],
+    profile_json: &str,
+) -> anyhow::Result<EventId> {
+    if relays.is_empty() {
+        anyhow::bail!("cannot publish a kind:0 profile with no relays");
+    }
+    // Sign the kind:0 with the canonical social (DM) key -- the npub a client resolves this
+    // agent to (posts + profile + DM all share it). A profile under any other key would name
+    // the wrong identity.
+    let client = Client::builder().signer(dm_identity.keys().clone()).build();
+    for r in relays {
+        add_relay_no_ping(&client, r).await?;
+    }
+    client.connect().await;
+    let builder = EventBuilder::new(Kind::Metadata, profile_json);
+    let event_id = client
+        .send_event_builder(builder)
+        .await
+        .context("publish the kind:0 canonical social profile")?
+        .val;
+    client.disconnect().await;
+    tracing::info!(
+        dm_npub = %dm_identity.npub(),
+        event_id = %event_id,
+        relays = relays.len(),
+        "published the kind:0 canonical social profile"
+    );
+    Ok(event_id)
+}
+
 /// Per-peer tracking state for the live presence task.
 struct PeerState {
     node_id: String,
@@ -1343,20 +1390,32 @@ impl AgentStateContent {
 fn build_agent_state_parts(
     content: &AgentStateContent,
     node_id: &str,
+    canonical_npub: Option<&str>,
 ) -> anyhow::Result<(String, Vec<Tag>)> {
     let json = serde_json::to_string(content).context("serialize agent-state content")?;
-    let tags: Vec<Tag> = vec![
+    let mut tags: Vec<Tag> = vec![
         Tag::parse([TAG_D, &content.agent_id])?,
         Tag::parse([TAG_T, TAG_T_KIRBY])?,
         Tag::parse([TAG_A, &content.agent_id])?,
         Tag::parse([TAG_NODE, node_id])?,
     ];
+    // CANONICAL SOCIAL binding (#76): when the agent has a canonical social key, carry its
+    // 32-byte HEX pubkey as `["social",<hex>]` so a reader can resolve `agent_id -> the ONE
+    // live DM target` off this Q-signed (forge-proof) beacon. `None` for non-DM agents ->
+    // no tag, byte-identical to before.
+    if let Some(hex) = canonical_npub {
+        tags.push(Tag::parse([TAG_SOCIAL, hex])?);
+    }
     Ok((json, tags))
 }
 
 /// Build a 31000 agent-state [`EventBuilder`] (the node-key signing path).
-fn build_agent_state(content: &AgentStateContent, node_id: &str) -> anyhow::Result<EventBuilder> {
-    let (json, tags) = build_agent_state_parts(content, node_id)?;
+fn build_agent_state(
+    content: &AgentStateContent,
+    node_id: &str,
+    canonical_npub: Option<&str>,
+) -> anyhow::Result<EventBuilder> {
+    let (json, tags) = build_agent_state_parts(content, node_id, canonical_npub)?;
     Ok(EventBuilder::new(Kind::from(KIND_KIRBY_AGENT_STATE), json).tags(tags))
 }
 
@@ -1377,17 +1436,24 @@ fn build_agent_state(content: &AgentStateContent, node_id: &str) -> anyhow::Resu
 /// `["t","kirby"]`, `["a",<agent_id>]`, `["node",<node_id>]`, content `{ agent_id,
 /// treasury_sats, runway_secs, lifecycle, backend, lease_holder_node, lease_term }`.
 /// Returns the published event id on success.
+///
+/// `canonical_npub` (P1, #76): when `Some`, the beacon carries the `["social",<hex>]`
+/// binding tag pointing at the agent's canonical social key (its DM/kind:0/kind:10050
+/// npub as 32-byte HEX). `None` for non-DM agents keeps the beacon byte-identical to
+/// before. Q STILL signs the whole beacon either way (`frost_sign_beacon` unchanged) --
+/// only the tag set changes -- so the binding is forge-proof under the sovereign key.
 pub async fn publish_agent_state(
     signer: &BeaconSigner,
     relay_url: &str,
     node_id: &str,
     content: &AgentStateContent,
+    canonical_npub: Option<&str>,
 ) -> anyhow::Result<String> {
     let client = connect_beacon_client(signer, relay_url).await?;
     let result: anyhow::Result<EventId> = async {
         match signer {
             BeaconSigner::NodeKey(_) => {
-                let builder = build_agent_state(content, node_id)?;
+                let builder = build_agent_state(content, node_id, canonical_npub)?;
                 Ok(client
                     .send_event_builder(builder)
                     .await
@@ -1395,7 +1461,7 @@ pub async fn publish_agent_state(
                     .val)
             }
             BeaconSigner::Frost(quorum) => {
-                let (json, tags) = build_agent_state_parts(content, node_id)?;
+                let (json, tags) = build_agent_state_parts(content, node_id, canonical_npub)?;
                 let created_at = Timestamp::now().as_secs();
                 let ev =
                     frost_sign_beacon(quorum, KIND_KIRBY_AGENT_STATE, &tags, &json, created_at)?;
@@ -1925,7 +1991,8 @@ mod tests {
         // lease_holder_node, lease_term} with null leases on the sovereign path.
         let keys = Keys::generate();
         let content = AgentStateContent::sovereign("agent-0", 1_234, Some(42), "running", "firecracker");
-        let event = build_agent_state(&content, "node-1")
+        // None canonical_npub: the historical byte-identical shape (no social binding tag).
+        let event = build_agent_state(&content, "node-1", None)
             .unwrap()
             .sign_with_keys(&keys)
             .unwrap();
@@ -1945,6 +2012,12 @@ mod tests {
         assert!(has_tag("t", "kirby"));
         assert!(has_tag("a", "agent-0"));
         assert!(has_tag("node", "node-1"));
+        // With canonical_npub None (a non-DM agent) there is NO social binding tag: byte-identical
+        // to before (the P1 non-DM invariant).
+        assert!(
+            !event.tags.iter().any(|t| t.as_slice().first().map(String::as_str) == Some("social")),
+            "a None canonical_npub must NOT add a social binding tag"
+        );
         let content: AgentStateContent = serde_json::from_str(&event.content).unwrap();
         assert_eq!(
             content,
@@ -1965,7 +2038,7 @@ mod tests {
 
         // A first-tick state with no established burn rate: runway_secs is null.
         let no_runway_content = AgentStateContent::sovereign("agent-0", 3_000, None, "running", "vz");
-        let no_runway = build_agent_state(&no_runway_content, "node-1")
+        let no_runway = build_agent_state(&no_runway_content, "node-1", None)
             .unwrap()
             .sign_with_keys(&keys)
             .unwrap();
@@ -1975,7 +2048,7 @@ mod tests {
 
         // The final dead state at budget-death: treasury 0, lifecycle "dead".
         let dead_content = AgentStateContent::sovereign("agent-0", 0, None, "dead", "firecracker");
-        let dead = build_agent_state(&dead_content, "node-1")
+        let dead = build_agent_state(&dead_content, "node-1", None)
             .unwrap()
             .sign_with_keys(&keys)
             .unwrap();
@@ -2114,7 +2187,7 @@ mod tests {
         let (ks, qs) = frost_signer();
         let content =
             AgentStateContent::sovereign("agent-0", 1_234, Some(42), "running", "firecracker");
-        let (json, tags) = build_agent_state_parts(&content, "node-1").expect("parts");
+        let (json, tags) = build_agent_state_parts(&content, "node-1", None).expect("parts");
         let event =
             frost_sign_beacon(&qs, KIND_KIRBY_AGENT_STATE, &tags, &json, 1_750_000_000).expect("sign");
         assert_beacon_under_q(&ks, &qs, &event, KIND_KIRBY_AGENT_STATE);
@@ -2124,6 +2197,86 @@ mod tests {
         // The addressable `d` tag (= agent_id) survived into the signed event.
         assert!(event.tags.iter().any(|t| t.as_slice() == ["d", "agent-0"]));
         println!("G-STATE-SIGNED-BY-Q PASS: 31000 agent-state verifies under Q, pubkey==Q, d-tag signed");
+    }
+
+    /// G-STATE-SOCIAL-BINDING-UNDER-Q (P1, #76): a 31000 beacon built with `canonical_npub=Some`
+    /// carries the `["social",<hex>]` binding tag AND STILL verifies under the sovereign Q. This is
+    /// the plane separation: the SOCIAL identity is bound INTO the beacon, but the beacon itself is
+    /// signed by CONTROL (Q) -- so the binding is forge-proof (a reader trusts it because Q, the key
+    /// no single holder controls, vouched for it). RED-on-revert: drop the `["social",..]` push in
+    /// `build_agent_state_parts` and the tag assertion fails; the Q-verify guards the plane split.
+    #[test]
+    fn g_state_social_binding_under_q() {
+        let (ks, qs) = frost_signer();
+        // The canonical social key is a SEPARATE plain key; its HEX pubkey is the binding value.
+        let canonical = Keys::generate();
+        let canonical_hex = canonical.public_key().to_hex();
+        let content =
+            AgentStateContent::sovereign("agent-0", 4_242, Some(7), "running", "firecracker");
+        let (json, tags) =
+            build_agent_state_parts(&content, "node-1", Some(&canonical_hex)).expect("parts");
+        let event =
+            frost_sign_beacon(&qs, KIND_KIRBY_AGENT_STATE, &tags, &json, 1_750_000_000).expect("sign");
+
+        // (1) The beacon STILL verifies under Q (CONTROL signs it), pubkey == Q, id over content+tags.
+        assert_beacon_under_q(&ks, &qs, &event, KIND_KIRBY_AGENT_STATE);
+        // (2) The `["social",<canonical-hex>]` binding rode INTO the SIGNED event (part of the id).
+        assert!(
+            event.tags.iter().any(|t| t.as_slice() == ["social", canonical_hex.as_str()]),
+            "the 31000 must carry the ['social', canonical-hex] binding tag"
+        );
+        // (3) The binding value is the SOCIAL key, NOT Q (the two planes are distinct).
+        assert_ne!(
+            canonical_hex,
+            hex::encode(qs.q_bytes()),
+            "the canonical social key MUST differ from the control key Q"
+        );
+        // (4) The d/t/a/node tags are still there (the binding is ADDITIVE).
+        assert!(event.tags.iter().any(|t| t.as_slice() == ["d", "agent-0"]));
+        println!(
+            "G-STATE-SOCIAL-BINDING-UNDER-Q PASS: 31000 carries ['social',<hex>] AND verifies under \
+             Q (plane separation: SOCIAL bound, CONTROL signs)"
+        );
+    }
+
+    /// G-METADATA-PROFILE-SIGNED-BY-CANONICAL (P1, #76): the kind:0 profile is signed by the
+    /// CANONICAL SOCIAL (DM) key -- the SAME npub that signs kind:1 posts, the kind:10050 inbox
+    /// list, and NIP-17 DMs -- so a client that resolves the agent to its social npub sees the
+    /// profile under that ONE identity. This drives the EXACT construction
+    /// `publish_metadata_profile` uses (a `Client` built with the DM signer + an
+    /// `EventBuilder::new(Kind::Metadata, json)`); only the relay transport (send_event_builder over
+    /// a live relay) is not exercised. RED-on-revert: sign with a different key (e.g. a fresh key or
+    /// Q) and the `pubkey == canonical` assertion fails.
+    #[tokio::test]
+    async fn g_metadata_profile_signed_by_canonical() {
+        // The canonical social (DM) identity: a plain keyfile, loaded exactly as boot does.
+        let dir = tempdir();
+        let dm_identity = NodeIdentity::load_or_create(&dir.join("social.dm.key")).expect("dm key");
+        let canonical_hex = dm_identity.public_key().to_hex();
+
+        // The EXACT event `publish_metadata_profile` builds + signs (the relay send is the only part
+        // that needs a live relay; the signing is the load-bearing plane assertion).
+        let profile_json = serde_json::json!({ "name": "agent-0" }).to_string();
+        let event = EventBuilder::new(Kind::Metadata, &profile_json)
+            .sign_with_keys(dm_identity.keys())
+            .expect("sign the kind:0 profile under the canonical social key");
+
+        assert_eq!(event.kind, Kind::Metadata, "the profile is a kind:0 Metadata event");
+        assert_eq!(
+            event.pubkey.to_hex(),
+            canonical_hex,
+            "the kind:0 profile is signed by the CANONICAL social (DM) key"
+        );
+        assert_eq!(event.content, profile_json, "the profile content is the minimal name JSON");
+        assert!(event.verify().is_ok(), "the profile self-verifies (id + sig under the canonical key)");
+        // The content is the minimal {"name": <agent_id>} P1 shape.
+        let decoded: serde_json::Value = serde_json::from_str(&event.content).expect("profile json");
+        assert_eq!(decoded["name"], "agent-0", "P1 minimal profile carries the agent_id as name");
+        cleanup(&dir);
+        println!(
+            "G-METADATA-PROFILE-SIGNED-BY-CANONICAL PASS: kind:0 profile signed by the canonical \
+             social key (the ONE npub posts+DM+inbox share)"
+        );
     }
 
     /// G-BEACON-MEMBRANE (nerve half): the guardian membrane gates beacon signing -- a
@@ -2143,7 +2296,7 @@ mod tests {
         //     signed event content.
         let content =
             AgentStateContent::sovereign("agent-0", 9_999, None, "dying", "vz");
-        let (json, tags) = build_agent_state_parts(&content, "node-1").expect("parts");
+        let (json, tags) = build_agent_state_parts(&content, "node-1", None).expect("parts");
         let event =
             frost_sign_beacon(&qs, KIND_KIRBY_AGENT_STATE, &tags, &json, 1_750_000_000).expect("sign");
         assert_eq!(

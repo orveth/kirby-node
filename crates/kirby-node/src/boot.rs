@@ -802,6 +802,22 @@ pub async fn boot_and_observe_with_rail(
                     tracing::warn!(error = %e, "kind:10050 publish failed (continuing; the agent still receives DMs)")
                 }
             }
+            // CANONICAL SOCIAL profile (P1, #76): publish a kind:0 under the SAME canonical (DM)
+            // key so a reader who resolves this agent to its social npub sees a human-legible name.
+            // Best-effort (a relay hiccup must not fail boot), alongside the 10050. P1 minimal
+            // content: `{"name":"<agent_id>"}` (the agent_id is the run task minus the launcher's
+            // `kirby-run-` prefix; fall back to the full task if the prefix is ever absent).
+            let profile_name = config.task.strip_prefix("kirby-run-").unwrap_or(&config.task);
+            let profile_json =
+                serde_json::json!({ "name": profile_name }).to_string();
+            match crate::nerve::publish_metadata_profile(&dm_identity, &social.relays, &profile_json)
+                .await
+            {
+                Ok(id) => tracing::info!(event_id = %id, "published the kind:0 canonical social profile"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "kind:0 profile publish failed (continuing; discovery still works via the 31000 binding)")
+                }
+            }
             let (tx, rx) = tokio::sync::oneshot::channel();
             let relays = social.relays.clone();
             tokio::spawn(async move {

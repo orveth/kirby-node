@@ -918,6 +918,21 @@ impl NostrActuator {
     ///     no local `Keys`).
     async fn publish_note(&self, content: &str) -> anyhow::Result<String> {
         use anyhow::Context as _;
+        // CANONICAL SOCIAL path (P1, #76): when a dedicated plain DM key is attached, the kind:1
+        // VOICE is PRE-SIGNED under that canonical social key (`sign_canonical_note`) and published
+        // as an OWNED event via `send_event` (which works whether the base client is single-key OR
+        // FROST -- the FROST client has no signer). `None` means no dm_keys -> fall through to the
+        // BYTE-IDENTICAL base-mode publish below.
+        if let Some(event) = self.sign_canonical_note(content)? {
+            let output = self
+                .client
+                .send_event(&event)
+                .await
+                .context("publish the canonical-signed kind:1 note to the relay set")?;
+            return Ok(output.val.to_hex());
+        }
+        // NO dm_keys (non-DM agents): BYTE-IDENTICAL to before -- kind:1 signs via the base mode
+        // (single local key OR the FROST quorum Q). Preserved verbatim.
         match &self.mode {
             SigningMode::SingleKey(_) => {
                 let builder = EventBuilder::new(Kind::from(kirby_proto::NOSTR_KIND_TEXT_NOTE), content);
@@ -941,6 +956,31 @@ impl NostrActuator {
                     .context("publish pre-signed FROST kind:1 note to the relay set")?;
                 Ok(output.val.to_hex())
             }
+        }
+    }
+
+    /// The CANONICAL-SOCIAL half of `publish_note` (P1, #76), factored out so an in-crate test can
+    /// drive the REAL signing decision (not a copy) WITHOUT a live relay -- mirroring how
+    /// `frost_sign_event` factors the Frost branch and `build_dm_reply_event` factors the DM wrap.
+    ///
+    /// When a dedicated plain DM key is attached, the agent's kind:1 VOICE is signed under THAT
+    /// canonical social key (the SAME npub that signs the kind:0 profile, the kind:10050 inbox
+    /// list, and NIP-17 DMs) -- NOT under Q. This is the intended unification: ONE canonical social
+    /// npub answers "who do I DM / whose posts are these", and Q STOPS signing kind:1 (Q keeps only
+    /// presence/lifecycle/lease). Money is never reachable here: the canonical key is a plain voice
+    /// key, never Q, never the wallet key. Returns `Ok(Some(event))` (the pre-signed, OWNED kind:1)
+    /// on the canonical path, or `Ok(None)` when no DM key is attached (the caller then falls
+    /// through to the byte-identical base-mode publish).
+    fn sign_canonical_note(&self, content: &str) -> anyhow::Result<Option<Event>> {
+        use anyhow::Context as _;
+        match self.dm_keys.as_ref() {
+            Some(dm_keys) => {
+                let event = EventBuilder::new(Kind::from(kirby_proto::NOSTR_KIND_TEXT_NOTE), content)
+                    .sign_with_keys(dm_keys)
+                    .context("sign the canonical kind:1 note under the social (DM) key")?;
+                Ok(Some(event))
+            }
+            None => Ok(None),
         }
     }
 
@@ -2582,27 +2622,69 @@ mod frost_actuator_tests {
     use bitcoin::KnownHrp;
     use kirby_custody::{generate_dealer_keyset, taproot_address};
 
-    /// G-FROST-ACTUATOR-PUBLISHES-QUORUM-SIGNED-EVENT: drive the REAL FROST publish path of the
-    /// actuator (`frost_sign_event`, the FROST-specific body of `publish_note`) WITHOUT a live
-    /// relay, and assert the event it would publish is signed under the group taproot key Q and
-    /// verifies (NIP-01 id + BIP-340 schnorr under Q, NOT under the untweaked internal key P).
+    /// G-FROST-ACTUATOR-PUBLISHES-QUORUM-SIGNED-EVENT (P1 canonical-npub rewrite, #76): the kind:1
+    /// VOICE signing now FORKS on whether a canonical social (DM) key is attached. This tooth
+    /// drives the actuator's REAL kind:1 signing decision (`sign_canonical_note` + `frost_sign_event`,
+    /// the exact methods `publish_note` calls before `client.send_event`) WITHOUT a live relay, in
+    /// BOTH directions:
+    ///   * WITH dm_keys attached -> the canonical path signs kind:1 under the DM key (event.pubkey
+    ///     == the canonical DM pubkey, NOT Q). This is the P1 unification (Q STOPS signing posts).
+    ///   * WITHOUT dm_keys -> the fallback is PRESERVED byte-for-byte: kind:1 signs under the FROST
+    ///     quorum Q (verifies under the tweaked Q, rejected under the untweaked internal key P).
     ///
-    /// This closes the gap that the gated e2e (`frost_quorum_publish.rs`) only tested a COPY of the
-    /// construction: here we build an in-process FROST-mode `NostrActuator` over a dealer keyset and
-    /// call the actuator's OWN `frost_sign_event` (the exact method `publish_note`'s Frost branch
-    /// calls before `client.send_event`). Only the generic relay transport is not exercised (it
-    /// cannot run without a relay); every FROST-specific, load-bearing step is the production code.
+    /// RED-on-revert BOTH ways: revert the canonical branch and the WITH case signs under Q (the
+    /// `pubkey == dm, != Q` asserts fail); break the fallback and the WITHOUT case fails.
     #[tokio::test]
     async fn g_frost_actuator_publishes_quorum_signed_event() {
         // A real 2-of-3 keyset + co-located quorum signer (in-process holders).
         let keyset = generate_dealer_keyset(2, 3).expect("2-of-3 dealer keygen");
         let quorum = Arc::new(local_quorum_from_keyset(&keyset).expect("build quorum signer"));
         let q_bytes = quorum.q_bytes();
+        let q_hex = hex::encode(q_bytes);
 
-        // Build the REAL FROST-mode actuator. `connect_frost` validates Q -> nostr PublicKey at
-        // construction (FIX 1) and queues the relay connection; nostr-sdk's `connect` is
-        // non-blocking, so a dummy relay URL is fine (we never send over it here).
-        let actuator = NostrActuator::connect_frost(
+        let content = "Kirby speaks with a threshold voice: a 2-of-3 FROST quorum co-signed this.";
+
+        // ---- Direction 1: WITH a canonical social (DM) key -> kind:1 signs under IT, NOT Q ----
+        let dm_keys = Keys::generate(); // the canonical social identity (plain, daemon-held)
+        assert_ne!(dm_keys.public_key().to_hex(), q_hex, "the canonical key must differ from Q");
+        let actuator_dm = NostrActuator::connect_frost(
+            quorum.clone(),
+            std::slice::from_ref(&"ws://127.0.0.1:65535".to_string()),
+            1,
+        )
+        .await
+        .expect("connect FROST actuator")
+        .with_dm_keys(dm_keys.clone());
+
+        // The FROST publish identity (public_key()) is STILL Q -- only kind:1 relocates onto the
+        // canonical key; presence/lifecycle/lease stay on Q.
+        assert_eq!(
+            actuator_dm.public_key().to_hex(),
+            q_hex,
+            "the actuator's public (beacon) identity is still Q"
+        );
+
+        // Drive the REAL canonical kind:1 signing path (the exact method publish_note calls).
+        let canonical_event = actuator_dm
+            .sign_canonical_note(content)
+            .expect("canonical kind:1 signing succeeds")
+            .expect("with a DM key attached, kind:1 takes the canonical (Some) path");
+        assert_eq!(
+            canonical_event.pubkey.to_hex(),
+            dm_keys.public_key().to_hex(),
+            "the canonical kind:1 note is signed by the SOCIAL (DM) key -- the P1 unification"
+        );
+        assert_ne!(
+            canonical_event.pubkey.to_hex(),
+            q_hex,
+            "the canonical kind:1 note is NOT signed by the threshold key Q (Q stops signing posts)"
+        );
+        assert_eq!(canonical_event.kind, Kind::from(kirby_proto::NOSTR_KIND_TEXT_NOTE), "kind:1");
+        assert_eq!(canonical_event.content, content, "the published content is the input");
+        assert!(canonical_event.verify().is_ok(), "the canonical event self-verifies (id + sig)");
+
+        // ---- Direction 2: WITHOUT a DM key -> the Q fallback is PRESERVED byte-for-byte ----
+        let actuator_q = NostrActuator::connect_frost(
             quorum.clone(),
             std::slice::from_ref(&"ws://127.0.0.1:65535".to_string()),
             1,
@@ -2610,28 +2692,32 @@ mod frost_actuator_tests {
         .await
         .expect("connect FROST actuator");
 
+        // No DM key -> the canonical path returns None (the caller falls through to base-mode).
+        assert!(
+            actuator_q.sign_canonical_note(content).expect("no-op is Ok").is_none(),
+            "without a DM key there is NO canonical path -> the base-mode (Q) publish runs"
+        );
         // public_key() must be the validated Q (FIX 1 fail-closed accessor), never a fallback.
         assert_eq!(
-            actuator.public_key().to_hex(),
-            hex::encode(q_bytes),
+            actuator_q.public_key().to_hex(),
+            q_hex,
             "actuator.public_key() must be the group taproot key Q (fail-closed, no fallback)"
         );
 
-        // Drive the REAL FROST signing path the actuator uses inside publish_note.
-        let content = "Kirby speaks with a threshold voice: a 2-of-3 FROST quorum co-signed this.";
-        let event = actuator
+        // Drive the REAL FROST signing path the actuator uses inside publish_note's fallback.
+        let event = actuator_q
             .frost_sign_event(&quorum, content)
             .expect("the actuator's real FROST publish path signs + locally verifies the event");
 
         // The event is authored by Q, kind:1, content == input, no tags.
-        assert_eq!(event.pubkey.to_hex(), hex::encode(q_bytes), "event author is Q");
+        assert_eq!(event.pubkey.to_hex(), q_hex, "event author is Q");
         assert_eq!(event.kind, Kind::from(kirby_proto::NOSTR_KIND_TEXT_NOTE), "kind:1");
         assert_eq!(event.content, content, "the published content is the (clean) input");
         assert!(event.tags.is_empty(), "no tags (NIP-01 id is over tags=[])");
 
         // The NIP-01 id is over Q + created_at + kind + content (re-derive independently).
         let expect_id = kirby_custody::cosign_net::nip01_event_id(
-            &hex::encode(q_bytes),
+            &q_hex,
             event.created_at.as_secs(),
             1,
             content,
@@ -2658,8 +2744,9 @@ mod frost_actuator_tests {
         // nostr-sdk's own verify already passed inside frost_sign_event (fail-closed) -- this is the
         // independent custody-chain re-verification on top.
         println!(
-            "G-FROST-ACTUATOR-PUBLISHES-QUORUM-SIGNED-EVENT PASS: the actuator's real FROST publish \
-             path produced a kind:1 event signed under Q (verifies under Q, rejected under P)"
+            "G-FROST-ACTUATOR-PUBLISHES-QUORUM-SIGNED-EVENT PASS: WITH a DM key the kind:1 voice \
+             signs under the canonical social key (not Q); WITHOUT one the Q fallback is preserved \
+             (verifies under Q, rejected under P)"
         );
     }
 }
