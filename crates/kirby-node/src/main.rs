@@ -828,7 +828,10 @@ async fn run_spawn_control_plane(
     // cross-node double-spawn). Shared (Arc) between the consumer's fence and the observe loop.
     let observer = Arc::new(FleetLeaseObserver::new(node_id));
     let consumer = SpawnConsumer::new(max_tenants, images, authorizer, funder, ledger)
-        .with_fence(observer.clone());
+        .with_fence(observer.clone())
+        // #78: OPT-IN stale-request filter — drop a spawn request older than the configured
+        // age (off when unset, byte-identical). Lets a long-lived node ignore parked ghosts.
+        .with_request_max_age(spawn_cfg.request_max_age_secs);
 
     // Subscribe to spawn requests AND lease events on the relay (read-only: an ephemeral key
     // signs nothing). The lease subscription feeds the occupancy fence; the relay RETAINS the

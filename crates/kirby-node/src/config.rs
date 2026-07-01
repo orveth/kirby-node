@@ -216,6 +216,19 @@ pub struct SpawnConfig {
     /// to disable the client-side backstop and rely solely on relay NIP-40 expiry.
     #[serde(default = "default_spawn_failover_max_lease_age_secs")]
     pub failover_max_lease_age_secs: u64,
+    /// OPT-IN stale-spawn-request filter (#78): the MAX AGE, in seconds, of a spawn-request
+    /// event this node will act on. A kind-31003 spawn request is addressable, so the relay
+    /// RETAINS it — a parked, long-dead request keeps being re-delivered on reconnect and,
+    /// once its agent is reaped (the ledger entry is cleared), re-spawns a FRESH agent (new
+    /// npub) that burns funds. When set, a request whose `created_at` is older than this many
+    /// seconds is DROPPED (logged `SpawnReject::Stale`) rather than acted on. `None` (the
+    /// default) keeps the historical behavior — NO age filter, byte-identical — so a fresh
+    /// node is unaffected; a long-lived node sets it (e.g. 3600) to ignore its accumulated
+    /// ghosts without the sentinel-mode crutch. This does NOT settle whether a spawn request
+    /// is a transient command or a standing declaration (that lifecycle question is tracked
+    /// separately); it is a pragmatic freshness filter the operator opts into.
+    #[serde(default)]
+    pub request_max_age_secs: Option<u64>,
 }
 
 /// Default anti-spam rate: 10 spawns per operator per window.
@@ -261,6 +274,7 @@ impl Default for SpawnConfig {
             failover_scan_secs: default_spawn_failover_scan_secs(),
             takeover_grace_secs: default_spawn_takeover_grace_secs(),
             failover_max_lease_age_secs: default_spawn_failover_max_lease_age_secs(),
+            request_max_age_secs: None,
         }
     }
 }
