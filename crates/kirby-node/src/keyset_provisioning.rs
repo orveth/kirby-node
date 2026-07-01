@@ -400,8 +400,8 @@ pub fn load_quorum_signer_at(keystore_dir: &Path) -> anyhow::Result<QuorumSigner
 
 /// Load a [`QuorumEcdh`](crate::quorum_ecdh::QuorumEcdh) -- the DM/wallet-side threshold-ECDH
 /// provider -- from the SAME persisted keystore as [`load_quorum_signer_at`] (the secret shares
-/// + the group pubkeys). It derives NIP-44 conversation keys under Q without reconstructing the
-/// group secret. Co-located (P1); cross-machine share distribution (P2) swaps the in-process
+/// and the group pubkeys). It derives NIP-44 conversation keys under Q without reconstructing
+/// the group secret. Co-located (P1); cross-machine share distribution (P2) swaps the in-process
 /// shares for a transport.
 pub fn load_quorum_ecdh_at(keystore_dir: &Path) -> anyhow::Result<crate::quorum_ecdh::QuorumEcdh> {
     let (key_packages, pubkeys) = load_keyset_material_at(keystore_dir)?;

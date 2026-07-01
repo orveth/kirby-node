@@ -196,6 +196,10 @@ pub mod quorum_signer;
 // threshold-ECDH primitive (never reconstructing the group secret), so the DM identity
 // is Q -- not a separate plain dm_keys. Host-side type (like `quorum_signer`).
 pub mod quorum_ecdh;
+// P1: `QSigner` -- a `nostr_sdk::NostrSigner` backed by Q (quorum_ecdh + quorum_signer).
+// Pass it where a plain `&Keys` DM identity went; nostr's own audited NIP-59 does the
+// seal/wrap/unwrap, calling back for Q-ECDH (nip44) + membrane-gated Q-sign (the seal).
+pub mod qsigner;
 // S5/S6 (chunk 1): the RemoteHolder -- a `quorum_signer::Holder` whose FROST share lives
 // on ANOTHER machine. It exchanges OPAQUE CoSignEvents with a holder-side server; the
 // secret SigningNonces NEVER crosses the wire (each holder owns its nonce locally) and the
