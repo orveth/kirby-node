@@ -33,3 +33,9 @@ futures = { version = "0.3", default-features = false, features = ["executor"] }
 sha2 = "0.10"
 bech32 = "0.11"
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+# Phase-0 threshold-ECDH spike (ecdh.rs): k256 is frost-secp256k1-tr's OWN curve
+# library (the same 0.13.x already in the tree via frost), used for the Lagrange
+# point-combine and the BIP-341 tweak fold. hkdf drives the NIP-44 v2 conversation
+# key (HKDF-Extract over SHA-256). Both are already resolved transitively.
+k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+hkdf = "0.12"

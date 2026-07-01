@@ -21,11 +21,16 @@ use frost::Identifier;
 
 pub mod coordinator;
 pub mod cosign_net;
+pub mod ecdh;
 pub mod guardian;
 pub mod persist;
 pub mod reshare;
 pub mod seam;
 pub use coordinator::{commit_for, key_packages, Coordinator, SessionState, SignError};
+pub use ecdh::{
+    holder_ecdh_contribution, nip44_conversation_key, threshold_ecdh_tweaked_q,
+    threshold_ecdh_untweaked, EcdhError, WirePoint,
+};
 pub use reshare::{reshare_same_membership, RefreshedKeyset};
 pub use seam::{coordinate_2of3_over_seam, CoSignEvent, GuardianId, InMemoryRelay, RelayAdapter};
 
