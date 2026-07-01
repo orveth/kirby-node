@@ -154,6 +154,13 @@ pub async fn open_persistent_wallet(
         .await
         .map_err(|e| anyhow::anyhow!("open persistent wallet store {}: {e}", db_path.display()))?;
 
+    // Mirror the NUT-13 keyset counter through the NIP-60 decorator so it can travel in
+    // the 17375 wallet-config for a cross-machine reconstruct. This is a pure pass-through
+    // otherwise — the wallet's behaviour against the inner store is byte-for-byte unchanged.
+    // The publish layer that reads `keyset_counters()` threads its handle out in the
+    // boot-push cut (which also primes the counter from the relay on reconstruct).
+    let localstore = crate::nip60_counter::Nip60CounterDb::new(Arc::new(localstore));
+
     let wallet = Wallet::new(mint_url, CurrencyUnit::Sat, Arc::new(localstore), seed, None)
         .map_err(|e| anyhow::anyhow!("build persistent cdk wallet against {mint_url}: {e}"))?;
     Ok(Arc::new(wallet))
