@@ -193,10 +193,14 @@ async fn persistent_wallet_reopen_after_drop_is_spendable() {
     let dir = TempDir::new("kirby-routstr-persist");
     let db_path = dir.path().join("brain-wallet.sqlite");
 
-    // First open creates the store + persists a fresh 0600 seed.
-    let w = open_persistent_wallet(&mint_url, &db_path, WalletKey::sibling_seed_of(&db_path))
-        .await
-        .expect("open persistent wallet");
+    // First open: resolve_seed load-or-creates the 0600 sibling seed, then open the store.
+    let seed = WalletKey::sibling_seed_of(&db_path)
+        .resolve_seed()
+        .expect("create the fresh 0600 seed");
+    let (w, _counter_db) =
+        open_persistent_wallet(&mint_url, &db_path, seed, std::collections::HashMap::new())
+            .await
+            .expect("open persistent wallet");
     fund_wallet(w.clone(), 300).await.expect("fund");
     assert_eq!(balance(&w).await, 300);
     // R2-4 smoke: recovery runs clean on a healthy funded wallet.
@@ -216,10 +220,14 @@ async fn persistent_wallet_reopen_after_drop_is_spendable() {
         assert_eq!(mode, 0o600, "the seed file is 0600");
     }
 
-    // Reopen with the SAME db_path + the persisted seed: balance survives and is spendable.
-    let w2 = open_persistent_wallet(&mint_url, &db_path, WalletKey::sibling_seed_of(&db_path))
-        .await
-        .expect("reopen persistent wallet");
+    // Reopen with the SAME db_path: resolve_seed LOADS the persisted seed → balance survives.
+    let seed2 = WalletKey::sibling_seed_of(&db_path)
+        .resolve_seed()
+        .expect("load the persisted seed");
+    let (w2, _counter_db) =
+        open_persistent_wallet(&mint_url, &db_path, seed2, std::collections::HashMap::new())
+            .await
+            .expect("reopen persistent wallet");
     assert_eq!(balance(&w2).await, 300, "balance survived the reopen (store + seed)");
     let handle = CdkEcash::new(w2.clone())
         .mint_send_token(64)

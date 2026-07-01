@@ -67,6 +67,9 @@ async fn g6_snapshot_and_resume_on_node2() {
         // G6 is vsock-only (the egress lockdown is G4); keeps the move lean.
         agent: None,
         social: None,
+        // No brain/wallet → NIP-60 inactive.
+        nip60: Default::default(),
+        fleet_relay: String::new(),
         lockdown_egress: false,
         snapshot_capable: true,
         restore_checkpoint: None,

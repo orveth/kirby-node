@@ -39,13 +39,16 @@ async fn live_one_real_completion_drains_sats() {
     let model = std::env::var("KIRBY_ROUTSTR_MODEL")
         .unwrap_or_else(|_| "anthropic/claude-sonnet-4.6".to_string());
 
-    let wallet = open_persistent_wallet(
-        &mint,
-        std::path::Path::new(&wallet_db),
-        WalletKey::sibling_seed_of(std::path::Path::new(&wallet_db)),
-    )
-    .await
-    .expect("open the funded live wallet");
+    let wallet_path = std::path::Path::new(&wallet_db);
+    // Resolve the funded store's sibling seed (the same seam boot uses), then open — an empty
+    // counter floor (no NIP-60 relay in this live smoke) keeps the store byte-identical.
+    let seed = WalletKey::sibling_seed_of(wallet_path)
+        .resolve_seed()
+        .expect("resolve the funded wallet's sibling seed");
+    let (wallet, _counter_db) =
+        open_persistent_wallet(&mint, wallet_path, seed, std::collections::HashMap::new())
+            .await
+            .expect("open the funded live wallet");
     let before = wallet.total_balance().await.map(u64::from).unwrap_or(0);
     assert!(before > 0, "the live wallet must be funded; balance {before}");
 

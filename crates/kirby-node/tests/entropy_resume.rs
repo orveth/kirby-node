@@ -76,6 +76,8 @@ fn boot_config(image: ImagePaths, node_id: &str, task: &str, cid: u32, port: u32
         // G7 is vsock-only (the egress lockdown is G4); keeps the move lean.
         agent: None,
         social: None,
+        nip60: Default::default(),
+        fleet_relay: String::new(),
         lockdown_egress: false,
         snapshot_capable: true,
         restore_checkpoint: None,

@@ -51,6 +51,8 @@ async fn g1_genome_boots_and_completes_session_context_round_trip() {
         // G1 is vsock-only (no TAP / no egress lockdown; that is C-5 / G4).
         agent: None,
         social: None,
+        nip60: Default::default(),
+        fleet_relay: String::new(),
         lockdown_egress: false,
         // G1 does not snapshot (no CPU template); snapshot is C-7 / G6.
         snapshot_capable: false,

@@ -123,6 +123,8 @@ async fn chunk_e_vz_boots_gateways_meters_capable_run_and_halts_when_broke() {
         memory: Some(memory),
         agent: Some(agent),
         social: None,
+        nip60: Default::default(),
+        fleet_relay: String::new(),
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

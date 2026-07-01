@@ -114,6 +114,9 @@ fn base_config(test: &str, guest_cid: u32, gateway_port: u32) -> Option<BootConf
         memory: None,
         agent: None,
         social: None,
+        // No brain/wallet → NIP-60 inactive.
+        nip60: Default::default(),
+        fleet_relay: String::new(),
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

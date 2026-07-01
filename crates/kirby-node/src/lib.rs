@@ -255,11 +255,15 @@ pub mod mint_rig;
 pub mod nerve;
 #[cfg(target_os = "linux")]
 pub mod network;
+pub mod nip60;
+pub mod nip60_counter;
+pub mod nip60_reconcile;
 pub mod prereqs;
 pub mod rail;
 pub mod relay_lease;
 pub mod run_agent;
 pub mod sandbox;
+pub mod nip60_key;
 pub mod spawn;
 #[cfg(target_os = "linux")]
 pub mod snapshot_run;

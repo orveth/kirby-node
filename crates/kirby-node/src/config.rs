@@ -67,6 +67,12 @@ pub struct KirbyConfig {
     /// Used only when `workload = "capable"`; defaults so a bare `[memory]` (or none) runs.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// The `[nip60]` knobs for the agent's PORTABLE Cashu wallet (proofs as NIP-44-encrypted
+    /// events on relays, for cross-machine money-continuity). DEDICATED + independent of
+    /// `[memory]`: money durability must not be coupled to the mind-state relay set. Defaults so
+    /// an absent `[nip60]` falls back to the single `[relay].url` (dev-only, not money-durable).
+    #[serde(default)]
+    pub nip60: Nip60Config,
     /// The `[agent]` knobs for the CAPABLE workload (the agentic kernel). Defaults so a
     /// bare `[agent]` (or none) runs. The agent's inference is configured by `[brain]`
     /// and its store by `[memory]` (it REUSES both verbatim); this block carries only the
@@ -729,6 +735,17 @@ pub struct BrainConfig {
     /// accepted mint, §11). Required iff `backend = "routstr"`.
     #[serde(default)]
     pub mint_url: String,
+    /// (routstr) EXTRA mint URLs to trust for NIP-60 reconcile beyond `mint_url`. The effective
+    /// allowlist ([`Self::effective_mint_allowlist`]) always includes `mint_url` (the wallet's own
+    /// mint), so this is only for ADDITIONAL trusted mints; empty (the default) = trust only
+    /// `mint_url`. The allowlist is the PRIMARY NIP-60 theft-guard: reconcile drops relay-stored
+    /// proofs drawn on a mint not in it, so a rogue relay/event cannot make the wallet adopt (and
+    /// later swap at) an attacker's mint. Conscious consequence of the `[mint_url]` default: the
+    /// agent accepts ONLY its own mint's proofs — a payer paying from a DIFFERENT mint is dropped
+    /// (safe-by-default). Cross-mint RECEIVE (accept-foreign-then-swap-to-trusted, where the
+    /// mint-swap re-introduces its own guard) is the earn-loop's future concern, not this filter.
+    #[serde(default)]
+    pub mint_allowlist: Vec<String>,
     /// (routstr) The PERSISTENT wallet store path (cdk-sqlite file). The wallet SEED
     /// persists alongside it (§7.1); funded proofs survive a reboot. Required iff
     /// `backend = "routstr"`.
@@ -793,6 +810,25 @@ fn default_brain_max_tokens() -> u32 {
     1024
 }
 
+impl BrainConfig {
+    /// The effective NIP-60 mint-allowlist: the wallet's own `mint_url` (always trusted, first)
+    /// plus any operator-configured [`Self::mint_allowlist`] extras, deduped. An empty configured
+    /// list = trust only `mint_url`; a blank `mint_url` (e.g. a non-routstr backend, no wallet) is
+    /// omitted. This is what the NIP-60 reconcile filters relay-stored proofs against.
+    pub fn effective_mint_allowlist(&self) -> Vec<String> {
+        let mut allow: Vec<String> = Vec::with_capacity(self.mint_allowlist.len() + 1);
+        if !self.mint_url.is_empty() {
+            allow.push(self.mint_url.clone());
+        }
+        for mint in &self.mint_allowlist {
+            if !allow.contains(mint) {
+                allow.push(mint.clone());
+            }
+        }
+        allow
+    }
+}
+
 impl Default for BrainConfig {
     fn default() -> Self {
         BrainConfig {
@@ -803,6 +839,7 @@ impl Default for BrainConfig {
             backend: BrainBackendKind::default(),
             node_url: String::new(),
             mint_url: String::new(),
+            mint_allowlist: Vec::new(),
             wallet_db_path: String::new(),
             api_key_path: String::new(),
             max_tokens: default_brain_max_tokens(),
@@ -880,6 +917,121 @@ impl Default for MemoryConfig {
             write_k: None,
             key_path: None,
         }
+    }
+}
+
+/// The `[nip60]` config: the agent's portable Cashu wallet (NIP-60 — Cashu proofs as
+/// NIP-44-encrypted nostr events on relays, for cross-machine money-continuity). DEDICATED +
+/// independent of `[memory]` (the design's "independent operators" point): money durability must
+/// not be coupled to the mind-state relay set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Nip60Config {
+    /// The relay set the NIP-60 wallet publishes encrypted proof events (+ the per-keyset
+    /// counter mirror) to. EMPTY (the default) falls back to the single node `[relay].url` —
+    /// DEV-ONLY, NOT money-durable. Set >=3 INDEPENDENT relays for production money-safety.
+    #[serde(default)]
+    pub relays: Vec<String>,
+    /// The K-of-N ack threshold a publish must reach to count as durable. `None` => strict
+    /// majority `floor(N/2)+1`, clamped to `[1, N]`.
+    #[serde(default)]
+    pub write_k: Option<usize>,
+}
+
+/// The durability verdict of a resolved NIP-60 relay set (drives the boot money-safety warning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nip60Durability {
+    /// >=3 relays — meets the design's money-durability quorum.
+    Quorum,
+    /// 2 relays — redundant but below the >=3 quorum.
+    BelowQuorum,
+    /// 1 relay (the single-`[relay].url` fallback) — DEV-ONLY, NOT money-durable.
+    SingleRelayDevOnly,
+}
+
+impl Nip60Durability {
+    /// The strong, no-money-loss warning for a sub-quorum relay set (`None` at quorum). The boot
+    /// emits it so a dev/single-relay deploy is LOUD about the gap — the Fork-A per-keyset counter
+    /// mirror rides the SAME relays, so a single-relay drop strands BOTH the proofs AND the
+    /// counter (doubly risky); NUT-13 seed-restore is then the only backstop.
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            Nip60Durability::Quorum => None,
+            Nip60Durability::BelowQuorum => Some(
+                "NIP-60 money on FEWER THAN 3 relays is below the durability quorum — a relay drop \
+                 risks money loss (NUT-13 seed-restore is the only backstop). Set >=3 independent \
+                 relays in [nip60].relays for production money-safety.",
+            ),
+            Nip60Durability::SingleRelayDevOnly => Some(
+                "NIP-60 money on a SINGLE relay is NOT durable (DEV-ONLY) — a relay drop risks money \
+                 loss and strands BOTH the proof events AND the per-keyset counter mirror. NUT-13 \
+                 seed-restore is the only backstop. Set >=3 independent relays in [nip60].relays \
+                 for production money-safety.",
+            ),
+        }
+    }
+}
+
+impl Nip60Config {
+    /// Resolve the effective relay set + K-of-N threshold + durability verdict. With no
+    /// `[nip60].relays`, falls back to the single node relay `fleet_relay` (k=1) — DEV-ONLY. PURE
+    /// (the caller emits [`Nip60Durability::warning`]), so it is unit-testable.
+    pub fn resolve(&self, fleet_relay: &str) -> (Vec<String>, usize, Nip60Durability) {
+        let relays = if self.relays.is_empty() {
+            vec![fleet_relay.to_string()]
+        } else {
+            self.relays.clone()
+        };
+        let n = relays.len();
+        let k = self.write_k.unwrap_or(n / 2 + 1).clamp(1, n);
+        let durability = match n {
+            0 | 1 => Nip60Durability::SingleRelayDevOnly,
+            2 => Nip60Durability::BelowQuorum,
+            _ => Nip60Durability::Quorum,
+        };
+        (relays, k, durability)
+    }
+}
+
+#[cfg(test)]
+mod nip60_config_tests {
+    use super::*;
+
+    #[test]
+    fn empty_relays_falls_back_to_single_fleet_relay_dev_only() {
+        let (relays, k, durability) = Nip60Config::default().resolve("ws://fleet:7777");
+        assert_eq!(relays, vec!["ws://fleet:7777".to_string()]);
+        assert_eq!(k, 1);
+        assert_eq!(durability, Nip60Durability::SingleRelayDevOnly);
+        assert!(
+            durability.warning().is_some(),
+            "the single-relay fallback MUST emit the money-durability warning"
+        );
+    }
+
+    #[test]
+    fn three_relays_meet_quorum_with_majority_k() {
+        let cfg = Nip60Config { relays: vec!["a".into(), "b".into(), "c".into()], write_k: None };
+        let (relays, k, durability) = cfg.resolve("ws://fleet:7777");
+        assert_eq!(relays.len(), 3, "configured relays override the fleet fallback");
+        assert_eq!(k, 2, "default K = strict majority floor(3/2)+1");
+        assert_eq!(durability, Nip60Durability::Quorum);
+        assert!(durability.warning().is_none(), "a >=3 quorum is money-durable, no warning");
+    }
+
+    #[test]
+    fn two_relays_are_below_quorum() {
+        let cfg = Nip60Config { relays: vec!["a".into(), "b".into()], write_k: None };
+        let (_relays, k, durability) = cfg.resolve("ws://fleet:7777");
+        assert_eq!(k, 2);
+        assert_eq!(durability, Nip60Durability::BelowQuorum);
+        assert!(durability.warning().is_some());
+    }
+
+    #[test]
+    fn write_k_clamps_into_range() {
+        let cfg = Nip60Config { relays: vec!["a".into(), "b".into(), "c".into()], write_k: Some(99) };
+        let (_relays, k, _d) = cfg.resolve("ws://fleet:7777");
+        assert_eq!(k, 3, "an over-large write_k clamps to N");
     }
 }
 
@@ -1202,6 +1354,9 @@ impl Default for KirbyConfig {
                 // M4: tenants EMPTY — pure infra; agents arrive via spawn.
                 ..FleetConfig::default()
             },
+            // NIP-60 wallet backup is OPT-IN: empty relays → no Nip60Store wired. A pure-infra host
+            // holds no wallet; a spawned tenant that wants the backup configures its own [nip60].
+            nip60: Nip60Config::default(),
             state_root: None,
             // M6: lift the 600s wall for the fleet tenants that inherit this template.
             max_run_secs: Some(DEFAULT_FLEET_MAX_RUN_SECS),
@@ -1706,6 +1861,43 @@ mod tests {
             cfg.identity.treasury_dir(),
             crate::boot::state_root(),
             "an unset key_path + unset treasury_dir defaults to the durable state root"
+        );
+    }
+
+    #[test]
+    fn effective_mint_allowlist_always_includes_the_wallet_mint() {
+        // Empty configured list → trust ONLY the wallet's own mint.
+        let mut brain = BrainConfig {
+            mint_url: "https://mint.trusted".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            brain.effective_mint_allowlist(),
+            vec!["https://mint.trusted".to_string()],
+            "empty allowlist → trust only mint_url"
+        );
+        // Operator extras are appended; mint_url stays present (first); a dup of it collapses.
+        brain.mint_allowlist = vec![
+            "https://mint.extra".to_string(),
+            "https://mint.trusted".to_string(),
+        ];
+        assert_eq!(
+            brain.effective_mint_allowlist(),
+            vec![
+                "https://mint.trusted".to_string(),
+                "https://mint.extra".to_string()
+            ],
+            "mint_url is always trusted (first) + operator extras, deduped"
+        );
+        // A blank mint_url (a non-routstr backend, no wallet) is omitted.
+        let stub = BrainConfig {
+            mint_url: String::new(),
+            mint_allowlist: vec!["https://only.this".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            stub.effective_mint_allowlist(),
+            vec!["https://only.this".to_string()]
         );
     }
 
