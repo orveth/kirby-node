@@ -66,37 +66,20 @@ pub async fn fund_wallet(wallet: Arc<Wallet>, amount_sats: u64) -> anyhow::Resul
     Ok(())
 }
 
-/// The Phase-2 wallet-seed provider behind [`WalletKey::Keyring`]: the reconstruct mechanism
-/// (the reconstruct-on-lease keyring, [`crate::seed_keyring`]) sits BEHIND this trait, so the
-/// wallet-open path stays oblivious to HOW the seed is obtained. PURPOSE-SCOPED: an impl
-/// yields ONLY the 64-byte wallet spend seed onto the spend plane — never a FROST key, never
-/// the DM key.
-pub trait WalletSeedProvider: Send + Sync {
-    /// Provide the 64-byte wallet spend seed. The keyring impl reconstructs the master seed
-    /// (gated on a fresh lease) and derives the wallet seed; an error (no fresh lease, too
-    /// few shares) REFUSES to open the wallet (loud + safe).
-    fn wallet_seed(&self) -> anyhow::Result<[u8; 64]>;
-}
-
-/// The source of a wallet's spend key — the 64-byte cdk seed that is spend authority over
-/// the wallet's proofs (HIGH-4). THE Phase-2 seam: the interim variant load-or-creates a
-/// local 0600 keyfile (byte-identical to the pre-seam behavior); the reconstruct-on-lease
-/// keyring (the #26 generalization) drops in as a new variant resolved by [`Self::resolve_seed`]
-/// with NO change to [`open_persistent_wallet`] or its callers. PURPOSE-SCOPED: resolving a
-/// `WalletKey` yields ONLY the wallet seed onto the spend plane — it shares no loader with the
-/// DM key (`with_dm_keys`), so the DM tick can never reach the wallet seed (capability
-/// isolation by construction; the two key seams stay independent).
+/// The source of a wallet's spend key — the 64-byte cdk seed that is spend authority over the
+/// wallet's proofs (HIGH-4). The SEPARATE-KEY P2 model: the wallet's seed is a local 0600 keyfile
+/// (the sibling `<db_path>.seed`), resolved by [`Self::resolve_seed`] and handed to
+/// [`open_persistent_wallet`]. Threshold-custody money — a Q-held wallet key never reassembled —
+/// is P3 (FROST-unify), which would add its own variant here WITHOUT moving the wallet-open path.
+/// PURPOSE-SCOPED: resolving a `WalletKey` yields ONLY the wallet seed onto the spend plane — it
+/// shares no loader with the DM key (`with_dm_keys`), so the DM tick can never reach the wallet
+/// seed (capability isolation by construction; the two key seams stay independent).
 pub enum WalletKey {
-    /// Interim host custody: a 64-byte spend-seed keyfile, load-or-create (0600), the
-    /// authority the genome never sees. For a fleet tenant this lands in the per-agent durable
-    /// dir because its `wallet_db_path` is per-agent ([`crate::boot::agent_state_dir_for`]); the
-    /// bare default is the wallet store's sibling `<db_path>.seed` ([`WalletKey::sibling_seed_of`]).
+    /// Host custody: a 64-byte spend-seed keyfile, load-or-create (0600), the authority the genome
+    /// never sees. For a fleet tenant this lands in the per-agent durable dir because its
+    /// `wallet_db_path` is per-agent ([`crate::boot::agent_state_dir_for`]); the bare default is
+    /// the wallet store's sibling `<db_path>.seed` ([`WalletKey::sibling_seed_of`]).
     Keyfile(std::path::PathBuf),
-    /// PHASE-2: a [`WalletSeedProvider`] (the reconstruct-on-lease keyring) supplies the seed.
-    /// The reconstruct mechanism sits BEHIND the trait, so the wallet-open hot path doesn't
-    /// move; the variant CHOICE is made at the construction site (`build_routstr_brain`).
-    /// Resolved by `resolve_seed` exactly like `Keyfile`.
-    Keyring(std::sync::Arc<dyn WalletSeedProvider>),
 }
 
 impl WalletKey {
@@ -112,14 +95,14 @@ impl WalletKey {
     /// — no DM key, no shared loader (the DM tick holds no `WalletKey` and never calls this, so
     /// capability isolation is structural, not visibility-based). `pub` so the boot site resolves
     /// it ONCE and both derives the NIP-60 event key from it
-    /// ([`crate::seed_keyring::derive_nip60_event_key`]) and hands it to [`open_persistent_wallet`]
-    /// — the reconstruct needs the event key BEFORE the wallet opens (to load the counter floor it
+    /// ([`crate::nip60_key::derive_nip60_event_key`]) and hands it to [`open_persistent_wallet`]
+    /// — the boot site needs the event key BEFORE the wallet opens (to load the counter floor it
     /// seeds the store with) — and the live-wallet integration test opens its funded store the same
-    /// way. Reading a `Keyfile` seed exposes nothing a path-holder couldn't read directly.
+    /// way. Reading a `Keyfile` seed exposes nothing a path-holder couldn't read directly. A
+    /// `match` (not an irrefutable `let`) so P3's FROST-unify threshold variant just adds an arm.
     pub fn resolve_seed(&self) -> anyhow::Result<[u8; 64]> {
         match self {
             WalletKey::Keyfile(path) => load_or_create_wallet_seed(path),
-            WalletKey::Keyring(provider) => provider.wallet_seed(),
         }
     }
 }
@@ -133,7 +116,7 @@ impl WalletKey {
 /// the caller resolves the 64-byte `seed` through the `WalletKey` seam (spend authority — treat
 /// it like the rail credential the genome never sees) and passes it in: the interim
 /// [`WalletKey::sibling_seed_of`] load-or-creates (0600) the byte-identical sibling
-/// `<db_path>.seed`, and Phase-2's reconstruct-on-lease keyring resolves it there instead. The
+/// `<db_path>.seed`. The
 /// caller resolves ONCE so it can also derive the NIP-60 event key from the seed; `initial_counters`
 /// seeds the returned NUT-13 counter mirror (the 17375 floor on a reconstruct, empty otherwise) and
 /// the returned handle exposes `keyset_counters()` for the publisher.

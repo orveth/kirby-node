@@ -14,7 +14,7 @@
 //!
 //! SELF-ENCRYPTION model (mirrors [`crate::engram`]'s `K_self`): the agent NIP-44-encrypts to
 //! its OWN NIP-60 event key (a wallet-plane key the keyring derives,
-//! [`crate::seed_keyring::derive_nip60_event_key`]), so a reborn / failed-over instance with the
+//! [`crate::nip60_key::derive_nip60_event_key`]), so a reborn / failed-over instance with the
 //! same reconstructed seed decrypts its own proof events. The event key is NEITHER the FROST Q
 //! (which cannot ECDH) NOR the DM key (capability isolation).
 
@@ -144,7 +144,7 @@ pub struct Nip60Crypto {
 
 impl Nip60Crypto {
     /// Build from the 32-byte keyring-derived event key
-    /// ([`crate::seed_keyring::derive_nip60_event_key`]). Errs only if the bytes are not a valid
+    /// ([`crate::nip60_key::derive_nip60_event_key`]). Errs only if the bytes are not a valid
     /// secp256k1 scalar (negligible for HKDF output, but propagated, never panicked).
     pub fn from_event_key(event_key: &[u8; 32]) -> anyhow::Result<Self> {
         let sk = SecretKey::from_slice(event_key)
@@ -627,7 +627,7 @@ mod tests {
 
     use super::*;
     use crate::nip60_counter::Nip60CounterDb;
-    use crate::seed_keyring::derive_nip60_event_key;
+    use crate::nip60_key::derive_nip60_event_key;
 
     /// The allowlist matching the `tec`/`tec_with` helpers' mint ("https://m"), so the aggregate /
     /// del-chain / transport teeth exercise their own logic without the N7 mint-filter dropping

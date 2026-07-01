@@ -263,7 +263,7 @@ pub mod rail;
 pub mod relay_lease;
 pub mod run_agent;
 pub mod sandbox;
-pub mod seed_keyring;
+pub mod nip60_key;
 pub mod spawn;
 #[cfg(target_os = "linux")]
 pub mod snapshot_run;

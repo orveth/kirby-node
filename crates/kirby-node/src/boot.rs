@@ -539,7 +539,7 @@ async fn build_routstr_brain(
     let nip60_store = if nip60.relays.is_empty() {
         None
     } else {
-        let event_key = crate::seed_keyring::derive_nip60_event_key(&seed);
+        let event_key = crate::nip60_key::derive_nip60_event_key(&seed);
         let (relays, write_k, durability) = nip60.resolve(fleet_relay);
         if let Some(warning) = durability.warning() {
             tracing::warn!(nip60_durability = %warning, "NIP-60 wallet backup: sub-quorum durability");
