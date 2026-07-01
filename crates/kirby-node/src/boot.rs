@@ -513,14 +513,21 @@ async fn build_routstr_brain(
 ) -> anyhow::Result<Arc<dyn BrainBackend>> {
     // 1) Open the PERSISTENT wallet (file store + persisted seed, §7.1). The wallet is
     //    funded out-of-band (§11); boot only opens an already-funded store.
-    let wallet = crate::mint_rig::open_persistent_wallet(
+    // Resolve the wallet spend seed ONCE through the WalletKey seam (interim: the byte-identical
+    // sibling `<db_path>.seed` keyfile, load-or-create 0600, per-agent because `wallet_db_path` is
+    // per-agent; the reconstruct-on-lease keyring swaps the variant here with no change below).
+    // Resolving it at the caller lets cut-3b derive the NIP-60 event key from the SAME seed and
+    // load the counter floor BEFORE the wallet opens.
+    let seed = crate::mint_rig::WalletKey::sibling_seed_of(Path::new(&brain.wallet_db_path))
+        .resolve_seed()?;
+    // cut-3a: an empty counter floor keeps the wallet byte-identical to the pre-NIP-60 store.
+    // cut-3b threads the loaded-17375 floor in here (with the event-key/store wiring) + uses the
+    // returned `_counter_db` handle for the counter-carrying publish.
+    let (wallet, _counter_db) = crate::mint_rig::open_persistent_wallet(
         &brain.mint_url,
         Path::new(&brain.wallet_db_path),
-        // Interim wallet spend key: the byte-identical sibling `<db_path>.seed` keyfile
-        // (load-or-create, 0600), per-agent because `wallet_db_path` is per-agent
-        // (derive_tenant_config). THE Phase-2 swap point — the reconstruct-on-lease keyring
-        // replaces this `WalletKey` with no change here.
-        crate::mint_rig::WalletKey::sibling_seed_of(Path::new(&brain.wallet_db_path)),
+        seed,
+        std::collections::HashMap::new(),
     )
     .await?;
     let ecash = CdkEcash::new(wallet.clone());
