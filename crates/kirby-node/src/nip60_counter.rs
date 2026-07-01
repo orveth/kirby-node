@@ -90,6 +90,31 @@ impl Nip60CounterDb {
         let entry = shadow.entry(*keyset_id).or_insert(0);
         *entry = (*entry).max(counter);
     }
+
+    /// Fast-forward the INNER store's NUT-13 derivation counter up to the seeded floor for every
+    /// keyset, so a fresh-store restore never re-derives an already-used secret. [`Self::with_counters`]
+    /// seeds the SHADOW (the publish-mirror), but cdk derives from the INNER counter — which starts
+    /// at 0 on a fresh store. Without this, `receive_proofs` on a reconstruct re-issues secrets at
+    /// indices the prior instance already spent → collision / loss. Reads the inner counter with a
+    /// no-op `increment_keyset_counter(id, 0)` (cdk returns the current value) and advances only when
+    /// the floor is higher — never regresses. Idempotent. Call ONCE at open, BEFORE the wallet
+    /// derives anything. This lifts ONLY the inner derivation counter (the read/restore side); making
+    /// the PUBLISHED mirror complete + non-regressing across keysets is deferred to the write-side
+    /// counter-publish cut (the mirror is vacuous until the proof-publish write half lands).
+    pub async fn fast_forward_inner_to_floor(&self) -> Result<(), Error> {
+        // Snapshot the seeded floors, releasing the std Mutex BEFORE any await.
+        let floors: Vec<(Id, u32)> = {
+            let shadow = self.shadow.lock().unwrap_or_else(|p| p.into_inner());
+            shadow.iter().map(|(id, c)| (*id, *c)).collect()
+        };
+        for (id, floor) in floors {
+            let cur = self.inner.increment_keyset_counter(&id, 0).await?;
+            if floor > cur {
+                self.inner.increment_keyset_counter(&id, floor - cur).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -449,6 +474,30 @@ mod tests {
             db.keyset_counters().get(&id).copied(),
             Some(floor),
             "the seeded floor must hold — the published counter must never regress"
+        );
+    }
+
+    /// The reconstruct floor is fast-forwarded into the INNER derivation counter (not just the
+    /// publish-mirror), so a fresh-store restore's `receive_proofs` derives BEYOND the prior
+    /// instance's used secrets. RED-on-revert: if `fast_forward_inner_to_floor` is a no-op the
+    /// inner counter stays at 0 and re-issues already-used indices.
+    #[tokio::test]
+    async fn fast_forward_lifts_the_inner_derivation_counter_to_the_floor() {
+        let mem = cdk_sqlite::wallet::memory::empty()
+            .await
+            .expect("in-memory wallet store");
+        let id = test_keyset_id();
+        let floor: u32 = 10_000;
+        let db = Nip60CounterDb::with_counters(Arc::new(mem), HashMap::from([(id, floor)]));
+
+        db.fast_forward_inner_to_floor().await.expect("fast-forward");
+
+        // A no-op read (increment by 0) of the INNER counter must now be at least the floor.
+        let inner_now = db.increment_keyset_counter(&id, 0).await.expect("read inner counter");
+        assert!(
+            inner_now >= floor,
+            "the INNER derivation counter must be fast-forwarded to >= the seeded floor \
+             (got {inner_now}, floor {floor}) — else receive_proofs re-derives used secrets"
         );
     }
 }

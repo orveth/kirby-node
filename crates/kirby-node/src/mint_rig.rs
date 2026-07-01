@@ -152,6 +152,14 @@ pub async fn open_persistent_wallet(
         Arc::new(localstore),
         initial_counters,
     ));
+    // Fast-forward the INNER NUT-13 derivation counter to the seeded floor BEFORE the wallet
+    // derives anything, so a fresh-store reconstruct never re-issues an already-used secret (the
+    // shadow seed alone fixes only the PUBLISH mirror, not what cdk derives from). No-op on a
+    // fresh / non-reconstruct boot (empty floor).
+    counter_db
+        .fast_forward_inner_to_floor()
+        .await
+        .map_err(|e| anyhow::anyhow!("fast-forward NUT-13 counter to the reconstruct floor: {e}"))?;
 
     let wallet = Wallet::new(mint_url, CurrencyUnit::Sat, counter_db.clone(), seed, None)
         .map_err(|e| anyhow::anyhow!("build persistent cdk wallet against {mint_url}: {e}"))?;

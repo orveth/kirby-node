@@ -15,10 +15,12 @@
 //!     (relay == local) imports nothing — no needless swap-churn / NUT-13 counter burn. Only a
 //!     fresh-store takeover, whose local wallet lacks the proofs, actually pulls them in.
 //!
-//! ⚠️ ORDER (takeover wiring, N5): `receive_proofs` derives its swap-output secrets from the NUT-13
-//! per-keyset counter. On a fresh-store takeover the counter MUST be fast-forwarded to the loaded
-//! floor BEFORE this import runs, or the swap re-derives already-spent secrets → collision. This
-//! module is the MECHANISM only; the boot/takeover call-site + the counter fast-forward are N5.
+//! ⚠️ ORDER (counter safety): `receive_proofs` derives its swap-output secrets from the NUT-13
+//! per-keyset counter. On a fresh-store restore the counter MUST be fast-forwarded to the loaded
+//! floor BEFORE this import runs, or the swap re-derives already-spent secrets → collision. That
+//! fast-forward happens at wallet-open (`mint_rig::open_persistent_wallet` →
+//! `Nip60CounterDb::fast_forward_inner_to_floor`), which precedes this boot-time import; this
+//! module is the import MECHANISM only.
 
 use async_trait::async_trait;
 use cdk::nuts::{Proof, ProofState, PublicKey, State};
@@ -127,6 +129,15 @@ pub async fn restore_from_relay_backup(
                 error = %e,
                 "NIP-60 restore: import failed (mint unreachable or a lost restore-race); booting on local wallet state"
             );
+            // A failed `receive_proofs` may leave an incomplete cdk receive-saga (reserved inputs +
+            // stored blinded messages). We DELIBERATELY do NOT compensate it here. cdk's saga
+            // recovery is designed to run once at STARTUP (boot step 2, `recover_sagas_within`);
+            // running it in this Err arm — immediately after an ambiguous mint error — risks
+            // compensating a swap whose request is still IN FLIGHT: the inputs read Unspent now, cdk
+            // deletes the saga (and its blinded-message recovery data), then the mint commits the
+            // swap, stranding the outputs. The reserved inputs are NOT spendable (Reserved, not
+            // Unspent), so they never inflate the solvency check; the saga is safely recovered at the
+            // next boot, once the mint has settled. Degrade to 0 and boot on durable local state.
             0
         }
     }
