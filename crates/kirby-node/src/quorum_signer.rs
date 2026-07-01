@@ -60,7 +60,7 @@ use kirby_custody::cosign_net::nip01_event_id;
 use kirby_custody::cosign_net::{nip01_event_id_with_tags, NostrEvent};
 use kirby_custody::guardian::{
     self, CoSignRequest, RefuseReason, SignIntent, KIND_KIRBY_AGENT_STATE, KIND_KIRBY_LEASE,
-    KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE,
+    KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE, KIND_NOSTR_SEAL,
 };
 use kirby_custody::group_xonly_q;
 
@@ -350,8 +350,9 @@ impl QuorumSigner {
         if !is_signable_kind(kind) {
             anyhow::bail!(
                 "QuorumSigner refuses kind {kind}: only kind 1 (voice), the Kirby beacons \
-                 {KIND_KIRBY_PRESENCE}/{KIND_KIRBY_LIFECYCLE}/{KIND_KIRBY_AGENT_STATE}, and the \
-                 cross-machine lease {KIND_KIRBY_LEASE} are signable"
+                 {KIND_KIRBY_PRESENCE}/{KIND_KIRBY_LIFECYCLE}/{KIND_KIRBY_AGENT_STATE}, the \
+                 cross-machine lease {KIND_KIRBY_LEASE}, and the NIP-17 DM seal {KIND_NOSTR_SEAL} \
+                 are signable"
             );
         }
         // The NOTE SANITIZER applies ONLY to kind:1 (free text). Beacons (JSON state) are
@@ -600,15 +601,20 @@ fn quorum_subsets(n: usize, t: usize) -> Vec<Vec<usize>> {
     out
 }
 
-/// Is `kind` one the QuorumSigner will sign? The agent's PUBLIC Nostr output: the
-/// free-text voice (kind:1) PLUS its three beacons (presence/lifecycle/agent-state),
-/// all under Q. Mirrors `kirby_custody::guardian`'s authorizable-kind set (the membrane
-/// re-checks independently per holder).
+/// Is `kind` one the QuorumSigner will sign? The agent's Nostr output under Q: the
+/// free-text voice (kind:1), its three beacons (presence/lifecycle/agent-state), the
+/// cross-machine lease (31002), and its NIP-17 DM seal (kind:13, P1). MUST mirror
+/// `kirby_custody::guardian::is_authorizable_kind` (the membrane re-checks independently
+/// per holder -- a tooth fails if either side omits a kind).
 fn is_signable_kind(kind: u32) -> bool {
     kind == kirby_proto::NOSTR_KIND_TEXT_NOTE as u32
         || matches!(
             kind,
-            KIND_KIRBY_PRESENCE | KIND_KIRBY_LIFECYCLE | KIND_KIRBY_AGENT_STATE | KIND_KIRBY_LEASE
+            KIND_KIRBY_PRESENCE
+                | KIND_KIRBY_LIFECYCLE
+                | KIND_KIRBY_AGENT_STATE
+                | KIND_KIRBY_LEASE
+                | KIND_NOSTR_SEAL
         )
 }
 
@@ -903,6 +909,44 @@ mod tests {
             );
         }
         println!("G-QUORUM-ALL-PAIRS-SIGN PASS: {{1,2}} {{1,3}} {{2,3}} each co-sign valid-under-Q (no privileged holder)");
+    }
+
+    /// G-SEAL-BOTH-MEMBRANES: a kind:13 NIP-17 DM seal co-signs through the co-located
+    /// quorum, which requires BOTH the node's `is_signable_kind` AND the custody guardian
+    /// membrane (`is_authorizable_kind`) to admit kind:13 (defense-in-depth: the coordinator
+    /// guard + the per-holder membrane). If EITHER omits 13, the ceremony aborts (the
+    /// coordinator bails up front, or a holder refuses per-membrane) and this fails -- the
+    /// red-on-revert tooth for the two-crate lockstep that lets DMs move to Q (P1).
+    #[test]
+    fn g_seal_kind13_signs_through_both_membranes() {
+        let (ks, qs) = signer();
+        // The seal content is opaque NIP-44 ciphertext in production; a placeholder suffices
+        // (the membrane signs kind:13 VERBATIM -- no content policy, unlike kind:1).
+        let content = "nip44-ciphertext-placeholder";
+        let seal = qs
+            .sign_nostr_event_with_tags(KIND_NOSTR_SEAL, CREATED_AT, &[], content)
+            .expect("kind:13 seal must co-sign (needs BOTH node is_signable_kind + custody membrane)");
+        assert_eq!(seal.kind, KIND_NOSTR_SEAL, "signed event must be a kind:13 seal");
+
+        // It is a real BIP-340 sig over the NIP-01 id under the tweaked Q (same check the beacons use).
+        let (_addr, internal_p) = taproot_address(&ks.pubkeys, KnownHrp::Testnets).expect("address");
+        let secp = Secp256k1::verification_only();
+        let (q_tweaked, _parity) = internal_p.tap_tweak(&secp, None);
+        let q_xonly = q_tweaked.to_x_only_public_key();
+        let id = nip01_event_id_with_tags(
+            &hex::encode(qs.q_bytes()),
+            seal.created_at,
+            seal.kind,
+            &[],
+            content,
+        );
+        assert_eq!(seal.id, hex::encode(id), "seal id must be the NIP-01 id under Q");
+        let sig = schnorr::Signature::from_slice(&hex::decode(&seal.sig).unwrap()).expect("parse sig");
+        assert!(
+            secp.verify_schnorr(&sig, &Message::from_digest(id), &q_xonly).is_ok(),
+            "the kind:13 seal must verify under Q"
+        );
+        println!("G-SEAL-BOTH-MEMBRANES PASS: kind:13 seal co-signs valid-under-Q (both membranes admit 13)");
     }
 
     /// G-SAME-SECOND-BEACONS-DONT-COLLIDE: two ceremonies that share a wall-clock

@@ -67,13 +67,22 @@ pub const KIND_KIRBY_AGENT_STATE: u32 = 31000;
 /// the id-over-content-and-tags equality check.
 pub const KIND_KIRBY_LEASE: u32 = 31002;
 
+/// The NIP-59 SEAL kind (13): a NIP-17 direct-message seal authored by Q (the DM-under-Q
+/// path, P1). Its content is NIP-44-ENCRYPTED (opaque ciphertext), so -- like the beacons
+/// and unlike kind:1 -- no content policy applies; the membrane's gate is the
+/// id-over-content-and-tags equality. Authorizing it lets Q author DMs, which is within the
+/// agent's existing DM capability (a compromised coordinator can at most get Q to author an
+/// encrypted DM). MUST stay in lockstep with `kirby-node`'s `quorum_signer::is_signable_kind`
+/// (a tooth fails if either membrane omits 13).
+pub const KIND_NOSTR_SEAL: u32 = 13;
+
 /// S3e: is `kind` one a guardian will authorize? The agent's PUBLIC Nostr output is its
 /// voice (kind:1) PLUS its three public beacons (presence/lifecycle/agent-state) PLUS its
-/// cross-machine lease (31002) -- all signed by the same group key Q ("Q signs everything",
-/// gudnuf's decision A). The lease rides the SAME membrane: a node cannot get the quorum to
-/// co-sign a lease for an agent whose shares it does not hold. Any other kind (and the
-/// future BitcoinSpend intent) needs its own reconstruction + policy and is refused as
-/// `BadKind` until added.
+/// cross-machine lease (31002) PLUS its NIP-17 DM seal (kind:13, P1) -- all signed by the
+/// same group key Q ("Q signs everything", gudnuf's decision A). The lease rides the SAME
+/// membrane: a node cannot get the quorum to co-sign a lease for an agent whose shares it
+/// does not hold. Any other kind (and the future BitcoinSpend intent) needs its own
+/// reconstruction + policy and is refused as `BadKind` until added.
 fn is_authorizable_kind(kind: u32) -> bool {
     matches!(
         kind,
@@ -82,6 +91,7 @@ fn is_authorizable_kind(kind: u32) -> bool {
             | KIND_KIRBY_LIFECYCLE
             | KIND_KIRBY_AGENT_STATE
             | KIND_KIRBY_LEASE
+            | KIND_NOSTR_SEAL
     )
 }
 

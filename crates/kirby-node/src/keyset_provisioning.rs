@@ -356,12 +356,17 @@ pub fn load_quorum_signer(instance_id: &str) -> anyhow::Result<QuorumSigner> {
     load_quorum_signer_at(&keystore_dir)
 }
 
-/// [`load_quorum_signer`] with an explicit keystore dir (tests + the boot-wiring path).
-pub fn load_quorum_signer_at(keystore_dir: &Path) -> anyhow::Result<QuorumSigner> {
+/// Load the raw keyset material -- the 3 secret-share `KeyPackage`s + the group
+/// `PublicKeyPackage` -- from a provisioned keystore dir. The single on-disk read path shared
+/// by the [`QuorumSigner`] (signing) and [`QuorumEcdh`](crate::quorum_ecdh::QuorumEcdh) (DM /
+/// wallet ECDH) loaders, so both read the shares identically.
+fn load_keyset_material_at(
+    keystore_dir: &Path,
+) -> anyhow::Result<(Vec<KeyPackage>, PublicKeyPackage)> {
     if !is_provisioned(keystore_dir) {
         anyhow::bail!(
             "FROST keystore {} is not provisioned (missing group pubkeys or one of the 3 holder \
-             shares); provision it at spawn before loading a quorum signer",
+             shares); provision it at spawn before loading",
             keystore_dir.display()
         );
     }
@@ -383,8 +388,25 @@ pub fn load_quorum_signer_at(keystore_dir: &Path) -> anyhow::Result<QuorumSigner
         key_packages.push(kp);
     }
 
+    Ok((key_packages, pubkeys))
+}
+
+/// [`load_quorum_signer`] with an explicit keystore dir (tests + the boot-wiring path).
+pub fn load_quorum_signer_at(keystore_dir: &Path) -> anyhow::Result<QuorumSigner> {
+    let (key_packages, pubkeys) = load_keyset_material_at(keystore_dir)?;
     QuorumSigner::from_local_key_packages(key_packages, pubkeys)
         .context("build co-located QuorumSigner from the persisted keystore")
+}
+
+/// Load a [`QuorumEcdh`](crate::quorum_ecdh::QuorumEcdh) -- the DM/wallet-side threshold-ECDH
+/// provider -- from the SAME persisted keystore as [`load_quorum_signer_at`] (the secret shares
+/// + the group pubkeys). It derives NIP-44 conversation keys under Q without reconstructing the
+/// group secret. Co-located (P1); cross-machine share distribution (P2) swaps the in-process
+/// shares for a transport.
+pub fn load_quorum_ecdh_at(keystore_dir: &Path) -> anyhow::Result<crate::quorum_ecdh::QuorumEcdh> {
+    let (key_packages, pubkeys) = load_keyset_material_at(keystore_dir)?;
+    crate::quorum_ecdh::QuorumEcdh::new(key_packages, pubkeys)
+        .context("build co-located QuorumEcdh from the persisted keystore")
 }
 
 /// Load the agent's group taproot key Q (32 x-only bytes) from a keystore dir using ONLY its
