@@ -474,6 +474,8 @@ async fn capable_vm_boots_plans_acts_verifies_and_dies_when_broke() {
         memory: Some(memory),
         agent: Some(agent),
         social: None,
+        nip60: Default::default(),
+        fleet_relay: String::new(),
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

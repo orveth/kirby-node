@@ -108,6 +108,29 @@ impl WalletConfigContent {
                 .collect(),
         }
     }
+
+    /// The inverse of [`Self::from_counters`]: parse the hex keyset ids back to [`Id`] for seeding
+    /// the counter mirror on a reconstruct
+    /// ([`crate::nip60_counter::Nip60CounterDb::with_counters`]). A key that fails to parse is
+    /// DROPPED with a warning — our own writes always round-trip (the hex is `Id`'s `Display`), so
+    /// a parse failure is relay corruption, not a normal case; dropping one keyset's floor (mint
+    /// remains truth; only that keyset is at risk, logged loudly) is safer than failing the boot.
+    pub fn counters_by_id(&self) -> HashMap<Id, u32> {
+        self.counters
+            .iter()
+            .filter_map(|(hex, &counter)| match hex.parse::<Id>() {
+                Ok(id) => Some((id, counter)),
+                Err(e) => {
+                    tracing::warn!(
+                        keyset_hex = %hex,
+                        error = %e,
+                        "NIP-60 load: dropping a counter with an unparseable keyset id (corruption)"
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 /// The NIP-60 event-encryption identity: a nostr keypair built from the keyring-derived 32-byte
@@ -603,6 +626,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+    use crate::nip60_counter::Nip60CounterDb;
     use crate::seed_keyring::derive_nip60_event_key;
 
     /// The allowlist matching the `tec`/`tec_with` helpers' mint ("https://m"), so the aggregate /
@@ -1005,5 +1029,69 @@ mod tests {
             store.load_config().await.is_err(),
             "an undecryptable config head fails CLOSED (never a silent empty floor → no regression)"
         );
+    }
+
+    #[test]
+    fn counters_by_id_is_the_inverse_of_from_counters() {
+        let id_a: Id = "00ad268c4d1f5826".parse().unwrap();
+        let id_b: Id = "009a1f293253e41e".parse().unwrap();
+        let original = HashMap::from([(id_a, 42u32), (id_b, 7u32)]);
+        let config = WalletConfigContent::from_counters(original.clone(), vec!["https://m".into()]);
+        // hex → Id recovers the EXACT original floors (lossless both ways) — so a reconstruct
+        // seeds the SAME keyset counters it published, with no misattribution or drop.
+        assert_eq!(
+            config.counters_by_id(),
+            original,
+            "counters_by_id inverts from_counters"
+        );
+    }
+
+    /// The boot-push money-MUST at the seam: on a reconstruct the loaded 17375 floor is seeded
+    /// into the counter mirror BEFORE the config is published, so the published counter can never
+    /// regress below what the relay already recorded (a regression would let a restored wallet
+    /// re-derive already-spent NUT-13 secrets). RED-on-revert: swap `with_counters(floor)` for
+    /// `new()` (the "unseeded" boot) and the published counter drops to None < the floor.
+    #[tokio::test]
+    async fn boot_seeds_the_loaded_floor_into_the_mirror_before_publishing() {
+        let crypto = Nip60Crypto::from_event_key(&derive_nip60_event_key(&[11u8; 64])).unwrap();
+        let id: Id = "00ad268c4d1f5826".parse().unwrap();
+        // A prior 17375 config on the relay carrying a counter FLOOR of 100 for the keyset.
+        let prior = WalletConfigContent {
+            mints: vec!["https://m".to_string()],
+            counters: HashMap::from([(id.to_string(), 100u32)]),
+        };
+        let signed = EventBuilder::new(
+            Kind::from(KIND_NIP60_WALLET_CONFIG),
+            crypto.encrypt_config(&prior).unwrap(),
+        )
+        .sign_with_keys(&crypto.signer_keys())
+        .unwrap();
+        let store = Nip60Store::with_transport(
+            crypto,
+            Arc::new(MockTransport::with_fetch(2, vec![signed])),
+            3,
+            2,
+            allow_m(),
+        );
+
+        // The boot sequence: load the floor → convert to Ids → SEED the mirror BEFORE publishing.
+        let loaded = store.load_config().await.unwrap().expect("prior config present");
+        let floor = loaded.counters_by_id();
+        let mem = cdk_sqlite::wallet::memory::empty().await.unwrap();
+        let counter_db = Nip60CounterDb::with_counters(Arc::new(mem), floor);
+
+        // What the (ordered-after-seed) publish carries: the mirror, which holds the loaded floor.
+        let to_publish = counter_db.keyset_counters();
+        assert_eq!(
+            to_publish.get(&id).copied(),
+            Some(100),
+            "the loaded floor is seeded into the mirror BEFORE publish → the published counter \
+             never regresses below 100 (revert with_counters→new and this drops to None)"
+        );
+        // And the publish lands durably (≥k), carrying the seeded floor.
+        store
+            .publish_wallet_config(to_publish, loaded.mints)
+            .await
+            .expect("durable config publish");
     }
 }

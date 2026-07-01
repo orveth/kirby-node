@@ -1504,6 +1504,9 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
         memory: None,
         agent: None,
         social: None,
+        // No brain/wallet in the G1 demo → NIP-60 is inactive (empty relays, no store).
+        nip60: Default::default(),
+        fleet_relay: String::new(),
         // G1 is vsock-only (no TAP); the egress lockdown is the `egress`
         // subcommand (C-5, G4).
         lockdown_egress: false,
@@ -1597,6 +1600,9 @@ async fn run_app_checkpoint(args: AppCheckpointArgs) -> anyhow::Result<()> {
         memory: None,
         agent: None,
         social: None,
+        // No brain/wallet in the app-checkpoint demo → NIP-60 inactive.
+        nip60: Default::default(),
+        fleet_relay: String::new(),
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

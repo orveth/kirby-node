@@ -112,6 +112,15 @@ pub struct BootConfig {
     /// attaches it to the `CompositeRail` (`with_actuator`), so an `Act::Actuate` is signed +
     /// published daemon-side. `None` for every other workload, so the rail performs ZERO publishes.
     pub social: Option<crate::config::SocialConfig>,
+    /// The `[nip60]` wallet-backup config (relays + write quorum). NIP-60 is OPT-IN: with an empty
+    /// relay set, `build_routstr_brain` wires NO Nip60Store and the wallet opens exactly as before;
+    /// when relays are configured it connects a store, seeds the NUT-13 counter floor from the
+    /// 17375 head BEFORE opening the wallet, and publishes the config — the cross-machine money-
+    /// continuity backup. Ignored by every non-`routstr` backend (only the Cashu wallet path).
+    pub nip60: crate::config::Nip60Config,
+    /// The node relay URL — the single-relay DEV fallback for [`crate::config::Nip60Config::resolve`]
+    /// when `[nip60]` lists no relays of its own.
+    pub fleet_relay: String,
     /// Wire a per-VM TAP into the VM and lock it down with nftables default-deny
     /// egress (C-5, spec 3.7, gate G4). When true, the VM gets a network interface
     /// it can ATTEMPT egress on, the host kernel drops that egress (counted), and
@@ -251,7 +260,9 @@ pub async fn boot_and_observe(
         // real Routstr node, paid from the treasury.
         Some(brain) if brain.backend == BrainBackendKind::Routstr => {
             let treasury_remaining = peek_treasury_remaining(&config).await?;
-            let brain_backend = build_routstr_brain(brain, treasury_remaining).await?;
+            let brain_backend =
+                build_routstr_brain(brain, treasury_remaining, &config.nip60, &config.fleet_relay)
+                    .await?;
             Arc::new(attach_actuator(
                 CompositeRail::new(Arc::new(MockRail::new()), brain_backend),
                 actuator,
@@ -510,26 +521,57 @@ where
 async fn build_routstr_brain(
     brain: &crate::config::BrainConfig,
     treasury_remaining: u64,
+    nip60: &crate::config::Nip60Config,
+    fleet_relay: &str,
 ) -> anyhow::Result<Arc<dyn BrainBackend>> {
-    // 1) Open the PERSISTENT wallet (file store + persisted seed, §7.1). The wallet is
-    //    funded out-of-band (§11); boot only opens an already-funded store.
+    let db_path = Path::new(&brain.wallet_db_path);
     // Resolve the wallet spend seed ONCE through the WalletKey seam (interim: the byte-identical
-    // sibling `<db_path>.seed` keyfile, load-or-create 0600, per-agent because `wallet_db_path` is
-    // per-agent; the reconstruct-on-lease keyring swaps the variant here with no change below).
-    // Resolving it at the caller lets cut-3b derive the NIP-60 event key from the SAME seed and
-    // load the counter floor BEFORE the wallet opens.
-    let seed = crate::mint_rig::WalletKey::sibling_seed_of(Path::new(&brain.wallet_db_path))
-        .resolve_seed()?;
-    // cut-3a: an empty counter floor keeps the wallet byte-identical to the pre-NIP-60 store.
-    // cut-3b threads the loaded-17375 floor in here (with the event-key/store wiring) + uses the
-    // returned `_counter_db` handle for the counter-carrying publish.
-    let (wallet, _counter_db) = crate::mint_rig::open_persistent_wallet(
-        &brain.mint_url,
-        Path::new(&brain.wallet_db_path),
-        seed,
-        std::collections::HashMap::new(),
-    )
-    .await?;
+    // sibling `<db_path>.seed` keyfile, load-or-create 0600, per-agent; the reconstruct-on-lease
+    // keyring swaps the variant here with no change below). Resolving it here lets us derive the
+    // NIP-60 event key from the SAME seed and load the counter floor BEFORE the wallet opens.
+    let seed = crate::mint_rig::WalletKey::sibling_seed_of(db_path).resolve_seed()?;
+
+    // NIP-60 cross-machine wallet backup — OPT-IN: only when `[nip60]` lists relays. Connect the
+    // store and LOAD the NUT-13 counter floor from the 17375 head BEFORE opening the wallet, so the
+    // counter mirror is SEEDED with the floor before any publish — a later publish can then never
+    // regress the counter below what the relay recorded (the no-regress MONEY-MUST). No relays →
+    // no store, empty floor, the wallet opens exactly as a non-NIP-60 agent.
+    let nip60_store = if nip60.relays.is_empty() {
+        None
+    } else {
+        let event_key = crate::seed_keyring::derive_nip60_event_key(&seed);
+        let (relays, write_k, durability) = nip60.resolve(fleet_relay);
+        if let Some(warning) = durability.warning() {
+            tracing::warn!(nip60_durability = %warning, "NIP-60 wallet backup: sub-quorum durability");
+        }
+        tracing::info!(n = relays.len(), k = write_k, "NIP-60 wallet backup enabled");
+        Some(
+            crate::nip60::Nip60Store::connect(
+                &event_key,
+                &relays,
+                Some(write_k),
+                brain.effective_mint_allowlist(),
+            )
+            .await?,
+        )
+    };
+
+    // The counter floor loaded from the 17375 head (empty with no store / a fresh wallet).
+    let initial_counters = match &nip60_store {
+        Some(store) => store
+            .load_config()
+            .await?
+            .map(|config| config.counters_by_id())
+            .unwrap_or_default(),
+        None => std::collections::HashMap::new(),
+    };
+
+    // 1) Open the PERSISTENT wallet (file store + persisted seed, §7.1; funded out-of-band, §11),
+    //    with the counter mirror SEEDED by the loaded floor — this seed PRECEDES the config publish
+    //    in step 4 (the no-regress ordering).
+    let (wallet, counter_db) =
+        crate::mint_rig::open_persistent_wallet(&brain.mint_url, db_path, seed, initial_counters)
+            .await?;
     let ecash = CdkEcash::new(wallet.clone());
 
     // 2) Recover incomplete cdk sagas FIRST (R2-4), BEFORE measuring the balance: a prior
@@ -551,7 +593,24 @@ async fn build_routstr_brain(
     let wallet_balance = wallet.total_balance().await.map(u64::from).unwrap_or(0);
     assert_wallet_backs_counter(wallet_balance, treasury_remaining)?;
 
-    // 4) Build the brain over the funded wallet, with the configured kill-window.
+    // 4) Publish the NIP-60 wallet-config (mints + the seeded NUT-13 counters). ORDERED AFTER the
+    //    with_counters seed at open (step 1), so the published counter is >= the loaded floor (no
+    //    regression). Best-effort at boot: a failure is logged, NOT fatal (the mint remains truth;
+    //    the next counter change re-publishes). The token-event (proofs) publish + reconcile-import
+    //    ride N2; the cdk-counter fast-forward on reconstruct rides N5.
+    if let Some(store) = &nip60_store {
+        if let Err(e) = store
+            .publish_wallet_config(counter_db.keyset_counters(), vec![brain.mint_url.clone()])
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                "NIP-60 boot config publish failed (advisory; the seeded floor re-publishes on the next change)"
+            );
+        }
+    }
+
+    // 5) Build the brain over the funded wallet, with the configured kill-window.
     let routstr = RoutstrBrain::new(
         brain.node_url.clone(),
         ecash,

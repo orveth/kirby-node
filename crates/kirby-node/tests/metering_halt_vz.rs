@@ -79,6 +79,8 @@ fn vz_boot(
         memory: None,
         agent: None,
         social: None,
+        nip60: Default::default(),
+        fleet_relay: String::new(),
         lockdown_egress: false,
         snapshot_capable: false,
         restore_checkpoint: None,

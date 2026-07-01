@@ -487,6 +487,8 @@ fn agent_boot_config(
         memory,
         agent,
         social,
+        nip60: cfg.nip60.clone(),
+        fleet_relay: cfg.relay.url.clone(),
         // Sovereign single-agent v0 is vsock-only (no TAP egress lockdown; that is
         // the C-5 lane). The membrane still holds structurally (no guest network).
         lockdown_egress: false,

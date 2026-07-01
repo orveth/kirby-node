@@ -53,6 +53,8 @@ async fn vz_lockdown_egress_boots_and_exposes_no_nic_egress_control() {
         social: None,
         // The Chunk B behavior under test: the egress lockdown is requested. On VZ
         // this is satisfied structurally by the no-NIC topology.
+        nip60: Default::default(),
+        fleet_relay: String::new(),
         lockdown_egress: true,
         snapshot_capable: false,
         restore_checkpoint: None,
