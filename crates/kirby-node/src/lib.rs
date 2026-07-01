@@ -179,6 +179,11 @@ pub mod engram;
 #[cfg(target_os = "linux")]
 pub mod firecracker;
 pub mod fleet;
+// The Routstr FUNDING primitive: turn N sats into a funded prepaid bearer key (create
+// invoice -> creator pays -> poll -> write 0600 keyfile), plus balance/topup/recover. A
+// pure Routstr HTTP client (no cluster, no relay, no mint) backing the `fund-key` CLI.
+// Platform-agnostic host-side code (like `nerve`/`engram`), so NOT cfg-gated.
+pub mod funding;
 // FROST per-agent identity (S3a graft). Loads a per-agent FROST PublicKeyPackage
 // from a keystore and derives the group taproot key Q + npub. NOT wired into any
 // signing path; fleet-tenant-only, behind the custody graft. Platform-agnostic

@@ -39,10 +39,7 @@ pub enum NodeBehavior {
     /// and returns the change token the hook yields in the `X-Cashu` response header. This
     /// proves node-CONSUMPTION (the sent token was real, spendable, and is now spent), not
     /// just the brain's local cost bookkeeping.
-    Redeem {
-        reply: String,
-        redeem: RedeemHook,
-    },
+    Redeem { reply: String, redeem: RedeemHook },
     /// A non-2xx status (e.g. 402 payment rejected, 500 model error).
     Status(u16),
     /// 200 with a body that is NOT valid completion JSON (malformed / missing content).
@@ -65,6 +62,9 @@ pub enum BalanceBehavior {
     Msats(u64),
     /// A non-2xx status (e.g. 401 for a bad/empty key) — drives the refuse-to-boot path.
     Status(u16),
+    /// 200 with a SHARED, mutable balance (millisats) a funding status-poll step can raise
+    /// (the topup-credit signal) — the atomic is read fresh on every `/v1/balance/info`.
+    Shared(Arc<AtomicU64>),
 }
 
 /// An async hook the round-trip mock invokes with the `X-Cashu` bearer token it received,
@@ -85,6 +85,100 @@ pub enum RefundBehavior {
     Token(String),
 }
 
+/// How the mock drives the Lightning FUNDING endpoints (`fund-key`): invoice create, the
+/// status poll, and recover. Cloned per connection so a scripted poll sequence advances by a
+/// shared step counter.
+#[derive(Clone, Default)]
+pub struct InvoiceBehavior {
+    /// `POST /v1/balance/lightning/invoice`: the create response, or a status to fail with.
+    pub create: InvoiceCreate,
+    /// `GET .../invoice/{id}/status`: the ordered `status` values to return across polls (the
+    /// last is repeated once exhausted), and whether/when to attach the minted `api_key`.
+    pub status_script: Vec<StatusStep>,
+    /// `POST /v1/balance/lightning/recover`: the `api_key` to return (None => `{}`), or a
+    /// status to fail with.
+    pub recover: RecoverResult,
+    /// A shared step cursor for the status script (advances one per status GET).
+    pub step: Arc<AtomicU64>,
+    /// A shared spendable balance (millisats) that a poll step can RAISE (the topup-credit
+    /// signal: `GET /v1/balance/info` reads this).
+    pub balance_msats: Arc<AtomicU64>,
+}
+
+/// The `POST /v1/balance/lightning/invoice` mock response.
+#[derive(Clone)]
+pub enum InvoiceCreate {
+    /// 200 with `{invoice_id, bolt11, amount_sats}` (the amount echoes the request).
+    Ok { invoice_id: String, bolt11: String },
+    /// A non-2xx status (e.g. 401 for a topup with a bad key, 500 for the live create bug).
+    Status(u16),
+}
+
+impl Default for InvoiceCreate {
+    fn default() -> Self {
+        InvoiceCreate::Ok {
+            invoice_id: "inv-mock-1".to_string(),
+            bolt11: "lnbcmock".to_string(),
+        }
+    }
+}
+
+/// One status-poll step. `status` is the returned `status` string; `mint_key` attaches that
+/// `api_key` (the paid+minted signal); `raise_balance_msats` bumps the shared balance (the
+/// topup-credit signal read by `/v1/balance/info`).
+#[derive(Clone, Default)]
+pub struct StatusStep {
+    pub status: String,
+    pub mint_key: Option<String>,
+    pub raise_balance_msats: Option<u64>,
+}
+
+impl StatusStep {
+    pub fn pending() -> Self {
+        StatusStep {
+            status: "pending".into(),
+            mint_key: None,
+            raise_balance_msats: None,
+        }
+    }
+    pub fn paid_with_key(key: &str) -> Self {
+        StatusStep {
+            status: "paid".into(),
+            mint_key: Some(key.into()),
+            raise_balance_msats: None,
+        }
+    }
+    pub fn terminal(status: &str) -> Self {
+        StatusStep {
+            status: status.into(),
+            mint_key: None,
+            raise_balance_msats: None,
+        }
+    }
+    pub fn credited(raise_to_msats: u64) -> Self {
+        StatusStep {
+            status: "paid".into(),
+            mint_key: None,
+            raise_balance_msats: Some(raise_to_msats),
+        }
+    }
+}
+
+/// The `POST /v1/balance/lightning/recover` mock response.
+#[derive(Clone)]
+pub enum RecoverResult {
+    /// 200 with `{api_key: <key|null>}`.
+    Key(Option<String>),
+    /// A non-2xx status.
+    Status(u16),
+}
+
+impl Default for RecoverResult {
+    fn default() -> Self {
+        RecoverResult::Key(None)
+    }
+}
+
 /// One request the mock received (for shape assertions).
 #[derive(Clone, Debug)]
 pub struct RecordedRequest {
@@ -102,6 +196,9 @@ pub struct RecordedRequest {
 pub struct MockNode {
     base_url: String,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    /// The SHARED spendable balance (millisats) the `/v1/balance/info` route reports and a
+    /// funding status step can raise (only meaningful for an invoice-driven node).
+    balance_msats: Arc<AtomicU64>,
     _shutdown: tokio::task::JoinHandle<()>,
 }
 
@@ -120,11 +217,37 @@ impl MockNode {
         refund: RefundBehavior,
         balance: BalanceBehavior,
     ) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock node");
+        Self::start_full(completion, refund, balance, InvoiceBehavior::default()).await
+    }
+
+    /// A node driving the Lightning FUNDING endpoints (`fund-key`): invoice create + the
+    /// status poll + recover, plus a shared balance the status script can raise. The
+    /// completion/refund routes 500/404 (unused on the funding path).
+    pub async fn start_with_invoices(invoices: InvoiceBehavior) -> Self {
+        Self::start_full(
+            NodeBehavior::Status(500),
+            RefundBehavior::None,
+            BalanceBehavior::Shared(invoices.balance_msats.clone()),
+            invoices,
+        )
+        .await
+    }
+
+    /// The full constructor: every route behavior, including the funding invoice endpoints.
+    pub async fn start_full(
+        completion: NodeBehavior,
+        refund: RefundBehavior,
+        balance: BalanceBehavior,
+        invoices: InvoiceBehavior,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock node");
         let addr = listener.local_addr().expect("mock node local addr");
         let base_url = format!("http://127.0.0.1:{}", addr.port());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_for_task = requests.clone();
+        let balance_msats = invoices.balance_msats.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _peer)) = listener.accept().await else {
@@ -133,24 +256,34 @@ impl MockNode {
                 let behavior = completion.clone();
                 let refund = refund.clone();
                 let balance = balance.clone();
+                let invoices = invoices.clone();
                 let recorder = requests_for_task.clone();
                 tokio::spawn(async move {
-                    handle_conn(stream, behavior, refund, balance, recorder).await;
+                    handle_conn(stream, behavior, refund, balance, invoices, recorder).await;
                 });
             }
         });
         MockNode {
             base_url,
             requests,
+            balance_msats,
             _shutdown: handle,
         }
+    }
+
+    /// Set the SHARED spendable balance (millisats) the `/v1/balance/info` route reports (an
+    /// invoice-driven node's balance-probe result; a status step can raise it later).
+    pub fn set_balance_msats(&self, msats: u64) {
+        self.balance_msats.store(msats, Ordering::SeqCst);
     }
 
     /// Convenience: a 200 node returning an arbitrary JSON `body` (the prepaid-key path
     /// carries its cost in `cost`/`usage` body fields), no refund, no balance route.
     pub async fn replying_json(body: &str) -> Self {
         MockNode::start(
-            NodeBehavior::ReplyJson { body: body.to_string() },
+            NodeBehavior::ReplyJson {
+                body: body.to_string(),
+            },
             RefundBehavior::None,
         )
         .await
@@ -223,6 +356,16 @@ impl MockNode {
             .find(|r| r.path.contains("/v1/chat/completions"))
             .cloned()
     }
+
+    /// The first request whose path contains `needle` (a funding-endpoint assertion target).
+    pub fn first_request_matching(&self, needle: &str) -> Option<RecordedRequest> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.path.contains(needle))
+            .cloned()
+    }
 }
 
 impl Drop for MockNode {
@@ -236,6 +379,7 @@ async fn handle_conn(
     completion: NodeBehavior,
     refund: RefundBehavior,
     balance: BalanceBehavior,
+    invoices: InvoiceBehavior,
     recorder: Arc<Mutex<Vec<RecordedRequest>>>,
 ) {
     // Read until the end of the headers, then drain the Content-Length body so the full
@@ -291,8 +435,10 @@ async fn handle_conn(
         }
     }
 
-    // Keep a copy of the received bearer for the redeem path (the record moves it).
+    // Keep a copy of the received bearer for the redeem path and the body for the invoice
+    // amount echo (the record moves both).
     let x_cashu_received = x_cashu.clone();
+    let body_for_invoice = body.clone();
     recorder.lock().unwrap().push(RecordedRequest {
         method,
         path: path.clone(),
@@ -321,6 +467,100 @@ async fn handle_conn(
             }
             BalanceBehavior::Status(code) => {
                 write_response(&mut stream, code, "Error", &[], b"{\"error\":\"mock\"}").await;
+            }
+            BalanceBehavior::Shared(cell) => {
+                let msats = cell.load(Ordering::SeqCst);
+                let body = serde_json::json!({ "balance": msats }).to_string();
+                write_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &[("Content-Type", "application/json")],
+                    body.as_bytes(),
+                )
+                .await;
+            }
+        }
+        return;
+    }
+
+    // The Lightning FUNDING endpoints (`fund-key`). Order matters: match the status GET
+    // (a longer path) before the create POST prefix.
+    if path.contains("/v1/balance/lightning/invoice/") && path.contains("/status") {
+        let step_idx = invoices.step.fetch_add(1, Ordering::SeqCst) as usize;
+        let script = &invoices.status_script;
+        let step = if script.is_empty() {
+            StatusStep::pending()
+        } else {
+            script[step_idx.min(script.len() - 1)].clone()
+        };
+        if let Some(raise) = step.raise_balance_msats {
+            invoices.balance_msats.store(raise, Ordering::SeqCst);
+        }
+        let body = match step.mint_key {
+            Some(key) => serde_json::json!({ "status": step.status, "api_key": key }),
+            None => serde_json::json!({ "status": step.status, "api_key": null }),
+        }
+        .to_string();
+        write_response(
+            &mut stream,
+            200,
+            "OK",
+            &[("Content-Type", "application/json")],
+            body.as_bytes(),
+        )
+        .await;
+        return;
+    }
+    if path.contains("/v1/balance/lightning/invoice") {
+        // Echo the requested amount so the response's amount_sats matches the request.
+        let amount = serde_json::from_slice::<serde_json::Value>(&body_for_invoice)
+            .ok()
+            .and_then(|v| v.get("amount_sats").and_then(|a| a.as_u64()))
+            .unwrap_or(0);
+        match invoices.create.clone() {
+            InvoiceCreate::Ok { invoice_id, bolt11 } => {
+                let resp = serde_json::json!({
+                    "invoice_id": invoice_id,
+                    "bolt11": bolt11,
+                    "amount_sats": amount,
+                    "expires_at": 1_720_000_000i64,
+                })
+                .to_string();
+                write_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &[("Content-Type", "application/json")],
+                    resp.as_bytes(),
+                )
+                .await;
+            }
+            InvoiceCreate::Status(code) => {
+                write_response(&mut stream, code, "Error", &[], b"{\"detail\":\"mock\"}").await;
+            }
+        }
+        return;
+    }
+    if path.contains("/v1/balance/lightning/recover") {
+        match invoices.recover.clone() {
+            RecoverResult::Key(key) => {
+                let body = match key {
+                    Some(k) => serde_json::json!({ "api_key": k }),
+                    None => serde_json::json!({ "api_key": null }),
+                }
+                .to_string();
+                write_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &[("Content-Type", "application/json")],
+                    body.as_bytes(),
+                )
+                .await;
+            }
+            RecoverResult::Status(code) => {
+                write_response(&mut stream, code, "Error", &[], b"{\"detail\":\"mock\"}").await;
             }
         }
         return;
@@ -442,7 +682,9 @@ fn synthetic_token(sats: u64) -> String {
 }
 
 fn parse_synthetic(token: &str) -> Option<u64> {
-    token.strip_prefix("ecash:").and_then(|s| s.parse::<u64>().ok())
+    token
+        .strip_prefix("ecash:")
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 struct StubEcashInner {
@@ -527,7 +769,8 @@ impl EcashProvider for StubEcash {
         if self.inner.fail_mint {
             anyhow::bail!("stub mint failure (no sats spent)");
         }
-        let op = OperationId::from_u128(self.inner.op_counter.fetch_add(1, Ordering::SeqCst) as u128);
+        let op =
+            OperationId::from_u128(self.inner.op_counter.fetch_add(1, Ordering::SeqCst) as u128);
         self.inner.minted.lock().unwrap().insert(op, amount_sats);
         Ok(SendHandle {
             token: synthetic_token(amount_sats),
@@ -546,7 +789,14 @@ impl EcashProvider for StubEcash {
         if !self.inner.revoke_succeeds {
             anyhow::bail!("stub revoke failed (token already consumed by the node)");
         }
-        let amount = self.inner.minted.lock().unwrap().get(op).copied().unwrap_or(0);
+        let amount = self
+            .inner
+            .minted
+            .lock()
+            .unwrap()
+            .get(op)
+            .copied()
+            .unwrap_or(0);
         Ok(amount)
     }
 
@@ -560,7 +810,9 @@ impl EcashProvider for StubEcash {
 /// to a fixture (e.g. the fake mint) that needs a fixed port. A small bind-race window,
 /// acceptable for tests.
 pub async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind for free port");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind for free port");
     let port = listener.local_addr().expect("local addr").port();
     drop(listener);
     port
@@ -712,4 +964,3 @@ pub mod mint_fixture {
         }
     }
 }
-
