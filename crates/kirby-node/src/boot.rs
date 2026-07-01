@@ -907,9 +907,15 @@ pub async fn boot_and_observe_with_rail(
             let relays = social.relays.clone();
             // #103: the DM backfill sweep interval (0 disables it). Copied out before the move.
             let dm_backfill_secs = social.dm_backfill_secs;
+            // The DM inbound identity is signer-agnostic: today the plain dm_keys (pre-P1,
+            // byte-identical). The born-unified gate (inc5) swaps a QSigner + Q here so inbound
+            // DMs decrypt under the FROST key Q.
+            let dm_signer: std::sync::Arc<dyn nostr_sdk::NostrSigner> =
+                std::sync::Arc::new(dm_identity.keys().clone());
+            let dm_me = dm_identity.public_key();
             tokio::spawn(async move {
                 if let Err(e) =
-                    crate::nerve::run_dm_inbound(&dm_identity, &relays, queue, dm_backfill_secs, rx)
+                    crate::nerve::run_dm_inbound(dm_signer, dm_me, &relays, queue, dm_backfill_secs, rx)
                         .await
                 {
                     tracing::error!(error = %e, "DM inbound task ended with error");
