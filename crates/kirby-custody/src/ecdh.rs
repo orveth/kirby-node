@@ -82,6 +82,13 @@ pub enum EcdhError {
     /// A holder was asked to contribute for a signing set it is not a member of (its
     /// Lagrange coefficient would be undefined for that set).
     SignerNotInSet(String),
+    /// Fewer than `min_signers` participated. A sub-threshold set would Lagrange-combine
+    /// to the WRONG scalar (not `s`), silently yielding an unusable secret — reject it.
+    SubThreshold(String),
+    /// The signers are not one consistent group, or do not match the supplied
+    /// `PublicKeyPackage` (shares from a different keyset would fold to a secret for no
+    /// real key). Binds the ceremony to exactly one Q.
+    MismatchedGroup(String),
 }
 
 impl fmt::Display for EcdhError {
@@ -92,6 +99,8 @@ impl fmt::Display for EcdhError {
             EcdhError::EmptySet => write!(f, "empty signing set / no contributions"),
             EcdhError::DuplicateSigner(m) => write!(f, "duplicate signer in set: {m}"),
             EcdhError::SignerNotInSet(m) => write!(f, "signer not in its signing set: {m}"),
+            EcdhError::SubThreshold(m) => write!(f, "sub-threshold signing set: {m}"),
+            EcdhError::MismatchedGroup(m) => write!(f, "mismatched signing group: {m}"),
         }
     }
 }
@@ -235,17 +244,53 @@ pub fn nip44_conversation_key(shared: &WirePoint) -> Result<[u8; 32], EcdhError>
     Ok(prk.into())
 }
 
+/// Validate a signing set for a threshold-ECDH ceremony and return the group's shared
+/// verifying-key bytes. Enforces: non-empty, no duplicate identifiers, all key packages
+/// from the SAME group (identical verifying key + threshold), and at least `min_signers`
+/// participants. A sub-threshold or cross-keyset set would Lagrange-combine to the wrong
+/// scalar and silently return an unusable "secret" — this rejects it up front, fail-closed.
+fn validate_signers(signers: &[&KeyPackage]) -> Result<Vec<u8>, EcdhError> {
+    let first = signers.first().ok_or(EcdhError::EmptySet)?;
+    let group_vk = first
+        .verifying_key()
+        .serialize()
+        .map_err(|e| EcdhError::MalformedPoint(e.to_string()))?;
+    let min_signers = *first.min_signers();
+
+    let mut seen: BTreeSet<Identifier> = BTreeSet::new();
+    for kp in signers {
+        if !seen.insert(*kp.identifier()) {
+            return Err(EcdhError::DuplicateSigner(format!("{:?}", kp.identifier())));
+        }
+        let vk = kp
+            .verifying_key()
+            .serialize()
+            .map_err(|e| EcdhError::MalformedPoint(e.to_string()))?;
+        if vk != group_vk || *kp.min_signers() != min_signers {
+            return Err(EcdhError::MismatchedGroup(
+                "signers are not one consistent 2-of-3 group".to_string(),
+            ));
+        }
+    }
+    if signers.len() < min_signers as usize {
+        return Err(EcdhError::SubThreshold(format!(
+            "{} of {} required signers",
+            signers.len(),
+            min_signers
+        )));
+    }
+    Ok(group_vk)
+}
+
 /// In-process threshold ECDH against the **untweaked** FROST group key `P`. Drives the
-/// participating `signers` (a ≥-threshold subset), aggregates their contributions, and
-/// returns the shared point `s·B`. Matches a peer who ECDHs against `P` (plain key) —
-/// the form the NIP-44 known-answer vectors exercise.
+/// participating `signers` (a ≥-threshold subset of ONE group), aggregates their
+/// contributions, and returns the shared point `s·B`. Matches a peer who ECDHs against
+/// `P` (plain key) — the form the NIP-44 known-answer vectors exercise.
 pub fn threshold_ecdh_untweaked(
     signers: &[&KeyPackage],
     peer_xonly: &[u8; 32],
 ) -> Result<WirePoint, EcdhError> {
-    if signers.is_empty() {
-        return Err(EcdhError::EmptySet);
-    }
+    validate_signers(signers)?;
     let peer = peer_point_from_xonly(peer_xonly)?;
     let signing_set: Vec<Identifier> = signers.iter().map(|kp| *kp.identifier()).collect();
     let contributions = signers
@@ -269,9 +314,16 @@ fn verifying_key_point(pubkeys: &PublicKeyPackage) -> Result<ProjectivePoint, Ec
         .ok_or_else(|| EcdhError::MalformedPoint("verifying key not on curve".to_string()))
 }
 
-/// The BIP-341 taproot tweak scalar `t = int(H_TapTweak(x(P)))` with no script tree
-/// (`merkle_root = None`) — computed exactly as `frost-secp256k1-tr` does (tagged
-/// hash `TapTweak` over the internal key's x-coordinate, reduced mod n).
+/// The taproot tweak scalar `t = int(H_TapTweak(x(P)))` with no script tree
+/// (`merkle_root = None`), computed EXACTLY as `frost-secp256k1-tr`'s `tweak()` does:
+/// tagged hash `TapTweak` over the internal key's x-coordinate, then `Scalar::reduce`
+/// (reduce mod n).
+///
+/// Note: strict BIP-341 treats `t ≥ n` as invalid (abort); frost REDUCES instead. We
+/// match frost deliberately — this ECDH must derive against the SAME Q the fleet already
+/// signs under (frost's `sign_with_tweak`/`group_xonly_q`), so matching frost's tweak,
+/// not strict BIP-341, is the requirement. The two differ only in the ~2⁻¹²⁸ `t ≥ n`
+/// case; `tweaked_q_matches_group_xonly_q` proves the derived Q equals the production Q.
 fn tap_tweak_none(internal_p: &ProjectivePoint) -> Scalar {
     // tagged_hash(tag) = SHA256( SHA256(tag) || SHA256(tag) || .. )
     let tag_hash = Sha256::digest(b"TapTweak");
@@ -326,6 +378,28 @@ pub fn threshold_ecdh_tweaked_q(
     pubkeys: &PublicKeyPackage,
     peer_xonly: &[u8; 32],
 ) -> Result<WirePoint, EcdhError> {
+    // Bind the signers to THIS group AND to the supplied `pubkeys` (the tweak/parity
+    // are derived from `pubkeys`): shares from a different keyset must not be folded
+    // with another group's tweak, which would return a secret for no real Q.
+    let group_vk = validate_signers(signers)?;
+    let pk_vk = pubkeys
+        .verifying_key()
+        .serialize()
+        .map_err(|e| EcdhError::MalformedPoint(e.to_string()))?;
+    if group_vk != pk_vk {
+        return Err(EcdhError::MismatchedGroup(
+            "signers' group key does not match the supplied PublicKeyPackage".to_string(),
+        ));
+    }
+    for kp in signers {
+        if !pubkeys.verifying_shares().contains_key(kp.identifier()) {
+            return Err(EcdhError::MismatchedGroup(format!(
+                "signer {:?} is not a member of the supplied PublicKeyPackage",
+                kp.identifier()
+            )));
+        }
+    }
+
     let peer = peer_point_from_xonly(peer_xonly)?;
     let b = peer.to_projective()?;
 
@@ -491,38 +565,84 @@ mod tests {
         println!("TWEAK-Q PASS: tweaked_q_xonly == group_xonly_q (tweak fold targets the real identity)");
     }
 
+    /// A keyset generated from a varied seed, plus whether its group key `P` has odd Y.
+    fn keyset_for_seed(seed_byte: u8) -> (Vec<KeyPackage>, PublicKeyPackage, bool) {
+        let mut seed = ECDH_SEED;
+        seed[0] = seed_byte;
+        let mut rng = StdRng::from_seed(seed);
+        let keyset = generate_dealer_keyset_with_rng(2, 3, &mut rng).expect("keygen");
+        let p_odd = bool::from(
+            verifying_key_point(&keyset.pubkeys)
+                .unwrap()
+                .to_affine()
+                .y_is_odd(),
+        );
+        let kps = key_packages(&keyset)
+            .expect("key packages")
+            .into_values()
+            .collect();
+        (kps, keyset.pubkeys, p_odd)
+    }
+
     /// End-to-end Kirby-identity proof (no external vector needed): a peer who ECDHs
     /// against the agent's real npub `Q` derives the SAME NIP-44 conversation key the
-    /// agent derives via tweaked-Q threshold ECDH — for every 2-of-3 quorum.
+    /// agent derives via tweaked-Q threshold ECDH — for every 2-of-3 quorum, and
+    /// deterministically across BOTH parities of the group key `P` (so the internal
+    /// even-Y negation branch of the tweak fold is actually exercised, not just the
+    /// happy parity of one fixed keyset).
     #[test]
-    fn peer_symmetry_tweaked_q() {
-        let (kps, pk) = dealer_keyset();
-
+    fn peer_symmetry_tweaked_q_both_parities() {
         // A peer with a fixed, valid secret b; its x-only pubkey is what the agent
         // ECDHs against.
         let b = scalar_from_be_bytes(&hex32(
             "1111111111111111111111111111111111111111111111111111111111111111",
         ))
         .unwrap();
-        let peer_pub = ProjectivePoint::GENERATOR * b;
-        let peer_xonly: [u8; 32] = peer_pub.to_affine().x().into();
+        let peer_xonly: [u8; 32] = (ProjectivePoint::GENERATOR * b).to_affine().x().into();
 
-        // Peer side: x( b · lift_even(Q) ) → conversation key.
-        let q_xonly = tweaked_q_xonly(&pk).unwrap();
-        let q_point = peer_point_from_xonly(&q_xonly).unwrap().to_projective().unwrap();
-        let peer_shared = WirePoint::from_projective(&(q_point * b)).unwrap();
-        let peer_ck = nip44_conversation_key(&peer_shared).unwrap();
-
-        for (a, c, label) in [(0usize, 1usize, "{1,2}"), (0, 2, "{1,3}"), (1, 2, "{2,3}")] {
-            let quorum = [&kps[a], &kps[c]];
-            let agent_shared = threshold_ecdh_tweaked_q(&quorum, &pk, &peer_xonly).unwrap();
-            let agent_ck = nip44_conversation_key(&agent_shared).unwrap();
-            assert_eq!(
-                agent_ck, peer_ck,
-                "agent (quorum {label}) and peer must derive the same conversation key"
-            );
+        // Find one even-Y-P keyset and one odd-Y-P keyset (P parity is ~50/50 per seed,
+        // so this terminates almost surely well within the bound).
+        let mut even = None;
+        let mut odd = None;
+        for seed_byte in 0u8..64 {
+            let (kps, pk, p_odd) = keyset_for_seed(seed_byte);
+            if p_odd && odd.is_none() {
+                odd = Some((kps, pk));
+            } else if !p_odd && even.is_none() {
+                even = Some((kps, pk));
+            }
+            if even.is_some() && odd.is_some() {
+                break;
+            }
         }
-        println!("SYMMETRY PASS: peer↔agent NIP-44 conversation keys match for all quorums (threshold-ECDH against the real Q)");
+        let even = even.expect("an even-Y P keyset within 64 seeds");
+        let odd = odd.expect("an odd-Y P keyset within 64 seeds");
+
+        for (parity, (kps, pk)) in [("even-Y P", even), ("odd-Y P", odd)] {
+            // The tweak path targets the real npub for THIS keyset (both parities).
+            assert_eq!(
+                tweaked_q_xonly(&pk).unwrap(),
+                group_xonly_q(&pk).unwrap(),
+                "{parity}: tweaked_q_xonly must equal group_xonly_q"
+            );
+
+            // Peer side: x( b · lift_even(Q) ) → conversation key.
+            let q_xonly = tweaked_q_xonly(&pk).unwrap();
+            let q_point = peer_point_from_xonly(&q_xonly).unwrap().to_projective().unwrap();
+            let peer_ck =
+                nip44_conversation_key(&WirePoint::from_projective(&(q_point * b)).unwrap()).unwrap();
+
+            for (a, c, label) in [(0usize, 1usize, "{1,2}"), (0, 2, "{1,3}"), (1, 2, "{2,3}")] {
+                let quorum = [&kps[a], &kps[c]];
+                let agent_shared = threshold_ecdh_tweaked_q(&quorum, &pk, &peer_xonly).unwrap();
+                assert_eq!(
+                    nip44_conversation_key(&agent_shared).unwrap(),
+                    peer_ck,
+                    "{parity} quorum {label}: agent and peer must derive the same conversation key"
+                );
+            }
+        }
+        println!("SYMMETRY PASS: peer↔agent NIP-44 conversation keys match for all quorums across BOTH P parities (even-Y and odd-Y group key)");
     }
 
     // ---- TEETH (red-on-revert) ----
@@ -591,25 +711,78 @@ mod tests {
         println!("TOOTH tweak PASS: threshold-ECDH under Q differs from under P (tweak fold is load-bearing)");
     }
 
-    /// A holder's on-the-wire contribution is a valid curve point that is NOT the peer
-    /// point and NOT a trivial echo of the share — the share stays home (structural).
+    /// A holder emits a POINT, never its share. The no-leak guarantee is STRUCTURAL: the
+    /// wire type is a 33-byte compressed curve point (`WirePoint([u8; 33])`), so it cannot
+    /// carry a scalar share by construction, and the emitted value is exactly `λ_i·s_i·B`
+    /// — recovering `s_i` from it is a discrete-log problem. This test makes that concrete:
+    /// the contribution decodes as an on-curve point, equals the independently recomputed
+    /// `λ·s·B`, and varies with the peer (so it is not a static function of the share).
     #[test]
-    fn tooth_contribution_is_a_point_not_a_share() {
+    fn tooth_contribution_is_a_point_valued_function() {
+        let (kps, _pk) = split_known_secret(&hex32(NIP44_VECTORS[0].0));
+        let set = [*kps[0].identifier(), *kps[1].identifier()];
+        let peer_a = peer_point_from_xonly(&hex32(NIP44_VECTORS[0].1)).unwrap();
+        let peer_b = peer_point_from_xonly(&hex32(NIP44_VECTORS[2].1)).unwrap();
+
+        let c_a = holder_ecdh_contribution(&kps[0], &set, &peer_a).unwrap();
+        let c_b = holder_ecdh_contribution(&kps[0], &set, &peer_b).unwrap();
+
+        // Decodes as a real on-curve point (a point, not a scalar).
+        let c_a_pt = c_a.to_projective().expect("on-curve point");
+        // Exactly λ·s·B (a point-valued function of the PUBLIC peer key; s is only
+        // discrete-log-recoverable from it).
+        let lambda = lagrange_coefficient(kps[0].identifier(), &set).unwrap();
+        let s_i = scalar_from_be_bytes(&kps[0].signing_share().serialize()).unwrap();
+        assert_eq!(
+            c_a_pt,
+            peer_a.to_projective().unwrap() * (lambda * s_i),
+            "contribution must equal λ·s·B"
+        );
+        // Peer-dependent: not a fixed echo of the share.
+        assert_ne!(c_a, c_b, "same share, different peer must give a different wire point");
+        assert_ne!(c_a, peer_a, "contribution is not the peer point itself");
+        println!("TOOTH wire PASS: a contribution is a peer-dependent curve point (λ·s·B), never the share");
+    }
+
+    /// The threshold is enforced at the driver: a sub-threshold set is rejected up front
+    /// (SubThreshold), never silently returning a wrong scalar's ECDH. (Finding 1.)
+    #[test]
+    fn tooth_untweaked_rejects_subthreshold() {
         let (kps, _pk) = split_known_secret(&hex32(NIP44_VECTORS[0].0));
         let pub2 = hex32(NIP44_VECTORS[0].1);
-        let peer = peer_point_from_xonly(&pub2).unwrap();
-        let contribution =
-            holder_ecdh_contribution(&kps[0], &[*kps[0].identifier(), *kps[1].identifier()], &peer)
-                .unwrap();
-        // It is a real, decodable curve point (33-byte compressed), distinct from B.
-        contribution.to_projective().expect("valid point");
-        assert_ne!(contribution, peer, "contribution must not be the peer point itself");
-        // The raw share bytes never appear inside the emitted point.
-        let share_bytes = kps[0].signing_share().serialize();
+        let lone = threshold_ecdh_untweaked(&[&kps[0]], &pub2);
         assert!(
-            !contribution.0.windows(share_bytes.len()).any(|w| w == share_bytes.as_slice()),
-            "the emitted point must not contain the raw share bytes"
+            matches!(lone, Err(EcdhError::SubThreshold(_))),
+            "a lone signer (1 of 2-of-3) must be rejected as SubThreshold, got {lone:?}"
         );
-        println!("TOOTH wire PASS: a contribution is an opaque curve point, not the share");
+        println!("TOOTH subthreshold PASS: the driver rejects a sub-threshold set (no silent wrong secret)");
+    }
+
+    /// Shares must be bound to their group: mixing key packages from two different keysets,
+    /// or handing tweaked-Q a mismatched PublicKeyPackage, is rejected (MismatchedGroup).
+    /// (Finding 2.)
+    #[test]
+    fn tooth_rejects_cross_keyset_shares() {
+        let (kps_a, pk_a) = split_known_secret(&hex32(NIP44_VECTORS[0].0));
+        let (kps_b, _pk_b) = split_known_secret(&hex32(NIP44_VECTORS[1].0));
+        let pub2 = hex32(NIP44_VECTORS[0].1);
+
+        // One share from keyset A, one from keyset B: not one group.
+        let mixed = threshold_ecdh_untweaked(&[&kps_a[0], &kps_b[1]], &pub2);
+        assert!(
+            matches!(mixed, Err(EcdhError::MismatchedGroup(_))),
+            "cross-keyset signers must be rejected, got {mixed:?}"
+        );
+
+        // Valid keyset-A quorum but the WRONG PublicKeyPackage's tweak would be applied.
+        let (_kps_b2, pk_b) = split_known_secret(&hex32(NIP44_VECTORS[1].0));
+        let wrong_pk = threshold_ecdh_tweaked_q(&[&kps_a[0], &kps_a[1]], &pk_b, &pub2);
+        assert!(
+            matches!(wrong_pk, Err(EcdhError::MismatchedGroup(_))),
+            "tweaked-Q with a mismatched PublicKeyPackage must be rejected, got {wrong_pk:?}"
+        );
+        // Sanity: the matching pubkeys is accepted.
+        assert!(threshold_ecdh_tweaked_q(&[&kps_a[0], &kps_a[1]], &pk_a, &pub2).is_ok());
+        println!("TOOTH group-binding PASS: cross-keyset shares and mismatched pubkeys are rejected (MismatchedGroup)");
     }
 }
