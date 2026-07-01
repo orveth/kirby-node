@@ -76,9 +76,11 @@ cargo run -p kirby-node -- prereqs       # check the host
 cargo run -p kirby-node -- agent --config kirby.toml
 ```
 
-That takes the node from nothing to a live Kirby in the Nostr fleet: it is dealt its own
-sovereign Q, joins the fleet (presence + heartbeat + lifecycle, all quorum-signed), funds
-itself to "born," boots inside the sandbox, runs its metered workload, and dies when broke.
+That takes you from nothing to a live Kirby in the Nostr fleet: it is dealt its own sovereign Q,
+joins the fleet (a quorum-signed lifecycle + live agent-state), funds itself to "born," boots
+inside the sandbox, runs its metered workload, and dies when broke. This command runs ONE agent;
+to run a **node** that joins the network and hosts agents, use `kirby-node fleet --config
+kirby.toml` (see [`AGENTS.md`](AGENTS.md)). The model: a node joins the network, agents run on top.
 
 `--no-frost` drops to a plain node-key signing path -- a **dev/test fast-path only**, not
 the sovereign default.
@@ -133,14 +135,17 @@ crates/
   kirby-ebpf/    the eBPF TC classifier that meters egress bytes (aya, nightly)
 
 nix/                 genome image (x86_64 + aarch64), guest kernels, local relay
-kirby.toml.example   the annotated `kirby run` config template
+kirby.toml.example   the annotated run config template
 docs/                the spec, the design records, and the VZ backend plan (see docs/README.md)
 ```
 
 ## Documentation
 
+- [`CLAUDE.md`](CLAUDE.md) -- orientation for a coding agent: the code map, the build/test loop, and
+  the full subcommand map (start here if you are working *in* the repo)
 - [`AGENTS.md`](AGENTS.md) -- set up and run a node on Linux or macOS (the runbook)
-- [`kirby.toml.example`](kirby.toml.example) -- the annotated `kirby run` config
+- [`kirby.toml.example`](kirby.toml.example) -- the annotated run config
+- [`docs/config.md`](docs/config.md) -- every kirby.toml key, default, and which entrypoint reads it
 - [`docs/README.md`](docs/README.md) -- index of the spec and design docs
 - [`docs/build-spec.md`](docs/build-spec.md) -- the build spec: gates, decisions, money-paths
 - [`docs/mac-build-and-run.md`](docs/mac-build-and-run.md) -- the verified macOS cold-boot walkthrough

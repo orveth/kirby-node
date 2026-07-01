@@ -5,8 +5,11 @@ The spec, the design records, and the macOS-backend plan for kirby-node.
 ## Start here
 
 - [`../README.md`](../README.md) -- what kirby-node is (human-facing intro)
+- [`../CLAUDE.md`](../CLAUDE.md) -- orientation for a coding agent (code map, build/test loop, the
+  full subcommand map)
 - [`../AGENTS.md`](../AGENTS.md) -- set up and run a node on Linux or macOS (the runbook)
-- [`../kirby.toml.example`](../kirby.toml.example) -- the annotated `kirby run` config
+- [`../kirby.toml.example`](../kirby.toml.example) -- the annotated run config
+- [`config.md`](config.md) -- every kirby.toml key, default, and which entrypoint reads it
 
 ## Reference (canonical)
 

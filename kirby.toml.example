@@ -1,6 +1,7 @@
-# Example `kirby run` config (copy to `kirby.toml` and edit).
+# Example kirby config (copy to `kirby.toml` and edit). One file, two entrypoints:
 #
-#   kirby-node agent --config kirby.toml
+#   kirby-node agent --config kirby.toml     # run ONE sovereign agent (the taste / smoke)
+#   kirby-node fleet --config kirby.toml     # run the NODE that joins the network + hosts agents
 #
 # Takes a node from nothing to a live sovereign Kirby agent in the Nostr fleet:
 # load-or-mint identity, join the fleet (presence + heartbeat + 9100 lifecycle),
@@ -37,6 +38,12 @@ mode = "bootstrap"
 agent_id = "agent-0"
 node_id  = "node-1"
 
+# The single durable root for ALL node state (treasuries, keystores, agent dirs). A top-level key,
+# so it must precede any [table] header. Unset, it resolves to $KIRBY_STATE_ROOT, else
+# $XDG_DATA_HOME/kirby, else $HOME/.local/share/kirby -- never a temp dir. Leave it unset for that
+# default; the explicit ./.kirby paths below also work for a single agent.
+# state_root = "/var/lib/kirby"
+
 [identity]
 # This node's BIP340 Nostr secret key. Minted (0600) on first run, loaded after, so
 # the node keeps the SAME npub across restarts. May be a file or a directory.
@@ -55,3 +62,27 @@ presence_stale_after_secs = 45
 # Initial treasury balance in sats, seeded only on first creation (play-money for
 # the spike; real funds are gated). A resume keeps the persisted balance.
 initial_sats = 1000000
+
+# --- Running a NODE (kirby-node fleet) ------------------------------------------------------
+# Everything above runs ONE agent. To run a node that joins the network and HOSTS agents, add a
+# [fleet] block and run `kirby-node fleet --config kirby.toml`. A bare fleet node (no tenants,
+# empty allowlists) joins and listens but hosts nothing until you declare tenants below or an
+# operator sends a spawn-request. Every key (plus the capable workload and [brain]/[memory]/
+# [agent]/[meter] blocks) is documented in docs/config.md.
+#
+# [fleet]
+# max_tenants = 16             # per-host tenant ceiling
+#
+# Statically declare the agents this node hosts (each becomes a child kirby-node agent):
+# [[fleet.tenants]]
+# agent_id = "agent-a"
+# initial_sats = 50000
+#
+# The kind-31003 spawn control plane runs whenever `kirby-node fleet` runs (there is no enable
+# flag); it is gated by these allowlists:
+# [fleet.spawn]
+# # SECURITY: an EMPTY operators list means ANY signer may spawn an agent on this node (a known
+# # MVP DoS vector). Allowlist the operator pubkeys you trust before exposing the node.
+# operators = ["<operator-pubkey-hex>"]
+# # The pre-staged genome images this node will run. EMPTY = spawn nothing (the safe backstop).
+# image_allowlist = ["<image-ref>"]
