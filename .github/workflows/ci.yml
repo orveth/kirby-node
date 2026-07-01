@@ -30,6 +30,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The full-workspace Nix build (cdk + tonic + firecracker + the genome image)
+      # overruns the ~14 GB free on a stock ubuntu-latest runner ("No space left on
+      # device"). Reclaim the pre-baked tool caches we never use before the build.
+      - name: Free disk space
+        # Pinned to a full commit SHA (v1.3.1), not a floating @main, for supply-chain safety.
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          docker-images: true
+          large-packages: false
+          swap-storage: false
+
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
 
