@@ -91,6 +91,47 @@ pub async fn reconcile_import(
     wallet.import_proofs(importable).await
 }
 
+/// Boot-time restore-from-backup: fetch the relay-backed candidate proofs and reconcile-import
+/// them, DEGRADING (log + continue, return 0) on ANY error so an unreachable mint/relay never
+/// fails boot — the downstream solvency check is the money gate (a fresh box that could not restore
+/// has too low a balance and dies-broke, correctly). Returns the sats imported.
+///
+/// `candidates` is the result of [`crate::nip60::Nip60Store::reconcile_on_load`]; the caller passes
+/// it in so this stays free of the relay transport and unit-testable. SAFE to call unconditionally
+/// at boot: novel-only makes a normal reboot (relay == local) a no-op, and the mint-swap in
+/// `import_proofs` is the single-writer arbiter — a lost double-restore race fails-closed here
+/// (Err → degrade → 0), never corrupting local state.
+pub async fn restore_from_relay_backup(
+    candidates: anyhow::Result<Vec<Proof>>,
+    wallet: &dyn ReconcileWallet,
+) -> u64 {
+    let candidates = match candidates {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "NIP-60 restore: relay fetch failed; booting on local wallet state");
+            return 0;
+        }
+    };
+    match reconcile_import(candidates, wallet).await {
+        Ok(imported) => {
+            if imported > 0 {
+                tracing::info!(
+                    imported_sats = imported,
+                    "NIP-60 restore: imported proofs from the relay backup"
+                );
+            }
+            imported
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "NIP-60 restore: import failed (mint unreachable or a lost restore-race); booting on local wallet state"
+            );
+            0
+        }
+    }
+}
+
 /// The production [`ReconcileWallet`]: the funded treasury `cdk::Wallet`. All ops are the daemon's
 /// own host networking to the mint; nothing crosses vsock. `receive_proofs` is the saga-backed
 /// swap-import (crash-recoverable); `check_proofs_spent` is the NUT-07 check-state.
@@ -161,12 +202,19 @@ mod tests {
     struct StubWallet {
         known: Vec<PublicKey>,
         states: Option<Vec<ProofState>>,
+        import_err: bool,
         imported: Mutex<Option<Vec<Proof>>>,
     }
 
     impl StubWallet {
         fn new(known: Vec<PublicKey>, states: Option<Vec<ProofState>>) -> Self {
-            StubWallet { known, states, imported: Mutex::new(None) }
+            StubWallet { known, states, import_err: false, imported: Mutex::new(None) }
+        }
+        /// Model a FAILED import swap — e.g. the double-restore-race LOSER whose proofs the mint
+        /// already spent for the winner. Records nothing (no partial adoption).
+        fn failing_import(mut self) -> Self {
+            self.import_err = true;
+            self
         }
         fn imported(&self) -> Option<Vec<Proof>> {
             self.imported.lock().unwrap().clone()
@@ -185,6 +233,8 @@ mod tests {
             }
         }
         async fn import_proofs(&self, proofs: Vec<Proof>) -> anyhow::Result<u64> {
+            // Bail BEFORE recording, so a failed swap (race loser) leaves NO partial adoption.
+            anyhow::ensure!(!self.import_err, "import swap failed (e.g. a lost restore-race)");
             let n = proofs.len() as u64;
             *self.imported.lock().unwrap() = Some(proofs);
             Ok(n)
@@ -241,5 +291,89 @@ mod tests {
             .expect("reconcile ok");
         assert_eq!(imported, 0, "a normal reboot (relay == local) imports nothing");
         assert!(wallet.imported().is_none(), "no import call when nothing is novel");
+    }
+
+    /// Property 1 (partial relay state): a mix of already-known + novel candidates imports ONLY
+    /// the novel UNSPENT ones — the known proof (e.g. one mid-saga) is skipped (no double-count),
+    /// the novel spent one is dropped.
+    #[tokio::test]
+    async fn partial_state_imports_only_novel_unspent_and_skips_known() {
+        let known = dummy_proof("known");
+        let novel_unspent = dummy_proof("novel_u");
+        let novel_spent = dummy_proof("novel_s");
+        // Wallet already tracks `known`; the mint verdicts cover only the novel two (known is
+        // skipped pre-check by the novel-only gate).
+        let wallet = StubWallet::new(
+            vec![y_of(&known)],
+            Some(vec![unspent(&novel_unspent), spent(&novel_spent)]),
+        );
+        let imported = reconcile_import(
+            vec![known, novel_unspent.clone(), novel_spent],
+            &wallet,
+        )
+        .await
+        .expect("reconcile ok");
+        assert_eq!(imported, 1, "only the novel UNSPENT proof imports");
+        let got = wallet.imported().expect("import called");
+        assert_eq!(got.len(), 1);
+        assert_eq!(y_of(&got[0]), y_of(&novel_unspent), "the known proof was skipped, not re-imported");
+    }
+
+    /// Property 2 (graceful): a FAILED import swap (the double-restore-race loser) surfaces as Err
+    /// with NO partial adoption — reconcile_import never half-commits.
+    #[tokio::test]
+    async fn a_failed_import_swap_propagates_gracefully_without_partial_state() {
+        let p = dummy_proof("race");
+        let wallet = StubWallet::new(vec![], Some(vec![unspent(&p)])).failing_import();
+        let res = reconcile_import(vec![p], &wallet).await;
+        assert!(res.is_err(), "a failed import swap (lost restore-race) surfaces as Err");
+        assert!(wallet.imported().is_none(), "a failed import adopts nothing (no partial state)");
+    }
+
+    /// Boot tooth (happy): a fresh box restores its proofs from the relay backup.
+    #[tokio::test]
+    async fn boot_restore_imports_from_the_relay_backup() {
+        let p = dummy_proof("restore");
+        let wallet = StubWallet::new(vec![], Some(vec![unspent(&p)]));
+        let restored = restore_from_relay_backup(Ok(vec![p]), &wallet).await;
+        assert_eq!(restored, 1, "a fresh box restores its proofs from the relay backup");
+        assert_eq!(wallet.imported().map(|v| v.len()), Some(1));
+    }
+
+    /// Boot tooth (degrade): a relay-FETCH error degrades to 0 (boot continues; solvency is the
+    /// real gate) — never fails boot, never imports.
+    #[tokio::test]
+    async fn boot_restore_degrades_to_zero_when_the_relay_fetch_fails() {
+        let wallet = StubWallet::new(vec![], Some(vec![]));
+        let restored =
+            restore_from_relay_backup(Err(anyhow::anyhow!("relay unreachable")), &wallet).await;
+        assert_eq!(restored, 0, "a relay-fetch error degrades to 0 (boot continues)");
+        assert!(wallet.imported().is_none(), "no import on a fetch failure");
+    }
+
+    /// Boot tooth (double-restore-race fail-closed): the race LOSER's swap fails → degrade to 0,
+    /// GRACEFULLY — no crash, no state corruption, boot continues on local state.
+    #[tokio::test]
+    async fn boot_restore_degrades_gracefully_when_a_restore_race_is_lost() {
+        let p = dummy_proof("lost_race");
+        let wallet = StubWallet::new(vec![], Some(vec![unspent(&p)])).failing_import();
+        let restored = restore_from_relay_backup(Ok(vec![p]), &wallet).await;
+        assert_eq!(restored, 0, "the race LOSER degrades to 0 — no crash, boot continues");
+        assert!(wallet.imported().is_none(), "the loser adopts nothing (no state corruption)");
+    }
+
+    /// Boot tooth (normal reboot no-op): relay == local → every candidate is already known →
+    /// nothing imported, the mint is never consulted.
+    #[tokio::test]
+    async fn boot_restore_is_a_noop_on_a_normal_reboot() {
+        let p1 = dummy_proof("a");
+        let p2 = dummy_proof("b");
+        let wallet = StubWallet::new(
+            vec![y_of(&p1), y_of(&p2)],
+            Some(vec![unspent(&p1), unspent(&p2)]),
+        );
+        let restored = restore_from_relay_backup(Ok(vec![p1, p2]), &wallet).await;
+        assert_eq!(restored, 0, "a normal reboot imports nothing (novel-only no-op)");
+        assert!(wallet.imported().is_none());
     }
 }

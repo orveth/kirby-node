@@ -586,18 +586,35 @@ async fn build_routstr_brain(
     )
     .await?;
 
-    // 3) Reconcile: the wallet must back every sat the counter believes it has. REFUSE
+    // 3) Restore-from-backup (N2): pull the relay-backed proof events into the wallet BEFORE the
+    //    solvency check, so a fresh box (empty local store — e.g. a cross-machine takeover) restores
+    //    its balance and does not false-die. reconcile_import is NUT-07-gated + FAIL-CLOSED +
+    //    NOVEL-ONLY, and restore_from_relay_backup DEGRADES (log + continue) on any error so an
+    //    unreachable mint/relay never fails boot — the solvency check (step 4) is the real money
+    //    gate. SAFE without a separate counter fast-forward: step 1 already seeded the NUT-13
+    //    counter to the loaded floor, so receive_proofs derives swap outputs from >= floor (no
+    //    reused-secret collision); the mint-swap is the single-writer arbiter, so a lost
+    //    double-restore race fails-closed (imports nothing) rather than double-spending.
+    if let Some(store) = &nip60_store {
+        let _restored = crate::nip60_reconcile::restore_from_relay_backup(
+            store.reconcile_on_load().await,
+            wallet.as_ref(),
+        )
+        .await;
+    }
+
+    // 4) Solvency check: the wallet must back every sat the counter believes it has. REFUSE
     //    TO BOOT on a shortfall (R2-5) — loud and safe — rather than letting the genome
     //    see repeated UPSTREAM_FAILED when the counter authorizes a think the wallet
     //    can't fund.
     let wallet_balance = wallet.total_balance().await.map(u64::from).unwrap_or(0);
     assert_wallet_backs_counter(wallet_balance, treasury_remaining)?;
 
-    // 4) Publish the NIP-60 wallet-config (mints + the seeded NUT-13 counters). ORDERED AFTER the
-    //    with_counters seed at open (step 1), so the published counter is >= the loaded floor (no
-    //    regression). Best-effort at boot: a failure is logged, NOT fatal (the mint remains truth;
-    //    the next counter change re-publishes). The token-event (proofs) publish + reconcile-import
-    //    ride N2; the cdk-counter fast-forward on reconstruct rides N5.
+    // 5) Publish the NIP-60 wallet-config (mints + the NUT-13 counters). ORDERED AFTER the
+    //    with_counters seed at open (step 1) AND the restore-import (step 3), so the published
+    //    counter is >= the loaded floor AND reflects any proofs restored this boot (no regression).
+    //    Best-effort: a failure is logged, NOT fatal (the mint remains truth; the next counter
+    //    change re-publishes).
     if let Some(store) = &nip60_store {
         if let Err(e) = store
             .publish_wallet_config(counter_db.keyset_counters(), vec![brain.mint_url.clone()])
@@ -610,7 +627,7 @@ async fn build_routstr_brain(
         }
     }
 
-    // 5) Build the brain over the funded wallet, with the configured kill-window.
+    // 6) Build the brain over the funded wallet, with the configured kill-window.
     let routstr = RoutstrBrain::new(
         brain.node_url.clone(),
         ecash,
