@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use async_trait::async_trait;
 use cdk::nuts::{Id, Proof};
 use nostr_sdk::nips::nip44::{self, Version};
 use nostr_sdk::prelude::*;
@@ -226,18 +227,84 @@ pub fn reconcile_token_set(events: &[(String, TokenEventContent)]) -> Vec<Proof>
     proofs
 }
 
+/// The raw nostr I/O a [`Nip60Store`] performs, behind a trait so the money-critical
+/// ORCHESTRATION on top of it — the ≥k publish durability gate, the aggregate reconcile, and the
+/// confirm-before-delete rollover ORDERING — is unit-testable against a mock transport instead of
+/// only exercised end-to-end against a live relay. The production impl ([`ClientTransport`]) is a
+/// thin wrapper over a signed nostr `Client`; the transport reports raw results (an ack count, the
+/// fetched events) and the [`Nip60Store`] owns every money decision made from them.
+#[async_trait]
+pub trait Nip60Transport: Send + Sync {
+    /// Send a signed event (built from `kind` + the already-encrypted `content` + `tags`) to the
+    /// relay set; return its id and the number of relays that ACKED. The caller applies the ≥k
+    /// durability gate — the transport only reports the count, it never decides durability.
+    async fn send_event(
+        &self,
+        kind: u16,
+        content: String,
+        tags: Vec<Tag>,
+    ) -> anyhow::Result<SendOutcome>;
+
+    /// Fetch every event matching `filter`, waiting up to `timeout`.
+    async fn fetch_events(&self, filter: Filter, timeout: Duration) -> anyhow::Result<Vec<Event>>;
+}
+
+/// The outcome of a [`Nip60Transport::send_event`]: the published event id + how many relays acked.
+pub struct SendOutcome {
+    /// The id of the published event (a rollover's `del` references a token event's id).
+    pub event_id: EventId,
+    /// The number of relays that acknowledged the write (the ≥k gate is applied by the caller).
+    pub acks: usize,
+}
+
+/// The production [`Nip60Transport`]: a signed nostr `Client` over the relay set.
+struct ClientTransport {
+    client: Client,
+}
+
+#[async_trait]
+impl Nip60Transport for ClientTransport {
+    async fn send_event(
+        &self,
+        kind: u16,
+        content: String,
+        tags: Vec<Tag>,
+    ) -> anyhow::Result<SendOutcome> {
+        let builder = EventBuilder::new(Kind::from(kind), content).tags(tags);
+        let output = self
+            .client
+            .send_event_builder(builder)
+            .await
+            .map_err(|e| anyhow::anyhow!("send NIP-60 event (kind {kind}): {e}"))?;
+        Ok(SendOutcome {
+            event_id: output.val,
+            acks: output.success.len(),
+        })
+    }
+
+    async fn fetch_events(&self, filter: Filter, timeout: Duration) -> anyhow::Result<Vec<Event>> {
+        let events = self
+            .client
+            .fetch_events(filter, timeout)
+            .await
+            .map_err(|e| anyhow::anyhow!("fetch NIP-60 events: {e}"))?;
+        Ok(events.into_iter().collect())
+    }
+}
+
 /// The NIP-60 wallet relay store: publishes the agent's Cashu proofs as NIP-44-encrypted
 /// kind:7375 token events to the [`crate::config::Nip60Config`] relay set (signed by + encrypted
 /// to the event key) and reconciles them back on load. Mirrors [`crate::rail::EngramStore`]'s
-/// publish+reconcile shape — a nostr `Client` over N relays with a K-of-N ack quorum.
+/// publish+reconcile shape — over N relays with a K-of-N ack quorum.
 ///
-/// The Client round-trip is exercised END-TO-END (the nostr `Client` is not unit-mockable, same
-/// as EngramStore); the pure encode/decode ([`Nip60Crypto`]) + the aggregate reconcile
-/// ([`reconcile_token_set`]) ARE unit-tested. Cheap to clone (an `Arc` over the client).
+/// The relay I/O sits behind [`Nip60Transport`], so the money-critical orchestration (the ≥k
+/// publish gate, the aggregate reconcile, the confirm-before-delete rollover ordering) is
+/// unit-tested against a mock transport; the pure encode/decode ([`Nip60Crypto`]) + aggregate
+/// ([`reconcile_token_set`]) are unit-tested too. Cheap to clone (an `Arc` over the transport).
 #[derive(Clone)]
 pub struct Nip60Store {
     crypto: Nip60Crypto,
-    client: Arc<Client>,
+    transport: Arc<dyn Nip60Transport>,
     /// The relay-set size N (durability = how many relays a publish reaches).
     n: usize,
     /// The K-of-N ack threshold a publish must reach to count as durable.
@@ -274,11 +341,29 @@ impl Nip60Store {
         tracing::info!(npub = %crypto.public_key().to_hex(), n, k, "NIP-60 wallet store connected");
         Ok(Nip60Store {
             crypto,
-            client: Arc::new(client),
+            transport: Arc::new(ClientTransport { client }),
             n,
             k,
             read_timeout: Duration::from_secs(NIP60_READ_TIMEOUT_SECS),
         })
+    }
+
+    /// Build a store over an arbitrary [`Nip60Transport`] — the seam the unit tests inject a mock
+    /// through to exercise the ≥k gate + confirm-before-delete ordering without a live relay.
+    #[cfg(test)]
+    fn with_transport(
+        crypto: Nip60Crypto,
+        transport: Arc<dyn Nip60Transport>,
+        n: usize,
+        k: usize,
+    ) -> Self {
+        Nip60Store {
+            crypto,
+            transport,
+            n,
+            k,
+            read_timeout: Duration::from_secs(NIP60_READ_TIMEOUT_SECS),
+        }
     }
 
     /// Publish one kind:7375 token event (the proofs, NIP-44 self-encrypted) to the relay set,
@@ -289,21 +374,20 @@ impl Nip60Store {
     /// about).
     pub async fn publish_token(&self, content: &TokenEventContent) -> anyhow::Result<EventId> {
         let ciphertext = self.crypto.encrypt(content)?;
-        let builder = EventBuilder::new(Kind::from(KIND_NIP60_TOKEN), ciphertext);
-        let output = self
-            .client
-            .send_event_builder(builder)
+        let outcome = self
+            .transport
+            .send_event(KIND_NIP60_TOKEN, ciphertext, Vec::new())
             .await
-            .map_err(|e| anyhow::anyhow!("publish NIP-60 token event: {e}"))?;
-        let acks = output.success.len();
+            .context("publish NIP-60 token event")?;
         anyhow::ensure!(
-            acks >= self.k,
-            "NIP-60 token publish reached only {acks} of {} relays (need k={}); NOT durable — \
+            outcome.acks >= self.k,
+            "NIP-60 token publish reached only {} of {} relays (need k={}); NOT durable — \
              refusing to treat the proofs as backed up",
+            outcome.acks,
             self.n,
             self.k
         );
-        Ok(output.val)
+        Ok(outcome.event_id)
     }
 
     /// Reconcile the wallet's LIVE proof set on load: fetch ALL kind:7375 token events authored
@@ -317,10 +401,10 @@ impl Nip60Store {
             .kind(Kind::from(KIND_NIP60_TOKEN))
             .author(self.crypto.public_key());
         let events = self
-            .client
+            .transport
             .fetch_events(filter, self.read_timeout)
             .await
-            .map_err(|e| anyhow::anyhow!("fetch NIP-60 token events for reconcile: {e}"))?;
+            .context("fetch NIP-60 token events for reconcile")?;
         let mut decoded: Vec<(String, TokenEventContent)> = Vec::new();
         for ev in events.into_iter() {
             match self.crypto.decrypt(&ev.content) {
@@ -347,21 +431,20 @@ impl Nip60Store {
     /// token publish — a sub-quorum config write is NOT durable and errors.
     pub async fn publish_config(&self, config: &WalletConfigContent) -> anyhow::Result<EventId> {
         let ciphertext = self.crypto.encrypt_config(config)?;
-        let builder = EventBuilder::new(Kind::from(KIND_NIP60_WALLET_CONFIG), ciphertext);
-        let output = self
-            .client
-            .send_event_builder(builder)
+        let outcome = self
+            .transport
+            .send_event(KIND_NIP60_WALLET_CONFIG, ciphertext, Vec::new())
             .await
-            .map_err(|e| anyhow::anyhow!("publish NIP-60 wallet-config event: {e}"))?;
-        let acks = output.success.len();
+            .context("publish NIP-60 wallet-config event")?;
         anyhow::ensure!(
-            acks >= self.k,
-            "NIP-60 wallet-config publish reached only {acks} of {} relays (need k={}); NOT durable \
+            outcome.acks >= self.k,
+            "NIP-60 wallet-config publish reached only {} of {} relays (need k={}); NOT durable \
              — refusing to treat the counters as backed up",
+            outcome.acks,
             self.n,
             self.k
         );
-        Ok(output.val)
+        Ok(outcome.event_id)
     }
 
     /// Publish the wallet-config from the decorator's observed counters + the wallet's mints:
@@ -391,11 +474,10 @@ impl Nip60Store {
             .kind(Kind::from(KIND_NIP60_WALLET_CONFIG))
             .author(self.crypto.public_key());
         let events = self
-            .client
+            .transport
             .fetch_events(filter, self.read_timeout)
             .await
-            .map_err(|e| anyhow::anyhow!("fetch NIP-60 wallet-config events: {e}"))?;
-        let events: Vec<Event> = events.into_iter().collect();
+            .context("fetch NIP-60 wallet-config events")?;
         match crate::engram::lww_head(&events) {
             Some(head) => {
                 let config = self
@@ -462,20 +544,26 @@ impl Nip60Store {
             .collect();
         anyhow::ensure!(!tags.is_empty(), "NIP-09 delete: no valid token-event ids to delete");
         let count = tags.len();
-        let builder = EventBuilder::new(Kind::from(KIND_NIP09_DELETE), "superseded by a NIP-60 rollover")
-            .tags(tags);
-        let output = self
-            .client
-            .send_event_builder(builder)
+        let outcome = self
+            .transport
+            .send_event(
+                KIND_NIP09_DELETE,
+                "superseded by a NIP-60 rollover".to_string(),
+                tags,
+            )
             .await
             .context("publish NIP-09 delete event")?;
-        tracing::debug!(deleted = count, acks = output.success.len(), "NIP-09 delete published (advisory)");
+        tracing::debug!(deleted = count, acks = outcome.acks, "NIP-09 delete published (advisory)");
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+
     use super::*;
     use crate::seed_keyring::derive_nip60_event_key;
 
@@ -682,5 +770,171 @@ mod tests {
                 "the hex round-trips to the SAME keyset (no counter misattribution on reconstruct)"
             );
         }
+    }
+
+    /// A test [`Nip60Transport`] that records the KIND of every send in order, returns a
+    /// configurable ack count, and replays a fixed event set on fetch — so the money-critical
+    /// orchestration (≥k gate, confirm-before-delete ordering, aggregate reconcile, fail-closed
+    /// load) is exercised without a live relay.
+    struct MockTransport {
+        acks: usize,
+        sends: Mutex<Vec<u16>>,
+        fetch_result: Vec<Event>,
+    }
+
+    impl MockTransport {
+        fn new(acks: usize) -> Self {
+            Self {
+                acks,
+                sends: Mutex::new(Vec::new()),
+                fetch_result: Vec::new(),
+            }
+        }
+
+        fn with_fetch(acks: usize, fetch_result: Vec<Event>) -> Self {
+            Self {
+                acks,
+                sends: Mutex::new(Vec::new()),
+                fetch_result,
+            }
+        }
+
+        /// The kinds sent so far, in call order (asserts the confirm-before-delete sequence).
+        fn sent_kinds(&self) -> Vec<u16> {
+            self.sends.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Nip60Transport for MockTransport {
+        async fn send_event(
+            &self,
+            kind: u16,
+            _content: String,
+            _tags: Vec<Tag>,
+        ) -> anyhow::Result<SendOutcome> {
+            self.sends.lock().unwrap().push(kind);
+            Ok(SendOutcome {
+                event_id: EventId::from_slice(&[0u8; 32]).expect("a 32-byte event id"),
+                acks: self.acks,
+            })
+        }
+
+        async fn fetch_events(
+            &self,
+            _filter: Filter,
+            _timeout: Duration,
+        ) -> anyhow::Result<Vec<Event>> {
+            Ok(self.fetch_result.clone())
+        }
+    }
+
+    /// A token event encrypted + SIGNED by `crypto` (so it passes the author filter and `crypto`
+    /// decrypts it) — the shape the transport replays on fetch.
+    fn signed_token_event(crypto: &Nip60Crypto, content: TokenEventContent) -> Event {
+        let ciphertext = crypto.encrypt(&content).expect("encrypt token content");
+        EventBuilder::new(Kind::from(KIND_NIP60_TOKEN), ciphertext)
+            .sign_with_keys(&crypto.signer_keys())
+            .expect("sign token event")
+    }
+
+    #[tokio::test]
+    async fn publish_token_requires_k_of_n_acks() {
+        let crypto = Nip60Crypto::from_event_key(&derive_nip60_event_key(&[4u8; 64])).unwrap();
+        let content = tec(&[]);
+        // n=3, k=2. Only 1 ack (< k) → NOT durable → error (proofs not backed up).
+        let under = Arc::new(MockTransport::new(1));
+        let store = Nip60Store::with_transport(crypto.clone(), under, 3, 2);
+        assert!(
+            store.publish_token(&content).await.is_err(),
+            "a sub-quorum publish (<k acks) must error — the proofs are NOT durably backed up"
+        );
+        // 2 acks (== k) → durable → ok.
+        let quorum = Arc::new(MockTransport::new(2));
+        let store_ok = Nip60Store::with_transport(crypto, quorum, 3, 2);
+        assert!(
+            store_ok.publish_token(&content).await.is_ok(),
+            "k-of-n acks → a durable publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollover_confirms_publish_before_delete_and_skips_delete_when_not_durable() {
+        let crypto = Nip60Crypto::from_event_key(&derive_nip60_event_key(&[5u8; 64])).unwrap();
+        let superseded =
+            vec!["0000000000000000000000000000000000000000000000000000000000000001".to_string()];
+
+        // Durable (2 == k): the new token event is published, THEN the old is deleted — in order.
+        let durable = Arc::new(MockTransport::new(2));
+        let store = Nip60Store::with_transport(crypto.clone(), durable.clone(), 3, 2);
+        store
+            .rollover("https://m", "sat", Vec::new(), superseded.clone())
+            .await
+            .expect("a durable rollover succeeds");
+        assert_eq!(
+            durable.sent_kinds(),
+            vec![KIND_NIP60_TOKEN, KIND_NIP09_DELETE],
+            "confirm-before-delete: the new token event is published BEFORE the NIP-09 delete"
+        );
+
+        // Sub-quorum (1 < k): the new event is NOT durable → rollover errors and NEVER deletes.
+        let sub = Arc::new(MockTransport::new(1));
+        let store2 = Nip60Store::with_transport(crypto, sub.clone(), 3, 2);
+        assert!(
+            store2
+                .rollover("https://m", "sat", Vec::new(), superseded)
+                .await
+                .is_err(),
+            "a non-durable new event must fail the rollover"
+        );
+        assert_eq!(
+            sub.sent_kinds(),
+            vec![KIND_NIP60_TOKEN],
+            "MONEY-SAFETY: the delete is NOT sent when the new event is not durable — the old \
+             proofs stay live"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_on_load_decrypts_and_aggregates_through_the_transport() {
+        let crypto = Nip60Crypto::from_event_key(&derive_nip60_event_key(&[6u8; 64])).unwrap();
+        // Two live token events, distinct proofs → both aggregate (a head would drop one = loss).
+        let e1 = signed_token_event(&crypto, tec_with(&[], vec![dummy_proof("s1")]));
+        let e2 = signed_token_event(&crypto, tec_with(&[], vec![dummy_proof("s2")]));
+        let mock = Arc::new(MockTransport::with_fetch(2, vec![e1, e2]));
+        let store = Nip60Store::with_transport(crypto, mock, 3, 2);
+        let proofs = store.reconcile_on_load().await.expect("reconcile");
+        assert_eq!(
+            proofs.len(),
+            2,
+            "both live events' proofs aggregate through the fetch→decrypt→aggregate path"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_config_is_none_when_fresh_and_fails_closed_on_undecryptable_head() {
+        let crypto = Nip60Crypto::from_event_key(&derive_nip60_event_key(&[8u8; 64])).unwrap();
+        // No config event → None (a fresh wallet), NOT an error.
+        let empty = Arc::new(MockTransport::with_fetch(2, Vec::new()));
+        let fresh = Nip60Store::with_transport(crypto.clone(), empty, 3, 2);
+        assert!(
+            fresh.load_config().await.expect("load").is_none(),
+            "no config event → None (fresh wallet)"
+        );
+        // A config head we cannot decrypt (encrypted to a DIFFERENT key, but signed by us so it
+        // passes the author filter) → hard error, NEVER a silent empty floor.
+        let other = Nip60Crypto::from_event_key(&derive_nip60_event_key(&[9u8; 64])).unwrap();
+        let foreign_ct = other
+            .encrypt_config(&WalletConfigContent::default())
+            .unwrap();
+        let head = EventBuilder::new(Kind::from(KIND_NIP60_WALLET_CONFIG), foreign_ct)
+            .sign_with_keys(&crypto.signer_keys())
+            .unwrap();
+        let corrupt = Arc::new(MockTransport::with_fetch(2, vec![head]));
+        let store = Nip60Store::with_transport(crypto, corrupt, 3, 2);
+        assert!(
+            store.load_config().await.is_err(),
+            "an undecryptable config head fails CLOSED (never a silent empty floor → no regression)"
+        );
     }
 }
