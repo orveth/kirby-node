@@ -7,20 +7,20 @@ single-agent keys. This page documents **every** key, its default, and which ent
 
 Source of truth: `crates/kirby-node/src/config.rs` (`KirbyConfig`).
 
-> **Zero-config vs this page.** The **Default** column below is the *field* default — what a
+> **Zero-config vs this page.** The **Default** column below is the *field* default -- what a
 > key falls back to when a config *file* is present but omits it (backcompat: existing files are
 > byte-identical). A **bare `kirby-node` with NO config file** synthesizes a different, richer
 > set of whole-struct defaults (a capable `routstr_key` fleet template, `mem` rent 0, a lifted
 > run wall, the blessed `image_allowlist`, etc.). Those are documented in
 > [`zero-config.md`](./zero-config.md); this page is the per-key reference for an explicit file.
 >
-> **Note:** `relay.url`, `genome_image`, and `[identity]` — previously required — now DEFAULT
+> **Note:** `relay.url`, `genome_image`, and `[identity]` -- previously required -- now DEFAULT
 > when omitted. A partial file with no `[relay]` silently joins the shared fleet relay
 > (`$KIRBY_RELAY_URL` else `ws://185.18.221.222:7777`); no `genome_image` uses `$KIRBY_GENOME_IMAGE`
 > / `./result`; no `[identity]` mints a durable node key. Set them explicitly to override.
 
 **TOML ordering rule:** the top-level scalar keys (`backend`, `genome_image`, `workload`, `mode`,
-`agent_id`, `node_id`, `state_root`) MUST appear **before** any `[table]` header.
+`agent_id`, `node_id`, `state_root`, `max_run_secs`) MUST appear **before** any `[table]` header.
 
 **"Consumed by"** column: `agent` = read on the `kirby-node agent` path; `fleet` = read on the
 `kirby-node fleet` path; `both` = read on either. The fleet supervisor clones the host config into
@@ -37,6 +37,7 @@ each child agent, overriding a few per-tenant paths (noted below).
 | `agent_id` | string | `agent-0` | The `["a",X]` lifecycle tag + treasury/metering label. Charset-validated. | both |
 | `node_id` | string | `node-1` | The `["node",X]` tag + presence node_id. Charset-validated. (Note: `kirby-node fleet` also takes a separate numeric `--node-id <u64>` lease id -- different thing.) | both |
 | `state_root` | path | unset | The single durable root for ALL node state (treasuries, keystores, agent dirs). Unset resolves to `$KIRBY_STATE_ROOT`, else `$XDG_DATA_HOME/kirby`, else `$HOME/.local/share/kirby` -- never a temp dir. | both |
+| `max_run_secs` | u64 | unset (600s) | The run safety ceiling in seconds: a bootstrap agent that never goes broke halts here. Omit for the 600s default; raise it for a long-lived die-when-broke run. `0` is rejected at load. | both |
 
 ## `[identity]`
 
@@ -77,7 +78,7 @@ These blocks are read only when `workload = "capable"` (the think/act loop). Wit
 | `node_url` | string | `""` | (routstr / routstr_key) The Routstr node URL. Required for both real backends; https unless loopback. |
 | `mint_url` | string | `""` | (routstr) The treasury wallet mint. Required iff `backend = "routstr"`. |
 | `wallet_db_path` | string | `""` | (routstr) The persistent cdk-sqlite wallet store. Required iff `backend = "routstr"`. Rewritten per-tenant by the fleet supervisor. |
-| `api_key_path` | string | `""` | (routstr_key) Path to the prepaid bearer key file. Required iff `backend = "routstr_key"`. Node-shared; deliberately NOT rewritten per-tenant. |
+| `api_key_path` | string | `""` | (routstr_key) Path to the prepaid bearer key file. Required iff `backend = "routstr_key"`. Node-shared; deliberately NOT rewritten per-tenant. The prepaid key balance must be `>=` the treasury (`funding.initial_sats` on first boot, the persisted balance on resume), else the brain refuses to boot (solvency guard). |
 | `max_tokens` | u32 | `1024` | (routstr_key) Caps the reply and Routstr's per-request reservation. Must be `> 0` iff `routstr_key`. |
 | `request_timeout_secs` | u64 | `30` | (routstr) Main-path kill window. |
 | `recovery_timeout_secs` | u64 | `10` | (routstr) Cleanup / refund budget. |
@@ -110,7 +111,7 @@ The play-money rent dials. All read on both paths.
 |---|---|---|---|
 | `cpu_sats_per_usec_num` | u64 | `1` | CPU sats/microsecond numerator. |
 | `cpu_sats_per_usec_den` | u64 | `1000` | CPU sats/microsecond denominator (default 1 sat/ms CPU). |
-| `mem_sats_per_mib_sec` | u64 | `1` | Sats per MiB resident per second -- the key rent dial. |
+| `mem_sats_per_mib_sec` | u64 | `1` | Sats per MiB resident per second -- the key rent dial. Set `0` for a long-lived capable agent; the default `1` burns ~128 sat/s on a 128 MiB VM (a small treasury hits `BudgetExhausted` in seconds). |
 | `egress_sats_per_byte_num` | u64 | `1` | Egress sats/byte numerator. |
 | `egress_sats_per_byte_den` | u64 | `1` | Egress sats/byte denominator. |
 
@@ -159,6 +160,7 @@ the allowlists below.
 | `failover_scan_secs` | u64 | `5` | (G-4) Seconds between lease scans for dark peers to take over. |
 | `takeover_grace_secs` | u64 | `30` | (G-4) The grace window a lease must be continuously stale before takeover (= the lease TTL). A money dial. |
 | `failover_max_lease_age_secs` | u64 | `300` | (G-4) The upper age bound; older stale leases are ancient ghosts, ignored. Cross-validated: must be `> takeover_grace_secs + 30`. |
+| `request_max_age_secs` | u64 | unset (off) | OPT-IN filter: drop spawn requests older than this many seconds (sheds stale/parked kind-31003 events). Omit to disable; a positive value sets the age bound. **Do NOT use `0` to mean off** -- `0` engages the filter with a zero window and rejects essentially ALL spawn requests (`created_at + 0 < now` => `SpawnReject::Stale`). |
 
 ## Notes
 

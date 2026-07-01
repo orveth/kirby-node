@@ -154,12 +154,12 @@ KIRBY-RUN mode=Bootstrap backend=... npub=... reached_running=true born=true die
 The process **exits 0 iff it reached Running.** Dying broke (`end=BudgetExhausted`) is the
 *normal* terminal state and still exits 0. A non-zero exit means it never booted -- read the
 error. (With the default funding and meter rates an agent usually halts at a safety ceiling --
-currently a hardcoded 600s, a config knob is in flight -- rather than actually running out of sats.)
+the top-level `max_run_secs` key, default 600s -- rather than actually running out of sats.)
 
 **Want to watch it *think*?** The default `app-checkpoint` workload boots and meters but does not
-run the agentic loop. Set `workload = "capable"` with a `[brain]` backend (`stub` for a free
-simulated think/act loop, or `routstr` / `routstr_key` for real inference) -- see
-[`docs/config.md`](docs/config.md).
+run the agentic loop. To see an agent reason for real, fund it and spawn it onto a node -- the
+capable / `routstr_key` flow is in [`docs/zero-config.md`](docs/zero-config.md) +
+[`docs/spawn-over-nostr.md`](docs/spawn-over-nostr.md); every knob is in [`docs/config.md`](docs/config.md).
 
 ## Run a fleet node (the deployment)
 
@@ -210,8 +210,9 @@ Verify the node joined (a node DOES beacon presence, unlike a bare agent):
   in `kirby.toml.example`.
 - **Where state lives.** The durable root is the top-level `state_root` key (or `$KIRBY_STATE_ROOT`).
   Unset, it resolves to `$XDG_DATA_HOME/kirby`, else `$HOME/.local/share/kirby` -- **never** a temp
-  dir. (`[identity] treasury_dir` is a separate per-config override most users leave unset; when
-  unset it falls back to the key_path's parent, not to `state_root`.)
+  dir. `[identity] key_path` is optional: omit it and the node key lands at
+  `<treasury_dir>/node.nostr.key`. `treasury_dir` itself defaults to the parent of an explicit
+  `key_path` when set, else to the durable `state_root` when both are unset.
 - **Fleet spawn is open by default.** In `[fleet.spawn]`, an **empty `operators` allowlist means
   ANY signer may spawn an agent on your node** (a known MVP DoS vector -- it logs a loud warning).
   An empty `image_allowlist` means the node will spawn nothing. There is **no `enabled` flag**; the
