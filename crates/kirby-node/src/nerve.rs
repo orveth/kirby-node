@@ -22,7 +22,7 @@
 //! directory, then loaded thereafter, so a node keeps the SAME npub across restarts
 //! (the stable cluster identity). See [`NodeIdentity`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -637,6 +637,50 @@ pub const MAX_INBOUND_DM_BYTES: usize = 16_384;
 /// OOMs the host). 1024 is generous for a long-poll consumer that drains on every tick.
 pub const INBOUND_QUEUE_CAP: usize = 1024;
 
+/// The dedup memory bound for an [`InboundQueue`]: how many recently-delivered correlation ids
+/// (gift-wrap event ids) it remembers so a re-fetch cannot re-enqueue an already-delivered DM
+/// (#103). Far above any realistic per-run DM volume; past it the OLDEST id is forgotten (a later
+/// re-fetch of a very old, long-since-acked DM could then re-enqueue, harmless for the MVP volume).
+pub const INBOUND_DEDUP_CAP: usize = 10_000;
+
+/// The bounded wait for one DM backfill sweep's stored-wrap fetch (REQ -> EOSE). A slow relay that
+/// never sends EOSE yields an empty sweep (the next tick retries) instead of wedging the DM task.
+const DM_BACKFILL_FETCH_TIMEOUT_SECS: u64 = 5;
+
+/// A bounded set of already-processed correlation ids (gift-wrap event ids) — the DM-delivery
+/// dedup memory. It makes a re-delivered gift wrap idempotent so the backfill sweep (or a relay
+/// re-REQ) can never enqueue the same DM twice, which would re-drive a reply the genome already
+/// sent. Insertion order is tracked so the memory stays flat (drop-oldest at `cap`).
+struct SeenIds {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl SeenIds {
+    fn new(cap: usize) -> Self {
+        SeenIds { set: HashSet::new(), order: VecDeque::new(), cap: cap.max(1) }
+    }
+
+    /// Record `id`; returns `true` if it was NEW (never seen), `false` if a duplicate. On a new id
+    /// past `cap`, evicts the oldest first (bounded memory).
+    fn insert(&mut self, id: &str) -> bool {
+        if self.set.contains(id) {
+            return false;
+        }
+        while self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.set.insert(id.to_string());
+        self.order.push_back(id.to_string());
+        true
+    }
+}
+
 /// The fixed HOST-SIDE kind-allowlist table (1.3, step 2): map a raw relay event kind to
 /// a typed [`InboundKind`], default-deny. An unrecognized kind returns `None` and is
 /// DROPPED. Only `JOB_REQUEST` (NIP-90 requests, kinds 5000-5999) is wired end-to-end this
@@ -688,6 +732,11 @@ pub struct InboundQueue {
     cap: usize,
     /// Wakes a parked `PollInbox` the instant a new event is enqueued (long-poll latency).
     notify: Arc<tokio::sync::Notify>,
+    /// The DM-delivery dedup memory (gift-wrap event ids already enqueued this queue's lifetime),
+    /// so the backfill sweep re-fetching stored wraps never double-enqueues a DM (#103). Bounded
+    /// (drop-oldest at [`INBOUND_DEDUP_CAP`]). Shared across clones so the persistent-subscription
+    /// producer and the backfill-sweep producer dedupe against ONE memory.
+    seen: Arc<Mutex<SeenIds>>,
 }
 
 impl InboundQueue {
@@ -705,6 +754,7 @@ impl InboundQueue {
             next_seq: Arc::new(AtomicU64::new(1)),
             cap: cap.max(1),
             notify: Arc::new(tokio::sync::Notify::new()),
+            seen: Arc::new(Mutex::new(SeenIds::new(INBOUND_DEDUP_CAP))),
         }
     }
 
@@ -745,6 +795,32 @@ impl InboundQueue {
         // Wake any parked long-poll: an event is now drainable.
         self.notify.notify_waiters();
         seq
+    }
+
+    /// Like [`push_typed`](Self::push_typed) but IDEMPOTENT on `correlation_id` (#103): if this
+    /// correlation id was already enqueued (this queue's lifetime, bounded memory), the event is
+    /// DROPPED and `None` returned; otherwise it is enqueued and its `inbox_seq` returned. The DM
+    /// path uses this so the backfill sweep re-fetching stored gift wraps (or a relay re-REQ) never
+    /// double-enqueues a DM already delivered live — which, once the genome advanced its `ack_seq`
+    /// past it, would re-drive a reply the genome already sent. The check-and-record is atomic
+    /// under one lock, so the persistent-subscription producer and the backfill producer cannot
+    /// both enqueue the same wrap in a race. An EMPTY `correlation_id` is not deduped (nothing to
+    /// key on) and always enqueues.
+    pub fn push_typed_once(
+        &self,
+        kind: InboundKind,
+        payload: Vec<u8>,
+        source_pubkey: String,
+        created_at: u64,
+        correlation_id: String,
+    ) -> Option<u64> {
+        if !correlation_id.is_empty() {
+            let mut seen = self.seen.lock().expect("inbound dedup set poisoned");
+            if !seen.insert(&correlation_id) {
+                return None;
+            }
+        }
+        Some(self.push_typed(kind, payload, source_pubkey, created_at, correlation_id))
     }
 
     /// Collect every queued event with `inbox_seq > ack_seq` whose kind is in `want` (the
@@ -1040,20 +1116,106 @@ pub async fn screen_and_enqueue_dm(
         );
         return None;
     }
-    // (6) Enqueue with the SEAL-VERIFIED sender as source_pubkey (= the reply-to recipient).
-    let seq = queue.push_typed(
+    // (6) Enqueue with the SEAL-VERIFIED sender as source_pubkey (= the reply-to recipient),
+    // IDEMPOTENT on the gift-wrap id (#103): the persistent subscription AND the backfill sweep
+    // both feed this wall, so a wrap the sweep re-fetches after the live sub already delivered it is
+    // a DEDUP no-op -- never a second inbox event, never a duplicate reply.
+    let seq = match queue.push_typed_once(
         InboundKind::DirectMessage,
         payload,
         unwrapped.sender.to_hex(),
         unwrapped.rumor.created_at.as_secs(),
         event.id.to_hex(),
-    );
+    ) {
+        Some(seq) => seq,
+        None => {
+            tracing::debug!(
+                gift_wrap = %event.id.to_hex(),
+                sender = %unwrapped.sender.to_hex(),
+                "inbound DM: already delivered (dedup); skipping"
+            );
+            return None;
+        }
+    };
     tracing::info!(
         inbox_seq = seq,
         sender = %unwrapped.sender.to_hex(),
         "inbound DM: VERIFIED + enqueued a NIP-17 DM"
     );
     Some(seq)
+}
+
+/// Fetches stored NIP-17 gift wraps (kind:1059, `#p` = the DM key) for the DM backfill sweep (#103)
+/// — a seam so the production path (a FRESH client per sweep) and tests (an injected event set)
+/// share [`dm_backfill_sweep`]'s screen -> dedup -> enqueue logic without a live relay.
+#[async_trait::async_trait]
+pub(crate) trait GiftWrapFetcher: Send + Sync {
+    /// Fetch every stored gift wrap addressed to `me` (`#p`), with NO `since`: NIP-17 backdates a
+    /// wrap's `created_at` up to 2 days, so any `since` would silently drop backdated wraps. Errors
+    /// bubble up so the sweep can log + skip (the next tick retries).
+    async fn fetch_stored_wraps(&self, me: PublicKey) -> anyhow::Result<Vec<Event>>;
+}
+
+/// The production [`GiftWrapFetcher`]: one FRESH throwaway client per sweep. A new TCP connection —
+/// so a silently half-open persistent socket (the #54 ping-off failure mode) cannot make the sweep
+/// go deaf — and a fresh event DB, so the relay pool's seen-set never suppresses a re-delivered
+/// stored wrap. Connect -> REQ (no `since`) -> collect until EOSE within `timeout` -> disconnect.
+struct FreshClientFetcher {
+    relays: Vec<String>,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl GiftWrapFetcher for FreshClientFetcher {
+    async fn fetch_stored_wraps(&self, me: PublicKey) -> anyhow::Result<Vec<Event>> {
+        let client = Client::builder().signer(Keys::generate()).build();
+        for url in &self.relays {
+            add_relay_no_ping(&client, url).await?;
+        }
+        client.connect().await;
+        let filter = Filter::new().kind(Kind::GiftWrap).pubkey(me);
+        let fetched = client.fetch_events(filter, self.timeout).await;
+        // Always disconnect the throwaway client, whether the fetch succeeded or errored (the sweep
+        // holds no long-lived connection — that is the whole point of a fresh client per sweep).
+        client.disconnect().await;
+        Ok(fetched.context("DM backfill: fetch stored gift wraps")?.into_iter().collect())
+    }
+}
+
+/// Run ONE DM backfill sweep (#103): fetch stored gift wraps, then run each through the DM trust
+/// boundary [`screen_and_enqueue_dm`], which dedupes by gift-wrap id — so a wrap already delivered
+/// live (or by an earlier sweep) is skipped, and only a genuinely-missed DM is enqueued. Returns
+/// how many NEW DMs it enqueued (0 on a fetch error, logged; the next tick retries). Factored out
+/// of [`run_dm_inbound`] so a test can drive it with an injected [`GiftWrapFetcher`].
+async fn dm_backfill_sweep(
+    fetcher: &dyn GiftWrapFetcher,
+    dm_identity: &NodeIdentity,
+    queue: &InboundQueue,
+) -> usize {
+    let me = dm_identity.public_key();
+    let wraps = match fetcher.fetch_stored_wraps(me).await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(error = %e, "DM backfill sweep: fetch failed; skipping (next tick retries)");
+            return 0;
+        }
+    };
+    let mut recovered = 0usize;
+    for event in &wraps {
+        if screen_and_enqueue_dm(queue, dm_identity.keys(), event).await.is_some() {
+            recovered += 1;
+        }
+    }
+    if recovered > 0 {
+        tracing::info!(
+            recovered,
+            fetched = wraps.len(),
+            "DM backfill sweep: recovered missed DM(s) the live subscription did not deliver"
+        );
+    } else {
+        tracing::debug!(fetched = wraps.len(), "DM backfill sweep: nothing new");
+    }
+    recovered
 }
 
 /// Run the persistent DM INBOUND subscription task to completion (the SIBLING of [`run_inbound`],
@@ -1063,10 +1225,18 @@ pub async fn screen_and_enqueue_dm(
 /// via `PollInbox`. `dm_identity` is the plain DM keypair (NEVER the FROST money key); it both
 /// addresses the subscription and decrypts. Pure host-side network; touches no genome, no VM
 /// socket. Returns on graceful shutdown or an unrecoverable client error.
+///
+/// The persistent subscription is the low-latency FAST PATH, but it is not the delivery guarantee:
+/// with the keepalive ping OFF (#54) a long-lived reader cannot notice a silently half-open socket,
+/// so a DM that lands during a dead window sits unread on the relay forever (#103). Every
+/// `backfill_secs` this task therefore also runs a [`dm_backfill_sweep`] on a FRESH connection
+/// (no `since`, deduped by gift-wrap id) so delivery is guaranteed within one interval regardless
+/// of the persistent socket's state. `backfill_secs == 0` disables the sweep (fast-path only).
 pub async fn run_dm_inbound(
     dm_identity: &NodeIdentity,
     relays: &[String],
     queue: InboundQueue,
+    backfill_secs: u64,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     if relays.is_empty() {
@@ -1094,11 +1264,35 @@ pub async fn run_dm_inbound(
         .context("subscribe to the NIP-17 DM inbox")?;
 
     let mut notifications = client.notifications();
+
+    // The DM backfill sweep (#103): the durable-delivery backstop for the fast-path subscription
+    // above. `None` when disabled (`backfill_secs == 0`). The fetcher opens a FRESH client each
+    // sweep, so it is immune to a half-open persistent socket. `interval`'s first tick fires
+    // immediately; we consume it up-front so the first sweep does not race the subscription's own
+    // initial no-since REQ (which already covers the startup backlog) — the first real sweep is one
+    // interval later, then every interval. When disabled we still arm a long idle timer so the
+    // select arm compiles; its body is a guarded no-op.
+    let backfill: Option<FreshClientFetcher> = (backfill_secs > 0).then(|| FreshClientFetcher {
+        relays: relays.to_vec(),
+        timeout: Duration::from_secs(DM_BACKFILL_FETCH_TIMEOUT_SECS),
+    });
+    let sweep_period = Duration::from_secs(if backfill_secs > 0 { backfill_secs } else { 3600 });
+    let mut backfill_tick = tokio::time::interval(sweep_period);
+    backfill_tick.tick().await;
+
     loop {
         tokio::select! {
             _ = &mut shutdown => {
                 tracing::info!(dm_npub = %dm_identity.npub(), "DM inbound task shutting down");
                 break;
+            }
+            _ = backfill_tick.tick() => {
+                // Re-fetch stored wraps on a fresh connection and enqueue any missed DM (deduped).
+                // A slow fetch briefly parks the live-notification arm; any live event that lags out
+                // of the broadcast buffer meanwhile is exactly what the next sweep recovers.
+                if let Some(fetcher) = &backfill {
+                    dm_backfill_sweep(fetcher, dm_identity, &queue).await;
+                }
             }
             notif = notifications.recv() => {
                 match notif {
@@ -1807,6 +2001,116 @@ mod tests {
             "a gift wrap whose rumor is not a kind:14 DM must be dropped"
         );
         assert_eq!(queue.len(), 0);
+    }
+
+    // ---- #103: idempotent enqueue + the DM backfill sweep (durable delivery past a half-open socket) ----
+
+    /// A [`GiftWrapFetcher`] that returns a canned set of wraps — so a test drives
+    /// [`dm_backfill_sweep`]'s screen -> dedup -> enqueue logic with no live relay (mirroring how a
+    /// real relay re-sends the SAME stored wraps on every REQ).
+    struct StaticFetcher {
+        wraps: Vec<Event>,
+    }
+
+    #[async_trait::async_trait]
+    impl GiftWrapFetcher for StaticFetcher {
+        async fn fetch_stored_wraps(&self, _me: PublicKey) -> anyhow::Result<Vec<Event>> {
+            Ok(self.wraps.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn dm_redelivery_of_the_same_giftwrap_enqueues_once() {
+        // TOOTH (#103): the enqueue is IDEMPOTENT on the gift-wrap id. A relay re-REQ (or a backfill
+        // re-fetch) re-delivers the same wrap; it must NOT create a second inbox event — else, once
+        // the genome advanced its ack_seq past it, the new seq would re-drive a reply it already sent.
+        let sender = Keys::generate();
+        let dm = Keys::generate();
+        let wrap = make_dm_wrap(&sender, &dm.public_key(), "only once").await;
+
+        let queue = InboundQueue::with_capacity(8);
+        assert_eq!(
+            screen_and_enqueue_dm(&queue, &dm, &wrap).await,
+            Some(1),
+            "the first delivery of a wrap enqueues at seq 1"
+        );
+        assert!(
+            screen_and_enqueue_dm(&queue, &dm, &wrap).await.is_none(),
+            "re-delivering the SAME gift wrap must be a dedup no-op"
+        );
+        assert_eq!(queue.len(), 1, "exactly one inbox event for one gift wrap");
+        // REVERT CHECK: drop push_typed_once's dedup and the second call pushes a 2nd event (seq 2).
+    }
+
+    #[tokio::test]
+    async fn dm_backfill_recovers_a_dm_the_live_sub_never_saw() {
+        // TOOTH (#103): the sweep is the durable-delivery backstop. Model the field failure — a DM
+        // that landed while the persistent socket was silently half-open (ping off, #54): never
+        // delivered live, but stored on the relay. The sweep re-fetches on a fresh connection and
+        // enqueues it, so delivery is guaranteed regardless of the persistent socket's state.
+        let dir = tempdir();
+        let dm_identity = NodeIdentity::load_or_create(&dir.join("dm.key")).unwrap();
+        let sender = Keys::generate();
+        let missed = make_dm_wrap(&sender, &dm_identity.public_key(), "did you get this?").await;
+
+        let queue = InboundQueue::with_capacity(8);
+        assert_eq!(queue.len(), 0, "the deaf live sub delivered nothing");
+
+        let fetcher = StaticFetcher { wraps: vec![missed] };
+        let recovered = dm_backfill_sweep(&fetcher, &dm_identity, &queue).await;
+        assert_eq!(recovered, 1, "the sweep recovers the one missed DM");
+        assert_eq!(queue.len(), 1, "the missed DM is now enqueued for the genome");
+
+        let batch = queue.poll(0, &[InboundKind::DirectMessage], Duration::from_millis(0)).await;
+        assert_eq!(String::from_utf8_lossy(&batch[0].payload), "did you get this?");
+        cleanup(&dir);
+        // REVERT CHECK: neuter dm_backfill_sweep to a no-op and a half-open reader never re-reads => #103.
+    }
+
+    #[tokio::test]
+    async fn dm_backfill_is_idempotent_across_sweeps() {
+        // TOOTH (#103): a relay returns the SAME stored wrap on EVERY REQ, so the sweep runs every
+        // interval over the same set. It must enqueue each DM exactly once across all sweeps — else
+        // the queue grows every interval and the genome re-replies to the same DM forever. This pins
+        // the property that makes running the sweep on a timer SAFE.
+        let dir = tempdir();
+        let dm_identity = NodeIdentity::load_or_create(&dir.join("dm.key")).unwrap();
+        let sender = Keys::generate();
+        let wrap = make_dm_wrap(&sender, &dm_identity.public_key(), "steady").await;
+
+        let queue = InboundQueue::with_capacity(8);
+        let fetcher = StaticFetcher { wraps: vec![wrap] };
+        let first = dm_backfill_sweep(&fetcher, &dm_identity, &queue).await;
+        let second = dm_backfill_sweep(&fetcher, &dm_identity, &queue).await;
+        let third = dm_backfill_sweep(&fetcher, &dm_identity, &queue).await;
+        assert_eq!(first, 1, "the first sweep enqueues the stored DM");
+        assert_eq!(second, 0, "a re-sweep of the same stored wrap enqueues nothing");
+        assert_eq!(third, 0, "and stays idempotent");
+        assert_eq!(queue.len(), 1, "exactly one inbox event no matter how many sweeps");
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn dm_delivered_live_is_not_reenqueued_by_a_later_sweep() {
+        // TOOTH (#103): the fast path (persistent sub) and the backstop (sweep) share ONE dedup
+        // memory. A DM delivered live must NOT be enqueued a second time when a later sweep re-fetches
+        // the same stored wrap — proving the two producers compose without duplicating.
+        let dir = tempdir();
+        let dm_identity = NodeIdentity::load_or_create(&dir.join("dm.key")).unwrap();
+        let sender = Keys::generate();
+        let wrap = make_dm_wrap(&sender, &dm_identity.public_key(), "live first").await;
+
+        let queue = InboundQueue::with_capacity(8);
+        assert_eq!(
+            screen_and_enqueue_dm(&queue, dm_identity.keys(), &wrap).await,
+            Some(1),
+            "the persistent subscription delivers it live"
+        );
+        let fetcher = StaticFetcher { wraps: vec![wrap] };
+        let recovered = dm_backfill_sweep(&fetcher, &dm_identity, &queue).await;
+        assert_eq!(recovered, 0, "a wrap already delivered live is not re-enqueued by the sweep");
+        assert_eq!(queue.len(), 1, "still exactly one inbox event");
+        cleanup(&dir);
     }
 
     #[tokio::test]

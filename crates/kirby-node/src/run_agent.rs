@@ -467,6 +467,9 @@ fn agent_boot_config(
             // key cannot decrypt). `load_or_create` mints it on first boot. This is the interim;
             // the fleet's Shamir-shared SK_social (#26) swaps in behind `with_dm_keys` later.
             dm_key_path: Some(cfg.identity.treasury_dir().join("social.dm.key")),
+            // The DM backfill sweep interval (#103): carried from `[relay]` so the durable-delivery
+            // backstop in `run_dm_inbound` re-fetches missed DMs on a fresh connection.
+            dm_backfill_secs: cfg.relay.dm_backfill_secs,
         }),
         _ => None,
     };
@@ -880,6 +883,7 @@ mod tests {
                 url: "ws://127.0.0.1:7777".to_string(),
                 presence_interval_secs: 15,
                 presence_stale_after_secs: 45,
+                dm_backfill_secs: 30,
             },
             backend: Backend::Auto,
             genome_image: GenomeImage::Path(root.join("img")),
