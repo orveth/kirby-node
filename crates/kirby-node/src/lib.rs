@@ -257,6 +257,7 @@ pub mod nerve;
 pub mod network;
 pub mod nip60;
 pub mod nip60_counter;
+pub mod nip60_reconcile;
 pub mod prereqs;
 pub mod rail;
 pub mod relay_lease;
