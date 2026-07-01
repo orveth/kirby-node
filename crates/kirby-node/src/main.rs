@@ -1425,12 +1425,17 @@ async fn fund_key_dispatch(cmd: FundKeyCmd) -> Result<(), kirby_node::funding::F
                         key_out.display()
                     )));
                 }
+                // F2/F7: refuse BEFORE any network call if a pending invoice already sits beside
+                // --key-out (a paid-but-unpolled invoice whose funds a fresh create would strand).
+                // `read_invoice_state` also fails closed on a tampered pending sidecar.
+                refuse_if_pending_invoice(&key_out)?;
                 let created =
                     funding::create_invoice(&node_url, amount_sats, "create", None).await?;
                 // F2/F4: persist the bearer-sensitive invoice_id AND the node_url it was
                 // created against to the 0600 pending sidecar so `poll` finds both. NEITHER is
-                // printed. The BOUND node_url sidecar is NOT written here — only after the key
-                // lands (F4), so no binding ever exists without a key beside it.
+                // printed. The write is O_EXCL (refuses an existing pending sidecar), and the
+                // BOUND node_url sidecar is NOT written here — only after the key lands (F4), so
+                // no binding ever exists without a key beside it.
                 funding::write_invoice_state(&key_out, &created.invoice_id, &node_url)?;
                 // The invoice_id is a capability — it is deliberately NOT on stdout (F1). A
                 // human/agent resumes with `fund-key poll --key-out <same path>`.
@@ -1456,11 +1461,13 @@ async fn fund_key_dispatch(cmd: FundKeyCmd) -> Result<(), kirby_node::funding::F
             json: _,
         } => {
             guarded(async move {
-                // F1/F4: the invoice_id AND the node_url both come from the pending sidecar
-                // `create` wrote beside --key-out (there is no --invoice-id). An explicit
-                // --node-url must MATCH the pending node_url unless the override flag is set
-                // (never poll a different node than the invoice was created against).
-                let pending = funding::read_invoice_state(&key_out).ok_or_else(|| {
+                // F1/F4/F9: the invoice_id AND the node_url both come from the pending sidecar
+                // `create` wrote beside --key-out (there is no --invoice-id). The read is
+                // hardened (no symlink-follow, mode 0600); a present-but-tampered sidecar is a
+                // hard error (fail closed), distinct from "absent". An explicit --node-url must
+                // MATCH the pending node_url unless the override flag is set (never poll a
+                // different node than the invoice was created against).
+                let pending = funding::read_invoice_state(&key_out)?.ok_or_else(|| {
                     FundingError::Usage(format!(
                         "no pending invoice state beside --key-out ({}); run `fund-key create` \
                          first (its 0600 sidecar carries the invoice_id + node_url)",
@@ -1514,9 +1521,13 @@ async fn fund_key_dispatch(cmd: FundKeyCmd) -> Result<(), kirby_node::funding::F
                         key_out.display()
                     )));
                 }
+                // F2/F7: refuse BEFORE any network call if a pending invoice already sits beside
+                // --key-out — a crash mid-poll is resumed with `fund-key poll`, NOT a fresh
+                // provision (which would strand the paid-but-unpolled invoice's funds).
+                refuse_if_pending_invoice(&key_out)?;
                 let created =
                     funding::create_invoice(&node_url, amount_sats, "create", None).await?;
-                // F2: persist the pending invoice-state (invoice_id + node_url, 0600) so a
+                // F2: persist the pending invoice-state (invoice_id + node_url, 0600, O_EXCL) so a
                 // crash between create and mint is recoverable via `poll`. The BOUND node_url
                 // sidecar is NOT written yet — only after the key lands (F4).
                 funding::write_invoice_state(&key_out, &created.invoice_id, &node_url)?;
@@ -1639,6 +1650,28 @@ async fn fund_key_dispatch(cmd: FundKeyCmd) -> Result<(), kirby_node::funding::F
             .await
         }
     }
+}
+
+/// Refuse `create`/`provision` if a pending invoice already sits beside `key_out` (F2/F7): an
+/// existing pending sidecar is a paid-but-unpolled invoice, and overwriting its capability would
+/// STRAND those funds (there is no `recover`). The fix is to RESUME with `fund-key poll`, not to
+/// mint a fresh invoice. Checked before any network call. `read_invoice_state` also fails closed
+/// on a tampered pending sidecar, so a present-but-unsafe sidecar surfaces here rather than being
+/// silently overwritten. (`write_invoice_state`'s O_EXCL is the belt-and-suspenders backstop.)
+fn refuse_if_pending_invoice(
+    key_out: &std::path::Path,
+) -> Result<(), kirby_node::funding::FundingError> {
+    use kirby_node::funding::FundingError;
+    if kirby_node::funding::read_invoice_state(key_out)?.is_some() {
+        return Err(FundingError::Usage(format!(
+            "a pending invoice already exists beside --key-out ({}); resume it with \
+             `fund-key poll --key-out {}` — a fresh create/provision would overwrite the pending \
+             capability and strand a paid-but-unpolled invoice",
+            key_out.display(),
+            key_out.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve the node_url a `poll` targets: the pending sidecar's node_url is authoritative (the

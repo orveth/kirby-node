@@ -376,6 +376,12 @@ pub async fn poll_invoice(
     timeout: Duration,
     mut on_wait: impl FnMut(u64),
 ) -> Result<String, FundingError> {
+    // The `invoice_id` is a bearer capability on the create path (a poll exchanges it for the
+    // `sk-`), so it must never cross plaintext non-loopback http — enforce the ONE transport
+    // policy BEFORE building the status URL (a tampered pending sidecar or an
+    // `--allow-node-url-override http://…` must not leak the capability). create/balance already
+    // guard; this closes the poll gap (F6).
+    require_secure_node_url(node_url)?;
     let http = build_client()?;
     let node = normalize_node_url(node_url);
     let url = format!("{node}/v1/balance/lightning/invoice/{invoice_id}/status");
@@ -511,6 +517,10 @@ pub fn write_key_atomic(path: &Path, key: &str) -> Result<(), FundingError> {
 
     match create {
         Ok(mut f) => {
+            // The dev/ino of the file we just created, captured from the fd (not the path) so the
+            // partial-file cleanup can confirm the path still refers to THIS inode before it
+            // unlinks — a swapped directory entry must never make cleanup delete a different file.
+            let created_id = f.metadata().ok().map(|m| (m.dev(), m.ino()));
             // On ANY failure past the create, remove the just-created partial file so a
             // partial/empty key never lingers (a later read would treat it as a real key).
             let write_and_sync = (|| {
@@ -521,7 +531,7 @@ pub fn write_key_atomic(path: &Path, key: &str) -> Result<(), FundingError> {
                 fsync_dir(&parent)
             })();
             if let Err(e) = write_and_sync {
-                let _ = std::fs::remove_file(path);
+                remove_if_same_inode(path, created_id);
                 return Err(e);
             }
             Ok(())
@@ -549,44 +559,100 @@ pub fn write_key_atomic(path: &Path, key: &str) -> Result<(), FundingError> {
     }
 }
 
+/// Unlink `path` ONLY if the directory entry still refers to the SAME inode we created
+/// (`created_id` = the fd's `(dev, ino)`), comparing against a no-follow `symlink_metadata` of
+/// the path. Cleaning up a partial write by PATH is a TOCTOU: if the entry is swapped between the
+/// failed write and the cleanup, a blind `remove_file(path)` would delete a DIFFERENT file. If
+/// the ids do not match (or either lookup is unavailable), the file is LEFT in place — a stray
+/// partial is safer than deleting the wrong file. `created_id` is `None` only if the post-create
+/// fstat failed, in which case we cannot prove ownership and decline to unlink.
+fn remove_if_same_inode(path: &Path, created_id: Option<(u64, u64)>) {
+    let Some(created_id) = created_id else { return };
+    // symlink_metadata (lstat): never follow a symlink swapped in at the path.
+    if let Ok(now) = std::fs::symlink_metadata(path) {
+        if (now.dev(), now.ino()) == created_id {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Read an existing keyfile for the idempotent-fingerprint compare WITHOUT following a symlink
-/// or trusting a wrong-mode file. Opens `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`, `fstat`s the fd
-/// (so the checks bind to the SAME inode that is read — no TOCTOU), requires a regular file
-/// mode exactly 0600, then reads from THAT fd (never [`std::fs::read_to_string`], which would
-/// re-open by path and follow a symlink). A symlink at the path fails the open (`ELOOP`); a
-/// non-regular or non-0600 file is refused.
+/// or trusting a wrong-mode file. Delegates to [`read_regular_0600_nofollow`], which opens
+/// `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`, `fstat`s the fd (so the checks bind to the SAME inode
+/// that is read — no TOCTOU), requires a regular file mode exactly 0600, then reads from THAT
+/// fd (never [`std::fs::read_to_string`], which would re-open by path and follow a symlink). A
+/// symlink at the path fails the open (`ELOOP`); a non-regular or non-0600 file is refused.
 fn read_existing_key_hardened(path: &Path) -> Result<String, FundingError> {
+    read_regular_0600_nofollow(path, "key")
+}
+
+/// Read a security-relevant sidecar (`<key>.node_url` / `<key>.invoice`) WITHOUT following a
+/// symlink or trusting a wrong-mode file — the read-side mirror of [`write_sidecar`] and the
+/// same hardened model as [`read_existing_key_hardened`]. A sidecar carries a bearer-routing
+/// binding (`node_url`) or a capability (`invoice_id`); a plain [`std::fs::read_to_string`]
+/// would FOLLOW a symlink and accept a wrong-mode file, so an attacker who swaps the sidecar
+/// for a symlink to `https://evil` (or a world-writable file) could redirect the bearer `sk-`
+/// or make a `poll` trust a tampered node_url. This opens `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`,
+/// `fstat`s the fd (checks bound to the read inode), requires a regular file mode exactly 0600
+/// (the mode `write_sidecar` always leaves), and reads from THAT fd.
+///
+/// `Ok(None)` means the sidecar is ABSENT (no file at the path); `Ok(Some(_))` is a safe read;
+/// `Err(_)` means the sidecar EXISTS but is unsafe (symlink / wrong-mode / unreadable) — a
+/// present-but-tampered sidecar FAILS CLOSED at every caller, never falling through to a default.
+fn read_sidecar_hardened(path: &Path) -> Result<Option<String>, FundingError> {
+    match read_regular_0600_nofollow(path, "sidecar") {
+        Ok(contents) => Ok(Some(contents)),
+        // A missing sidecar is a normal "absent" — distinct from a present-but-unsafe one.
+        Err(FundingError::KeyWrite(_)) if !path_exists_nofollow(path) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a path resolves to an entry WITHOUT following a final symlink (`lstat`): a dangling
+/// or planted symlink still counts as "exists" (so a symlinked sidecar is treated as
+/// present-but-unsafe, never as absent). Used to split "sidecar absent" from "sidecar present
+/// but the hardened open refused it".
+fn path_exists_nofollow(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Open `path` with `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`, `fstat` the fd to require a regular
+/// file mode exactly 0600, and read its full contents from THAT fd (never re-opening by path).
+/// The shared hardened-read core behind the keyfile and the sidecars: binding the type/mode
+/// checks to the same inode that is read closes the TOCTOU, and `O_NOFOLLOW` refuses a symlink
+/// planted at the path (a bearer-secret redirection). `what` names the file in errors.
+fn read_regular_0600_nofollow(path: &Path, what: &str) -> Result<String, FundingError> {
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .map_err(|e| {
             FundingError::KeyWrite(format!(
-                "open existing key {} O_RDONLY|O_NOFOLLOW: {e}",
+                "open existing {what} {} O_RDONLY|O_NOFOLLOW: {e}",
                 path.display()
             ))
         })?;
     let meta = f
         .metadata()
-        .map_err(|e| FundingError::KeyWrite(format!("fstat existing key: {e}")))?;
+        .map_err(|e| FundingError::KeyWrite(format!("fstat existing {what}: {e}")))?;
     if !meta.file_type().is_file() {
         return Err(FundingError::KeyWrite(format!(
-            "existing key {} is not a regular file (refusing to fingerprint it)",
+            "existing {what} {} is not a regular file (refusing to trust it)",
             path.display()
         )));
     }
     let mode = meta.mode() & 0o777;
     if mode != 0o600 {
         return Err(FundingError::KeyWrite(format!(
-            "existing key {} has mode {:#o}, expected 0600 (refusing to trust a wrong-mode key)",
+            "existing {what} {} has mode {:#o}, expected 0600 (refusing to trust a wrong-mode {what})",
             path.display(),
             mode
         )));
     }
-    let mut existing = String::new();
-    f.read_to_string(&mut existing)
-        .map_err(|e| FundingError::KeyWrite(format!("read existing key for fingerprint: {e}")))?;
-    Ok(existing)
+    let mut contents = String::new();
+    f.read_to_string(&mut contents)
+        .map_err(|e| FundingError::KeyWrite(format!("read existing {what}: {e}")))?;
+    Ok(contents)
 }
 
 /// The persisted PENDING-invoice state (F2): the capability `invoice_id` a `poll` exchanges
@@ -610,12 +676,18 @@ impl std::fmt::Debug for PendingInvoice {
     }
 }
 
-/// Write the PENDING-invoice state (invoice_id + node_url) to its 0600 sidecar (F2). Both are
-/// stored as JSON (`{"invoice_id":..,"node_url":..}`). The invoice_id is bearer-sensitive on
-/// the create path (the poll exchanges it for the `sk-`), so it is never logged. Overwrites are
-/// allowed (a fresh create replaces a stale invoice for the same key-out); the file is 0600
-/// and no-symlink-follow. The node_url is normalized so a later `poll` compares apples to
-/// apples.
+/// Write a FRESH PENDING-invoice state (invoice_id + node_url) to its 0600 sidecar (F2/F7).
+/// Both are stored as JSON (`{"invoice_id":..,"node_url":..}`); the invoice_id is bearer-
+/// sensitive on the create path (the poll exchanges it for the `sk-`), so it is never logged.
+///
+/// This is `O_EXCL` create-NEW: it REFUSES if a pending sidecar already exists — an existing
+/// pending sidecar is a paid-but-unpolled invoice whose funds would be STRANDED if a fresh
+/// `create` overwrote its capability (there is no `recover`). The caller (`create`/`provision`)
+/// turns that refusal into "run `fund-key poll` to resume". It is deliberately DISTINCT from
+/// [`write_node_url_binding`]/[`write_sidecar`], which legitimately overwrite the node_url
+/// binding after the key lands. `poll` clears the pending sidecar only after the key is written,
+/// so a clean resume re-reads it and the O_EXCL create applies only to a genuinely new invoice.
+/// The node_url is normalized so a later `poll` compares apples to apples.
 pub fn write_invoice_state(
     key_path: &Path,
     invoice_id: &str,
@@ -628,17 +700,37 @@ pub fn write_invoice_state(
         "node_url": normalize_node_url(node_url),
     })
     .to_string();
-    write_sidecar(&invoice_state_path(key_path), &json)
+    write_sidecar_exclusive(&invoice_state_path(key_path), &json)
 }
 
-/// Read the persisted PENDING-invoice state (F2), if present + parseable.
-pub fn read_invoice_state(key_path: &Path) -> Option<PendingInvoice> {
-    let raw = std::fs::read_to_string(invoice_state_path(key_path)).ok()?;
-    let pending: PendingInvoice = serde_json::from_str(raw.trim()).ok()?;
+/// Read the persisted PENDING-invoice state (F2) through the hardened sidecar reader (F9):
+/// `Ok(None)` if the sidecar is ABSENT, `Ok(Some(_))` if it is present + safe + parseable,
+/// `Err(_)` if it EXISTS but is unsafe (symlink / wrong-mode). The `invoice_id` is the
+/// capability a `poll` exchanges for the `sk-`, so a present-but-tampered sidecar must fail
+/// closed here (never be treated as "no pending invoice" and silently re-created over). A
+/// present-but-UNPARSEABLE (or empty-field) sidecar is a hard error too, not a silent absence:
+/// it still shadows a possibly-paid invoice, so create/provision must refuse rather than clobber.
+pub fn read_invoice_state(key_path: &Path) -> Result<Option<PendingInvoice>, FundingError> {
+    let path = invoice_state_path(key_path);
+    let raw = match read_sidecar_hardened(&path)? {
+        Some(raw) => raw,
+        None => return Ok(None),
+    };
+    let pending: PendingInvoice = serde_json::from_str(raw.trim()).map_err(|e| {
+        FundingError::Usage(format!(
+            "the pending-invoice sidecar {} exists but is not valid JSON ({e}); \
+             refusing to overwrite a possibly-paid invoice — inspect or remove it by hand",
+            path.display()
+        ))
+    })?;
     if pending.invoice_id.trim().is_empty() || pending.node_url.trim().is_empty() {
-        return None;
+        return Err(FundingError::Usage(format!(
+            "the pending-invoice sidecar {} exists but is missing invoice_id/node_url; \
+             refusing to overwrite it — inspect or remove it by hand",
+            path.display()
+        )));
     }
-    Some(pending)
+    Ok(Some(pending))
 }
 
 /// Clear the PENDING-invoice state once the key is safely written (the invoice is claimed;
@@ -657,12 +749,28 @@ pub fn write_node_url_binding(key_path: &Path, node_url: &str) -> Result<(), Fun
     )
 }
 
-/// Read the bound `node_url` for a key (F9), if the sidecar exists.
-pub fn read_node_url_binding(key_path: &Path) -> Option<String> {
-    std::fs::read_to_string(node_url_sidecar_path(key_path))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+/// Read the bound `node_url` for a key (F9) through the hardened sidecar reader: `Ok(None)` if
+/// the binding is ABSENT, `Ok(Some(url))` if present + safe + non-empty, `Err(_)` if it EXISTS
+/// but is unsafe (symlink / wrong-mode) or is present-but-empty. The binding decides where the
+/// bearer `sk-` is sent, so a plain [`std::fs::read_to_string`] here would follow a symlink to
+/// `https://evil` (or accept a world-writable file) and redirect the secret; a present-but-empty
+/// binding is a hard error too (never silently fall through to a default/override when a binding
+/// file is present-but-broken).
+pub fn read_node_url_binding(key_path: &Path) -> Result<Option<String>, FundingError> {
+    let path = node_url_sidecar_path(key_path);
+    let raw = match read_sidecar_hardened(&path)? {
+        Some(raw) => raw,
+        None => return Ok(None),
+    };
+    let url = raw.trim().to_string();
+    if url.is_empty() {
+        return Err(FundingError::Usage(format!(
+            "the node_url binding {} exists but is empty; refusing to fall through to a default \
+             (a present-but-broken binding must not silently send the bearer key elsewhere)",
+            path.display()
+        )));
+    }
+    Ok(Some(url))
 }
 
 /// The effective `node_url` for a `balance`/`topup` on an existing key (F9): the BOUND url
@@ -674,7 +782,10 @@ pub fn resolve_bound_node_url(
     override_url: Option<&str>,
     allow_override: bool,
 ) -> Result<String, FundingError> {
-    let bound = read_node_url_binding(key_path);
+    // FAIL CLOSED: if the binding sidecar is present-but-unsafe (symlink/wrong-mode/empty), the
+    // `?` surfaces that error rather than treating it as "no binding" and falling through to an
+    // override/default — a tampered binding must never redirect the bearer key.
+    let bound = read_node_url_binding(key_path)?;
     match (bound, override_url) {
         (Some(bound), Some(over)) => {
             if normalize_node_url(over) == bound {
@@ -767,11 +878,57 @@ fn write_sidecar(path: &Path, contents: &str) -> Result<(), FundingError> {
     // Truncate any prior (possibly longer) content, then write.
     f.set_len(0)
         .map_err(|e| FundingError::KeyWrite(format!("truncate sidecar: {e}")))?;
-    (&f).write_all(format!("{contents}\n").as_bytes())
+    write_and_sync_sidecar(&f, &parent, contents)
+}
+
+/// Write a 0600 sidecar that must NOT already exist (F7): `O_CREAT | O_EXCL | O_WRONLY |
+/// O_NOFOLLOW | O_CLOEXEC`. Unlike [`write_sidecar`] (which overwrites), this REFUSES an
+/// existing file — used for the PENDING-invoice sidecar, whose capability must never be
+/// clobbered over a paid-but-unpolled invoice (that would strand the funds). O_EXCL also makes
+/// a symlink at the path fail the create, so no separate O_NOFOLLOW read is needed. On success
+/// it writes + `fsync`s the file and its parent dir.
+fn write_sidecar_exclusive(path: &Path, contents: &str) -> Result<(), FundingError> {
+    let parent = ensure_parent_dir(path)?;
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                FundingError::Usage(format!(
+                    "a pending invoice already exists at {} — resume it with \
+                     `fund-key poll --key-out {}` (do NOT re-create; overwriting the pending \
+                     capability would strand a paid-but-unpolled invoice)",
+                    path.display(),
+                    // The key path is this sidecar's path minus the `.invoice` suffix.
+                    path.with_extension("").display()
+                ))
+            } else {
+                FundingError::KeyWrite(format!(
+                    "open pending sidecar {} O_EXCL 0600: {e}",
+                    path.display()
+                ))
+            }
+        })?;
+    write_and_sync_sidecar(&f, &parent, contents)
+}
+
+/// Write `contents` (+ newline) to an already-open sidecar fd and `fsync` BOTH the file and its
+/// parent dir (the durable-write tail shared by [`write_sidecar`] and [`write_sidecar_exclusive`]).
+fn write_and_sync_sidecar(
+    f: &std::fs::File,
+    parent: &Path,
+    contents: &str,
+) -> Result<(), FundingError> {
+    // `impl Write for &File`: write through a `&File` so the caller keeps ownership of the fd.
+    let mut w: &std::fs::File = f;
+    w.write_all(format!("{contents}\n").as_bytes())
         .map_err(|e| FundingError::KeyWrite(format!("write sidecar: {e}")))?;
     f.sync_all()
         .map_err(|e| FundingError::KeyWrite(format!("fsync sidecar: {e}")))?;
-    fsync_dir(&parent)
+    fsync_dir(parent)
 }
 
 #[cfg(test)]
@@ -1136,7 +1293,7 @@ mod tests {
         write_node_url_binding(&key_path, "https://api.routstr.com/").unwrap();
         // Trailing slash is normalized away on write.
         assert_eq!(
-            read_node_url_binding(&key_path).as_deref(),
+            read_node_url_binding(&key_path).unwrap().as_deref(),
             Some("https://api.routstr.com")
         );
         // The sidecar sits BESIDE the key with a distinct name (keyfile stays raw sk-).
@@ -1194,7 +1351,9 @@ mod tests {
         // The pending state holds BOTH the invoice_id AND the node_url it was created against
         // (so poll targets the right node). The node_url is normalized (trailing slash gone).
         write_invoice_state(&key_path, "inv-abc-123", "https://custom.node.example/").unwrap();
-        let pending = read_invoice_state(&key_path).expect("pending state parses");
+        let pending = read_invoice_state(&key_path)
+            .unwrap()
+            .expect("pending state parses");
         assert_eq!(pending.invoice_id, "inv-abc-123");
         assert_eq!(pending.node_url, "https://custom.node.example");
         assert_eq!(invoice_state_path(&key_path), dir.join("brain.key.invoice"));
@@ -1217,7 +1376,7 @@ mod tests {
         }
         // clear removes it (idempotent even when already gone).
         clear_invoice_state(&key_path);
-        assert!(read_invoice_state(&key_path).is_none());
+        assert!(read_invoice_state(&key_path).unwrap().is_none());
         clear_invoice_state(&key_path);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1225,13 +1384,15 @@ mod tests {
     #[test]
     fn write_sidecar_enforces_0600_on_an_existing_wider_mode_file() {
         // TOOTH (#3/write_sidecar): a pre-existing 0644 sidecar must be re-permissioned to 0600
-        // on write — the mode-on-create flag alone would leave 0644 (world-readable capability).
+        // on write — the mode-on-create flag alone would leave 0644 (world-readable). Exercised
+        // via the node_url binding, which legitimately OVERWRITES its sidecar (the pending-invoice
+        // sidecar is O_EXCL create-new and refuses an existing file, so it cannot test overwrite).
         // Reverting to the create-only `.mode(0o600)` (no fchmod on the open fd) makes this RED:
         // the file would stay 0644.
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir("sidecar-mode");
         let key_path = dir.join("brain.key");
-        let sidecar = invoice_state_path(&key_path);
+        let sidecar = node_url_sidecar_path(&key_path);
         // Plant a world-readable sidecar with stale content.
         std::fs::write(&sidecar, "stale\n").unwrap();
         std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -1240,33 +1401,165 @@ mod tests {
             0o644,
             "precondition: the planted sidecar is 0644"
         );
-        // Writing fresh state must drop it to 0600 AND replace the content.
-        write_invoice_state(&key_path, "inv-new", "https://api.routstr.com").unwrap();
+        // Writing a fresh binding must drop it to 0600 AND replace the content.
+        write_node_url_binding(&key_path, "https://api.routstr.com").unwrap();
         assert_eq!(
             std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
             0o600,
             "an existing wider-mode sidecar is re-permissioned to 0600"
         );
-        let pending = read_invoice_state(&key_path).unwrap();
-        assert_eq!(pending.invoice_id, "inv-new");
+        assert_eq!(
+            read_node_url_binding(&key_path).unwrap().as_deref(),
+            Some("https://api.routstr.com")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn write_sidecar_refuses_to_follow_a_symlink() {
         // Complements the 0600 tooth: O_NOFOLLOW means a symlink planted at the sidecar path is
-        // refused, never written THROUGH to its target. Reverting O_NOFOLLOW would clobber the
-        // target's content (and its mode).
+        // refused, never written THROUGH to its target. Exercised via the node_url binding (the
+        // overwriting sidecar). Reverting O_NOFOLLOW would clobber the target's content + mode.
         let dir = temp_dir("sidecar-symlink");
         let key_path = dir.join("brain.key");
-        let sidecar = invoice_state_path(&key_path);
+        let sidecar = node_url_sidecar_path(&key_path);
         let target = dir.join("target.txt");
         std::fs::write(&target, "victim\n").unwrap();
         std::os::unix::fs::symlink(&target, &sidecar).unwrap();
-        let err = write_invoice_state(&key_path, "inv-x", "https://api.routstr.com").unwrap_err();
+        let err = write_node_url_binding(&key_path, "https://api.routstr.com").unwrap_err();
         assert_eq!(err.exit_code(), exit_code::KEY_WRITE_FAILURE);
         // The symlink target is untouched.
         assert_eq!(std::fs::read_to_string(&target).unwrap().trim(), "victim");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_invoice_state_refuses_an_existing_pending_sidecar() {
+        // TOOTH (F2/F7): the PENDING-invoice write is O_EXCL create-new — it REFUSES if a pending
+        // sidecar already exists, so a fresh create/provision can never overwrite the capability
+        // of a paid-but-unpolled invoice (which would strand the funds; there is no `recover`).
+        // Reverting `write_invoice_state` to the overwriting `write_sidecar` makes this RED: the
+        // second write would clobber the first invoice_id instead of refusing.
+        let dir = temp_dir("invoice-excl");
+        let key_path = dir.join("brain.key");
+        write_invoice_state(&key_path, "inv-FIRST", "https://api.routstr.com").unwrap();
+        let err =
+            write_invoice_state(&key_path, "inv-SECOND", "https://api.routstr.com").unwrap_err();
+        assert_eq!(
+            err.exit_code(),
+            exit_code::USAGE_ERROR,
+            "an existing pending sidecar is a usage refusal (resume via poll), not a clobber"
+        );
+        // The FIRST invoice_id is intact — never overwritten.
+        let pending = read_invoice_state(&key_path).unwrap().unwrap();
+        assert_eq!(
+            pending.invoice_id, "inv-FIRST",
+            "the original pending capability survives (no clobber)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_sidecar_hardened_fails_closed_on_symlink_and_wrong_mode() {
+        // TOOTH (F9 read side): the hardened sidecar reader must FAIL CLOSED (Err, not None) on a
+        // present-but-unsafe sidecar — a symlink or a wrong-mode file — so a tampered node_url
+        // binding never redirects the bearer key and a tampered pending sidecar never silently
+        // reads as "absent". Reverting the readers to `std::fs::read_to_string` makes this RED:
+        // the symlink would be FOLLOWED (returning the target's content) and the 0644 file trusted.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("read-hardened");
+        let key_path = dir.join("brain.key");
+
+        // (1) A symlinked node_url binding -> Err (fail closed), not a followed read.
+        let bind = node_url_sidecar_path(&key_path);
+        let evil = dir.join("evil.txt");
+        std::fs::write(&evil, "https://evil.example.com\n").unwrap();
+        std::os::unix::fs::symlink(&evil, &bind).unwrap();
+        assert!(
+            read_node_url_binding(&key_path).is_err(),
+            "a symlinked node_url binding fails closed (never follows to the evil target)"
+        );
+        std::fs::remove_file(&bind).unwrap();
+
+        // (2) A wrong-mode (0644) node_url binding -> Err (fail closed).
+        std::fs::write(&bind, "https://api.routstr.com\n").unwrap();
+        std::fs::set_permissions(&bind, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            read_node_url_binding(&key_path).is_err(),
+            "a wrong-mode node_url binding fails closed"
+        );
+        std::fs::remove_file(&bind).unwrap();
+
+        // (3) A wrong-mode pending sidecar -> Err (fail closed), distinct from absent (Ok(None)).
+        let inv = invoice_state_path(&key_path);
+        let json =
+            serde_json::json!({"invoice_id":"inv-x","node_url":"https://api.routstr.com"}).to_string();
+        std::fs::write(&inv, format!("{json}\n")).unwrap();
+        std::fs::set_permissions(&inv, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            read_invoice_state(&key_path).is_err(),
+            "a wrong-mode pending sidecar fails closed (not silently absent)"
+        );
+
+        // Sanity: a genuinely absent sidecar is Ok(None), not an error.
+        std::fs::remove_file(&inv).unwrap();
+        assert!(read_invoice_state(&key_path).unwrap().is_none());
+        assert!(read_node_url_binding(&key_path).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_bound_node_url_fails_closed_on_tampered_binding() {
+        // TOOTH (F9): resolve_bound_node_url must FAIL CLOSED when the binding sidecar is present
+        // but unsafe — never fall through to the override/default (which would send the bearer key
+        // to an attacker-chosen host). Here a wrong-mode binding is present AND an override is
+        // given: the resolve must ERROR, not return the override. Reverting the reader to a
+        // read_to_string that returns None on a wrong-mode file makes this RED (it would return
+        // the override url).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("resolve-tampered");
+        let key_path = dir.join("brain.key");
+        let bind = node_url_sidecar_path(&key_path);
+        std::fs::write(&bind, "https://api.routstr.com\n").unwrap();
+        std::fs::set_permissions(&bind, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = resolve_bound_node_url(&key_path, Some("https://attacker.example.com"), true)
+            .expect_err("a present-but-tampered binding must fail closed");
+        assert_eq!(err.exit_code(), exit_code::KEY_WRITE_FAILURE);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_if_same_inode_leaves_a_swapped_entry_untouched() {
+        // TOOTH (cleanup TOCTOU): the partial-file cleanup unlinks only when the path still
+        // refers to the SAME inode we created. Simulate a swapped directory entry: capture one
+        // file's (dev,ino), then replace the path with a DIFFERENT file, and assert the cleanup
+        // declines to remove it. Reverting to a blind remove_file(path) makes this RED (it would
+        // delete the swapped-in file).
+        let dir = temp_dir("toctou");
+        let created = dir.join("created.key");
+        std::fs::write(&created, "sk-created\n").unwrap();
+        let created_id = {
+            let m = std::fs::symlink_metadata(&created).unwrap();
+            (m.dev(), m.ino())
+        };
+        // The entry we would clean up now points at a DIFFERENT file (a swapped victim).
+        let victim = dir.join("victim.key");
+        std::fs::write(&victim, "sk-victim\n").unwrap();
+        remove_if_same_inode(&victim, Some(created_id));
+        assert!(
+            victim.exists(),
+            "a swapped-in (different-inode) entry is never removed by the cleanup"
+        );
+        // And it DOES remove when the ids match (the genuine partial-cleanup case).
+        let victim_id = {
+            let m = std::fs::symlink_metadata(&victim).unwrap();
+            (m.dev(), m.ino())
+        };
+        remove_if_same_inode(&victim, Some(victim_id));
+        assert!(
+            !victim.exists(),
+            "the matching-inode file (our own partial) IS removed"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

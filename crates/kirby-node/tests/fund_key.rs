@@ -14,10 +14,13 @@
 //!   (#1) the capability invoice_id never appears on stdout from `create`;
 //!   (#4) the BOUND node_url sidecar is written only AFTER the key lands (not at create);
 //!   (#6) an https-or-loopback check refuses a bearer call to a plaintext non-loopback node;
-//!   (#8) `poll` propagates a 401/403 as an auth failure, not a misleading unpaid-timeout.
+//!   (#8) `poll` propagates a 401/403 as an auth failure, not a misleading unpaid-timeout;
+//!   (F9r) balance refuses a SYMLINKED or WRONG-MODE node_url sidecar (hardened read, fail closed);
+//!   (F6p) `poll` refuses a plaintext non-loopback RESOLVED node_url (poll's require_secure gate);
+//!   (F7x) `create` refuses (does NOT clobber) an existing pending sidecar (O_EXCL, no strand).
 //! Teeth (a) write_key_atomic refuses to overwrite a DIFFERENT key, (b) the keyfile is
-//! 0600 raw sk- (boot.rs compat), plus the write_sidecar/idempotent-read/redaction teeth are
-//! the `src/funding.rs` unit teeth.
+//! 0600 raw sk- (boot.rs compat), plus the write_sidecar/idempotent-read/redaction/hardened-read/
+//! O_EXCL-pending/inode-cleanup teeth are the `src/funding.rs` unit teeth.
 
 mod common;
 
@@ -538,8 +541,12 @@ async fn topup_authenticates_with_key_and_confirms_credit() {
     .await;
     node.set_balance_msats(1_000_000); // 1000 sats before topup
 
-    // Bind the node_url beside the key so F9 lets the topup proceed without --node-url.
-    std::fs::write(dir.join("brain.key.node_url"), format!("{}\n", node.url())).unwrap();
+    // Bind the node_url beside the key so F9 lets the topup proceed without --node-url. The
+    // binding is 0600 (as `write_node_url_binding` always writes it); the hardened sidecar
+    // reader refuses a wrong-mode binding, so a bare 0644 `write` would fail closed here.
+    let binding = dir.join("brain.key.node_url");
+    std::fs::write(&binding, format!("{}\n", node.url())).unwrap();
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     let (code, stdout, stderr) = run_fund_key(&[
         "topup",
@@ -597,11 +604,11 @@ async fn topup_without_a_bearer_key_is_refused() {
     let dir = temp_dir("topup-nokey");
     let key_path = dir.join("missing.key"); // does not exist
                                             // Bind a url so F9 is satisfied and the failure is specifically the missing bearer.
-    std::fs::write(
-        dir.join("missing.key.node_url"),
-        "https://api.routstr.com\n",
-    )
-    .unwrap();
+                                            // The binding is 0600 (the hardened reader refuses a wrong-mode binding), so the
+                                            // failure is the missing bearer key, not a wrong-mode sidecar.
+    let binding = dir.join("missing.key.node_url");
+    std::fs::write(&binding, "https://api.routstr.com\n").unwrap();
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     let (code, stdout, _stderr) = run_fund_key(&[
         "topup",
@@ -629,8 +636,11 @@ async fn balance_refuses_mismatched_node_url_without_override() {
     let key_path = dir.join("brain.key");
     std::fs::write(&key_path, "sk-bound-key\n").unwrap();
     std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    // The key is bound to routstr.com.
-    std::fs::write(dir.join("brain.key.node_url"), "https://api.routstr.com\n").unwrap();
+    // The key is bound to routstr.com (0600, as production writes it — the hardened reader
+    // refuses a wrong-mode binding, so the refusal below is the mismatch, not a bad mode).
+    let binding = dir.join("brain.key.node_url");
+    std::fs::write(&binding, "https://api.routstr.com\n").unwrap();
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     // A DIFFERENT --node-url without the flag -> refused (usage error, before any network).
     let (code, stdout, _e) = run_fund_key(&[
@@ -658,7 +668,10 @@ async fn balance_uses_bound_url_and_reads_sats() {
     let node = MockNode::start_with_invoices(InvoiceBehavior::default()).await;
     node.set_balance_msats(4_242_000); // 4242 sats
                                        // Bind the mock's url so balance needs no --node-url and never risks a wrong server.
-    std::fs::write(dir.join("brain.key.node_url"), format!("{}\n", node.url())).unwrap();
+                                       // 0600, as `write_node_url_binding` writes it (the hardened reader refuses 0644).
+    let binding = dir.join("brain.key.node_url");
+    std::fs::write(&binding, format!("{}\n", node.url())).unwrap();
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     let (code, stdout, stderr) =
         run_fund_key(&["balance", "--key-path", key_path.to_str().unwrap()]);
@@ -691,8 +704,13 @@ async fn balance_refuses_plaintext_nonloopback_node_url() {
     let key_path = dir.join("brain.key");
     std::fs::write(&key_path, "sk-plaintext-key\n").unwrap();
     std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    // A plaintext-http NON-loopback host (TEST-NET-1, unroutable — never a real service).
-    std::fs::write(dir.join("brain.key.node_url"), "http://192.0.2.1\n").unwrap();
+    // A plaintext-http NON-loopback host (TEST-NET-1, unroutable — never a real service). The
+    // binding is 0600 (as production writes it) so the flow READS it and reaches the https-guard
+    // — the target of this tooth. (A wrong-mode binding would fail closed at the hardened read
+    // first, exit 8, masking the https-guard; that fail-closed read is F9r's tooth.)
+    let binding = dir.join("brain.key.node_url");
+    std::fs::write(&binding, "http://192.0.2.1\n").unwrap();
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     let (code, stdout, _e) = run_fund_key(&["balance", "--key-path", key_path.to_str().unwrap()]);
     assert_eq!(
@@ -728,5 +746,214 @@ async fn create_against_a_closed_node_is_network_failure() {
         "a connect failure -> network-failure (exit 5); stdout:\n{stdout}"
     );
     assert_eq!(last_json(&stdout)["status"], "network-failure");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- hardened sidecar reads + O_EXCL stranding (F9r / F6p / F7x) ----------------------
+
+/// TOOTH (F9r): `balance` refuses a SYMLINKED or WRONG-MODE `<key>.node_url` binding through
+/// the CLI. The binding decides where the bearer `sk-` is sent, so `balance` resolves it via
+/// the hardened sidecar reader (`resolve_bound_node_url` -> `read_node_url_binding` ->
+/// `read_sidecar_hardened` -> `read_regular_0600_nofollow`): a symlink fails the `O_NOFOLLOW`
+/// open, a wrong-mode file fails the `fstat` mode==0600 check, and either surfaces as a
+/// KEY_WRITE_FAILURE (exit 8) BEFORE the key is loaded or any network call is made — never
+/// following the tampered binding to a different server.
+///
+/// RED-on-revert: reverting `read_sidecar_hardened` / `read_regular_0600_nofollow` to a plain
+/// `std::fs::read_to_string` makes this RED — the symlink would be FOLLOWED (reading the
+/// planted target) and the 0644 file TRUSTED, so `resolve_bound_node_url` would return the
+/// tampered url and `balance` would carry on (exit != 8). Both planted targets hold a plaintext
+/// NON-loopback url (TEST-NET-1, unroutable), so even a reverted build never reaches a real
+/// host — it would refuse at the https-guard (exit 9), still != 8 (a clean RED).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn balance_refuses_symlinked_or_wrong_mode_node_url_binding() {
+    let dir = temp_dir("bind-hardened");
+    let key_path = dir.join("brain.key");
+    std::fs::write(&key_path, "sk-hardened-key\n").unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let binding = dir.join("brain.key.node_url");
+
+    // (1) A SYMLINKED binding -> refused (fail closed), never followed to the planted target.
+    // The target holds a plaintext non-loopback url so a reverted (followed) read cannot reach
+    // a real server (it would refuse at the https-guard), and the point — the refusal — holds.
+    let evil = dir.join("evil-url.txt");
+    std::fs::write(&evil, "http://192.0.2.1\n").unwrap();
+    std::os::unix::fs::symlink(&evil, &binding).unwrap();
+    let (code, stdout, _e) = run_fund_key(&["balance", "--key-path", key_path.to_str().unwrap()]);
+    assert_eq!(
+        code, 8,
+        "a symlinked node_url binding is a key-write-failure (fail closed), never followed; \
+         stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "key-write-failure");
+    std::fs::remove_file(&binding).unwrap();
+
+    // (2) A WRONG-MODE (0644) binding -> refused (fail closed), never trusted.
+    std::fs::write(&binding, "http://192.0.2.1\n").unwrap();
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (code, stdout, _e) = run_fund_key(&["balance", "--key-path", key_path.to_str().unwrap()]);
+    assert_eq!(
+        code, 8,
+        "a wrong-mode (0644) node_url binding is a key-write-failure (fail closed); \
+         stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "key-write-failure");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// TOOTH (F6p): `poll` refuses a plaintext NON-loopback RESOLVED node_url through the CLI. The
+/// pending sidecar pins the node the invoice was created against; `poll` reads it and calls
+/// `poll_invoice`, which enforces the ONE https-or-loopback transport policy
+/// (`require_secure_node_url`) BEFORE building the status URL (the `invoice_id` is a bearer
+/// capability on the create path — a poll exchanges it for the `sk-`, so it must never cross
+/// plaintext non-loopback http). Here the pending node_url is `http://192.0.2.1` (TEST-NET-1,
+/// unroutable) so even a reverted build never touches a real server.
+///
+/// RED-on-revert: removing the `require_secure_node_url(node_url)?` call at the top of
+/// `poll_invoice` makes this RED — `poll` would proceed to send the capability `invoice_id`
+/// to a plaintext non-loopback host (a connect attempt -> network-failure exit 5, or worse a
+/// real leak against a routable host), instead of the clean usage refusal (exit 9) with no
+/// network call at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poll_refuses_plaintext_nonloopback_resolved_node_url() {
+    let dir = temp_dir("poll-http");
+    let key_out = dir.join("brain.key");
+    // A pending sidecar pinning a plaintext NON-loopback host (TEST-NET-1, never a real
+    // service). No --node-url: the resolved url is exactly this tampered/unsafe pending node_url.
+    write_pending(&key_out, "inv-HTTP-CAP", "http://192.0.2.1");
+
+    let (code, stdout, _e) = run_fund_key(&[
+        "poll",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--timeout-secs",
+        "60",
+    ]);
+    assert_eq!(
+        code, 9,
+        "a plaintext non-loopback resolved node_url is a usage refusal (poll's https-guard), \
+         with NO network call; stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "usage-error");
+    // The capability invoice_id never left the machine, and no key was written.
+    assert!(
+        !key_out.exists(),
+        "no key is written on the https-guard refusal"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// TOOTH (F7x): the FULL stranding scenario end-to-end (the important one). A first `create`
+/// writes the 0600 pending sidecar; a SECOND `create` on the SAME `--key-out` REFUSES (exit 9)
+/// and does NOT clobber the pending capability, pointing the operator at `poll`; THEN `poll`
+/// RESUMES from the existing pending sidecar and PROVISIONS the key (the mock pays the invoice).
+/// This proves a paid-but-unpolled invoice is never stranded by a re-`create`.
+///
+/// Two guards defend this behavior, in order: the CLI's `refuse_if_pending_invoice` (main.rs,
+/// checked before any network call) is the FIRST to fire, and `write_invoice_state`'s O_EXCL
+/// create-new (`write_sidecar_exclusive`) is the belt-and-suspenders backstop that refuses the
+/// clobber even if the pre-check were bypassed. Because both hold, this end-to-end tooth stays
+/// green while EITHER stands; the O_EXCL guard is additionally isolated RED-on-revert by the
+/// `funding.rs` unit tooth `write_invoice_state_refuses_an_existing_pending_sidecar` (reverting
+/// O_EXCL to the overwriting `write_sidecar` flips THAT unit tooth RED). RED-on-revert here:
+/// reverting BOTH the `refuse_if_pending_invoice` pre-check AND O_EXCL makes the second create
+/// overwrite the pending sidecar (its invoice_id changes) — flipping the "unchanged invoice_id"
+/// assertion RED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_refuses_second_create_then_poll_resumes_and_provisions() {
+    let dir = temp_dir("strand");
+    let key_out = dir.join("brain.key");
+    let node = MockNode::start_with_invoices(InvoiceBehavior {
+        create: InvoiceCreate::Ok {
+            invoice_id: "inv-F7X-FIRST".into(),
+            bolt11: "lnbcFIRST".into(),
+        },
+        // The resume poll: first pending, then paid + minted key.
+        status_script: vec![
+            StatusStep::pending(),
+            StatusStep::paid_with_key("sk-strand-key"),
+        ],
+        ..Default::default()
+    })
+    .await;
+    node.set_balance_msats(7_777_000); // 7777 sats confirmed after payment
+
+    // (1) First create: writes the 0600 pending sidecar (invoice_id + node_url), no key yet.
+    let (code, stdout, _e) = run_fund_key(&[
+        "create",
+        "--amount-sats",
+        "2000",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--node-url",
+        &node.url(),
+    ]);
+    assert_eq!(code, 0, "the first create succeeds; stdout:\n{stdout}");
+    assert_eq!(last_json(&stdout)["status"], "invoice-created");
+    let invoice_sidecar = dir.join("brain.key.invoice");
+    let first: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&invoice_sidecar).unwrap().trim()).unwrap();
+    assert_eq!(
+        first["invoice_id"], "inv-F7X-FIRST",
+        "the pending sidecar holds the first invoice's capability"
+    );
+
+    // (2) Second create on the SAME key-out: REFUSED, and the pending sidecar is UNCHANGED
+    // (the paid-but-unpolled capability is never clobbered — no stranding).
+    let (code, stdout, _e) = run_fund_key(&[
+        "create",
+        "--amount-sats",
+        "2000",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--node-url",
+        &node.url(),
+    ]);
+    assert_eq!(
+        code, 9,
+        "a second create over a pending sidecar is a usage refusal; stdout:\n{stdout}"
+    );
+    let j = last_json(&stdout);
+    assert_eq!(j["status"], "usage-error");
+    assert!(
+        j["error"].as_str().unwrap_or("").contains("poll"),
+        "the refusal points the operator at `poll` to resume; error: {}",
+        j["error"]
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&invoice_sidecar).unwrap().trim()).unwrap();
+    assert_eq!(
+        after["invoice_id"], "inv-F7X-FIRST",
+        "the pending sidecar's capability is UNCHANGED after the refused second create (no clobber)"
+    );
+
+    // (3) Poll resumes from the existing pending sidecar and provisions the key.
+    let (code, stdout, stderr) = run_fund_key(&[
+        "poll",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--timeout-secs",
+        "60",
+    ]);
+    assert_eq!(
+        code, 0,
+        "poll resumes the pending invoice and mints the key; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let j = last_json(&stdout);
+    assert_eq!(j["status"], "funded");
+    assert_eq!(j["balance_sats"], 7777, "the probed balance after payment");
+
+    // The 0600 key landed, and the pending capability was cleared once it did.
+    let raw = std::fs::read_to_string(&key_out).unwrap();
+    assert_eq!(raw, "sk-strand-key\n");
+    assert_eq!(file_mode(&key_out), 0o600, "the minted key is 0600");
+    assert!(
+        !invoice_sidecar.exists(),
+        "the pending sidecar is cleared once the key is written"
+    );
+    // The minted key never leaks.
+    assert!(!stdout.contains("sk-strand-key") && !stderr.contains("sk-strand-key"));
+
     std::fs::remove_dir_all(&dir).ok();
 }
