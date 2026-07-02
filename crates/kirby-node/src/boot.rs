@@ -259,13 +259,45 @@ pub async fn boot_and_observe(
         }
         // The prepaid API-KEY brain (mint-independent fallback): a CompositeRail whose
         // brain is a RoutstrKeyBrain over a node-held custodial balance. Building it loads
-        // the bearer key and probes /v1/balance/info to (a) validate the key works and (b)
-        // assert the balance backs the treasury counter BEFORE the VM boots (REFUSE-TO-BOOT
-        // on a shortfall or unusable key — the same loud-and-safe stance as the Cashu path).
-        // No wallet/mint/saga: the key is the only credential.
+        // the bearer key and probes /v1/balance/info to validate the key works and read the
+        // custodial balance (REFUSE-TO-BOOT on an unusable key). The custodial key balance is
+        // the AUTHORITATIVE spendable truth here (the EXTERNAL-BALANCE-IS-TRUTH model), so
+        // instead of asserting the counter is already backed we RECONCILE the metabolism
+        // counter to the probed balance (G4): reconcile-DOWN degrades the budget to real
+        // money (an external spend the counter had not seen); reconcile-UP lets a topped-up
+        // agent think again. No wallet/mint/saga: the key is the only credential.
         Some(brain) if brain.backend == BrainBackendKind::RoutstrKey => {
-            let treasury_remaining = peek_treasury_remaining(&config).await?;
-            let brain_backend = build_routstr_key_brain(brain, treasury_remaining).await?;
+            let (brain_backend, balance_sats) = build_routstr_key_brain(brain).await?;
+            match g4_reconcile_action(balance_sats) {
+                G4Action::Reconcile(observed) => {
+                    // Open the SAME per-node treasury the gateway will use, SET the counter to
+                    // the observed custodial balance, then drop the handle BEFORE
+                    // `boot_and_observe_with_rail` reopens it (sequential; the reconcile does its
+                    // own txn + db.flush before the drop, and `open_treasury_retrying` absorbs the
+                    // brief sled/flock reclaim lag). After the SET, counter == balance.
+                    let treasury = open_treasury_retrying(
+                        &treasury_path_for(&config.node_id),
+                        config.initial_sats,
+                        Duration::from_secs(5),
+                    )
+                    .await?;
+                    let outcome = treasury.reconcile_to_observed(observed)?;
+                    drop(treasury);
+                    tracing::info!(
+                        ?outcome,
+                        balance_sats,
+                        "G4: reconciled the metabolism counter to the custodial key balance"
+                    );
+                }
+                G4Action::SkipZero => {
+                    tracing::warn!(
+                        "G4: prepaid key balance probed 0 sat; not zeroing the counter \
+                         (fetch_balance floors sub-sat dust to 0, and a spurious 0 must not kill \
+                         a funded agent) — the key gates real spend, so die-when-broke fires at \
+                         first spend if truly empty"
+                    );
+                }
+            }
             Arc::new(attach_actuator(
                 CompositeRail::new(Arc::new(MockRail::new()), brain_backend),
                 actuator,
@@ -557,16 +589,16 @@ async fn build_routstr_brain(
 
 /// Build the [`RoutstrKeyBrain`] backend for `backend = "routstr_key"` (the prepaid,
 /// mint-independent path): load the bearer key from its keyfile, construct the brain, then
-/// probe `/v1/balance/info` to BOTH validate the key works AND assert the custodial
-/// balance backs the treasury counter (`balance_sats >= treasury_remaining`). REFUSE TO
-/// BOOT on an unusable key (a bad/empty/unfunded key surfaces as a balance-probe error) or
-/// a shortfall — the same loud-and-safe stance as [`build_routstr_brain`]'s wallet
-/// reconcile, mirrored for the custodial balance. No wallet, no mint, no saga recovery:
-/// the key is the only credential, and the money already left at funding time.
+/// probe `/v1/balance/info` to BOTH validate the key works AND read the custodial balance.
+/// REFUSE TO BOOT on an unusable key (a bad/empty/unfunded key surfaces as a balance-probe
+/// error) — the agent cannot think without a working key. Returns the brain PLUS the probed
+/// `balance_sats`, so the G4 caller (`boot_and_observe`) can reconcile the metabolism
+/// counter to the custodial-key truth (RAISE on a topup, LOWER on an external spend) instead
+/// of asserting the counter is already backed. No wallet, no mint, no saga recovery: the key
+/// is the only credential, and the money already left at funding time.
 async fn build_routstr_key_brain(
     brain: &crate::config::BrainConfig,
-    treasury_remaining: u64,
-) -> anyhow::Result<Arc<dyn BrainBackend>> {
+) -> anyhow::Result<(Arc<dyn BrainBackend>, u64)> {
     // 1) Load the bearer key from its FILE (never inline in the logged/serialized config —
     //    it is bearer money, the same discipline as the wallet seed / dm key).
     let api_key = load_api_key(&brain.api_key_path)?;
@@ -581,36 +613,49 @@ async fn build_routstr_key_brain(
 
     // 3) Probe the balance: this BOTH validates the key (a bad/empty/unfunded key returns
     //    non-2xx, surfaced as an error) and reads the custodial balance. REFUSE TO BOOT if
-    //    the probe fails (don't boot a brain that cannot think) ...
+    //    the probe fails (don't boot a brain that cannot think). The custodial balance is the
+    //    authoritative spendable truth; the G4 caller reconciles the counter to it (a probe
+    //    error refuses here, so the reconcile below only ever runs on a successful probe).
     let balance_sats = key_brain.fetch_balance_sats().await.map_err(|e| {
         anyhow::anyhow!(
             "RoutstrKeyBrain refuses to boot: could not read the prepaid key balance from \
              the node ({e}). The agent cannot think without a working, funded key."
         )
     })?;
-    // ... or the custodial balance does not back the counter.
-    assert_balance_backs_counter(balance_sats, treasury_remaining)?;
 
     let backend: Arc<dyn BrainBackend> = Arc::new(key_brain);
-    Ok(backend)
+    Ok((backend, balance_sats))
 }
 
-/// The custodial-balance analog of [`assert_wallet_backs_counter`] for the prepaid
-/// API-key path: the node-held balance must back every sat the metabolism counter believes
-/// it has (`balance_sats >= treasury_remaining`, `>=` NOT `==`), or the brain REFUSES TO
-/// BOOT (loud + safe, the same stance as the Cashu wallet reconcile). There is no fee
-/// reserve to subtract here — the per-think charge is debited server-side from this same
-/// balance, so the whole balance backs the counter.
-pub fn assert_balance_backs_counter(balance_sats: u64, treasury_remaining: u64) -> anyhow::Result<()> {
-    if balance_sats < treasury_remaining {
-        anyhow::bail!(
-            "RoutstrKeyBrain refuses to boot: prepaid key balance ({balance_sats} sat) < \
-             treasury_remaining ({treasury_remaining} sat). The custodial balance must back \
-             every sat the metabolism counter believes it has. Top up the key (POST \
-             /v1/balance/topup) or lower funding.initial_sats before resuming."
-        );
+/// The G4 boot reconcile decision for the prepaid API-key path (the pure, unit-testable core
+/// of the caller arm in [`boot_and_observe`]). The custodial key balance is the authoritative
+/// spendable truth (the EXTERNAL-BALANCE-IS-TRUTH model), so a SUCCESSFUL, NON-ZERO probe SETS
+/// the metabolism counter to it via [`crate::treasury::Treasury::reconcile_to_observed`]
+/// ([`G4Action::Reconcile`]) — RAISING on a topup, LOWERING on an external spend the counter
+/// had not seen. A probed `0` is NOT trusted to zero the counter ([`G4Action::SkipZero`]):
+/// [`crate::rail::RoutstrKeyBrain::fetch_balance_sats`] FLOORS sub-sat dust to 0, and a
+/// spurious 0 must not brick a funded agent — the key gates real spend, so die-when-broke
+/// still fires at first spend if the key is truly empty. (A probe ERROR never reaches here:
+/// `build_routstr_key_brain` refuses to boot on it.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum G4Action {
+    /// Reconcile the counter to this observed custodial balance (a non-zero probe): SET it,
+    /// both directions (RAISE on a topup, LOWER on an external spend).
+    Reconcile(u64),
+    /// The probe read 0 sat: SKIP the reconcile (do NOT zero the counter) and proceed, because
+    /// a floored-dust / spurious 0 must not kill a funded agent.
+    SkipZero,
+}
+
+/// The G4 reconcile decision (see [`G4Action`]): a non-zero balance reconciles the counter to
+/// it; a `0` reading skips (never zeroes the counter). Pure so the money-critical decision is
+/// unit-tested WITHOUT a live balance probe or a real treasury; the caller arm wires to it.
+pub fn g4_reconcile_action(balance_sats: u64) -> G4Action {
+    if balance_sats > 0 {
+        G4Action::Reconcile(balance_sats)
+    } else {
+        G4Action::SkipZero
     }
-    Ok(())
 }
 
 /// Load the prepaid bearer key from its keyfile: read the file, trim surrounding
@@ -941,7 +986,7 @@ async fn wait_for_hello(
 
 #[cfg(test)]
 mod routstr_key_boot_tests {
-    use super::{assert_balance_backs_counter, load_api_key};
+    use super::{g4_reconcile_action, load_api_key, G4Action};
 
     /// A unique temp path for a test keyfile (no shared `tests/common` here — this is a
     /// `src` unit test, so we mint our own temp path the same way the harness does).
@@ -978,15 +1023,32 @@ mod routstr_key_boot_tests {
     }
 
     #[test]
-    fn balance_backs_counter_ok_at_or_above_and_refuses_below() {
-        // The `>=` boundary backs the counter; excess is fine (no fee reserve to subtract).
-        assert!(assert_balance_backs_counter(100, 100).is_ok(), "the >= boundary backs the counter");
-        assert!(assert_balance_backs_counter(101, 100).is_ok(), "excess balance is fine");
-        // Short by a single sat: REFUSE TO BOOT, naming both figures.
-        let err = assert_balance_backs_counter(99, 100).expect_err("a shortfall must refuse to boot");
-        let msg = err.to_string();
-        assert!(msg.contains("refuses to boot"), "got: {msg}");
-        assert!(msg.contains("99") && msg.contains("100"), "names both figures: {msg}");
+    fn g4_reconciles_a_nonzero_balance_to_that_observed_truth() {
+        // Any non-zero probe SETS the counter to the balance (the reconcile itself, tested for
+        // BOTH directions against the real treasury in `treasury::tests`, decides RAISE vs LOWER
+        // vs Unchanged). Here we only assert the decision carries the exact observed sats through.
+        assert_eq!(g4_reconcile_action(1), G4Action::Reconcile(1), "the 1-sat boundary reconciles");
+        assert_eq!(
+            g4_reconcile_action(50_000),
+            G4Action::Reconcile(50_000),
+            "a topped-up balance reconciles UP to the observed truth"
+        );
+        assert_eq!(
+            g4_reconcile_action(42),
+            G4Action::Reconcile(42),
+            "a partly-spent balance reconciles DOWN to the observed truth (never a refuse)"
+        );
+    }
+
+    #[test]
+    fn g4_skips_zeroing_the_counter_on_a_zero_probe() {
+        // A successful 0-sat probe is NOT trusted to zero the counter (floored sub-sat dust /
+        // a spurious 0 must not brick a funded agent); skip + proceed. The key gates real spend.
+        assert_eq!(
+            g4_reconcile_action(0),
+            G4Action::SkipZero,
+            "a 0 reading must SKIP the reconcile, never zero the counter"
+        );
     }
 }
 
