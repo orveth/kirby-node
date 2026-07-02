@@ -968,7 +968,7 @@ impl GatewayService {
     /// Called by the customer's settlement client (or the E6 integration test rig), NOT by
     /// the genome. The genome polls the inbox for `PAYMENT_SETTLED` to learn the outcome.
     ///
-    /// `credit_verified` is idempotent on `charge_id` — a double-settle attempt returns
+    /// `credit_verified` is idempotent on `charge_id` -- a double-settle attempt returns
     /// `CreditOutcome::Duplicate` with no double-credit.
     pub async fn settle_charge(
         &self,
