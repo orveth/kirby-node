@@ -16,11 +16,13 @@
 //!   (#6) an https-or-loopback check refuses a bearer call to a plaintext non-loopback node;
 //!   (#8) `poll` propagates a 401/403 as an auth failure, not a misleading unpaid-timeout;
 //!   (F9r) balance refuses a SYMLINKED or WRONG-MODE node_url sidecar (hardened read, fail closed);
+//!   (Kr) balance refuses a SYMLINKED `--key-path` — the keyfile read is hardened too, so the
+//!        bearer `sk-` at a symlink target is never followed and sent to the node;
 //!   (F6p) `poll` refuses a plaintext non-loopback RESOLVED node_url (poll's require_secure gate);
 //!   (F7x) `create` refuses (does NOT clobber) an existing pending sidecar (O_EXCL, no strand).
 //! Teeth (a) write_key_atomic refuses to overwrite a DIFFERENT key, (b) the keyfile is
 //! 0600 raw sk- (boot.rs compat), plus the write_sidecar/idempotent-read/redaction/hardened-read/
-//! O_EXCL-pending/inode-cleanup teeth are the `src/funding.rs` unit teeth.
+//! O_EXCL-pending/leave-the-partial/clear-invoice-state teeth are the `src/funding.rs` unit teeth.
 
 mod common;
 
@@ -54,6 +56,30 @@ fn run_fund_key(args: &[&str]) -> (i32, String, String) {
         .args(args)
         .output()
         .expect("spawn kirby-node");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Run `kirby-node fund-key <args...>` in a CHILD process whose umask is set to `mask` via
+/// `pre_exec` (after fork, before exec). This isolates the restrictive umask to the child — a
+/// process-global `libc::umask` in the parent test process would race the thread-parallel test
+/// suite and break every concurrent file/dir create. Returns (exit_code, stdout, stderr).
+fn run_fund_key_with_umask(mask: libc::mode_t, args: &[&str]) -> (i32, String, String) {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(bin());
+    cmd.arg("fund-key").args(args);
+    // SAFETY: pre_exec runs in the forked child before exec; `libc::umask` is async-signal-safe
+    // and touches no parent state. It only sets the child's file-creation mask.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::umask(mask);
+            Ok(())
+        });
+    }
+    let out = cmd.output().expect("spawn kirby-node");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -159,6 +185,78 @@ async fn create_persists_pending_state_without_leaking_invoice_id_or_binding() {
         !key_out.exists(),
         "create does not write the key; poll does"
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// TOOTH (#3/pending sidecar umask): `create` writes the `.invoice` pending sidecar as EXACTLY
+/// 0600 even under a RESTRICTIVE umask. `write_sidecar_exclusive`'s `.mode(0o600)` on the O_EXCL
+/// create is MASKED by the process umask, so under umask 0277 (which includes the owner-WRITE bit
+/// 0200) a bare create would land 0400 (0600 & ~0277); the hardened reader (requires exactly 0600)
+/// would then REJECT it, so a later `poll` could not resume. The added fstat + fchmod-to-0600 on
+/// the opened fd defeats the umask. The child process gets umask 0277 via `pre_exec` (isolated —
+/// never racing the parallel suite).
+///
+/// RED-on-revert: reverting the fchmod in `write_sidecar_exclusive` makes this RED — under umask
+/// 0277 the sidecar would be 0400, failing the `0o600` assertion (and a subsequent poll's hardened
+/// read would reject it). (Note: umask 0277 must include 0200 to actually strip owner-write from
+/// 0600 — a umask like 0177 leaves 0600 unchanged and would NOT exercise the bug.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_pending_sidecar_is_0600_under_restrictive_umask() {
+    let dir = temp_dir("create-umask");
+    let key_out = dir.join("brain.key");
+    let node = MockNode::start_with_invoices(InvoiceBehavior {
+        create: InvoiceCreate::Ok {
+            invoice_id: "inv-UMASK".into(),
+            bolt11: "lnbcUMASK".into(),
+        },
+        ..Default::default()
+    })
+    .await;
+
+    // Run `create` with a restrictive umask (0277: strips owner-write + all group/other, so a
+    // bare create would land 0400). The pending sidecar must still land 0600.
+    let (code, stdout, _e) = run_fund_key_with_umask(
+        0o277,
+        &[
+            "create",
+            "--amount-sats",
+            "2000",
+            "--key-out",
+            key_out.to_str().unwrap(),
+            "--node-url",
+            &node.url(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "create under a restrictive umask still succeeds; stdout:\n{stdout}"
+    );
+    let invoice_sidecar = dir.join("brain.key.invoice");
+    assert_eq!(
+        file_mode(&invoice_sidecar),
+        0o600,
+        "the pending-invoice sidecar is fchmod'd to exactly 0600, defeating the umask"
+    );
+
+    // The hardened reader accepts it — a poll READS it (revert would leave 0400 and REJECT the
+    // read as a key-write-failure). The mock never pays (empty status_script -> always pending),
+    // so poll times out UNPAID (exit 2) after one poll interval; the exit-2 (not exit-8
+    // key-write-failure) is the proof the 0600 sidecar was readable. A short --timeout-secs keeps
+    // the test to ~one poll interval.
+    let (poll_code, poll_out, _pe) = run_fund_key(&[
+        "poll",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--timeout-secs",
+        "1",
+    ]);
+    assert_eq!(
+        poll_code, 2,
+        "poll READS the 0600 sidecar then times out unpaid (not an exit-8 rejected-sidecar error); \
+         stdout:\n{poll_out}"
+    );
+    assert_eq!(last_json(&poll_out)["status"], "unpaid-timeout");
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -799,6 +897,49 @@ async fn balance_refuses_symlinked_or_wrong_mode_node_url_binding() {
     );
     assert_eq!(last_json(&stdout)["status"], "key-write-failure");
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// TOOTH (Kr): `balance` refuses a SYMLINKED `--key-path` through the CLI. The keyfile holds the
+/// bearer `sk-`; it is read through the SAME hardened path as the fingerprint read
+/// (`load_raw_key` -> `funding::read_key_file` -> `read_regular_0600_nofollow`, O_NOFOLLOW), so a
+/// symlink planted at `--key-path` fails the open (ELOOP) and surfaces as an auth failure (exit 6)
+/// BEFORE any bearer call — the `sk-` at the symlink target is never followed and sent to the node.
+/// The bound node_url is the mock (0600, so the binding read passes and the failure is specifically
+/// the symlinked KEY, not the binding).
+///
+/// RED-on-revert: reverting `load_raw_key` to `std::fs::read_to_string` makes this RED — the
+/// symlink would be FOLLOWED, the target's `sk-` loaded, and `balance` would carry on to read the
+/// balance from the mock (exit 0), leaking the resolved key to the node instead of the clean exit-6
+/// refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn balance_refuses_a_symlinked_key_path() {
+    let dir = temp_dir("key-symlink");
+    // The real keyfile (0600) holds a bearer sk-; --key-path is a SYMLINK pointing at it.
+    let real_key = dir.join("real.key");
+    std::fs::write(&real_key, "sk-symlinked-key\n").unwrap();
+    std::fs::set_permissions(&real_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let key_path = dir.join("brain.key");
+    std::os::unix::fs::symlink(&real_key, &key_path).unwrap();
+
+    // A live mock is bound so that a REVERTED (symlink-following) build would actually reach the
+    // bearer call and return a balance (exit 0) — the clean RED. The binding is 0600 beside the
+    // symlink so the node_url read passes and the ONLY failure is the symlinked key.
+    let node = MockNode::start_with_invoices(InvoiceBehavior::default()).await;
+    node.set_balance_msats(5_000_000);
+    let binding = dir.join("brain.key.node_url");
+    std::fs::write(&binding, format!("{}\n", node.url())).unwrap();
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let (code, stdout, _e) = run_fund_key(&["balance", "--key-path", key_path.to_str().unwrap()]);
+    assert_eq!(
+        code, 6,
+        "a symlinked --key-path is an auth failure (hardened key read, never followed); \
+         stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "auth-failure");
+    // The bearer key at the symlink target never left the machine.
+    assert!(!stdout.contains("sk-symlinked-key"));
     std::fs::remove_dir_all(&dir).ok();
 }
 

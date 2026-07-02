@@ -517,12 +517,6 @@ pub fn write_key_atomic(path: &Path, key: &str) -> Result<(), FundingError> {
 
     match create {
         Ok(mut f) => {
-            // The dev/ino of the file we just created, captured from the fd (not the path) so the
-            // partial-file cleanup can confirm the path still refers to THIS inode before it
-            // unlinks — a swapped directory entry must never make cleanup delete a different file.
-            let created_id = f.metadata().ok().map(|m| (m.dev(), m.ino()));
-            // On ANY failure past the create, remove the just-created partial file so a
-            // partial/empty key never lingers (a later read would treat it as a real key).
             let write_and_sync = (|| {
                 writeln!(f, "{key}")
                     .map_err(|e| FundingError::KeyWrite(format!("write key: {e}")))?;
@@ -531,8 +525,16 @@ pub fn write_key_atomic(path: &Path, key: &str) -> Result<(), FundingError> {
                 fsync_dir(&parent)
             })();
             if let Err(e) = write_and_sync {
-                remove_if_same_inode(path, created_id);
-                return Err(e);
+                // LEAVE the partial file in place: a path-based unlink here would be a TOCTOU (an
+                // entry swapped between the failed write and the cleanup would delete a DIFFERENT
+                // file). A lingering partial is safe — the NEXT write_key_atomic's O_EXCL create
+                // refuses to reopen it and its fingerprint-mismatch refusal means it can never be
+                // silently trusted as a key. The operator removes it by hand before retrying.
+                return Err(FundingError::KeyWrite(format!(
+                    "{e}; a PARTIAL keyfile may remain at {} — remove it by hand before retrying \
+                     (the next attempt's O_EXCL create refuses to reopen it)",
+                    path.display()
+                )));
             }
             Ok(())
         }
@@ -559,23 +561,6 @@ pub fn write_key_atomic(path: &Path, key: &str) -> Result<(), FundingError> {
     }
 }
 
-/// Unlink `path` ONLY if the directory entry still refers to the SAME inode we created
-/// (`created_id` = the fd's `(dev, ino)`), comparing against a no-follow `symlink_metadata` of
-/// the path. Cleaning up a partial write by PATH is a TOCTOU: if the entry is swapped between the
-/// failed write and the cleanup, a blind `remove_file(path)` would delete a DIFFERENT file. If
-/// the ids do not match (or either lookup is unavailable), the file is LEFT in place — a stray
-/// partial is safer than deleting the wrong file. `created_id` is `None` only if the post-create
-/// fstat failed, in which case we cannot prove ownership and decline to unlink.
-fn remove_if_same_inode(path: &Path, created_id: Option<(u64, u64)>) {
-    let Some(created_id) = created_id else { return };
-    // symlink_metadata (lstat): never follow a symlink swapped in at the path.
-    if let Ok(now) = std::fs::symlink_metadata(path) {
-        if (now.dev(), now.ino()) == created_id {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
 /// Read an existing keyfile for the idempotent-fingerprint compare WITHOUT following a symlink
 /// or trusting a wrong-mode file. Delegates to [`read_regular_0600_nofollow`], which opens
 /// `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`, `fstat`s the fd (so the checks bind to the SAME inode
@@ -583,6 +568,18 @@ fn remove_if_same_inode(path: &Path, created_id: Option<(u64, u64)>) {
 /// fd (never [`std::fs::read_to_string`], which would re-open by path and follow a symlink). A
 /// symlink at the path fails the open (`ELOOP`); a non-regular or non-0600 file is refused.
 fn read_existing_key_hardened(path: &Path) -> Result<String, FundingError> {
+    read_regular_0600_nofollow(path, "key")
+}
+
+/// Read the bearer `sk-` from a keyfile for a bearer call (`balance`/`topup`, and any in-process
+/// inference load) through the SAME hardened path as the idempotent-fingerprint read: the shared
+/// [`read_regular_0600_nofollow`] opens `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`, `fstat`s the fd to
+/// require a regular file mode exactly 0600, and reads from THAT fd. A plain
+/// [`std::fs::read_to_string`] here would FOLLOW a symlink planted at `--key-path` and send the
+/// resolved file's `sk-` to the node — the bearer-secret redirection this closes. The returned
+/// content is the RAW file (caller trims); a symlink fails the open (`ELOOP`), a non-regular or
+/// non-0600 file is refused. This completes the discipline: EVERY key read is hardened.
+pub fn read_key_file(path: &Path) -> Result<String, FundingError> {
     read_regular_0600_nofollow(path, "key")
 }
 
@@ -734,9 +731,20 @@ pub fn read_invoice_state(key_path: &Path) -> Result<Option<PendingInvoice>, Fun
 }
 
 /// Clear the PENDING-invoice state once the key is safely written (the invoice is claimed;
-/// keeping the capability around is needless exposure). Absence is fine (idempotent).
-pub fn clear_invoice_state(key_path: &Path) {
-    let _ = std::fs::remove_file(invoice_state_path(key_path));
+/// keeping the capability around is needless exposure). Absence is fine — a `NotFound` is `Ok`
+/// (idempotent). Any OTHER unlink failure is PROPAGATED, not swallowed: a silent failure would
+/// leave the `invoice_id` capability on disk while the caller reports "funded", so the caller
+/// must surface it (the key is already written, so the caller warns rather than failing the op).
+pub fn clear_invoice_state(key_path: &Path) -> Result<(), FundingError> {
+    let path = invoice_state_path(key_path);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(FundingError::KeyWrite(format!(
+            "clear pending-invoice sidecar {}: {e}",
+            path.display()
+        ))),
+    }
 }
 
 /// Bind the `node_url` beside the key (F9). Written 0600, no-symlink-follow. The keyfile
@@ -887,6 +895,13 @@ fn write_sidecar(path: &Path, contents: &str) -> Result<(), FundingError> {
 /// clobbered over a paid-but-unpolled invoice (that would strand the funds). O_EXCL also makes
 /// a symlink at the path fail the create, so no separate O_NOFOLLOW read is needed. On success
 /// it writes + `fsync`s the file and its parent dir.
+///
+/// The `.mode(0o600)` on the open flags is masked by the process umask, so a restrictive umask
+/// could create the pending sidecar as (e.g.) 0400/0000; the hardened reader
+/// ([`read_regular_0600_nofollow`]) then rejects a non-0600 sidecar and poll-resume would fail.
+/// So it `fstat`s + `fchmod`s the OPENED fd to exactly 0600 BEFORE writing (mirroring
+/// [`write_sidecar`]), binding the mode to the same inode that is written — the sidecar is 0600
+/// regardless of umask.
 fn write_sidecar_exclusive(path: &Path, contents: &str) -> Result<(), FundingError> {
     let parent = ensure_parent_dir(path)?;
     let f = std::fs::OpenOptions::new()
@@ -912,6 +927,11 @@ fn write_sidecar_exclusive(path: &Path, contents: &str) -> Result<(), FundingErr
                 ))
             }
         })?;
+    // O_EXCL created a fresh regular file (an existing file/symlink would have failed the open),
+    // so no fstat file-type re-check is needed here — but fchmod the OPEN fd to exactly 0600 to
+    // defeat a restrictive umask, so the hardened reader accepts the sidecar on poll-resume.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| FundingError::KeyWrite(format!("chmod pending sidecar 0600: {e}")))?;
     write_and_sync_sidecar(&f, &parent, contents)
 }
 
@@ -1243,26 +1263,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn write_key_atomic_removes_partial_file_on_write_failure() {
-        // The fresh-create path must not leave a partial/empty key behind if the write/fsync
-        // fails. We can't easily force a write failure on a normal fd, so assert the happy
-        // path leaves a complete file (the removal branch is covered by inspection) AND that
-        // a zero-length pre-existing 0600 file is treated as a DIFFERENT (empty) key, not a
-        // silent match — an empty key must never fingerprint-equal a real one.
-        use std::os::unix::fs::PermissionsExt;
-        let dir = temp_dir("partial");
-        let key_path = dir.join("brain.key");
-        std::fs::write(&key_path, "").unwrap();
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let err = write_key_atomic(&key_path, "sk-real").unwrap_err();
-        assert_eq!(
-            err.exit_code(),
-            exit_code::KEY_WRITE_FAILURE,
-            "an empty existing key is a fingerprint MISMATCH, refused (never a silent match)"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
+    // The "leave the partial on a fresh-create write failure" contract (no path-unlink) and the
+    // empty-key fingerprint-mismatch guard are asserted in
+    // `write_key_atomic_leaves_a_partial_file_and_never_path_unlinks` below.
 
     // ---- https-before-bearer enforcement (#6) ---------------------------------------
 
@@ -1374,10 +1377,11 @@ mod tests {
                 "the invoice_id sidecar is 0600 (it is capability-sensitive)"
             );
         }
-        // clear removes it (idempotent even when already gone).
-        clear_invoice_state(&key_path);
+        // clear removes it and returns Ok; a second clear on the now-absent sidecar is also Ok
+        // (NotFound is idempotent, not an error).
+        clear_invoice_state(&key_path).unwrap();
         assert!(read_invoice_state(&key_path).unwrap().is_none());
-        clear_invoice_state(&key_path);
+        clear_invoice_state(&key_path).expect("clearing an absent sidecar is Ok (idempotent)");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1432,6 +1436,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap().trim(), "victim");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // The "O_EXCL pending sidecar is exactly 0600 even under a restrictive umask" tooth lives in
+    // the integration suite (`tests/fund_key.rs::create_pending_sidecar_is_0600_under_restrictive_umask`):
+    // it drives `fund-key create` in a CHILD process whose umask is set via `pre_exec`, so the
+    // restrictive umask is isolated to that child and never races the (thread-parallel) unit tests
+    // — a process-global `libc::umask` in a unit test breaks every concurrent test that creates a
+    // file or directory.
 
     #[test]
     fn write_invoice_state_refuses_an_existing_pending_sidecar() {
@@ -1529,37 +1540,86 @@ mod tests {
     }
 
     #[test]
-    fn remove_if_same_inode_leaves_a_swapped_entry_untouched() {
-        // TOOTH (cleanup TOCTOU): the partial-file cleanup unlinks only when the path still
-        // refers to the SAME inode we created. Simulate a swapped directory entry: capture one
-        // file's (dev,ino), then replace the path with a DIFFERENT file, and assert the cleanup
-        // declines to remove it. Reverting to a blind remove_file(path) makes this RED (it would
-        // delete the swapped-in file).
-        let dir = temp_dir("toctou");
-        let created = dir.join("created.key");
-        std::fs::write(&created, "sk-created\n").unwrap();
-        let created_id = {
-            let m = std::fs::symlink_metadata(&created).unwrap();
-            (m.dev(), m.ino())
-        };
-        // The entry we would clean up now points at a DIFFERENT file (a swapped victim).
-        let victim = dir.join("victim.key");
-        std::fs::write(&victim, "sk-victim\n").unwrap();
-        remove_if_same_inode(&victim, Some(created_id));
-        assert!(
-            victim.exists(),
-            "a swapped-in (different-inode) entry is never removed by the cleanup"
+    fn write_key_atomic_leaves_a_partial_file_and_never_path_unlinks() {
+        // TOOTH (fresh-create TOCTOU elimination): on a fresh-create write/fsync FAILURE,
+        // write_key_atomic must LEAVE the partial file in place — it must NOT unlink by path (the
+        // old `remove_if_same_inode` path-unlink was a TOCTOU: an entry swapped between the failed
+        // write and the cleanup would delete a DIFFERENT file). Forcing a real fsync failure on a
+        // normal fd is not portable, so the write-failure branch is covered BY INSPECTION (the
+        // error path now returns without any `remove_file(path)`), and this asserts the two
+        // observable safety consequences that make "leave the partial" safe:
+        //
+        //  (1) a partial/empty keyfile is a fingerprint MISMATCH (never silently equals a real
+        //      key), so a lingering partial is refused, not trusted; and
+        //  (2) the next write_key_atomic on that path hits O_EXCL AlreadyExists and — because the
+        //      content differs — refuses with a fingerprint-mismatch error, never clobbering it.
+        //
+        // Reverting to a path-based unlink would remove this file (breaking the by-inspection
+        // contract); the assertions below independently guarantee a leftover partial is safe.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("leave-partial");
+        let key_path = dir.join("brain.key");
+        // Simulate a partial/empty keyfile left behind by a crashed write (0600, as the create
+        // flags would have set it before the write failed).
+        std::fs::write(&key_path, "").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // (1)+(2): the next attempt REFUSES (O_EXCL AlreadyExists -> fingerprint mismatch), never
+        // trusting or clobbering the lingering partial.
+        let err = write_key_atomic(&key_path, "sk-real").unwrap_err();
+        assert_eq!(
+            err.exit_code(),
+            exit_code::KEY_WRITE_FAILURE,
+            "a lingering partial is refused by the next O_EXCL+fingerprint write, never trusted"
         );
-        // And it DOES remove when the ids match (the genuine partial-cleanup case).
-        let victim_id = {
-            let m = std::fs::symlink_metadata(&victim).unwrap();
-            (m.dev(), m.ino())
-        };
-        remove_if_same_inode(&victim, Some(victim_id));
-        assert!(
-            !victim.exists(),
-            "the matching-inode file (our own partial) IS removed"
+        // The partial is still present (we never path-unlink it), and the real key never landed.
+        assert!(key_path.exists(), "the lingering partial is left in place");
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            "",
+            "the partial is untouched (no clobber) and the real key was not written"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clear_invoice_state_is_ok_on_absent_and_errs_on_unlink_failure() {
+        // TOOTH (F4 clear): clear_invoice_state returns Ok when the sidecar is ABSENT (NotFound is
+        // idempotent) and Err on any OTHER unlink failure — a silent failure would leave the
+        // invoice_id capability on disk while poll/provision report "funded". Reverting to
+        // `let _ = remove_file(...)` (swallowing the error) makes the read-only-parent case RED
+        // (it would return Ok despite the file surviving).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("clear-result");
+        let key_path = dir.join("brain.key");
+
+        // (1) Absent sidecar -> Ok (idempotent NotFound).
+        clear_invoice_state(&key_path).expect("clearing an absent sidecar is Ok");
+
+        // (2) Present sidecar under a READ-ONLY parent dir -> the unlink fails (EACCES/EPERM) and
+        // the error is PROPAGATED, not swallowed. (Skipped when running as root, where directory
+        // write bits are not enforced and the unlink would succeed.)
+        let sub = dir.join("locked");
+        std::fs::create_dir_all(&sub).unwrap();
+        let locked_key = sub.join("brain.key");
+        write_invoice_state(&locked_key, "inv-LINGER", "https://api.routstr.com").unwrap();
+        let sidecar = invoice_state_path(&locked_key);
+        assert!(sidecar.exists(), "precondition: the pending sidecar exists");
+        // Make the PARENT dir read-only so removing the entry within it fails.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let running_as_root = std::fs::write(sub.join(".root-probe"), b"x").is_ok();
+        // Clean the probe (if any) before asserting.
+        let _ = std::fs::remove_file(sub.join(".root-probe"));
+        if !running_as_root {
+            let err = clear_invoice_state(&locked_key)
+                .expect_err("an unlink failure must propagate, not be swallowed");
+            assert_eq!(err.exit_code(), exit_code::KEY_WRITE_FAILURE);
+            assert!(
+                sidecar.exists(),
+                "the capability still lingers on disk (the error is why the caller must warn)"
+            );
+        }
+        // Restore write so the temp dir can be cleaned up.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 

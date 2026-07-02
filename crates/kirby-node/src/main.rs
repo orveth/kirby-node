@@ -1491,7 +1491,10 @@ async fn fund_key_dispatch(cmd: FundKeyCmd) -> Result<(), kirby_node::funding::F
                 // capability (the invoice is claimed).
                 funding::write_key_atomic(&key_out, &key)?;
                 funding::write_node_url_binding(&key_out, &effective_url)?;
-                funding::clear_invoice_state(&key_out);
+                // The key IS written (the money landed), so a failed clear does NOT fail the op —
+                // but the lingering invoice_id capability must not be silent: warn LOUDLY so the
+                // operator removes it (a stale capability on disk while we report "funded").
+                warn_if_clear_failed(&key_out);
                 // Probe the CONFIRMED balance (F6): the authoritative funded amount.
                 let balance_sats = funding::fetch_balance_sats(&effective_url, &key).await?;
                 emit_json(&serde_json::json!({
@@ -1550,7 +1553,9 @@ async fn fund_key_dispatch(cmd: FundKeyCmd) -> Result<(), kirby_node::funding::F
                 // pending capability.
                 funding::write_key_atomic(&key_out, &key)?;
                 funding::write_node_url_binding(&key_out, &node_url)?;
-                funding::clear_invoice_state(&key_out);
+                // The key IS written — a failed clear does not fail the op, but warn LOUDLY so the
+                // lingering invoice_id capability is never silent (see the poll path).
+                warn_if_clear_failed(&key_out);
                 let balance_sats = funding::fetch_balance_sats(&node_url, &key).await?;
                 // Layer 1: optionally emit a minimal runnable kirby config whose treasury
                 // initial_sats is the CONFIRMED probed balance (F6), never the requested N.
@@ -1704,11 +1709,17 @@ fn resolve_pending_node_url(
 }
 
 /// Load the raw `sk-` from a keyfile (the same shape [`kirby_node::boot`]'s `load_api_key`
-/// reads: a raw trimmed one-line key). A read failure or an empty file is an auth failure
-/// (the credential is unusable). The key is never logged.
+/// reads: a raw trimmed one-line key). The read goes through [`kirby_node::funding::read_key_file`]
+/// — the SAME hardened path (O_RDONLY|O_NOFOLLOW|O_CLOEXEC, fstat regular file exactly 0600) as
+/// the fingerprint read — so `balance`/`topup` never follow a symlinked `--key-path` and send the
+/// resolved node's `sk-` elsewhere. A read failure (missing / symlinked / wrong-mode) or an empty
+/// file is surfaced as an auth failure (the credential is unusable). The key is never logged.
 fn load_raw_key(path: &std::path::Path) -> Result<String, kirby_node::funding::FundingError> {
     use kirby_node::funding::FundingError;
-    let raw = std::fs::read_to_string(path)
+    // The hardened reader refuses a symlink / wrong-mode / non-regular file (a bearer-secret
+    // redirection); map any such refusal to an auth failure — an unusable credential, not a
+    // key-write error — so `balance`/`topup` exit 6 as before on a bad/missing key.
+    let raw = kirby_node::funding::read_key_file(path)
         .map_err(|e| FundingError::Auth(format!("read key {}: {e}", path.display())))?;
     let key = raw.trim().to_string();
     if key.is_empty() {
@@ -1718,6 +1729,25 @@ fn load_raw_key(path: &std::path::Path) -> Result<String, kirby_node::funding::F
         )));
     }
     Ok(key)
+}
+
+/// Clear the pending-invoice sidecar after the key has landed, WARNING LOUDLY (stderr) if the
+/// unlink fails instead of failing the op. The key is already written (the money landed), so a
+/// failed clear must not fail the flow — but a silently-lingering `invoice_id` capability while
+/// we report "funded" is unacceptable, so [`funding::clear_invoice_state`] now returns a Result
+/// and this surfaces any non-`NotFound` failure as a loud warning naming the path the operator
+/// must remove by hand. The capability path itself is a lingering on-disk secret, so the warning
+/// names the sidecar PATH (safe to print) but never its contents.
+fn warn_if_clear_failed(key_out: &std::path::Path) {
+    if let Err(e) = kirby_node::funding::clear_invoice_state(key_out) {
+        let sidecar = kirby_node::funding::invoice_state_path(key_out);
+        tracing::warn!(
+            "fund-key: the key was written and funded, but the pending-invoice capability could \
+             NOT be cleared ({e}); it LINGERS at {} — remove that file by hand (it is a stale \
+             invoice_id capability, no longer needed now the key exists)",
+            sidecar.display()
+        );
+    }
 }
 
 /// Poll a topup invoice to confirmation. A topup mints no new key, so the status poll's
