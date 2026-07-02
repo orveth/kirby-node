@@ -532,21 +532,29 @@ pub async fn fetch_balance_sats(node_url: &str, api_key: &str) -> Result<u64, Fu
 const MINTED_KEY_FIELDS: &[&str] = &["api_key", "sk", "key", "token", "apiKey", "api_token"];
 
 /// Extract the minted `sk-` from the loose ecash-create response (tolerant, F-empirical). It
-/// tries the known field names ([`MINTED_KEY_FIELDS`]) in order and returns the first non-empty
-/// STRING value; failing that, it accepts any top-level string value that looks like a Routstr
-/// key (`sk-…`), so an unexpected-but-obvious field name still funds. Returns `None` if nothing
-/// key-shaped is present (the caller maps that to a Network error — a malformed response).
+/// tries the known field names ([`MINTED_KEY_FIELDS`]) in order and returns the first value
+/// shaped like a Routstr key (`sk-…`); failing that, it accepts any top-level string value that
+/// looks like an `sk-…` key, so an unexpected-but-obvious field name still funds. Returns `None`
+/// if nothing key-shaped is present (the caller maps that to a Network error — a malformed
+/// response).
+///
+/// EVERY candidate must satisfy the `sk-` shape — never merely non-empty. A loose response can
+/// ECHO the input token under a broad field name (`MINTED_KEY_FIELDS` includes `token`);
+/// accepting that after the token is redeemed would write garbage as the key and BURN the funds.
+/// The shape check on BOTH the named-field path and the fallback is that guard.
 fn extract_minted_key(raw: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     for field in MINTED_KEY_FIELDS {
         if let Some(s) = raw.get(*field).and_then(|v| v.as_str()) {
-            if !s.is_empty() {
+            let s = s.trim();
+            if s.starts_with("sk-") {
                 return Some(s.to_string());
             }
         }
     }
-    // Fallback: any top-level string value that is shaped like an `sk-…` key.
+    // Fallback: any top-level string value shaped like an `sk-…` key.
     raw.values()
         .filter_map(|v| v.as_str())
+        .map(str::trim)
         .find(|s| s.starts_with("sk-"))
         .map(|s| s.to_string())
 }
@@ -1857,6 +1865,16 @@ mod tests {
         let m: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"api_key":"","detail":"nope"}"#).unwrap();
         assert_eq!(extract_minted_key(&m), None);
+
+        // DECOY (fund-burn guard): a broad priority field (`token`) echoing the input token is
+        // NOT trusted — only an `sk-`-shaped candidate is, so the real key under an unknown field
+        // wins. Reverting the shape check (accepting any non-empty priority value) returns the
+        // echoed token here -> RED (and in production would write the already-redeemed token as
+        // the key, burning the funds).
+        let m: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"token":"cashuBECHOED-INPUT-TOKEN","minted":"sk-real-key"}"#)
+                .unwrap();
+        assert_eq!(extract_minted_key(&m).as_deref(), Some("sk-real-key"));
     }
 
     #[test]
