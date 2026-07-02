@@ -1349,7 +1349,7 @@ pub async fn run_dm_inbound(
 /// a sender at the wrong identity. MVP: the inbox relays ARE the agent's own relay set (where it
 /// also runs `run_dm_inbound`). Returns the published event id.
 pub async fn publish_inbox_relay_list(
-    dm_identity: &NodeIdentity,
+    signer: std::sync::Arc<dyn nostr_sdk::NostrSigner>,
     relays: &[String],
 ) -> anyhow::Result<EventId> {
     if relays.is_empty() {
@@ -1362,8 +1362,11 @@ pub async fn publish_inbox_relay_list(
     if tags.is_empty() {
         anyhow::bail!("no valid relay URLs for the kind:10050 inbox relay list");
     }
-    // Sign the 10050 with the DM key (the npub a NIP-17 client will DM).
-    let client = Client::builder().signer(dm_identity.keys().clone()).build();
+    // Sign the 10050 via `signer` -- the npub a NIP-17 client will DM. On the born-unified path
+    // (P1) this is the QSigner, so the 10050 is FROST-signed UNDER Q (routed through the guardian
+    // membrane, which authorizes kind:10050); otherwise the plain dm_keys. A 10050 under any other
+    // key would point a sender at the wrong identity, so the signer IS the DM identity.
+    let client = Client::builder().signer(signer.clone()).build();
     for r in relays {
         add_relay_no_ping(&client, r).await?;
     }
@@ -1375,8 +1378,14 @@ pub async fn publish_inbox_relay_list(
         .context("publish the kind:10050 DM-inbox relay list")?
         .val;
     client.disconnect().await;
+    let dm_npub = signer
+        .get_public_key()
+        .await
+        .ok()
+        .map(|pk| pk.to_bech32().unwrap_or_default())
+        .unwrap_or_default();
     tracing::info!(
-        dm_npub = %dm_identity.npub(),
+        %dm_npub,
         event_id = %event_id,
         relays = relays.len(),
         "published the kind:10050 DM-inbox relay list"

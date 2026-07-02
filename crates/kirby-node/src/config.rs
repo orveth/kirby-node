@@ -406,6 +406,15 @@ pub struct IdentityConfig {
     /// child's `kirby.toml`; `agent_boot_config` reads it to build the child's `SocialConfig`.
     #[serde(default)]
     pub frost_keystore_dir: Option<PathBuf>,
+    /// P1 born-unified gate (scope B): when true (AND a FROST keystore is provisioned), the
+    /// agent's NIP-17 DM identity IS its FROST group key Q — DMs seal/unwrap under Q via threshold
+    /// ECDH (the `QSigner`) and the kind:10050 inbox list publishes under Q, instead of the separate
+    /// plain `dm_keys`. Defaults FALSE, so a live agent's DM path is byte-identical until opted in
+    /// (the npub cutover for posts/profile is a separate, later migration). Propagates like
+    /// `frost_keystore_dir`: `derive_tenant_config` sets it for a born-unified tenant so it survives
+    /// serialization into the child `kirby.toml`.
+    #[serde(default)]
+    pub dm_under_q: bool,
 }
 
 impl IdentityConfig {
@@ -1075,6 +1084,12 @@ pub struct SocialConfig {
     /// `0` disables the sweep (persistent-subscription-only). Carried here — not re-parsed — the
     /// same way `relays` is copied from the presence relay (this is a derived runtime carrier).
     pub dm_backfill_secs: u64,
+    /// P1 born-unified gate (scope B), carried from `identity.dm_under_q`: when true AND
+    /// `frost_keystore_dir` is `Some`, the DM identity is the FROST key Q — `build_nostr_actuator`
+    /// loads a `QuorumEcdh`, builds a `QSigner`, and attaches it via `with_dm_q_signer` (DMs seal
+    /// under Q), `run_dm_inbound` filters `#p = Q` and unwraps under Q, and the kind:10050 inbox
+    /// list publishes under Q. `false` (the default) keeps the plain-`dm_keys` path byte-identical.
+    pub dm_under_q: bool,
 }
 
 /// The default fixed publish cost (sats): small + non-zero so a post costs the agent (no free

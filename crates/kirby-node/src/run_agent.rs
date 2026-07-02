@@ -479,6 +479,10 @@ fn agent_boot_config(
             // The DM backfill sweep interval (#103): carried from `[relay]` so the durable-delivery
             // backstop in `run_dm_inbound` re-fetches missed DMs on a fresh connection.
             dm_backfill_secs: cfg.relay.dm_backfill_secs,
+            // P1 born-unified gate (scope B): carried from `[identity] dm_under_q`. When true (+ a
+            // provisioned FROST keystore) boot wires the DM path onto Q; default false keeps the
+            // plain-dm_keys path byte-identical.
+            dm_under_q: cfg.identity.dm_under_q,
         }),
         _ => None,
     };
@@ -945,6 +949,7 @@ mod tests {
                 key_path: Some(root.join("node.key")),
                 treasury_dir: Some(root.clone()),
                 frost_keystore_dir: None,
+                dm_under_q: false,
             },
             relay: RelayConfig {
                 url: "ws://127.0.0.1:7777".to_string(),
@@ -982,6 +987,7 @@ mod tests {
             key_path: Some(PathBuf::from("/var/lib/kirby/node.nostr.key")),
             treasury_dir: None,
             frost_keystore_dir: None,
+            dm_under_q: false,
         };
 
         // Unset => pinned to the resolved identity key (the SAME resolution the run uses).

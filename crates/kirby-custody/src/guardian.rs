@@ -76,13 +76,21 @@ pub const KIND_KIRBY_LEASE: u32 = 31002;
 /// (a tooth fails if either membrane omits 13).
 pub const KIND_NOSTR_SEAL: u32 = 13;
 
+/// The NIP-17 DM inbox-relay list kind (10050): where peers should send this agent's NIP-17
+/// DMs. On the born-unified path (P1) it is published UNDER Q so peers DM Q. Like the seal
+/// and the beacons it is a public Q-signed event (JSON, no content policy); the membrane gate
+/// is the id-over-content-and-tags equality. Authorized alongside kind:13 so a born-unified
+/// agent can advertise its DM inbox under Q. MUST stay in lockstep with `kirby-node`'s
+/// `quorum_signer::is_signable_kind` (a tooth fails if either membrane omits it).
+pub const KIND_NOSTR_INBOX_RELAYS: u32 = 10050;
+
 /// S3e: is `kind` one a guardian will authorize? The agent's PUBLIC Nostr output is its
 /// voice (kind:1) PLUS its three public beacons (presence/lifecycle/agent-state) PLUS its
-/// cross-machine lease (31002) PLUS its NIP-17 DM seal (kind:13, P1) -- all signed by the
-/// same group key Q ("Q signs everything", gudnuf's decision A). The lease rides the SAME
-/// membrane: a node cannot get the quorum to co-sign a lease for an agent whose shares it
-/// does not hold. Any other kind (and the future BitcoinSpend intent) needs its own
-/// reconstruction + policy and is refused as `BadKind` until added.
+/// cross-machine lease (31002) PLUS its NIP-17 DM seal (kind:13) and DM inbox-relay list
+/// (kind:10050) (P1) -- all signed by the same group key Q ("Q signs everything", gudnuf's
+/// decision A). The lease rides the SAME membrane: a node cannot get the quorum to co-sign a
+/// lease for an agent whose shares it does not hold. Any other kind (and the future
+/// BitcoinSpend intent) needs its own reconstruction + policy and is refused as `BadKind`.
 fn is_authorizable_kind(kind: u32) -> bool {
     matches!(
         kind,
@@ -92,6 +100,7 @@ fn is_authorizable_kind(kind: u32) -> bool {
             | KIND_KIRBY_AGENT_STATE
             | KIND_KIRBY_LEASE
             | KIND_NOSTR_SEAL
+            | KIND_NOSTR_INBOX_RELAYS
     )
 }
 

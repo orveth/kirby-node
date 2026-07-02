@@ -60,7 +60,7 @@ use kirby_custody::cosign_net::nip01_event_id;
 use kirby_custody::cosign_net::{nip01_event_id_with_tags, NostrEvent};
 use kirby_custody::guardian::{
     self, CoSignRequest, RefuseReason, SignIntent, KIND_KIRBY_AGENT_STATE, KIND_KIRBY_LEASE,
-    KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE, KIND_NOSTR_SEAL,
+    KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE, KIND_NOSTR_INBOX_RELAYS, KIND_NOSTR_SEAL,
 };
 use kirby_custody::group_xonly_q;
 
@@ -351,8 +351,8 @@ impl QuorumSigner {
             anyhow::bail!(
                 "QuorumSigner refuses kind {kind}: only kind 1 (voice), the Kirby beacons \
                  {KIND_KIRBY_PRESENCE}/{KIND_KIRBY_LIFECYCLE}/{KIND_KIRBY_AGENT_STATE}, the \
-                 cross-machine lease {KIND_KIRBY_LEASE}, and the NIP-17 DM seal {KIND_NOSTR_SEAL} \
-                 are signable"
+                 cross-machine lease {KIND_KIRBY_LEASE}, the NIP-17 DM seal {KIND_NOSTR_SEAL}, and \
+                 the DM inbox-relay list {KIND_NOSTR_INBOX_RELAYS} are signable"
             );
         }
         // The NOTE SANITIZER applies ONLY to kind:1 (free text). Beacons (JSON state) are
@@ -603,9 +603,9 @@ fn quorum_subsets(n: usize, t: usize) -> Vec<Vec<usize>> {
 
 /// Is `kind` one the QuorumSigner will sign? The agent's Nostr output under Q: the
 /// free-text voice (kind:1), its three beacons (presence/lifecycle/agent-state), the
-/// cross-machine lease (31002), and its NIP-17 DM seal (kind:13, P1). MUST mirror
-/// `kirby_custody::guardian::is_authorizable_kind` (the membrane re-checks independently
-/// per holder -- a tooth fails if either side omits a kind).
+/// cross-machine lease (31002), and its NIP-17 DM seal (kind:13) + DM inbox-relay list
+/// (kind:10050) (P1). MUST mirror `kirby_custody::guardian::is_authorizable_kind` (the
+/// membrane re-checks independently per holder -- a tooth fails if either side omits a kind).
 fn is_signable_kind(kind: u32) -> bool {
     kind == kirby_proto::NOSTR_KIND_TEXT_NOTE as u32
         || matches!(
@@ -615,6 +615,7 @@ fn is_signable_kind(kind: u32) -> bool {
                 | KIND_KIRBY_AGENT_STATE
                 | KIND_KIRBY_LEASE
                 | KIND_NOSTR_SEAL
+                | KIND_NOSTR_INBOX_RELAYS
         )
 }
 
@@ -947,6 +948,33 @@ mod tests {
             "the kind:13 seal must verify under Q"
         );
         println!("G-SEAL-BOTH-MEMBRANES PASS: kind:13 seal co-signs valid-under-Q (both membranes admit 13)");
+    }
+
+    /// G-INBOX-RELAYS-BOTH-MEMBRANES: the kind:10050 DM inbox-relay list co-signs through the
+    /// quorum, which (like the seal) needs BOTH membranes to admit 10050 -- so a born-unified
+    /// agent can advertise its DM inbox UNDER Q (peers must find Q's inbox to DM Q). Red-on-revert:
+    /// if either membrane omits 10050 the ceremony aborts. (P1, the second membrane expansion.)
+    #[test]
+    fn g_inbox_relays_kind10050_signs_through_both_membranes() {
+        let (ks, qs) = signer();
+        // A kind:10050 carries relay tags (["relay", <url>]); empty content, signed verbatim.
+        let tags = vec![vec!["relay".to_string(), "wss://relay.example".to_string()]];
+        let ev = qs
+            .sign_nostr_event_with_tags(KIND_NOSTR_INBOX_RELAYS, CREATED_AT, &tags, "")
+            .expect("kind:10050 must co-sign (needs BOTH node is_signable_kind + custody membrane)");
+        assert_eq!(ev.kind, KIND_NOSTR_INBOX_RELAYS, "signed event must be a kind:10050 inbox list");
+        let (_addr, internal_p) = taproot_address(&ks.pubkeys, KnownHrp::Testnets).expect("address");
+        let secp = Secp256k1::verification_only();
+        let (q_tweaked, _parity) = internal_p.tap_tweak(&secp, None);
+        let q_xonly = q_tweaked.to_x_only_public_key();
+        let id = nip01_event_id_with_tags(&hex::encode(qs.q_bytes()), ev.created_at, ev.kind, &tags, "");
+        assert_eq!(ev.id, hex::encode(id), "10050 id must be the NIP-01 id under Q");
+        let sig = schnorr::Signature::from_slice(&hex::decode(&ev.sig).unwrap()).expect("parse sig");
+        assert!(
+            secp.verify_schnorr(&sig, &Message::from_digest(id), &q_xonly).is_ok(),
+            "the kind:10050 inbox list must verify under Q"
+        );
+        println!("G-INBOX-RELAYS-BOTH-MEMBRANES PASS: kind:10050 co-signs valid-under-Q (both membranes admit 10050)");
     }
 
     /// G-SAME-SECOND-BEACONS-DONT-COLLIDE: two ceremonies that share a wall-clock
