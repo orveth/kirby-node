@@ -37,7 +37,9 @@ use prost::Message as _;
 // The real EngramStore (Chunk-2) is a host-side nostr-sdk client over the nerve relay
 // set. `Event` here is the nostr event, NOT `kirby_proto::Event` (which rail.rs never
 // names) -- no conflict. `EventBuilder` builds the actuator's kind:1 note (the agent's voice).
-use nostr_sdk::{Client, Event, EventBuilder, Filter, JsonUtil, Keys, Kind, Timestamp, ToBech32};
+use nostr_sdk::{
+    Client, Event, EventBuilder, Filter, JsonUtil, Keys, Kind, NostrSigner, Timestamp, ToBech32,
+};
 
 use crate::engram::{EngramCrypto, EngramFrame, KIND_ENGRAM};
 
@@ -814,6 +816,14 @@ pub struct NostrActuator {
     /// means a DM-path compromise costs only DM privacy -- the "new entry point needs its own
     /// guards" discipline applied to key material.
     dm_keys: Option<Keys>,
+    /// The Q-backed DM signer (P1): when set (a born-unified agent), it OVERRIDES `dm_keys`
+    /// for `nostr.dm_reply` so NIP-17 DMs are sealed + unwrapped under the FROST group key Q
+    /// via threshold ECDH ([`crate::qsigner::QSigner`]), never a plain per-node key. Stored as
+    /// `dyn NostrSigner` so the DM-reply path is signer-agnostic (a plain `Keys` or Q). `None`
+    /// leaves the pre-P1 `dm_keys` behavior byte-identical. Additive + boot-gated: it touches
+    /// ONLY the DM-reply path, never the kind:1 post identity (that stays `dm_keys` / the FROST
+    /// mode), so it does not flip a live agent's social npub (scope B).
+    dm_signer: Option<Arc<dyn NostrSigner>>,
 }
 
 impl NostrActuator {
@@ -845,6 +855,7 @@ impl NostrActuator {
             client: Arc::new(client),
             cost_sats: cost_sats.max(1),
             dm_keys: None,
+            dm_signer: None,
         })
     }
 
@@ -855,6 +866,15 @@ impl NostrActuator {
     /// NEVER the FROST money key Q. Returns self so it chains after `connect`/`connect_frost`.
     pub fn with_dm_keys(mut self, dm_keys: Keys) -> Self {
         self.dm_keys = Some(dm_keys);
+        self
+    }
+
+    /// Attach a Q-backed DM signer (P1, born-unified): a `dyn NostrSigner` (e.g.
+    /// [`crate::qsigner::QSigner`]) that OVERRIDES `dm_keys` for `nostr.dm_reply`, so DM replies
+    /// seal under the FROST group key Q via threshold ECDH. Builder form, wired at boot behind
+    /// the born-unified gate; leaves the kind:1 post identity untouched (scope B).
+    pub fn with_dm_q_signer(mut self, dm_signer: Arc<dyn NostrSigner>) -> Self {
+        self.dm_signer = Some(dm_signer);
         self
     }
 
@@ -902,6 +922,7 @@ impl NostrActuator {
             client: Arc::new(client),
             cost_sats: cost_sats.max(1),
             dm_keys: None,
+            dm_signer: None,
         })
     }
 
@@ -1062,10 +1083,18 @@ impl NostrActuator {
         text: &str,
     ) -> anyhow::Result<Event> {
         use anyhow::Context as _;
+        // Prefer the Q-backed DM signer (born-unified: the DM identity IS the FROST key Q, so
+        // the NIP-17 seal + wrap ride nostr's NIP-59 with threshold ECDH under Q). Else the
+        // dedicated plain dm_keys (pre-P1, byte-identical). Exactly one is wired at boot.
+        if let Some(dm_signer) = self.dm_signer.as_ref() {
+            return EventBuilder::private_msg(dm_signer, to, text, [])
+                .await
+                .context("NIP-17-wrap the DM reply under Q");
+        }
         let dm_keys = self
             .dm_keys
             .as_ref()
-            .context("nostr.dm_reply requested but no DM key is configured (boot-wiring bug)")?;
+            .context("nostr.dm_reply requested but no DM signer/key is configured (boot-wiring bug)")?;
         EventBuilder::private_msg(dm_keys, to, text, [])
             .await
             .context("NIP-17-wrap the DM reply")

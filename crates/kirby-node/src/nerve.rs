@@ -1072,9 +1072,9 @@ pub async fn run_inbound(
 ///   6. enqueue as a typed `DIRECT_MESSAGE` with `source_pubkey = sender` (the seal-verified
 ///      sender) -- BOTH the screening identity AND the reply-to recipient, so the one value guards
 ///      delivery integrity + anti-spoof together.
-pub async fn screen_and_enqueue_dm(
+pub async fn screen_and_enqueue_dm<S: nostr_sdk::NostrSigner>(
     queue: &InboundQueue,
-    dm_keys: &Keys,
+    signer: &S,
     event: &Event,
 ) -> Option<u64> {
     use nostr_sdk::nips::nip59::UnwrappedGift;
@@ -1092,7 +1092,7 @@ pub async fn screen_and_enqueue_dm(
         return None;
     }
     // (3) Unwrap with the PLAIN DM key: decrypt + seal-verify + learn the REAL sender from the seal.
-    let unwrapped = match UnwrappedGift::from_gift_wrap(dm_keys, event).await {
+    let unwrapped = match UnwrappedGift::from_gift_wrap(signer, event).await {
         Ok(u) => u,
         Err(e) => {
             tracing::warn!(
@@ -1195,12 +1195,12 @@ impl GiftWrapFetcher for FreshClientFetcher {
 /// live (or by an earlier sweep) is skipped, and only a genuinely-missed DM is enqueued. Returns
 /// how many NEW DMs it enqueued (0 on a fetch error, logged; the next tick retries). Factored out
 /// of [`run_dm_inbound`] so a test can drive it with an injected [`GiftWrapFetcher`].
-async fn dm_backfill_sweep(
+async fn dm_backfill_sweep<S: nostr_sdk::NostrSigner>(
     fetcher: &dyn GiftWrapFetcher,
-    dm_identity: &NodeIdentity,
+    signer: &S,
+    me: nostr_sdk::PublicKey,
     queue: &InboundQueue,
 ) -> usize {
-    let me = dm_identity.public_key();
     let wraps = match fetcher.fetch_stored_wraps(me).await {
         Ok(w) => w,
         Err(e) => {
@@ -1210,7 +1210,7 @@ async fn dm_backfill_sweep(
     };
     let mut recovered = 0usize;
     for event in &wraps {
-        if screen_and_enqueue_dm(queue, dm_identity.keys(), event).await.is_some() {
+        if screen_and_enqueue_dm(queue, signer, event).await.is_some() {
             recovered += 1;
         }
     }
@@ -1241,7 +1241,8 @@ async fn dm_backfill_sweep(
 /// (no `since`, deduped by gift-wrap id) so delivery is guaranteed within one interval regardless
 /// of the persistent socket's state. `backfill_secs == 0` disables the sweep (fast-path only).
 pub async fn run_dm_inbound(
-    dm_identity: &NodeIdentity,
+    dm_signer: std::sync::Arc<dyn nostr_sdk::NostrSigner>,
+    me: nostr_sdk::PublicKey,
     relays: &[String],
     queue: InboundQueue,
     backfill_secs: u64,
@@ -1250,9 +1251,12 @@ pub async fn run_dm_inbound(
     if relays.is_empty() {
         anyhow::bail!("run_dm_inbound requires at least one relay (the agent's DM inbox relays)");
     }
-    let me = dm_identity.public_key();
+    // `me` (the agent's DM identity pubkey) addresses the #p filter; `dm_signer` unwraps. For a
+    // born-unified agent both are Q (the QSigner threshold-decrypts); on the pre-P1 path both
+    // come from the plain dm_keys. run_dm_inbound is signer-agnostic (the gate lives at boot).
+    let me_npub = me.to_bech32().unwrap_or_default();
     tracing::info!(
-        dm_npub = %dm_identity.npub(),
+        dm_npub = %me_npub,
         relays = relays.len(),
         "DM inbound subscription task starting (the NIP-17 inbox)"
     );
@@ -1299,7 +1303,7 @@ pub async fn run_dm_inbound(
     loop {
         tokio::select! {
             _ = &mut shutdown => {
-                tracing::info!(dm_npub = %dm_identity.npub(), "DM inbound task shutting down");
+                tracing::info!(dm_npub = %me_npub, "DM inbound task shutting down");
                 break;
             }
             _ = backfill_tick.tick() => {
@@ -1307,14 +1311,14 @@ pub async fn run_dm_inbound(
                 // A slow fetch briefly parks the live-notification arm; any live event that lags out
                 // of the broadcast buffer meanwhile is exactly what the next sweep recovers.
                 if let Some(fetcher) = &backfill {
-                    dm_backfill_sweep(fetcher, dm_identity, &queue).await;
+                    dm_backfill_sweep(fetcher, &dm_signer, me, &queue).await;
                 }
             }
             notif = notifications.recv() => {
                 match notif {
                     Ok(RelayPoolNotification::Event { event, .. }) => {
                         // The DM trust boundary: verify -> unwrap -> assert-DM -> size-cap -> enqueue.
-                        screen_and_enqueue_dm(&queue, dm_identity.keys(), &event).await;
+                        screen_and_enqueue_dm(&queue, &dm_signer, &event).await;
                     }
                     Ok(RelayPoolNotification::Shutdown) => {
                         tracing::warn!("relay pool shut down; DM inbound task stopping");
@@ -1345,7 +1349,7 @@ pub async fn run_dm_inbound(
 /// a sender at the wrong identity. MVP: the inbox relays ARE the agent's own relay set (where it
 /// also runs `run_dm_inbound`). Returns the published event id.
 pub async fn publish_inbox_relay_list(
-    dm_identity: &NodeIdentity,
+    signer: std::sync::Arc<dyn nostr_sdk::NostrSigner>,
     relays: &[String],
 ) -> anyhow::Result<EventId> {
     if relays.is_empty() {
@@ -1358,8 +1362,11 @@ pub async fn publish_inbox_relay_list(
     if tags.is_empty() {
         anyhow::bail!("no valid relay URLs for the kind:10050 inbox relay list");
     }
-    // Sign the 10050 with the DM key (the npub a NIP-17 client will DM).
-    let client = Client::builder().signer(dm_identity.keys().clone()).build();
+    // Sign the 10050 via `signer` -- the npub a NIP-17 client will DM. On the born-unified path
+    // (P1) this is the QSigner, so the 10050 is FROST-signed UNDER Q (routed through the guardian
+    // membrane, which authorizes kind:10050); otherwise the plain dm_keys. A 10050 under any other
+    // key would point a sender at the wrong identity, so the signer IS the DM identity.
+    let client = Client::builder().signer(signer.clone()).build();
     for r in relays {
         add_relay_no_ping(&client, r).await?;
     }
@@ -1371,8 +1378,14 @@ pub async fn publish_inbox_relay_list(
         .context("publish the kind:10050 DM-inbox relay list")?
         .val;
     client.disconnect().await;
+    let dm_npub = signer
+        .get_public_key()
+        .await
+        .ok()
+        .map(|pk| pk.to_bech32().unwrap_or_default())
+        .unwrap_or_default();
     tracing::info!(
-        dm_npub = %dm_identity.npub(),
+        %dm_npub,
         event_id = %event_id,
         relays = relays.len(),
         "published the kind:10050 DM-inbox relay list"
@@ -2154,7 +2167,7 @@ mod tests {
         assert_eq!(queue.len(), 0, "the deaf live sub delivered nothing");
 
         let fetcher = StaticFetcher { wraps: vec![missed] };
-        let recovered = dm_backfill_sweep(&fetcher, &dm_identity, &queue).await;
+        let recovered = dm_backfill_sweep(&fetcher, dm_identity.keys(), dm_identity.public_key(), &queue).await;
         assert_eq!(recovered, 1, "the sweep recovers the one missed DM");
         assert_eq!(queue.len(), 1, "the missed DM is now enqueued for the genome");
 
@@ -2177,9 +2190,9 @@ mod tests {
 
         let queue = InboundQueue::with_capacity(8);
         let fetcher = StaticFetcher { wraps: vec![wrap] };
-        let first = dm_backfill_sweep(&fetcher, &dm_identity, &queue).await;
-        let second = dm_backfill_sweep(&fetcher, &dm_identity, &queue).await;
-        let third = dm_backfill_sweep(&fetcher, &dm_identity, &queue).await;
+        let first = dm_backfill_sweep(&fetcher, dm_identity.keys(), dm_identity.public_key(), &queue).await;
+        let second = dm_backfill_sweep(&fetcher, dm_identity.keys(), dm_identity.public_key(), &queue).await;
+        let third = dm_backfill_sweep(&fetcher, dm_identity.keys(), dm_identity.public_key(), &queue).await;
         assert_eq!(first, 1, "the first sweep enqueues the stored DM");
         assert_eq!(second, 0, "a re-sweep of the same stored wrap enqueues nothing");
         assert_eq!(third, 0, "and stays idempotent");
@@ -2204,7 +2217,7 @@ mod tests {
             "the persistent subscription delivers it live"
         );
         let fetcher = StaticFetcher { wraps: vec![wrap] };
-        let recovered = dm_backfill_sweep(&fetcher, &dm_identity, &queue).await;
+        let recovered = dm_backfill_sweep(&fetcher, dm_identity.keys(), dm_identity.public_key(), &queue).await;
         assert_eq!(recovered, 0, "a wrap already delivered live is not re-enqueued by the sweep");
         assert_eq!(queue.len(), 1, "still exactly one inbox event");
         cleanup(&dir);

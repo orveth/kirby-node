@@ -60,7 +60,7 @@ use kirby_custody::cosign_net::nip01_event_id;
 use kirby_custody::cosign_net::{nip01_event_id_with_tags, NostrEvent};
 use kirby_custody::guardian::{
     self, CoSignRequest, RefuseReason, SignIntent, KIND_KIRBY_AGENT_STATE, KIND_KIRBY_LEASE,
-    KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE,
+    KIND_KIRBY_LIFECYCLE, KIND_KIRBY_PRESENCE, KIND_NOSTR_INBOX_RELAYS, KIND_NOSTR_SEAL,
 };
 use kirby_custody::group_xonly_q;
 
@@ -350,8 +350,9 @@ impl QuorumSigner {
         if !is_signable_kind(kind) {
             anyhow::bail!(
                 "QuorumSigner refuses kind {kind}: only kind 1 (voice), the Kirby beacons \
-                 {KIND_KIRBY_PRESENCE}/{KIND_KIRBY_LIFECYCLE}/{KIND_KIRBY_AGENT_STATE}, and the \
-                 cross-machine lease {KIND_KIRBY_LEASE} are signable"
+                 {KIND_KIRBY_PRESENCE}/{KIND_KIRBY_LIFECYCLE}/{KIND_KIRBY_AGENT_STATE}, the \
+                 cross-machine lease {KIND_KIRBY_LEASE}, the NIP-17 DM seal {KIND_NOSTR_SEAL}, and \
+                 the DM inbox-relay list {KIND_NOSTR_INBOX_RELAYS} are signable"
             );
         }
         // The NOTE SANITIZER applies ONLY to kind:1 (free text). Beacons (JSON state) are
@@ -600,15 +601,21 @@ fn quorum_subsets(n: usize, t: usize) -> Vec<Vec<usize>> {
     out
 }
 
-/// Is `kind` one the QuorumSigner will sign? The agent's PUBLIC Nostr output: the
-/// free-text voice (kind:1) PLUS its three beacons (presence/lifecycle/agent-state),
-/// all under Q. Mirrors `kirby_custody::guardian`'s authorizable-kind set (the membrane
-/// re-checks independently per holder).
+/// Is `kind` one the QuorumSigner will sign? The agent's Nostr output under Q: the
+/// free-text voice (kind:1), its three beacons (presence/lifecycle/agent-state), the
+/// cross-machine lease (31002), and its NIP-17 DM seal (kind:13) + DM inbox-relay list
+/// (kind:10050) (P1). MUST mirror `kirby_custody::guardian::is_authorizable_kind` (the
+/// membrane re-checks independently per holder -- a tooth fails if either side omits a kind).
 fn is_signable_kind(kind: u32) -> bool {
     kind == kirby_proto::NOSTR_KIND_TEXT_NOTE as u32
         || matches!(
             kind,
-            KIND_KIRBY_PRESENCE | KIND_KIRBY_LIFECYCLE | KIND_KIRBY_AGENT_STATE | KIND_KIRBY_LEASE
+            KIND_KIRBY_PRESENCE
+                | KIND_KIRBY_LIFECYCLE
+                | KIND_KIRBY_AGENT_STATE
+                | KIND_KIRBY_LEASE
+                | KIND_NOSTR_SEAL
+                | KIND_NOSTR_INBOX_RELAYS
         )
 }
 
@@ -903,6 +910,112 @@ mod tests {
             );
         }
         println!("G-QUORUM-ALL-PAIRS-SIGN PASS: {{1,2}} {{1,3}} {{2,3}} each co-sign valid-under-Q (no privileged holder)");
+    }
+
+    /// G-SEAL-BOTH-MEMBRANES: a kind:13 NIP-17 DM seal co-signs through the co-located
+    /// quorum, which requires BOTH the node's `is_signable_kind` AND the custody guardian
+    /// membrane (`is_authorizable_kind`) to admit kind:13 (defense-in-depth: the coordinator
+    /// guard + the per-holder membrane). If EITHER omits 13, the ceremony aborts (the
+    /// coordinator bails up front, or a holder refuses per-membrane) and this fails -- the
+    /// red-on-revert tooth for the two-crate lockstep that lets DMs move to Q (P1).
+    #[test]
+    fn g_seal_kind13_signs_through_both_membranes() {
+        let (ks, qs) = signer();
+        // The seal content is opaque NIP-44 ciphertext in production; a placeholder suffices
+        // (the membrane signs kind:13 VERBATIM -- no content policy, unlike kind:1).
+        let content = "nip44-ciphertext-placeholder";
+        let seal = qs
+            .sign_nostr_event_with_tags(KIND_NOSTR_SEAL, CREATED_AT, &[], content)
+            .expect("kind:13 seal must co-sign (needs BOTH node is_signable_kind + custody membrane)");
+        assert_eq!(seal.kind, KIND_NOSTR_SEAL, "signed event must be a kind:13 seal");
+
+        // It is a real BIP-340 sig over the NIP-01 id under the tweaked Q (same check the beacons use).
+        let (_addr, internal_p) = taproot_address(&ks.pubkeys, KnownHrp::Testnets).expect("address");
+        let secp = Secp256k1::verification_only();
+        let (q_tweaked, _parity) = internal_p.tap_tweak(&secp, None);
+        let q_xonly = q_tweaked.to_x_only_public_key();
+        let id = nip01_event_id_with_tags(
+            &hex::encode(qs.q_bytes()),
+            seal.created_at,
+            seal.kind,
+            &[],
+            content,
+        );
+        assert_eq!(seal.id, hex::encode(id), "seal id must be the NIP-01 id under Q");
+        let sig = schnorr::Signature::from_slice(&hex::decode(&seal.sig).unwrap()).expect("parse sig");
+        assert!(
+            secp.verify_schnorr(&sig, &Message::from_digest(id), &q_xonly).is_ok(),
+            "the kind:13 seal must verify under Q"
+        );
+        println!("G-SEAL-BOTH-MEMBRANES PASS: kind:13 seal co-signs valid-under-Q (both membranes admit 13)");
+    }
+
+    /// G-INBOX-RELAYS-BOTH-MEMBRANES: the kind:10050 DM inbox-relay list co-signs through the
+    /// quorum, which (like the seal) needs BOTH membranes to admit 10050 -- so a born-unified
+    /// agent can advertise its DM inbox UNDER Q (peers must find Q's inbox to DM Q). Red-on-revert:
+    /// if either membrane omits 10050 the ceremony aborts. (P1, the second membrane expansion.)
+    #[test]
+    fn g_inbox_relays_kind10050_signs_through_both_membranes() {
+        let (ks, qs) = signer();
+        // A kind:10050 carries relay tags (["relay", <url>]); empty content, signed verbatim.
+        let tags = vec![vec!["relay".to_string(), "wss://relay.example".to_string()]];
+        let ev = qs
+            .sign_nostr_event_with_tags(KIND_NOSTR_INBOX_RELAYS, CREATED_AT, &tags, "")
+            .expect("kind:10050 must co-sign (needs BOTH node is_signable_kind + custody membrane)");
+        assert_eq!(ev.kind, KIND_NOSTR_INBOX_RELAYS, "signed event must be a kind:10050 inbox list");
+        let (_addr, internal_p) = taproot_address(&ks.pubkeys, KnownHrp::Testnets).expect("address");
+        let secp = Secp256k1::verification_only();
+        let (q_tweaked, _parity) = internal_p.tap_tweak(&secp, None);
+        let q_xonly = q_tweaked.to_x_only_public_key();
+        let id = nip01_event_id_with_tags(&hex::encode(qs.q_bytes()), ev.created_at, ev.kind, &tags, "");
+        assert_eq!(ev.id, hex::encode(id), "10050 id must be the NIP-01 id under Q");
+        let sig = schnorr::Signature::from_slice(&hex::decode(&ev.sig).unwrap()).expect("parse sig");
+        assert!(
+            secp.verify_schnorr(&sig, &Message::from_digest(id), &q_xonly).is_ok(),
+            "the kind:10050 inbox list must verify under Q"
+        );
+        println!("G-INBOX-RELAYS-BOTH-MEMBRANES PASS: kind:10050 co-signs valid-under-Q (both membranes admit 10050)");
+    }
+
+    /// G-HOSTILE-10050-REFUSED (P1): a MALFORMED / non-ws / empty / oversized kind:10050 is REFUSED
+    /// (the membrane's bounded-relay-tags check aborts the ceremony), so a compromised coordinator
+    /// cannot get Q to sign a hostile inbox list that redirects DM senders to attacker relays (the
+    /// DM-eclipse vector the 10050-under-Q publish introduces). Red-on-revert against
+    /// `guardian::inbox_relay_tags_ok`.
+    #[test]
+    fn g_hostile_10050_refused() {
+        let (_ks, qs) = signer();
+        // (a) a non-relay tag mixed in.
+        let mixed = vec![
+            vec!["relay".to_string(), "wss://ok.example".to_string()],
+            vec!["p".to_string(), "deadbeef".to_string()],
+        ];
+        assert!(
+            qs.sign_nostr_event_with_tags(KIND_NOSTR_INBOX_RELAYS, CREATED_AT, &mixed, "").is_err(),
+            "a 10050 with a non-relay tag must be refused"
+        );
+        // (b) a relay tag with a non-ws(s) URL (redirect to a non-relay scheme).
+        let bad_scheme = vec![vec!["relay".to_string(), "http://evil.example".to_string()]];
+        assert!(
+            qs.sign_nostr_event_with_tags(KIND_NOSTR_INBOX_RELAYS, CREATED_AT, &bad_scheme, "")
+                .is_err(),
+            "a 10050 relay tag with a non-ws(s) URL must be refused"
+        );
+        // (c) an empty relay list.
+        assert!(
+            qs.sign_nostr_event_with_tags(KIND_NOSTR_INBOX_RELAYS, CREATED_AT, &[], "").is_err(),
+            "an empty 10050 must be refused"
+        );
+        // (d) oversized (> MAX_INBOX_RELAY_TAGS).
+        let oversized: Vec<Vec<String>> = (0..40)
+            .map(|i| vec!["relay".to_string(), format!("wss://r{i}.example")])
+            .collect();
+        assert!(
+            qs.sign_nostr_event_with_tags(KIND_NOSTR_INBOX_RELAYS, CREATED_AT, &oversized, "")
+                .is_err(),
+            "an oversized 10050 (> MAX_INBOX_RELAY_TAGS) must be refused"
+        );
+        println!("G-HOSTILE-10050-REFUSED PASS: malformed/non-ws/empty/oversized 10050 refused by the membrane (DM-eclipse blunt)");
     }
 
     /// G-SAME-SECOND-BEACONS-DONT-COLLIDE: two ceremonies that share a wall-clock

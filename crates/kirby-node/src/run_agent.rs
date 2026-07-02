@@ -479,6 +479,10 @@ fn agent_boot_config(
             // The DM backfill sweep interval (#103): carried from `[relay]` so the durable-delivery
             // backstop in `run_dm_inbound` re-fetches missed DMs on a fresh connection.
             dm_backfill_secs: cfg.relay.dm_backfill_secs,
+            // P1 born-unified gate (scope B): carried from `[identity] dm_under_q`. When true (+ a
+            // provisioned FROST keystore) boot wires the DM path onto Q; default false keeps the
+            // plain-dm_keys path byte-identical.
+            dm_under_q: cfg.identity.dm_under_q,
         }),
         _ => None,
     };
@@ -616,6 +620,21 @@ fn resolve_canonical_social_hex(config: &KirbyConfig) -> anyhow::Result<Option<S
     // workload has no canonical social key.
     if config.workload != Workload::Capable {
         return Ok(None);
+    }
+    // BORN-UNIFIED (P1, dm_under_q): the canonical social identity IS the FROST key Q -- the SAME
+    // key inbound DMs, DM replies, and the kind:10050 inbox list are wired to at boot. The 31000
+    // ["social",..] binding MUST advertise Q, else a discovery client resolves this agent to the
+    // plain dm_keys npub (which has NO inbound DM subscription) and its wraps are never received.
+    // Fail closed if the keystore is missing (dm_under_q without Q is a boot-wiring bug).
+    if config.identity.dm_under_q {
+        let keystore_dir = config.identity.frost_keystore_dir.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "dm_under_q requires a provisioned FROST keystore to advertise Q as the canonical \
+                 social identity (frost_keystore_dir is unset)"
+            )
+        })?;
+        let q = crate::keyset_provisioning::load_group_q_at(keystore_dir)?;
+        return Ok(Some(hex::encode(q)));
     }
     let dm_path = config.identity.treasury_dir().join("social.dm.key");
     let dm_identity = NodeIdentity::load_or_create(&dm_path)?;
@@ -945,6 +964,7 @@ mod tests {
                 key_path: Some(root.join("node.key")),
                 treasury_dir: Some(root.clone()),
                 frost_keystore_dir: None,
+                dm_under_q: false,
             },
             relay: RelayConfig {
                 url: "ws://127.0.0.1:7777".to_string(),
@@ -982,6 +1002,7 @@ mod tests {
             key_path: Some(PathBuf::from("/var/lib/kirby/node.nostr.key")),
             treasury_dir: None,
             frost_keystore_dir: None,
+            dm_under_q: false,
         };
 
         // Unset => pinned to the resolved identity key (the SAME resolution the run uses).
