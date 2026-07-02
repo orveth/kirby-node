@@ -235,6 +235,17 @@ impl ServeGuard {
         // already-spent NUT-13 secrets). BEST-EFFORT + fail-soft (same posture as the proof flush): a
         // publish error is logged, NEVER panics or blocks teardown. Ordered after the proof flush so
         // the counter that ships reflects any last-interval mutation's proofs the flush just backed up.
+        //
+        // #125 BOUNDARY (freshness, NOT collision — do not delete/reorder this arm without reading):
+        // this estate publish covers GRACEFUL death (die-when-broke + the max_run ceiling); the next
+        // boot's publish covers reboot. What is NOT covered: counter advances lost to an ABRUPT death
+        // (panic / SIGKILL) after the last publish. That residual is SAFE because B1 (the union-max
+        // seed at open, mint_rig.rs) makes the published floor COMPLETE — so the lost advances are a
+        // CONTIGUOUS run of used counters ABOVE a present floor, never an omission-to-zero: a
+        // fresh-store NUT-13 restore scans forward through them (no unused gap to trip gap_limit) and
+        // the mint (NUT-07) rejects any re-issued secret → post-restore derivation FRICTION, never a
+        // double-spend / phantom / missed proof. Periodic + abrupt-death re-publish is deferred to
+        // #125 (aligned with #123's abrupt-death residual class).
         if let Some((store, counter_db, mint_url)) = &self.nip60_counter_estate {
             if let Err(e) = store
                 .publish_wallet_config(counter_db.keyset_counters(), vec![mint_url.clone()])
