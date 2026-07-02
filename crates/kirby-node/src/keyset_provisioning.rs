@@ -1496,6 +1496,25 @@ mod tests {
         println!("LOAD-GROUP-Q-AT PASS: pubkeys-only Q == provisioned Q == full-signer Q");
     }
 
+    /// G-QUORUM-ECDH-LOADER (P1 born-unified wiring): `load_quorum_ecdh_at` — the loader the boot
+    /// gate uses when `dm_under_q` is set — recovers a `QuorumEcdh` from the SAME persisted keystore
+    /// whose Q equals the signing Q. So the born-unified DM identity is the SAME key the agent signs
+    /// under (one npub); the QSigner threshold-ECDHs against exactly the published FROST identity.
+    #[test]
+    fn load_quorum_ecdh_at_yields_the_signing_q() {
+        let dir = temp_keystore("ecdh_loader");
+        let id = provision_keyset_at(&dir).expect("provision");
+        let ecdh = load_quorum_ecdh_at(&dir).expect("load QuorumEcdh from the keystore");
+        assert_eq!(ecdh.q_xonly(), id.q_bytes(), "the ECDH provider's Q must equal the provisioned Q");
+        assert_eq!(
+            ecdh.q_xonly(),
+            load_quorum_signer_at(&dir).expect("load signer").q_bytes(),
+            "the born-unified DM identity Q must equal the signing Q (one key)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("QUORUM-ECDH-LOADER PASS: load_quorum_ecdh_at recovers the signing Q from the keystore (DM identity == signing Q)");
+    }
+
     /// G-KEYSTORE-PERMS: the holder KeyPackage files are mode 0600 (never world/group
     /// readable). A dedicated permission gate (the secret shares are the crown jewels).
     #[test]
