@@ -93,3 +93,21 @@ initial_sats = 1000000
 # # OPT-IN: drop spawn requests older than N seconds (sheds stale/parked ones). Omit = off.
 # # Do NOT set 0 to mean off -- 0 rejects ALL spawn requests. Use a positive value.
 # request_max_age_secs = 3600
+
+# --- Portable wallet backup (NIP-60) --------------------------------------------------------
+# OPT-IN: publish the agent's ecash proofs (+ the per-keyset NUT-13 counter mirror) as encrypted
+# Nostr events so a reborn / failed-over instance restores its money. Off unless `relays` is set;
+# with it empty the wallet is local-only (a single-relay fallback is DEV-ONLY, not money-durable).
+# For production money-safety set >=3 relays INCLUDING at least one you do NOT operate, so the
+# backup survives a team-wide / turtle outage that takes out every relay you run at once. The boot
+# log prints the resolved relay posture (relays, n, k, tier) so you can SEE your durability.
+#
+# [nip60]
+# relays = [
+#   "wss://relay.damus.io",     # independent public relay
+#   "wss://nos.lol",            # independent public relay
+#   "wss://relay.primal.net",   # independent public relay
+#   "ws://185.18.221.222:7777", # your own fleet relay (optional 4th)
+# ]
+# write_k = 2                    # optional; default = floor(N/2)+1 (2 of 3). A sub-K publish errors.
+# backup_flush_secs = 10         # optional; snapshot cadence after a spend dirties the backup.

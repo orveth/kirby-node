@@ -97,6 +97,48 @@ These blocks are read only when `workload = "capable"` (the think/act loop). Wit
 | `tick_secs` | u64 | `5` | Memory op cadence (overridden by `[agent].tick_secs`). |
 | `bytes_per_sat` | u64 | `16` | Storage cost knob. |
 
+### `[nip60]` -- the portable Cashu wallet backup
+
+The agent's ecash proofs (+ the per-keyset NUT-13 counter mirror) published as NIP-44-encrypted
+Nostr events, so a reborn / failed-over instance restores its money. **OPT-IN**: with `relays`
+empty this whole block is off and the wallet is local-only. NIP-60 buys PORTABILITY, not safety --
+the mint (NUT-07) is always the source of truth; these events are a durable encrypted backup.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `relays` | list of strings | `[]` | The relay set the wallet backup publishes to. **EMPTY = OFF** -- opt-in: no backup store is wired, the wallet is local-only. NON-EMPTY enables the backup; the list size is N (see the durability tiers below -- a single relay is dev-only, not money-durable). |
+| `write_k` | usize | strict majority `floor(N/2)+1` | The K-of-N ack threshold a publish must reach to count as durable. A sub-K publish ERRORS (the proofs are not treated as backed up). |
+| `backup_flush_secs` | u64 | `10` | How often the background flusher republishes the current-unspent snapshot after a spend marks it dirty. `0` clamps to the default (never a busy loop). Only takes effect when `relays` is non-empty. |
+
+**Durability tiers** (the boot log emits a `NIP-60 wallet backup relay posture` line with the
+resolved relay set, `n`, `k`, and the `tier`, plus a loud WARN below quorum):
+
+| N | Tier | Money-durable? |
+|---|---|---|
+| 1 | `SingleRelayDevOnly` | No -- a relay drop strands BOTH the proofs and the counter mirror. |
+| 2 | `BelowQuorum` | Redundant but below quorum -- one drop still risks loss. |
+| >=3 | `Quorum` | Yes. |
+
+**Recommended for production money-safety:** set **>=3 relays, including at least one you do NOT
+operate**, so the backup survives a team-wide or turtle (host-network) outage that would take out
+every relay you run at once. A durable set mixes an operator relay with independent public relays,
+for example:
+
+```toml
+[nip60]
+relays = [
+  "wss://relay.damus.io",     # independent public relay
+  "wss://nos.lol",            # independent public relay
+  "wss://relay.primal.net",   # independent public relay
+  "ws://185.18.221.222:7777", # your own fleet relay (optional 4th)
+]
+# write_k defaults to floor(N/2)+1 (2 of 3, 3 of 4). Leave unset unless you need a stricter gate.
+```
+
+Do not rely on a single relay -- especially not only relays you operate -- for anything holding
+value. (kirby ships NO default relay URLs in code; the list above is guidance to copy, not a
+built-in default.)
+
 ### `[agent]` -- the plan/act loop
 
 | Key | Type | Default | Meaning |
