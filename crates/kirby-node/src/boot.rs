@@ -768,12 +768,36 @@ pub fn g4_reconcile_action(balance_sats: u64) -> G4Action {
     }
 }
 
-/// Load the prepaid bearer key from its keyfile: read the file, trim surrounding
-/// whitespace/newline (an editor- or `printf`-written key usually has a trailing newline),
-/// and reject an empty result. The key is bearer money — it lives in a FILE (never inline
-/// in the logged/serialized config) and is never logged here.
+/// Load the prepaid bearer key from its keyfile: open `O_NOFOLLOW` (a symlink planted at the
+/// path is REFUSED, never followed to a different file — a bearer-key redirection guard, #117),
+/// read the file, trim surrounding whitespace/newline (an editor- or `printf`-written key usually
+/// has a trailing newline), and reject an empty result. A loose file mode (not 0600) is WARNED,
+/// not rejected: a strict requirement would refuse an existing manually-created keyfile (often
+/// 0644) and could brick a live agent on redeploy; fund-key provisions its keys 0600, so
+/// strict-0600 convergence comes naturally. The key is bearer money — it lives in a FILE (never
+/// inline in the logged/serialized config) and is never logged here.
 fn load_api_key(path: &str) -> anyhow::Result<String> {
-    let raw = std::fs::read_to_string(path)
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("open brain.api_key_path {path:?} (O_NOFOLLOW): {e}"))?;
+    // WARN — do NOT reject — on a loose file mode; signal the tightening, never the key's bytes.
+    if let Ok(meta) = f.metadata() {
+        let mode = meta.mode() & 0o777;
+        if mode != 0o600 {
+            tracing::warn!(
+                path,
+                mode = format!("{mode:#o}"),
+                "brain.api_key_path is not mode 0600 (a bearer key should be owner-only) — \
+                 proceeding; fund-key provisions keys 0600"
+            );
+        }
+    }
+    let mut raw = String::new();
+    f.read_to_string(&mut raw)
         .map_err(|e| anyhow::anyhow!("read brain.api_key_path {path:?}: {e}"))?;
     let key = raw.trim().to_string();
     if key.is_empty() {
@@ -1157,7 +1181,38 @@ mod routstr_key_boot_tests {
     fn load_api_key_rejects_a_missing_file() {
         let path = temp_key_path("missing"); // never created
         let err = load_api_key(path.to_str().unwrap()).expect_err("a missing keyfile errors");
-        assert!(err.to_string().contains("read brain.api_key_path"), "got: {err}");
+        assert!(err.to_string().contains("brain.api_key_path"), "got: {err}");
+    }
+
+    #[test]
+    fn load_api_key_refuses_a_symlink() {
+        // TOOTH (#117): O_NOFOLLOW refuses a symlink planted at brain.api_key_path — a bearer-key
+        // redirection guard. Reverting to std::fs::read_to_string (which follows symlinks) makes
+        // this RED: the key would be read THROUGH the symlink to its target.
+        use std::os::unix::fs::symlink;
+        let target = temp_key_path("symlink-target");
+        std::fs::write(&target, "sk-redirected\n").unwrap();
+        let link = temp_key_path("symlink-link");
+        symlink(&target, &link).unwrap();
+        let err = load_api_key(link.to_str().unwrap())
+            .expect_err("a symlinked keyfile is refused (O_NOFOLLOW), never followed");
+        assert!(err.to_string().contains("O_NOFOLLOW"), "got: {err}");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn load_api_key_warns_but_accepts_a_loose_mode() {
+        // A manually-created keyfile is often 0644; load_api_key WARNS (does not reject) so a
+        // strict-0600 requirement cannot brick a live agent on redeploy. The key still loads.
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_key_path("loose-mode");
+        std::fs::write(&path, "sk-loose\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let key = load_api_key(path.to_str().unwrap())
+            .expect("a 0644 keyfile is accepted (mode is warned, not rejected)");
+        assert_eq!(key, "sk-loose");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
