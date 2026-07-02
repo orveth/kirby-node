@@ -757,10 +757,16 @@ pub async fn boot_and_observe_with_rail(
     // the genome pulls at boot (spec 3.1).
     let treasury_path = treasury_path_for(&config.node_id);
     let treasury = open_treasury_retrying(&treasury_path, config.initial_sats, Duration::from_secs(5)).await?;
-    // The NIP-17 DM path (task #12) is enabled when the social config pins a dedicated DM keyfile.
-    // It allowlists inbound DIRECT_MESSAGE (the inbound mirror of the nostr.dm_reply outbound token)
-    // and attaches an InboundQueue the gateway's PollInbox drains + the run_dm_inbound task feeds.
-    let dm_enabled = config.social.as_ref().and_then(|s| s.dm_key_path.as_ref()).is_some();
+    // The NIP-17 DM path (task #12) is enabled when the social config pins a dedicated DM keyfile
+    // OR the born-unified gate is set (P1, `dm_under_q`: the DM identity is Q, so a true Q-only
+    // config may leave `dm_key_path` unset). It allowlists inbound DIRECT_MESSAGE (the inbound
+    // mirror of the nostr.dm_reply outbound token) and attaches an InboundQueue the gateway's
+    // PollInbox drains + the run_dm_inbound task feeds.
+    let dm_enabled = config
+        .social
+        .as_ref()
+        .map(|s| s.dm_key_path.is_some() || s.dm_under_q)
+        .unwrap_or(false);
     let session = Session {
         task_descriptor: config.task.clone(),
         budget_sats: config.budget_sats,

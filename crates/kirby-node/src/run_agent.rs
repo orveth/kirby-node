@@ -621,6 +621,21 @@ fn resolve_canonical_social_hex(config: &KirbyConfig) -> anyhow::Result<Option<S
     if config.workload != Workload::Capable {
         return Ok(None);
     }
+    // BORN-UNIFIED (P1, dm_under_q): the canonical social identity IS the FROST key Q -- the SAME
+    // key inbound DMs, DM replies, and the kind:10050 inbox list are wired to at boot. The 31000
+    // ["social",..] binding MUST advertise Q, else a discovery client resolves this agent to the
+    // plain dm_keys npub (which has NO inbound DM subscription) and its wraps are never received.
+    // Fail closed if the keystore is missing (dm_under_q without Q is a boot-wiring bug).
+    if config.identity.dm_under_q {
+        let keystore_dir = config.identity.frost_keystore_dir.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "dm_under_q requires a provisioned FROST keystore to advertise Q as the canonical \
+                 social identity (frost_keystore_dir is unset)"
+            )
+        })?;
+        let q = crate::keyset_provisioning::load_group_q_at(keystore_dir)?;
+        return Ok(Some(hex::encode(q)));
+    }
     let dm_path = config.identity.treasury_dir().join("social.dm.key");
     let dm_identity = NodeIdentity::load_or_create(&dm_path)?;
     Ok(Some(dm_identity.public_key().to_hex()))

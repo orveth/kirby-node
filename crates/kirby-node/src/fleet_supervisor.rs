@@ -1827,7 +1827,11 @@ mod tests {
     /// recursive fleets). This pins the derivation without spawning a real process.
     #[test]
     fn real_launcher_derives_isolated_per_tenant_config() {
-        let base = base_config_with_tenants(vec![]);
+        let mut base = base_config_with_tenants(vec![]);
+        // P1: a born-unified supervisor sets `dm_under_q`; it must survive `base_config.clone()`
+        // into each tenant (the spawn-propagation path). Set it here so the assertion below is not
+        // vacuous.
+        base.identity.dm_under_q = true;
         let launcher = ProcessTenantLauncher::new(
             base,
             PathBuf::from("/nonexistent/kirby"),
@@ -1871,6 +1875,14 @@ mod tests {
             Some(keystore_a.as_path()),
             "the FROST-tenant child must carry its provisioned keystore dir (else its voice signs \
              with the node key, not its sovereign Q — the FROST branch would be dead)"
+        );
+
+        // P1: the born-unified gate propagates to the tenant via `base_config.clone()` --
+        // `derive_tenant_config` does not rewrite `dm_under_q`, so the base value survives. A silent
+        // drop here would leave a spawned born-unified tenant on the plain dm_keys DM path.
+        assert!(
+            cfg_a.identity.dm_under_q,
+            "dm_under_q must propagate from the supervisor base config to the tenant (born-unified spawn)"
         );
 
         // Two tenants derive DISTINCT node_ids => distinct treasury paths (the isolation
