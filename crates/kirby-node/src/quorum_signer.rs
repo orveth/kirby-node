@@ -977,6 +977,47 @@ mod tests {
         println!("G-INBOX-RELAYS-BOTH-MEMBRANES PASS: kind:10050 co-signs valid-under-Q (both membranes admit 10050)");
     }
 
+    /// G-HOSTILE-10050-REFUSED (P1): a MALFORMED / non-ws / empty / oversized kind:10050 is REFUSED
+    /// (the membrane's bounded-relay-tags check aborts the ceremony), so a compromised coordinator
+    /// cannot get Q to sign a hostile inbox list that redirects DM senders to attacker relays (the
+    /// DM-eclipse vector the 10050-under-Q publish introduces). Red-on-revert against
+    /// `guardian::inbox_relay_tags_ok`.
+    #[test]
+    fn g_hostile_10050_refused() {
+        let (_ks, qs) = signer();
+        // (a) a non-relay tag mixed in.
+        let mixed = vec![
+            vec!["relay".to_string(), "wss://ok.example".to_string()],
+            vec!["p".to_string(), "deadbeef".to_string()],
+        ];
+        assert!(
+            qs.sign_nostr_event_with_tags(KIND_NOSTR_INBOX_RELAYS, CREATED_AT, &mixed, "").is_err(),
+            "a 10050 with a non-relay tag must be refused"
+        );
+        // (b) a relay tag with a non-ws(s) URL (redirect to a non-relay scheme).
+        let bad_scheme = vec![vec!["relay".to_string(), "http://evil.example".to_string()]];
+        assert!(
+            qs.sign_nostr_event_with_tags(KIND_NOSTR_INBOX_RELAYS, CREATED_AT, &bad_scheme, "")
+                .is_err(),
+            "a 10050 relay tag with a non-ws(s) URL must be refused"
+        );
+        // (c) an empty relay list.
+        assert!(
+            qs.sign_nostr_event_with_tags(KIND_NOSTR_INBOX_RELAYS, CREATED_AT, &[], "").is_err(),
+            "an empty 10050 must be refused"
+        );
+        // (d) oversized (> MAX_INBOX_RELAY_TAGS).
+        let oversized: Vec<Vec<String>> = (0..40)
+            .map(|i| vec!["relay".to_string(), format!("wss://r{i}.example")])
+            .collect();
+        assert!(
+            qs.sign_nostr_event_with_tags(KIND_NOSTR_INBOX_RELAYS, CREATED_AT, &oversized, "")
+                .is_err(),
+            "an oversized 10050 (> MAX_INBOX_RELAY_TAGS) must be refused"
+        );
+        println!("G-HOSTILE-10050-REFUSED PASS: malformed/non-ws/empty/oversized 10050 refused by the membrane (DM-eclipse blunt)");
+    }
+
     /// G-SAME-SECOND-BEACONS-DONT-COLLIDE: two ceremonies that share a wall-clock
     /// second (the same `created_at`) BOTH succeed and produce valid-under-Q events.
     /// Regression guard for the availability bug where the session id was derived from

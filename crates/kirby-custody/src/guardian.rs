@@ -104,6 +104,27 @@ fn is_authorizable_kind(kind: u32) -> bool {
     )
 }
 
+/// The maximum number of relay tags a kind:10050 DM inbox-relay list may carry. A real agent
+/// advertises a handful of inbox relays, not thousands; an oversized list is a red flag.
+pub const MAX_INBOX_RELAY_TAGS: usize = 32;
+
+/// Is `tags` a BOUNDED, well-formed kind:10050 DM inbox-relay list? Each tag must be
+/// `["relay", <ws://|wss:// url>]` (a trailing marker is allowed), with at least one tag and at
+/// most [`MAX_INBOX_RELAY_TAGS`]. The membrane's TARGETED defense against a hostile 10050 (a
+/// compromised coordinator redirecting DM senders to attacker relays); NOT full content-schema
+/// validation (that is a membrane-wide typed-intents follow-up, orveth/kirby-node#119).
+fn inbox_relay_tags_ok(tags: &[Vec<String>]) -> bool {
+    if tags.is_empty() || tags.len() > MAX_INBOX_RELAY_TAGS {
+        return false;
+    }
+    tags.iter().all(|t| {
+        t.len() >= 2
+            && t[0] == "relay"
+            && (t[1].starts_with("ws://") || t[1].starts_with("wss://"))
+            && t[1].len() <= 512
+    })
+}
+
 /// Maximum content length (bytes, UTF-8) a guardian will co-sign for a kind:1 note.
 ///
 /// MUST match `kirby_proto::MAX_NOTE_BYTES`.
@@ -202,6 +223,13 @@ pub enum RefuseReason {
     /// 1..=n; under custom/DKG identifiers an alias would weaken the signer-set
     /// cross-check, so the guardian refuses rather than trust a possibly-collapsed set.
     IdentifierAliasing,
+    /// A kind:10050 DM inbox-relay list whose tags are not a bounded, well-formed relay list:
+    /// each tag must be `["relay", <ws://|wss:// url>]`, at least one and at most
+    /// [`MAX_INBOX_RELAY_TAGS`]. Blunts a compromised coordinator forging a HOSTILE 10050 that
+    /// redirects DM senders to attacker relays (a DM-eclipse vector — the one new attack flavor
+    /// P1 introduces by publishing a 10050 under Q). A TARGETED check; full content-schema
+    /// validation across all authorizable kinds is a membrane-wide typed-intents follow-up.
+    MalformedInboxRelays,
 }
 
 /// A deliberate, hand-maintained REPLICA of `kirby_proto::sanitize_note_for_publish`
@@ -323,6 +351,15 @@ pub fn validate(
             // their id (over content AND tags), which is the real anti-blind-sign gate.
             if *kind == NOSTR_TEXT_NOTE_KIND && !content_is_clean(content) {
                 return Err(RefuseReason::DirtyContent);
+            }
+            // A kind:10050 DM inbox-relay list must be a BOUNDED, well-formed relay list. A
+            // compromised coordinator could otherwise get Q to sign a hostile 10050 that redirects
+            // DM senders to attacker relays (a DM-eclipse vector — the one new attack flavor P1's
+            // 10050-under-Q publish introduces). This is a targeted blunt, not full content-schema
+            // validation (that is a membrane-wide typed-intents follow-up); the seal (kind:13) stays
+            // verbatim (its content is opaque NIP-44 ciphertext, nothing to schema-check).
+            if *kind == KIND_NOSTR_INBOX_RELAYS && !inbox_relay_tags_ok(tags) {
+                return Err(RefuseReason::MalformedInboxRelays);
             }
             // Reconstruct over content AND tags: for a beacon the tags are part of the
             // signed id, so a coordinator that altered a tag would fail the equality check.
