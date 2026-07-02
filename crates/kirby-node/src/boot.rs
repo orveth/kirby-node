@@ -174,12 +174,67 @@ pub struct ServeGuard {
     /// dropping this sender fires `run_dm_inbound`'s shutdown arm, so it disconnects its relay
     /// client and returns. `None` when the DM path is not enabled (no task was spawned).
     _dm_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Held so the Cut A (#115) NIP-60 backup flusher publishes ONE FINAL snapshot at ABRUPT
+    /// teardown — the drop-fired "estate" flush FALLBACK. Dropping this sender fires a spawned
+    /// shutdown task's `flush()` (see the `Some(flusher)` wiring below). This is now the
+    /// PANIC/KILL fallback ONLY: on the GRACEFUL path the run driver calls [`Self::flush_estate`]
+    /// (awaited to completion) BEFORE this guard drops, which CONSUMES the dirty flag, so the
+    /// drop-fired task then no-ops (`!dirty`) — no double publish. It survives to cover a panic /
+    /// abrupt unwind where `flush_estate` was never reached, on a best-effort basis (a detached
+    /// task can still lose the race with process exit — which is exactly why the graceful path no
+    /// longer relies on it). `None` when no cdk-wallet brain configured a flusher.
+    _nip60_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The Cut A (#115) NIP-60 backup flusher itself, held so the GRACEFUL teardown can AWAIT one
+    /// final "estate" flush via [`Self::flush_estate`] (rather than racing process exit through the
+    /// detached drop task above). `None` when no cdk-wallet brain configured a flusher.
+    nip60_flusher: Option<Arc<crate::rail::Nip60BackupFlusher>>,
+}
+
+impl ServeGuard {
+    /// AWAIT one final NIP-60 backup "estate" flush at graceful teardown (#115 codex #3). Called by
+    /// the run driver AFTER the metered run returns for any GRACEFUL reason (die-when-broke /
+    /// BudgetExhausted, or the `max_run_secs` safety ceiling) and BEFORE this guard drops, so the
+    /// last-interval mutation's snapshot is guaranteed PUBLISHED (awaited to completion), not raced
+    /// against process exit by the detached drop-fired task. Best-effort: an error is logged and
+    /// NEVER propagated (the cdk wallet is already the truth; the next boot re-snapshots). A no-op
+    /// when no flusher is configured. Because `flush()` CONSUMES the dirty flag, the subsequent
+    /// drop-fired fallback observes `!dirty` and does nothing — so a graceful teardown publishes
+    /// EXACTLY ONCE.
+    pub async fn flush_estate(&self) {
+        if let Some(flusher) = &self.nip60_flusher {
+            if let Err(e) = flusher.flush().await {
+                tracing::warn!(
+                    error = %e,
+                    "NIP-60 estate flush at graceful teardown failed (spend truth is unaffected; the next boot re-snapshots)"
+                );
+            } else {
+                tracing::debug!("NIP-60 estate flush at graceful teardown complete (awaited)");
+            }
+        }
+    }
+
+    /// TEST-ONLY: build a `ServeGuard` carrying just a NIP-60 flusher, so the estate-flush behavior
+    /// (codex #3) is exercisable WITHOUT booting a VM. The abort handle wraps a trivial spawned task
+    /// (never observed); the DM/nip60-shutdown senders are `None` (no fallback task in the test).
+    #[cfg(test)]
+    pub(crate) fn for_estate_test(nip60_flusher: Arc<crate::rail::Nip60BackupFlusher>) -> Self {
+        let noop = tokio::spawn(async {});
+        ServeGuard {
+            handle: noop.abort_handle(),
+            _dm_shutdown: None,
+            _nip60_shutdown: None,
+            nip60_flusher: Some(nip60_flusher),
+        }
+    }
 }
 
 impl Drop for ServeGuard {
     fn drop(&mut self) {
         self.handle.abort();
         // `_dm_shutdown` drops with the struct -> the DM inbound task's shutdown arm fires.
+        // `_nip60_shutdown` drops with the struct -> the ABRUPT-death fallback flush fires (a
+        // detached task). On the graceful path `flush_estate` already ran + consumed `dirty`, so
+        // that fallback no-ops (`!dirty`); it exists only for a panic/kill that skipped it.
     }
 }
 
@@ -260,13 +315,20 @@ pub async fn boot_and_observe(
         // real Routstr node, paid from the treasury.
         Some(brain) if brain.backend == BrainBackendKind::Routstr => {
             let treasury_remaining = peek_treasury_remaining(&config).await?;
-            let brain_backend =
+            let (brain_backend, nip60_flusher) =
                 build_routstr_brain(brain, treasury_remaining, &config.nip60, &config.fleet_relay)
                     .await?;
-            Arc::new(attach_actuator(
-                CompositeRail::new(Arc::new(MockRail::new()), brain_backend),
-                actuator,
-            ))
+            // Carry the Cut A (#115) backup flusher (if NIP-60 is configured) into the run so a
+            // graceful shutdown fires ONE final snapshot flush (via the ServeGuard drop, below).
+            return boot_and_observe_with_rail(
+                config,
+                Arc::new(attach_actuator(
+                    CompositeRail::new(Arc::new(MockRail::new()), brain_backend),
+                    actuator,
+                )),
+                nip60_flusher,
+            )
+            .await;
         }
         // The prepaid API-KEY brain (mint-independent fallback): a CompositeRail whose
         // brain is a RoutstrKeyBrain over a node-held custodial balance. Building it loads
@@ -334,7 +396,9 @@ pub async fn boot_and_observe(
             Arc::new(MockRail::new())
         }
     };
-    boot_and_observe_with_rail(config, rail).await
+    // The non-Routstr arms configure no NIP-60 backup flusher (only the real cdk-wallet brain has
+    // a wallet to back up); the Routstr arm returns early above with its flusher.
+    boot_and_observe_with_rail(config, rail, None).await
 }
 
 /// Attach an optional outward [`Actuator`] to a [`CompositeRail`] (the agent's voice), returning
@@ -580,7 +644,7 @@ async fn build_routstr_brain(
     treasury_remaining: u64,
     nip60: &crate::config::Nip60Config,
     fleet_relay: &str,
-) -> anyhow::Result<Arc<dyn BrainBackend>> {
+) -> anyhow::Result<(Arc<dyn BrainBackend>, Option<Arc<crate::rail::Nip60BackupFlusher>>)> {
     let db_path = Path::new(&brain.wallet_db_path);
     // Resolve the wallet spend seed ONCE through the WalletKey seam (interim: the byte-identical
     // sibling `<db_path>.seed` keyfile, load-or-create 0600, per-agent; the reconstruct-on-lease
@@ -602,7 +666,9 @@ async fn build_routstr_brain(
             tracing::warn!(nip60_durability = %warning, "NIP-60 wallet backup: sub-quorum durability");
         }
         tracing::info!(n = relays.len(), k = write_k, "NIP-60 wallet backup enabled");
-        Some(
+        // Arc so the boot-time reconcile/publish AND the Cut A (#115) background backup flusher
+        // can share ONE store (all its methods take `&self`).
+        Some(Arc::new(
             crate::nip60::Nip60Store::connect(
                 &event_key,
                 &relays,
@@ -610,7 +676,7 @@ async fn build_routstr_brain(
                 brain.effective_mint_allowlist(),
             )
             .await?,
-        )
+        ))
     };
 
     // The counter floor loaded from the 17375 head (empty with no store / a fresh wallet).
@@ -654,12 +720,22 @@ async fn build_routstr_brain(
     //    outputs from >= floor (no reused-secret collision); the mint-swap is the single-writer
     //    arbiter, so a lost double-restore race fails-closed (imports nothing) rather than
     //    double-spending.
+    // The token-event ids the reconcile saw — the Cut A (#115) backup flusher SEEDS its live-id
+    // set with these so the first flush del-chains ALL prior events into one clean new snapshot.
+    // Empty with no store; the reconcile error path degrades to empty (a fresh backup then simply
+    // supersedes nothing).
+    let mut nip60_initial_live_ids: Vec<String> = Vec::new();
     if let Some(store) = &nip60_store {
-        let _restored = crate::nip60_reconcile::restore_from_relay_backup(
-            store.reconcile_on_load().await,
-            wallet.as_ref(),
-        )
-        .await;
+        let reconciled = store.reconcile_on_load_with_ids().await;
+        let candidates = match reconciled {
+            Ok((candidates, ids)) => {
+                nip60_initial_live_ids = ids;
+                Ok(candidates)
+            }
+            Err(e) => Err(e),
+        };
+        let _restored =
+            crate::nip60_reconcile::restore_from_relay_backup(candidates, wallet.as_ref()).await;
     }
 
     // 4) Solvency check: the wallet must back every sat the counter believes it has. REFUSE
@@ -686,15 +762,48 @@ async fn build_routstr_brain(
         }
     }
 
-    // 6) Build the brain over the funded wallet, with the configured kill-window.
-    let routstr = RoutstrBrain::new(
-        brain.node_url.clone(),
-        ecash,
-        Duration::from_secs(brain.request_timeout_secs),
-        Duration::from_secs(brain.recovery_timeout_secs),
-    )?;
-    let backend: Arc<dyn BrainBackend> = Arc::new(routstr);
-    Ok(backend)
+    // 6) Build the brain over the funded wallet, with the configured kill-window. When NIP-60 is
+    //    configured, WRAP the ecash provider in the Cut A (#115) backup decorator: it marks a
+    //    shared dirty flag after each successful wallet mutation (cheap, on the spend hot path —
+    //    NO relay I/O there) and a background flusher republishes the current-unspent snapshot on
+    //    the [nip60].backup_flush_secs cadence (best-effort, off the hot path). The wallet is the
+    //    truth and is durable before any backup; a backup publish can never block or fail a spend.
+    //    With no store the bare CdkEcash is used unchanged (no decorator, no flusher).
+    let (backend, flusher): (Arc<dyn BrainBackend>, Option<Arc<crate::rail::Nip60BackupFlusher>>) =
+        match &nip60_store {
+            Some(store) => {
+                let (decorated, flusher) = crate::rail::Nip60BackedEcash::with_flusher(
+                    ecash,
+                    wallet.clone(),
+                    store.clone(),
+                    brain.mint_url.clone(),
+                    "sat".to_string(),
+                    nip60_initial_live_ids,
+                );
+                let routstr = RoutstrBrain::new(
+                    brain.node_url.clone(),
+                    decorated,
+                    Duration::from_secs(brain.request_timeout_secs),
+                    Duration::from_secs(brain.recovery_timeout_secs),
+                )?;
+                // Spawn the periodic backup flush (best-effort; the handle is detached — the task
+                // lives for the run and a failure logs + retries next tick). The returned Arc is
+                // kept for a FINAL shutdown flush (below), so a graceful death publishes the last
+                // snapshot even if a mutation landed inside the last flush interval.
+                let _periodic = flusher.clone().spawn_periodic(nip60.backup_flush_interval());
+                (Arc::new(routstr), Some(flusher))
+            }
+            None => {
+                let routstr = RoutstrBrain::new(
+                    brain.node_url.clone(),
+                    ecash,
+                    Duration::from_secs(brain.request_timeout_secs),
+                    Duration::from_secs(brain.recovery_timeout_secs),
+                )?;
+                (Arc::new(routstr), None)
+            }
+        };
+    Ok((backend, flusher))
 }
 
 /// Build the [`RoutstrKeyBrain`] backend for `backend = "routstr_key"` (the prepaid,
@@ -820,6 +929,11 @@ fn load_api_key(path: &str) -> anyhow::Result<String> {
 pub async fn boot_and_observe_with_rail(
     config: BootConfig,
     rail: Arc<dyn Rail>,
+    // The Cut A (#115) NIP-60 backup flusher, when a real cdk-wallet brain configured one. Kept
+    // alive for the run and given a FINAL flush at graceful teardown (wired into the ServeGuard's
+    // drop below). `None` for every non-wallet path (nothing to back up). Only `boot_and_observe`'s
+    // Routstr arm passes `Some`.
+    nip60_flusher: Option<Arc<crate::rail::Nip60BackupFlusher>>,
 ) -> anyhow::Result<(Box<dyn SandboxInstance>, BootOutcome, Treasury, EventStream, ServeGuard)> {
     // The persisted, daemon-owned treasury (D-9). A per-node temp store keeps two
     // node processes distinct on one host. The session is the non-secret snapshot
@@ -1042,6 +1156,35 @@ pub async fn boot_and_observe_with_rail(
         _ => None,
     };
 
+    // Cut A (#115): the ABRUPT-death NIP-60 backup flush FALLBACK ("estate" flush). If a cdk-wallet
+    // brain configured a flusher, spawn a detached task that waits on a shutdown signal, then does
+    // ONE last best-effort `flush()`. The signal fires when the `ServeGuard` (and thus
+    // `_nip60_shutdown`) drops at run-end. This is now the PANIC/KILL fallback ONLY: the GRACEFUL
+    // path awaits `ServeGuard::flush_estate()` before the guard drops (codex #3), which consumes the
+    // dirty flag, so this detached task then no-ops (`!dirty`) — no double publish. It survives to
+    // cover an abrupt unwind that skipped `flush_estate`. The guard ALSO keeps a clone of the
+    // flusher (below) so the awaited graceful flush is possible. Best-effort: errors logged, never
+    // propagated (the wallet is already truth). `None` => no task, no sender, no flusher.
+    let nip60_shutdown = nip60_flusher.as_ref().map(|flusher| {
+        let flusher = flusher.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            // Resolves on an explicit signal OR (the drop path) when the sender is dropped: either
+            // way the receiver completes and we do the fallback flush (a no-op if `flush_estate`
+            // already consumed the dirty flag on the graceful path).
+            let _ = rx.await;
+            if let Err(e) = flusher.flush().await {
+                tracing::warn!(
+                    error = %e,
+                    "NIP-60 abrupt-death fallback backup flush failed (spend truth is unaffected; the next boot re-snapshots)"
+                );
+            } else {
+                tracing::debug!("NIP-60 abrupt-death fallback backup flush complete (or no-op if the graceful estate flush already ran)");
+            }
+        });
+        tx
+    });
+
     // The serve task holds a GatewayService clone (and thus a Treasury Arc, holding
     // the sled lock). It is a listener loop that never returns on its own, so it
     // must be aborted at run-end to release the lock; the ServeGuard does that on
@@ -1049,6 +1192,10 @@ pub async fn boot_and_observe_with_rail(
     let serve_guard = ServeGuard {
         handle: serve_task.abort_handle(),
         _dm_shutdown: dm_shutdown,
+        _nip60_shutdown: nip60_shutdown,
+        // Held for the AWAITED graceful estate flush (codex #3). `nip60_shutdown` above already
+        // consumed a clone into the abrupt-death fallback task; this keeps the original `Option`.
+        nip60_flusher,
     };
 
     // Wait for the genome's boot hello event (session=<task>). This is the G1

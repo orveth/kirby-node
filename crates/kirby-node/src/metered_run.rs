@@ -234,7 +234,10 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
     // the meter debits the SAME counter the gateway uses (D-9).
     // `vm` is `mut` so the metering loop can poll `is_alive(&mut self)` to detect an
     // externally-killed/crashed guest (G-4 failover bug 1); it is still moved into `halt()` below.
-    let (mut vm, outcome, treasury, _events, _serve_guard) =
+    // `serve_guard` (not `_serve_guard`): named so the GRACEFUL teardown below can AWAIT one final
+    // NIP-60 backup estate flush via `serve_guard.flush_estate()` BEFORE it drops (codex #3). Its
+    // drop still aborts the serve task + fires the abrupt-death fallback for the error/panic paths.
+    let (mut vm, outcome, treasury, _events, serve_guard) =
         boot::boot_and_observe(config.boot).await?;
     if !outcome.reached_running {
         vm.halt().await;
@@ -367,6 +370,16 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
         "budget reached: daemon HALTING the VM (pause then kill), recording terminated:budget_exhausted"
     );
     vm.halt().await;
+
+    // GRACEFUL teardown (codex #3): the metered run returned normally (die-when-broke /
+    // BudgetExhausted OR the max_run_secs safety ceiling), and the VM is now halted (no further
+    // spend-path mutations possible). AWAIT one final NIP-60 backup "estate" flush here — BEFORE
+    // `serve_guard` drops at end of scope — so the last-interval mutation's snapshot is published to
+    // completion rather than raced against process exit by the detached drop-fired fallback.
+    // Best-effort (errors logged, never propagated); it consumes the dirty flag, so the drop-fired
+    // fallback then no-ops (no double publish). The error-return paths above deliberately skip this
+    // and lean on the drop fallback (they are abrupt, not a graceful completion).
+    serve_guard.flush_estate().await;
 
     let (terminated, remaining_at_halt) = match meter_outcome {
         MeterOutcome::BudgetExhausted {
@@ -530,6 +543,29 @@ fn estimate_runway_secs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codex #3 (focused call-site guard): the GRACEFUL teardown in `run()` MUST await the NIP-60
+    /// estate flush before the `ServeGuard` drops. The full metered run boots a VM (untestable in a
+    /// unit test), so this asserts the call-site is present in this module's source — a deterministic
+    /// regression guard against silently deleting `serve_guard.flush_estate().await` (which would
+    /// re-introduce the "final snapshot raced against process exit by the detached drop task" bug).
+    /// The behavioral proof that an awaited estate flush publishes a pending snapshot lives in
+    /// `crate::nip60`'s `flush_estate_awaited_publishes_a_pending_dirty_snapshot`.
+    #[test]
+    fn graceful_teardown_awaits_the_estate_flush() {
+        let src = include_str!("metered_run.rs");
+        assert!(
+            src.contains("serve_guard.flush_estate().await"),
+            "the graceful teardown in run() must await serve_guard.flush_estate() before the guard drops (codex #3)"
+        );
+        // And the binding is NOT the `_`-prefixed drop-only form (that would drop the guard at
+        // scope end WITHOUT the awaited flush).
+        assert!(
+            src.contains(", serve_guard) =\n        boot::boot_and_observe")
+                || src.contains(", serve_guard) = boot::boot_and_observe"),
+            "the ServeGuard is bound as `serve_guard` (named), so flush_estate can be awaited on it"
+        );
+    }
 
     fn emitter(budget_sats: u64) -> AgentStateEmitter {
         // A per-call unique dir (pid + a process-wide counter) so parallel tests do

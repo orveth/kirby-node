@@ -944,6 +944,39 @@ pub struct Nip60Config {
     /// majority `floor(N/2)+1`, clamped to `[1, N]`.
     #[serde(default)]
     pub write_k: Option<usize>,
+    /// How often (seconds) the background NIP-60 backup FLUSHER republishes the wallet's
+    /// current-unspent proof snapshot after a spend has marked it dirty (Cut A, #115). This is a
+    /// best-effort backup OFF the spend hot path — the hot path only flips a dirty flag; the
+    /// flusher does the relay publish on this cadence. `None` => the
+    /// [`DEFAULT_NIP60_BACKUP_FLUSH_SECS`] default. Only takes effect when `[nip60].relays` is
+    /// non-empty (NIP-60 is opt-in).
+    #[serde(default)]
+    pub backup_flush_secs: Option<u64>,
+}
+
+/// The default NIP-60 backup flush cadence (seconds): how often the background flusher republishes
+/// the current-unspent snapshot after a spend dirties it. Short enough that a crash loses at most a
+/// few seconds of backup FRESHNESS (never truth — the mint is authoritative and the next flush
+/// re-snapshots), long enough to coalesce a burst of spends into one publish.
+pub const DEFAULT_NIP60_BACKUP_FLUSH_SECS: u64 = 10;
+
+impl Nip60Config {
+    /// The resolved background-backup flush interval ([`DEFAULT_NIP60_BACKUP_FLUSH_SECS`] when
+    /// unset). Best-effort background backup of the current-unspent proof snapshot after a spend
+    /// marks it dirty; strictly off the spend hot path.
+    ///
+    /// A configured `0` (#115 codex #4) is CLAMPED to the default rather than taken literally: a
+    /// zero-second interval would turn [`crate::rail::Nip60BackupFlusher::spawn_periodic`] into a
+    /// zero-sleep busy loop that pins a core hammering the relay. `0` means "no explicit cadence,"
+    /// so it resolves to [`DEFAULT_NIP60_BACKUP_FLUSH_SECS`] exactly like an unset value.
+    pub fn backup_flush_interval(&self) -> std::time::Duration {
+        let s = self.backup_flush_secs.unwrap_or(DEFAULT_NIP60_BACKUP_FLUSH_SECS);
+        std::time::Duration::from_secs(if s == 0 {
+            DEFAULT_NIP60_BACKUP_FLUSH_SECS
+        } else {
+            s
+        })
+    }
 }
 
 /// The durability verdict of a resolved NIP-60 relay set (drives the boot money-safety warning).
@@ -1019,7 +1052,11 @@ mod nip60_config_tests {
 
     #[test]
     fn three_relays_meet_quorum_with_majority_k() {
-        let cfg = Nip60Config { relays: vec!["a".into(), "b".into(), "c".into()], write_k: None };
+        let cfg = Nip60Config {
+            relays: vec!["a".into(), "b".into(), "c".into()],
+            write_k: None,
+            ..Default::default()
+        };
         let (relays, k, durability) = cfg.resolve("ws://fleet:7777");
         assert_eq!(relays.len(), 3, "configured relays override the fleet fallback");
         assert_eq!(k, 2, "default K = strict majority floor(3/2)+1");
@@ -1029,7 +1066,11 @@ mod nip60_config_tests {
 
     #[test]
     fn two_relays_are_below_quorum() {
-        let cfg = Nip60Config { relays: vec!["a".into(), "b".into()], write_k: None };
+        let cfg = Nip60Config {
+            relays: vec!["a".into(), "b".into()],
+            write_k: None,
+            ..Default::default()
+        };
         let (_relays, k, durability) = cfg.resolve("ws://fleet:7777");
         assert_eq!(k, 2);
         assert_eq!(durability, Nip60Durability::BelowQuorum);
@@ -1038,9 +1079,44 @@ mod nip60_config_tests {
 
     #[test]
     fn write_k_clamps_into_range() {
-        let cfg = Nip60Config { relays: vec!["a".into(), "b".into(), "c".into()], write_k: Some(99) };
+        let cfg = Nip60Config {
+            relays: vec!["a".into(), "b".into(), "c".into()],
+            write_k: Some(99),
+            ..Default::default()
+        };
         let (_relays, k, _d) = cfg.resolve("ws://fleet:7777");
         assert_eq!(k, 3, "an over-large write_k clamps to N");
+    }
+
+    #[test]
+    fn backup_flush_secs_zero_clamps_to_default() {
+        // #115 codex #4: an explicit `0` must NOT become a zero-sleep busy loop in
+        // `spawn_periodic`; it is treated as "no explicit cadence" = the default.
+        let zero = Nip60Config {
+            backup_flush_secs: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            zero.backup_flush_interval(),
+            std::time::Duration::from_secs(DEFAULT_NIP60_BACKUP_FLUSH_SECS),
+            "backup_flush_secs = 0 clamps to the default (never a 0-second busy loop)"
+        );
+        // Unset resolves to the same default.
+        assert_eq!(
+            Nip60Config::default().backup_flush_interval(),
+            std::time::Duration::from_secs(DEFAULT_NIP60_BACKUP_FLUSH_SECS),
+            "an unset backup_flush_secs is the default cadence"
+        );
+        // A real non-zero value is honored verbatim.
+        let explicit = Nip60Config {
+            backup_flush_secs: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(
+            explicit.backup_flush_interval(),
+            std::time::Duration::from_secs(3),
+            "an explicit non-zero cadence is honored"
+        );
     }
 }
 

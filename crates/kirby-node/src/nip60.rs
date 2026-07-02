@@ -451,6 +451,19 @@ impl Nip60Store {
     /// CANDIDATE proofs; NUT-07 check-state (N2) filters it to UNSPENT before any spend (NIP-60
     /// is portability, not safety — the mint is the source of truth).
     pub async fn reconcile_on_load(&self) -> anyhow::Result<Vec<Proof>> {
+        // Reuse the id-carrying reconcile and drop the ids (the restore path only needs the
+        // candidate proofs). Kept as one implementation so the two never drift.
+        let (proofs, _ids) = self.reconcile_on_load_with_ids().await?;
+        Ok(proofs)
+    }
+
+    /// As [`Self::reconcile_on_load`], but ALSO returns the hex ids of EVERY kind:7375 token event
+    /// fetched under the event key (decryptable or not). The Cut A (#115) backup flusher seeds its
+    /// live-id set with these so the FIRST flush's rollover del-chains ALL prior token events into
+    /// ONE clean new snapshot — superseding an already-dead / undecryptable-foreign event is a
+    /// harmless no-op (the del-chain is advisory + the mint is truth), and it prevents the relay set
+    /// accreting stale events across restarts.
+    pub async fn reconcile_on_load_with_ids(&self) -> anyhow::Result<(Vec<Proof>, Vec<String>)> {
         let filter = Filter::new()
             .kind(Kind::from(KIND_NIP60_TOKEN))
             .author(self.crypto.public_key());
@@ -459,10 +472,13 @@ impl Nip60Store {
             .fetch_events(filter, self.read_timeout)
             .await
             .context("fetch NIP-60 token events for reconcile")?;
+        let mut all_ids: Vec<String> = Vec::with_capacity(events.len());
         let mut decoded: Vec<(String, TokenEventContent)> = Vec::new();
         for ev in events.into_iter() {
+            let id_hex = ev.id.to_hex();
+            all_ids.push(id_hex.clone());
             match self.crypto.decrypt(&ev.content) {
-                Ok(content) => decoded.push((ev.id.to_hex(), content)),
+                Ok(content) => decoded.push((id_hex, content)),
                 Err(e) => tracing::warn!(
                     event_id = %ev.id,
                     error = %e,
@@ -470,7 +486,7 @@ impl Nip60Store {
                 ),
             }
         }
-        Ok(reconcile_token_set(&decoded, &self.mint_allowlist))
+        Ok((reconcile_token_set(&decoded, &self.mint_allowlist), all_ids))
     }
 
     /// Publish the kind:17375 wallet-config (mints + per-keyset NUT-13 counters, NIP-44
@@ -1093,5 +1109,747 @@ mod tests {
             .publish_wallet_config(to_publish, loaded.mints)
             .await
             .expect("durable config publish");
+    }
+
+    // ========================================================================
+    // Cut A (#115): NIP-60 backup write-half teeth. The decorator + flusher live
+    // in `crate::rail`; the DI-transport `Nip60Store` + the crypto/proof helpers
+    // live here, so the end-to-end round-trip is exercised without a live relay.
+    // ========================================================================
+
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use crate::rail::{EcashProvider, Nip60BackedEcash, OperationId, SendHandle};
+
+    /// A minimal in-crate ecash stub for the decorator teeth: every mutation succeeds and bumps a
+    /// per-method call counter, EXCEPT when armed to fail (to prove an Err leaves dirty untouched).
+    /// Distinct from the integration `StubEcash` (that one lives in `tests/common`, unreachable from
+    /// a lib unit test); this one only needs to model success/failure + count calls.
+    struct CountingEcash {
+        fail: bool,
+        mint_calls: AtomicU64,
+        redeem_calls: AtomicU64,
+    }
+
+    impl CountingEcash {
+        fn healthy() -> Self {
+            Self {
+                fail: false,
+                mint_calls: AtomicU64::new(0),
+                redeem_calls: AtomicU64::new(0),
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                fail: true,
+                mint_calls: AtomicU64::new(0),
+                redeem_calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EcashProvider for CountingEcash {
+        async fn mint_send_token(&self, _amount_sats: u64) -> anyhow::Result<SendHandle> {
+            self.mint_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.fail {
+                anyhow::bail!("counting-ecash mint failure");
+            }
+            Ok(SendHandle {
+                token: "cashuTEST".to_string(),
+                operation_id: OperationId::from_u128(1),
+            })
+        }
+        async fn redeem_foreign(&self, _token: &str) -> anyhow::Result<u64> {
+            self.redeem_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.fail {
+                anyhow::bail!("counting-ecash redeem failure");
+            }
+            Ok(0)
+        }
+        async fn revoke_send(&self, _op: &OperationId) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+        async fn recover_incomplete_sagas(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A recording, round-tripping in-memory relay double: on `send_event` it STORES the (kind,
+    /// encrypted content) and returns a UNIQUE event id (so distinct sends get distinct ids); on
+    /// `fetch_events` it REPLAYS every stored kind:7375 event as a signed event authored by
+    /// `crypto` — so `reconcile_on_load` reads back exactly what a flush published. `acks` is the
+    /// per-send ack count (>= k → durable; 0 → the publish/rollover fails, modelling a doomed
+    /// backup). NIP-09 deletes are recorded but not applied (advisory; the del-chain is what the
+    /// reconcile honors, and a snapshot flush del-chains the PRIOR ids each time).
+    struct InMemoryRelay {
+        acks: usize,
+        crypto: Nip60Crypto,
+        // (assigned event id, kind, ciphertext) in send order. The id is EXACTLY what `send_event`
+        // returned (the id a rollover recorded into `live_ids`), so a test can pair each published
+        // token event with the id the flusher tracks and run `live_token_event_ids` on the chain.
+        sends: Mutex<Vec<(EventId, u16, String)>>,
+        counter: AtomicU64,
+    }
+
+    impl InMemoryRelay {
+        fn new(acks: usize, crypto: Nip60Crypto) -> Self {
+            Self {
+                acks,
+                crypto,
+                sends: Mutex::new(Vec::new()),
+                counter: AtomicU64::new(1),
+            }
+        }
+        /// The kinds sent so far, in order (asserts publish count / sequencing).
+        fn sent_kinds(&self) -> Vec<u16> {
+            self.sends.lock().unwrap().iter().map(|(_, k, _)| *k).collect()
+        }
+        /// How many kind:7375 token events were published (the rollover snapshots).
+        fn token_publishes(&self) -> usize {
+            self.sent_kinds()
+                .iter()
+                .filter(|k| **k == KIND_NIP60_TOKEN)
+                .count()
+        }
+    }
+
+    #[async_trait]
+    impl Nip60Transport for InMemoryRelay {
+        async fn send_event(
+            &self,
+            kind: u16,
+            content: String,
+            _tags: Vec<Tag>,
+        ) -> anyhow::Result<SendOutcome> {
+            let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&n.to_be_bytes());
+            let event_id = EventId::from_slice(&bytes).expect("a 32-byte event id");
+            self.sends.lock().unwrap().push((event_id, kind, content));
+            Ok(SendOutcome {
+                event_id,
+                acks: self.acks,
+            })
+        }
+
+        async fn fetch_events(
+            &self,
+            _filter: Filter,
+            _timeout: Duration,
+        ) -> anyhow::Result<Vec<Event>> {
+            // Replay every stored TOKEN event as a signed, author-matching event (so the reconcile's
+            // author filter + decrypt succeed). The ciphertext is exactly what was published.
+            let events = self
+                .sends
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, k, _)| *k == KIND_NIP60_TOKEN)
+                .map(|(_, _, ct)| {
+                    EventBuilder::new(Kind::from(KIND_NIP60_TOKEN), ct.clone())
+                        .sign_with_keys(&self.crypto.signer_keys())
+                        .expect("sign replayed token event")
+                })
+                .collect();
+            Ok(events)
+        }
+    }
+
+    fn test_crypto(seed_byte: u8) -> Nip60Crypto {
+        Nip60Crypto::from_event_key(&derive_nip60_event_key(&[seed_byte; 64])).unwrap()
+    }
+
+    /// An EMPTY in-memory cdk wallet pointed at a dead URL. `get_proofs_with` reads the LOCAL store
+    /// only (no network), so this yields an empty unspent set for the decorator/coalesce teeth that
+    /// do not assert on proof contents (only tooth 2 funds a wallet, which needs a live mint).
+    async fn empty_wallet() -> Arc<cdk::Wallet> {
+        crate::mint_rig::build_wallet("http://127.0.0.1:1")
+            .await
+            .expect("build an empty in-memory wallet (no network at construction)")
+    }
+
+    // ---- Tooth 1 (the load-bearer): a spend is NEVER blocked by a doomed backup. --------------
+    #[tokio::test]
+    async fn spend_succeeds_even_when_the_backup_publish_fails() {
+        let crypto = test_crypto(0x11);
+        // A 0-ack relay: every publish is sub-quorum → rollover ERRORS → the backup is DOOMED.
+        let relay = Arc::new(InMemoryRelay::new(0, crypto.clone()));
+        let store = Arc::new(Nip60Store::with_transport(crypto, relay, 3, 2, allow_m()));
+        let wallet = empty_wallet().await;
+        let ecash = CountingEcash::healthy();
+        let (decorated, flusher) = Nip60BackedEcash::with_flusher(
+            ecash,
+            wallet,
+            store,
+            "https://m".to_string(),
+            "sat".to_string(),
+            Vec::new(),
+        );
+        // Start from a clean flag so the mutation's SET is what we observe (the constructor seeds
+        // dirty=true for the initial snapshot; clear it first).
+        flusher.force_clean();
+        assert!(!flusher.is_dirty(), "baseline: clean before the mutation");
+
+        // The spend runs through the decorator and SUCCEEDS even though the backup is doomed —
+        // the hot path only flips a flag, it never touches the (doomed) relay.
+        let handle = decorated
+            .mint_send_token(42)
+            .await
+            .expect("the spend must NOT be blocked by the backup path");
+        assert_eq!(handle.token, "cashuTEST", "the inner spend result is returned unchanged");
+        assert!(
+            flusher.is_dirty(),
+            "a successful mutation marks the backup dirty (the hot-path signal)"
+        );
+
+        // And proving the backup really is doomed: a flush now ERRORS (sub-quorum rollover) yet the
+        // spend above already succeeded, and the failed flush RE-ARMS dirty for a later retry.
+        assert!(
+            flusher.flush().await.is_err(),
+            "the doomed backup fails to publish (0 acks < k) — but the spend already succeeded"
+        );
+        assert!(flusher.is_dirty(), "a failed flush stays dirty (re-armed for retry)");
+
+        // The complement MONEY-MUST: a FAILED mutation changed nothing, so it must NOT dirty the
+        // backup (there are no new proofs to snapshot).
+        let crypto2 = test_crypto(0x12);
+        let relay2 = Arc::new(InMemoryRelay::new(2, crypto2.clone()));
+        let store2 = Arc::new(Nip60Store::with_transport(crypto2, relay2, 3, 2, allow_m()));
+        let (decorated_fail, flusher_fail) = Nip60BackedEcash::with_flusher(
+            CountingEcash::failing(),
+            empty_wallet().await,
+            store2,
+            "https://m".to_string(),
+            "sat".to_string(),
+            Vec::new(),
+        );
+        flusher_fail.force_clean();
+        assert!(
+            decorated_fail.mint_send_token(9).await.is_err(),
+            "the inner mint failed → the decorator propagates the Err"
+        );
+        assert!(
+            !flusher_fail.is_dirty(),
+            "a FAILED mutation must NOT mark the backup dirty (nothing changed to back up)"
+        );
+    }
+
+    // ---- Tooth 2 (non-vacuity): a real funded wallet's proofs round-trip through a flush. ------
+    //
+    // The ONLY tooth that needs a live mint (real unspent proofs). Boots a compact local cdk-mintd
+    // fakewallet fixture, funds a wallet, wraps it in the decorator, does a mutation, flushes, then
+    // asserts `reconcile_on_load` reads back a NON-EMPTY proof set. RED-on-revert: neuter the flush
+    // (make it a no-op) and the relay stays empty → reconcile returns empty → the assert fails.
+    #[tokio::test]
+    async fn restore_finds_the_proofs_after_a_spend_then_flush() {
+        let mint = mint_fixture::FakeMint::start(18860)
+            .await
+            .expect("boot the local fakewallet mint");
+        let mint_url = mint.url();
+
+        let wallet = crate::mint_rig::build_wallet(&mint_url)
+            .await
+            .expect("build wallet");
+        crate::mint_rig::fund_wallet(wallet.clone(), 1000)
+            .await
+            .expect("fund the wallet on the fakewallet mint");
+
+        let crypto = test_crypto(0x22);
+        // A 2-ack (>= k=2) relay: publishes are durable and round-trip on fetch.
+        let relay = Arc::new(InMemoryRelay::new(2, crypto.clone()));
+        let store = Arc::new(Nip60Store::with_transport(
+            crypto,
+            relay.clone(),
+            3,
+            2,
+            vec![mint_url.clone()],
+        ));
+
+        let ecash = crate::rail::CdkEcash::new(wallet.clone());
+        let (decorated, flusher) = Nip60BackedEcash::with_flusher(
+            ecash,
+            wallet.clone(),
+            store.clone(),
+            mint_url.clone(),
+            "sat".to_string(),
+            Vec::new(),
+        );
+
+        // BEFORE any flush the relay is empty → reconcile finds nothing (the pre-condition the
+        // production-dead write-chain was stuck at).
+        let before = store
+            .reconcile_on_load()
+            .await
+            .expect("reconcile (empty backup)");
+        assert!(before.is_empty(), "no backup yet → reconcile returns empty");
+
+        // A spend-path mutation (mint a send token) marks dirty; the flush publishes the wallet's
+        // CURRENT UNSPENT snapshot (the change proofs left after the send).
+        decorated
+            .mint_send_token(100)
+            .await
+            .expect("mint a send token from the funded wallet");
+        flusher.flush().await.expect("the backup flush publishes durably");
+
+        // The non-vacuity proof: reconcile now reads back the wallet's unspent proofs.
+        let restored = store
+            .reconcile_on_load()
+            .await
+            .expect("reconcile after the flush");
+        let live_unspent = wallet
+            .get_proofs_with(Some(vec![cdk::nuts::State::Unspent]), None)
+            .await
+            .expect("read the wallet's current unspent proofs");
+        assert!(
+            !restored.is_empty(),
+            "AFTER a spend+flush the relay-backed proofs are non-empty (the write-chain is LIVE, \
+             not vacuous) — revert the flush wiring and this is empty"
+        );
+        assert_eq!(
+            restored.len(),
+            live_unspent.len(),
+            "the backup snapshot is exactly the wallet's current-unspent set"
+        );
+        assert_eq!(relay.token_publishes(), 1, "the flush published exactly one snapshot");
+
+        mint.shutdown().await;
+    }
+
+    // ---- Tooth 3: a failed flush stays dirty and a later working flush publishes. --------------
+    #[tokio::test]
+    async fn a_failed_flush_stays_dirty_and_retries() {
+        let crypto = test_crypto(0x33);
+        // Start doomed (0 acks): the first flush fails and re-arms dirty.
+        let relay = Arc::new(InMemoryRelay::new(0, crypto.clone()));
+        let store = Arc::new(Nip60Store::with_transport(crypto, relay.clone(), 3, 2, allow_m()));
+        let wallet = empty_wallet().await;
+        let (decorated, flusher) = Nip60BackedEcash::with_flusher(
+            ecash_healthy(),
+            wallet,
+            store,
+            "https://m".to_string(),
+            "sat".to_string(),
+            Vec::new(),
+        );
+        flusher.force_clean();
+        decorated.mint_send_token(7).await.expect("spend ok");
+        assert!(flusher.is_dirty(), "the mutation dirtied the state");
+
+        assert!(
+            flusher.flush().await.is_err(),
+            "the failing transport (0 acks) makes the flush error"
+        );
+        assert!(flusher.is_dirty(), "a failed flush STAYS dirty (not consumed)");
+        assert_eq!(relay.token_publishes(), 1, "it attempted the publish (which was sub-quorum)");
+
+        // Now swap in a working relay (>= k) and flush again: it publishes durably and the retry
+        // succeeds. (A fresh store over a healthy relay models the next-tick retry landing.)
+        let good_relay = Arc::new(InMemoryRelay::new(2, test_crypto(0x33)));
+        let good_store =
+            Arc::new(Nip60Store::with_transport(test_crypto(0x33), good_relay.clone(), 3, 2, allow_m()));
+        let wallet2 = empty_wallet().await;
+        let (_decorated2, flusher2) = Nip60BackedEcash::with_flusher(
+            ecash_healthy(),
+            wallet2,
+            good_store,
+            "https://m".to_string(),
+            "sat".to_string(),
+            Vec::new(),
+        );
+        // The constructor seeded dirty=true (an initial snapshot is pending) → this flush publishes.
+        assert!(flusher2.is_dirty(), "a fresh flusher is dirty (initial snapshot pending)");
+        flusher2.flush().await.expect("the working transport publishes durably");
+        assert_eq!(good_relay.token_publishes(), 1, "the retry landed one durable publish");
+    }
+
+    // ---- Tooth 4: two mutations coalesce into ONE snapshot publish. ----------------------------
+    #[tokio::test]
+    async fn two_mutations_coalesce_into_one_snapshot() {
+        let crypto = test_crypto(0x44);
+        let relay = Arc::new(InMemoryRelay::new(2, crypto.clone()));
+        let store = Arc::new(Nip60Store::with_transport(crypto, relay.clone(), 3, 2, allow_m()));
+        let wallet = empty_wallet().await;
+        let (decorated, flusher) = Nip60BackedEcash::with_flusher(
+            ecash_healthy(),
+            wallet,
+            store,
+            "https://m".to_string(),
+            "sat".to_string(),
+            Vec::new(),
+        );
+        flusher.force_clean();
+
+        // TWO successful mutations before any flush.
+        decorated.mint_send_token(1).await.expect("spend 1 ok");
+        decorated.redeem_foreign("cashuX").await.expect("spend 2 ok");
+        assert!(flusher.is_dirty(), "the two mutations left the state dirty (coalesced)");
+
+        // ONE flush → exactly ONE rollover publish of the current set (not one-per-mutation).
+        flusher.flush().await.expect("the single flush publishes once");
+        assert_eq!(
+            relay.token_publishes(),
+            1,
+            "two mutations then one flush → ONE snapshot publish (the dirty flag coalesces them)"
+        );
+
+        // A second flush with NO new mutation is a no-op (nothing new to back up).
+        flusher.flush().await.expect("a clean flush is Ok");
+        assert_eq!(
+            relay.token_publishes(),
+            1,
+            "a flush with no intervening mutation republishes nothing"
+        );
+    }
+
+    /// A gating relay for the codex-#2 serialization tooth: it BLOCKS the FIRST `send_event` on a
+    /// `Notify` (until the test releases it) and lets every later send through immediately. That
+    /// deterministically pins flush A INSIDE its rollover publish while flush B runs, so the test
+    /// can force the exact interleave the `flush_lock` must prevent. Records `(id, kind, ciphertext)`
+    /// like [`InMemoryRelay`] so `decoded_token_events` computes the live set.
+    struct GatedRelay {
+        acks: usize,
+        crypto: Nip60Crypto,
+        sends: Mutex<Vec<(EventId, u16, String)>>,
+        counter: AtomicU64,
+        // Fires when the FIRST send may proceed (the test controls when flush A leaves its publish).
+        release_first: tokio::sync::Notify,
+        // Signals that flush A has ENTERED its (blocked) first send — so the test can start flush B
+        // only once A is provably parked mid-publish (holding its cloned live_ids).
+        first_entered: tokio::sync::Notify,
+        sends_started: AtomicU64,
+    }
+
+    impl GatedRelay {
+        fn new(acks: usize, crypto: Nip60Crypto) -> Self {
+            Self {
+                acks,
+                crypto,
+                sends: Mutex::new(Vec::new()),
+                counter: AtomicU64::new(1),
+                release_first: tokio::sync::Notify::new(),
+                first_entered: tokio::sync::Notify::new(),
+                sends_started: AtomicU64::new(0),
+            }
+        }
+        fn decoded_token_events(&self) -> Vec<(String, TokenEventContent)> {
+            self.sends
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, k, _)| *k == KIND_NIP60_TOKEN)
+                .map(|(id, _, ct)| {
+                    let content = self.crypto.decrypt(ct).expect("decrypt a token event");
+                    (id.to_hex(), content)
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl Nip60Transport for GatedRelay {
+        async fn send_event(
+            &self,
+            kind: u16,
+            content: String,
+            _tags: Vec<Tag>,
+        ) -> anyhow::Result<SendOutcome> {
+            let started = self.sends_started.fetch_add(1, AtomicOrdering::SeqCst);
+            if started == 0 {
+                // The FIRST send (flush A's rollover publish): announce entry, then park until the
+                // test releases it — pinning A mid-publish while flush B is driven.
+                self.first_entered.notify_one();
+                self.release_first.notified().await;
+            }
+            let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&n.to_be_bytes());
+            let event_id = EventId::from_slice(&bytes).expect("a 32-byte event id");
+            self.sends.lock().unwrap().push((event_id, kind, content));
+            Ok(SendOutcome {
+                event_id,
+                acks: self.acks,
+            })
+        }
+
+        async fn fetch_events(
+            &self,
+            _filter: Filter,
+            _timeout: Duration,
+        ) -> anyhow::Result<Vec<Event>> {
+            Ok(Vec::new())
+        }
+    }
+
+    // ---- Codex #2: two overlapping flushes NEVER leak a stale live event. ----------------------
+    //
+    // Without the flush_lock, a periodic + estate flush can BOTH consume-then-publish from the same
+    // `live_ids` if a mutation re-dirties between them: each rollover del-chains the SAME prior set
+    // (here the empty seed), so NEITHER new event supersedes the other → TWO live events (an orphan
+    // that leaks + grows the relay set unbounded). With serialization, flush B waits for flush A to
+    // COMMIT its new live id, so B del-chains THAT (a single chain), leaving EXACTLY one live event.
+    //
+    // The `GatedRelay` pins flush A inside its rollover publish (holding its cloned live_ids) while
+    // flush B is driven — the deterministic form of the race. Without the lock, B reads the SAME
+    // stale live_ids and publishes an ORPHAN; with the lock, B blocks on flush_lock until A commits.
+    //
+    // RED-on-revert: remove `let _flush_guard = self.flush_lock.lock().await;` from `flush()` and
+    // this fails — `live_token_event_ids` returns 2 (the leaked orphan).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_flushes_do_not_leak_a_stale_live_event() {
+        let crypto = test_crypto(0x55);
+        let relay = Arc::new(GatedRelay::new(2, crypto.clone()));
+        let store = Arc::new(Nip60Store::with_transport(crypto, relay.clone(), 3, 2, allow_m()));
+        let wallet = empty_wallet().await;
+        let (decorated, flusher) = Nip60BackedEcash::with_flusher(
+            ecash_healthy(),
+            wallet,
+            store,
+            "https://m".to_string(),
+            "sat".to_string(),
+            Vec::new(),
+        );
+        // Start clean, then a first mutation dirties the state (flush A's snapshot pending).
+        flusher.force_clean();
+        decorated.mint_send_token(10).await.expect("spend 1 ok");
+        assert!(flusher.is_dirty(), "the first mutation dirtied the state");
+
+        // Flush A: consumes dirty + clones live_ids (=[]), then PARKS inside its rollover publish
+        // (the GatedRelay holds the first send). Spawned so the main task can proceed.
+        let fa = flusher.clone();
+        let a = tokio::spawn(async move { fa.flush().await });
+
+        // Wait until A is provably parked mid-publish (holding its stale live_ids clone).
+        relay.first_entered.notified().await;
+
+        // A mutation re-dirties the state WHILE A is mid-publish — the exact window the fix guards.
+        decorated.mint_send_token(20).await.expect("interleaved spend ok");
+        assert!(flusher.is_dirty(), "the interleaved mutation re-dirtied the state");
+
+        // Flush B: WITHOUT the lock it now consumes dirty + clones the SAME live_ids A is holding and
+        // publishes an orphan; WITH the lock it blocks on flush_lock until A commits. Give it a beat
+        // to reach that point, THEN release A.
+        let fb = flusher.clone();
+        let b = tokio::spawn(async move { fb.flush().await });
+        // Let B run up to its (locked) wait or (unlocked) publish.
+        tokio::task::yield_now().await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // Release A's parked publish; both flushes now complete.
+        relay.release_first.notify_one();
+        a.await.expect("join A").expect("flush A publishes durably");
+        b.await.expect("join B").expect("flush B publishes durably");
+
+        // The invariant: the del-chain left EXACTLY ONE live (non-superseded) token event, and
+        // `live_ids` points at the last published snapshot — no orphaned live event.
+        let decoded = relay.decoded_token_events();
+        let live = live_token_event_ids(&decoded);
+        assert_eq!(
+            live.len(),
+            1,
+            "serialized flushes leave EXACTLY one live snapshot chain (no orphaned live event); got live ids {live:?} across {} publishes",
+            decoded.len()
+        );
+        let live_ids = flusher.live_ids();
+        assert_eq!(live_ids.len(), 1, "live_ids tracks a single live event");
+        assert_eq!(
+            live_ids[0],
+            live[0].to_string(),
+            "live_ids points at the one event still live on the relay (the last published snapshot)"
+        );
+    }
+
+    // ---- Codex #3: the AWAITED graceful estate flush publishes the final snapshot exactly once. -
+    //
+    // `ServeGuard::flush_estate()` is what the metered-run driver calls at graceful teardown (after
+    // the run returns for die-when-broke / max_run, BEFORE the guard drops) so the last-interval
+    // mutation is AWAITED to the relay, not raced against process exit. This exercises that seam
+    // directly (a full VM boot is far too heavy for a unit test).
+    //
+    // RED-on-revert: make `flush_estate` a no-op (drop the `flusher.flush().await` call) and the
+    // "published a snapshot" assert fails (the relay stays empty).
+    #[tokio::test]
+    async fn flush_estate_awaited_publishes_a_pending_dirty_snapshot() {
+        let crypto = test_crypto(0x56);
+        let relay = Arc::new(InMemoryRelay::new(2, crypto.clone()));
+        let store = Arc::new(Nip60Store::with_transport(crypto, relay.clone(), 3, 2, allow_m()));
+        let wallet = empty_wallet().await;
+        let (decorated, flusher) = Nip60BackedEcash::with_flusher(
+            ecash_healthy(),
+            wallet,
+            store,
+            "https://m".to_string(),
+            "sat".to_string(),
+            Vec::new(),
+        );
+        flusher.force_clean();
+        // A last-interval mutation the periodic flusher never got to (it dirties, nothing published).
+        decorated.mint_send_token(5).await.expect("spend ok");
+        assert!(flusher.is_dirty(), "the mutation left a pending dirty snapshot");
+        assert_eq!(relay.token_publishes(), 0, "nothing published before the estate flush");
+
+        // The graceful teardown seam: build the guard the driver holds and AWAIT its estate flush.
+        let guard = crate::boot::ServeGuard::for_estate_test(flusher.clone());
+        guard.flush_estate().await;
+
+        assert_eq!(
+            relay.token_publishes(),
+            1,
+            "the awaited estate flush published the final snapshot (revert flush_estate → 0)"
+        );
+        assert!(!flusher.is_dirty(), "the estate flush consumed the dirty flag");
+
+        // NO DOUBLE PUBLISH: the drop-fired abrupt-death fallback is another `flush()`. Because the
+        // estate flush consumed `dirty`, that fallback is a no-op — model it with a direct flush and
+        // assert the publish count did not grow (the property the graceful call-site guarantees).
+        flusher.flush().await.expect("the drop-fallback flush is Ok (no-op)");
+        assert_eq!(
+            relay.token_publishes(),
+            1,
+            "the drop-fired fallback no-ops after the awaited estate flush → EXACTLY one publish on the graceful path"
+        );
+    }
+
+    fn ecash_healthy() -> CountingEcash {
+        CountingEcash::healthy()
+    }
+
+    /// The compact local fakewallet mint fixture for tooth 2 (real unspent proofs need a live mint).
+    /// Mirrors the `tests/full_loop.rs` fixture, trimmed to the fakewallet+sqlite features the daemon
+    /// build already carries; cdk-mintd is a dev-dependency, so this is test-only.
+    mod mint_fixture {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use cdk::nuts::CurrencyUnit;
+        use tokio::sync::Notify;
+
+        pub struct FakeMint {
+            port: u16,
+            shutdown: Arc<Notify>,
+            handle: tokio::task::JoinHandle<()>,
+            _work_dir: TempDir,
+        }
+
+        impl FakeMint {
+            pub async fn start(port: u16) -> anyhow::Result<Self> {
+                let work_dir = TempDir::new(&format!("kirby-nip60-mint-{port}"));
+                let settings = fake_wallet_settings(port);
+                let shutdown = Arc::new(Notify::new());
+
+                let work_dir_path = work_dir.path().to_path_buf();
+                let shutdown_for_task = shutdown.clone();
+                let handle = tokio::spawn(async move {
+                    let shutdown_future = async move {
+                        shutdown_for_task.notified().await;
+                    };
+                    if let Err(e) = cdk_mintd::run_mintd_with_shutdown(
+                        &work_dir_path,
+                        &settings,
+                        shutdown_future,
+                        None,
+                        None,
+                        vec![],
+                    )
+                    .await
+                    {
+                        eprintln!("local fakewallet mint exited with error: {e}");
+                    }
+                });
+
+                wait_ready(port, Duration::from_secs(30)).await?;
+                Ok(FakeMint {
+                    port,
+                    shutdown,
+                    handle,
+                    _work_dir: work_dir,
+                })
+            }
+
+            pub fn url(&self) -> String {
+                format!("http://127.0.0.1:{}", self.port)
+            }
+
+            pub async fn shutdown(self) {
+                self.shutdown.notify_waiters();
+                let _ = tokio::time::timeout(Duration::from_secs(5), self.handle).await;
+            }
+        }
+
+        async fn wait_ready(port: u16, timeout: Duration) -> anyhow::Result<()> {
+            let url = format!("http://127.0.0.1:{port}");
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if let Ok(wallet) = crate::mint_rig::build_wallet(&url).await {
+                    if wallet.fetch_mint_info().await.is_ok() {
+                        return Ok(());
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!("local fakewallet mint on port {port} did not become ready in time");
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+
+        fn fake_wallet_settings(port: u16) -> cdk_mintd::config::Settings {
+            let info = cdk_mintd::config::Info {
+                url: format!("http://127.0.0.1:{port}"),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: port,
+                seed: None,
+                // A throwaway fixture mnemonic (local fakewallet, tests only; no real funds).
+                mnemonic: Some(
+                    "eye survey guilt napkin crystal cup whisper salt luggage manage unveil loyal"
+                        .to_string(),
+                ),
+                signatory_url: None,
+                signatory_certs: None,
+                input_fee_ppk: None,
+                use_keyset_v2: None,
+                http_cache: Default::default(),
+                logging: Default::default(),
+                enable_info_page: None,
+                quote_ttl: None,
+            };
+
+            let fake_wallet = cdk_mintd::config::FakeWallet {
+                supported_units: vec![CurrencyUnit::Sat],
+                fee_percent: 0.0,
+                reserve_fee_min: 1.into(),
+                ..Default::default()
+            };
+
+            cdk_mintd::config::Settings {
+                info,
+                // cdk 0.17.x takes a Vec<Ln>; boot a single fakewallet backend.
+                ln: vec![cdk_mintd::config::Ln {
+                    ln_backend: cdk_mintd::config::LnBackend::FakeWallet,
+                    ..Default::default()
+                }],
+                fake_wallet: Some(fake_wallet),
+                ..Default::default()
+            }
+        }
+
+        pub struct TempDir {
+            path: std::path::PathBuf,
+        }
+        impl TempDir {
+            pub fn new(prefix: &str) -> Self {
+                let path = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
+                std::fs::create_dir_all(&path).expect("create temp dir");
+                TempDir { path }
+            }
+            pub fn path(&self) -> &std::path::Path {
+                &self.path
+            }
+        }
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
     }
 }
