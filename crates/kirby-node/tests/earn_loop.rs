@@ -448,3 +448,192 @@ async fn duplicate_settle_emits_no_second_payment_settled() {
 
     mint.shutdown().await;
 }
+
+/// Finding-1 (the concurrency money tooth): two CONCURRENT settles of the SAME charge_id,
+/// each carrying a DISTINCT genuinely-valid token, must redeem into the wallet EXACTLY
+/// ONCE. The per-charge async lock serializes the lookup -> verify -> credit sequence, so
+/// the first settle redeems + credits and the second sees the durable row and short-circuits
+/// (Duplicate) WITHOUT redeeming its token. Exactly one credit, one PAYMENT_SETTLED, one
+/// wallet redemption; the loser's token stays unspent.
+///
+/// RED-on-revert: drop the `settle_locks` serialization (revert `settle_charge` to the bare
+/// lookup -> verify -> credit with no per-charge guard) and both futures miss the lookup,
+/// BOTH call `wallet.receive` on their distinct tokens, and the wallet redeems ~100 sats
+/// (both tokens) while only ~50 is credited -- the wallet-redeemed-once assert below fails.
+#[tokio::test]
+async fn concurrent_settles_of_same_charge_redeem_exactly_once() {
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    let node_wallet = build_wallet(&mint.url()).await.expect("build node wallet");
+    let payer = build_wallet(&mint.url()).await.expect("build payer wallet");
+    fund_wallet(payer.clone(), 500).await.expect("fund payer");
+
+    // Keep a probe handle to the daemon wallet to prove it redeemed exactly one token.
+    let node_wallet_probe = node_wallet.clone();
+    let (svc, _queue) = settlement_gateway(0, node_wallet);
+
+    let charge_id = issue_charge_via_gateway(&svc, "earn-charge-concurrent", 50).await;
+
+    // Two DISTINCT genuinely-valid tokens for the SAME charge_id.
+    let token_a = customer_pays(&payer, 50).await;
+    let token_b = customer_pays(&payer, 50).await;
+
+    // Race both settles. tokio::join! drives them concurrently, maximizing the window in
+    // which both could pass the lookup -- the lock is what forces exactly-once.
+    let (res_a, res_b) = tokio::join!(
+        svc.settle_charge(&charge_id, &token_a),
+        svc.settle_charge(&charge_id, &token_b),
+    );
+    let out_a = res_a.expect("settle A");
+    let out_b = res_b.expect("settle B");
+
+    // EXACTLY ONE Credited, EXACTLY ONE Duplicate (order is nondeterministic).
+    let credited_count = [&out_a, &out_b]
+        .iter()
+        .filter(|o| matches!(o, CreditOutcome::Credited { .. }))
+        .count();
+    let duplicate_count = [&out_a, &out_b]
+        .iter()
+        .filter(|o| matches!(o, CreditOutcome::Duplicate(_)))
+        .count();
+    assert_eq!(credited_count, 1, "exactly ONE of the racing settles credits");
+    assert_eq!(duplicate_count, 1, "the loser is a Duplicate no-op");
+
+    let credited = match (&out_a, &out_b) {
+        (CreditOutcome::Credited { amount_sats, .. }, _)
+        | (_, CreditOutcome::Credited { amount_sats, .. }) => *amount_sats,
+        _ => panic!("one settle must have credited"),
+    };
+
+    // The treasury rose by exactly ONE credit (never both tokens).
+    let balance = svc.treasury_remaining().unwrap();
+    assert_eq!(balance, credited, "treasury credited exactly once");
+    assert!(balance > 0 && balance <= 50, "credited one token's worth, never two");
+
+    // The MONEY tooth: the wallet redeemed exactly ONE token. If both had redeemed, the
+    // wallet would hold ~100; it holds ~50 (one token, within fee).
+    let wallet_balance: u64 = node_wallet_probe
+        .total_balance()
+        .await
+        .expect("read node wallet balance")
+        .into();
+    assert!(
+        wallet_balance > 0 && wallet_balance <= 50,
+        "MONEY-MUST: exactly ONE token was redeemed into the wallet ({wallet_balance}), never both"
+    );
+
+    // Exactly ONE PAYMENT_SETTLED (the winner's); the loser emitted none.
+    let notices = poll_payment_settled(&svc, 0).await;
+    assert_eq!(notices.len(), 1, "exactly one PAYMENT_SETTLED from the winning settle");
+    assert_eq!(notices[0].charge_id, charge_id);
+
+    // The loser's token is still unspent: one of A/B was never redeemed and is reclaimable.
+    // Whichever lost is still valid at the mint; try both, exactly one must reclaim.
+    let reclaim_a = payer
+        .receive(&token_a, cdk::wallet::ReceiveOptions::default())
+        .await
+        .map(u64::from)
+        .unwrap_or(0);
+    let reclaim_b = payer
+        .receive(&token_b, cdk::wallet::ReceiveOptions::default())
+        .await
+        .map(u64::from)
+        .unwrap_or(0);
+    assert!(
+        (reclaim_a > 0) ^ (reclaim_b > 0),
+        "exactly one token was redeemed by the daemon; the loser's is still reclaimable"
+    );
+
+    mint.shutdown().await;
+}
+
+/// Finding-2 (the terminal money tooth, end-to-end): force an OVERFLOW (treasury seeded near
+/// u64::MAX so a real mint-verified credit would wrap), then RETRY with a FRESH token. The
+/// first attempt redeems its token into the wallet but overflows (credits nothing) and writes
+/// the durable terminal marker; the retry sees that marker, returns `Terminal`, and NEVER
+/// redeems its fresh token -- the wallet balance is unchanged by the retry and still no credit.
+///
+/// RED-on-revert: delete the terminal-marker insert in `credit_verified`'s overflow branch
+/// and the retry's `credit_lookup` misses, the retry redeems token B into the wallet (wallet
+/// balance RISES on the retry), and the outcome is `Overflow`, not `Terminal` -- the
+/// wallet-unchanged and Terminal asserts below fail.
+#[tokio::test]
+async fn overflow_marks_terminal_and_blocks_further_redemption() {
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    let node_wallet = build_wallet(&mint.url()).await.expect("build node wallet");
+    let payer = build_wallet(&mint.url()).await.expect("build payer wallet");
+    fund_wallet(payer.clone(), 500).await.expect("fund payer");
+
+    let node_wallet_probe = node_wallet.clone();
+    // Seed the treasury just below u64::MAX so ANY positive credit overflows.
+    let (svc, _queue) = settlement_gateway(u64::MAX - 5, node_wallet);
+
+    let charge_id = issue_charge_via_gateway(&svc, "earn-charge-overflow", 50).await;
+
+    // First settle: the token IS redeemed into the wallet, but the credit overflows u64, so
+    // the balance is untouched and the outcome is Overflow (the terminal marker is written).
+    let token_a = customer_pays(&payer, 50).await;
+    let first = svc
+        .settle_charge(&charge_id, &token_a)
+        .await
+        .expect("first (overflowing) settle");
+    assert!(
+        matches!(first, CreditOutcome::Overflow { .. }),
+        "a credit that would wrap u64 is Overflow"
+    );
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        u64::MAX - 5,
+        "an overflow must not wrap or move the balance"
+    );
+    let wallet_after_first: u64 = node_wallet_probe
+        .total_balance()
+        .await
+        .expect("wallet balance after the overflowing settle")
+        .into();
+    assert!(wallet_after_first > 0, "the first attempt DID redeem token A into the wallet");
+
+    // Retry with a FRESH token B. The terminal marker short-circuits it BEFORE the wallet.
+    let token_b = customer_pays(&payer, 50).await;
+    let retry = svc
+        .settle_charge(&charge_id, &token_b)
+        .await
+        .expect("retry after overflow");
+    assert!(
+        matches!(retry, CreditOutcome::Terminal(_)),
+        "a retry of an overflowed charge is Terminal (settled-dead), not a fresh credit"
+    );
+
+    // The MONEY tooth: token B was NEVER redeemed -- the wallet is unchanged by the retry.
+    let wallet_after_retry: u64 = node_wallet_probe
+        .total_balance()
+        .await
+        .expect("wallet balance after the retry")
+        .into();
+    assert_eq!(
+        wallet_after_retry, wallet_after_first,
+        "finding-2: the retry never reached the wallet -- balance unchanged"
+    );
+
+    // Still no credit (the balance never moved), and token B is still reclaimable.
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        u64::MAX - 5,
+        "a terminal charge credits NOTHING"
+    );
+    let reclaim: u64 = payer
+        .receive(&token_b, cdk::wallet::ReceiveOptions::default())
+        .await
+        .expect("token B is unspent -- the daemon never redeemed it")
+        .into();
+    assert!(reclaim > 0, "token B was never redeemed by the daemon");
+
+    // No PAYMENT_SETTLED at all: neither an overflow nor a terminal is a credit.
+    let notices = poll_payment_settled(&svc, 0).await;
+    assert!(notices.is_empty(), "no PAYMENT_SETTLED for a charge that never credited");
+
+    mint.shutdown().await;
+}

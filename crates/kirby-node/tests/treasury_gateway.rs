@@ -336,6 +336,61 @@ fn credit_is_only_via_host_verified_settlement() {
     assert_eq!(big.remaining().unwrap(), u64::MAX - 10, "an overflow credit must not wrap the balance");
 }
 
+/// Finding-2 (treasury level): an OVERFLOW writes a DURABLE TERMINAL marker, so a RETRY of
+/// the same charge_id is `Terminal` (settled-dead), NEVER credits, and NEVER lets the
+/// balance wrap. The old behaviour left NO row on overflow, so a retry would miss the
+/// lookup and (having redeemed a fresh token) credit again -- here we prove the row now
+/// exists and re-blocks. Driven directly on `Treasury` (its overflow branch is the seam),
+/// mirroring the overflow assertion in `credit_is_only_via_host_verified_settlement`.
+///
+/// RED-on-revert: delete the terminal-marker insert in `credit_verified`'s overflow branch
+/// and (a) `credit_lookup` returns `None` after the overflow, and (b) the retry is
+/// `Overflow`, not `Terminal` -- both asserts below fail.
+#[test]
+fn overflow_writes_terminal_marker_and_blocks_retry() {
+    let t = Treasury::open_temporary(u64::MAX - 10).expect("open near-max treasury");
+
+    // First attempt overflows: refused, no balance mutation, returns Overflow.
+    match t.credit_verified("charge-of", 100).unwrap() {
+        CreditOutcome::Overflow { remaining } => assert_eq!(remaining, u64::MAX - 10),
+        _ => panic!("the first overflowing credit must be Overflow"),
+    }
+    assert_eq!(t.remaining().unwrap(), u64::MAX - 10, "an overflow must not wrap the balance");
+
+    // The overflow left a DURABLE terminal row (finding-2): credit_lookup now surfaces it.
+    let row = t
+        .credit_lookup("charge-of")
+        .unwrap()
+        .expect("an overflow now leaves a durable terminal marker row");
+    // The marker is NOT a credit: it recorded the balance unchanged and cost nothing.
+    assert_eq!(row.treasury_remaining_after, u64::MAX - 10);
+    assert_eq!(row.cost_sats, 0);
+
+    // A RETRY with a fresh (would-be-valid) credit is TERMINAL, not a fresh credit and not a
+    // plain Overflow: the charge is settled-dead. The balance is STILL unchanged.
+    match t.credit_verified("charge-of", 100).unwrap() {
+        CreditOutcome::Terminal(rec) => {
+            assert_eq!(rec.treasury_remaining_after, u64::MAX - 10);
+        }
+        other => panic!("a retry of an overflowed charge must be Terminal, got {}", outcome_name(&other)),
+    }
+    assert_eq!(
+        t.remaining().unwrap(),
+        u64::MAX - 10,
+        "finding-2: a retry of an overflowed charge must never credit -- balance unchanged"
+    );
+}
+
+/// Name a `CreditOutcome` variant for a panic message (no Debug on the enum).
+fn outcome_name(o: &CreditOutcome) -> &'static str {
+    match o {
+        CreditOutcome::Credited { .. } => "Credited",
+        CreditOutcome::Duplicate(_) => "Duplicate",
+        CreditOutcome::Overflow { .. } => "Overflow",
+        CreditOutcome::Terminal(_) => "Terminal",
+    }
+}
+
 // ---- G3c: self-reported numbers are never billed ----
 
 /// G3c: the daemon ignores the genome's self-reported ReportEvent numbers for

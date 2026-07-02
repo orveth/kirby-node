@@ -52,6 +52,22 @@ use sled::Transactional;
 /// Sled key for the authoritative balance (a single u64, big-endian).
 const BALANCE_KEY: &[u8] = b"remaining_sats";
 
+/// The `proof` marker on a credit row that CREDITED the balance (the normal path).
+/// Distinguishes a genuine credit from the terminal-overflow marker below when a
+/// stored `credit_ledger` row is read back.
+const CREDIT_PROOF_MARKER: &[u8] = b"credit-verified";
+
+/// The `proof` marker on a TERMINAL settlement row written when a credit OVERFLOWED
+/// (finding-2). An overflow means the token was ALREADY redeemed into the wallet but
+/// the u64 add would wrap, so NOTHING was credited -- yet the charge must never reach
+/// the wallet again (drain-only discipline: a redeemed token is spent for good). This
+/// row is the durable terminal wall: it credits NOTHING (it is NOT a credit row) but
+/// `credit_lookup` surfaces it and `credit_verified`'s in-txn dedupe honours it, so a
+/// retry with a fresh token short-circuits to `CreditOutcome::Terminal` and never
+/// redeems again. It reuses the `PerformedRecord` shape (the only serde row type in
+/// this db) with this distinguishing proof marker and `cost_sats = 0`.
+const CREDIT_TERMINAL_OVERFLOW_MARKER: &[u8] = b"credit-terminal-overflow";
+
 /// Errors the treasury surfaces to the daemon. These are host-side faults
 /// (storage, encoding), never genome-driven outcomes: a genome that asks for
 /// too much gets a DENIED receipt, not an error.
@@ -224,12 +240,18 @@ impl Treasury {
     /// genome-supplied capability keys exactly as `lookup()` is blind to credit rows.
     ///
     /// This is the durable settled-charge query the settlement path consults BEFORE
-    /// touching the wallet/mint: if a `charge_id` already has a credit row, the
-    /// settlement was already applied, so the caller returns the prior outcome without
-    /// redeeming any (fresh or replayed) token. It reads the SAME rows
-    /// `credit_verified` writes, so it can never disagree with the durable credit wall.
-    /// A stored `Overflow`-only history leaves no row (credit_verified writes none on
-    /// overflow), so an overflowed charge is correctly seen as not-yet-credited here.
+    /// touching the wallet/mint: if a `charge_id` already has a row, the settlement was
+    /// already resolved, so the caller returns the prior outcome without redeeming any
+    /// (fresh or replayed) token. It reads the SAME rows `credit_verified` writes, so it
+    /// can never disagree with the durable wall.
+    ///
+    /// A row is either a genuine credit (`proof == CREDIT_PROOF_MARKER`) OR a TERMINAL
+    /// overflow marker (`proof == CREDIT_TERMINAL_OVERFLOW_MARKER`, finding-2): both mean
+    /// "do not touch the wallet for this charge again", but only the former credited
+    /// anything. The caller (`settle_charge`) inspects the proof marker to map the row to
+    /// `Duplicate` (credited) vs `Terminal` (settled-dead, credited nothing). Either way
+    /// an overflowed charge is now SURFACED here (it once left no row), so a retry with a
+    /// fresh token can no longer miss the lookup and redeem again.
     pub fn credit_lookup(&self, credit_id: &str) -> Result<Option<PerformedRecord>, TreasuryError> {
         match self.inner.credit_ledger.get(credit_id.as_bytes())? {
             Some(raw) => {
@@ -238,6 +260,20 @@ impl Treasury {
                 Ok(Some(rec))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Map a prior `credit_ledger` row (from `credit_lookup`) to the `CreditOutcome` a
+    /// settlement retry should return WITHOUT touching the wallet. A terminal-overflow
+    /// marker (finding-2) becomes `Terminal` (settled-dead, credited nothing); any other
+    /// row is a genuine credit, so `Duplicate` (credited already). The marker proof bytes
+    /// are private to this module, so this classification lives here rather than at the
+    /// gateway call site.
+    pub fn classify_prior(&self, prior: PerformedRecord) -> CreditOutcome {
+        if prior.proof == CREDIT_TERMINAL_OVERFLOW_MARKER {
+            CreditOutcome::Terminal(prior)
+        } else {
+            CreditOutcome::Duplicate(prior)
         }
     }
 
@@ -421,9 +457,15 @@ impl Treasury {
     /// Credit happens EXACTLY ONCE per `credit_id`.
     ///
     /// OVERFLOW: the add uses `checked_add`. An add that would overflow u64 is
-    /// REFUSED (`Overflow`, no mutation), never wrapped. u64::MAX sats is
+    /// REFUSED (`Overflow`, no BALANCE mutation), never wrapped. u64::MAX sats is
     /// unreachable in practice, but a credit must never silently wrap the balance
-    /// to a smaller value.
+    /// to a smaller value. Because the token was ALREADY redeemed by the time we run
+    /// (verify_settlement precedes us), an overflow ALSO writes a durable TERMINAL
+    /// marker row under this `credit_id` (finding-2): the charge is settled-dead. The
+    /// marker credits nothing (distinct proof marker, cost 0, no balance change) but
+    /// makes the charge visible to `credit_lookup` and this in-txn dedupe, so a retry
+    /// with a fresh token returns `Terminal` and NEVER redeems into the wallet again.
+    /// The first overflow returns `Overflow`; every retry returns `Terminal`.
     ///
     /// KEY NAMESPACE (structural, not by convention): credit rows live in their OWN
     /// sled tree (`credit_ledger`), SEPARATE from the debit `ledger` that holds the
@@ -447,11 +489,17 @@ impl Treasury {
             move |(balance, credit_ledger)| {
                 // Dedupe inside the transaction is the no-double-credit wall: a row
                 // already under this credit_id means this settlement was already
-                // credited (re-delivery or restart-mid-verify), so make NO balance
-                // change and return the stored record.
+                // resolved (re-delivery, restart-mid-verify, or a prior overflow), so
+                // make NO balance change and return the stored record. The row's proof
+                // marker distinguishes a genuine credit (`Duplicate`) from a terminal
+                // overflow marker (`Terminal`, finding-2) so a retry of an overflowed
+                // charge is never mistaken for a credited one.
                 if let Some(existing) = credit_ledger.get(&key_bytes)? {
                     let rec: PerformedRecord = serde_json::from_slice(&existing)
                         .map_err(|e| abort(format!("credit record: {e}")))?;
+                    if rec.proof == CREDIT_TERMINAL_OVERFLOW_MARKER {
+                        return Ok(CreditOutcome::Terminal(rec));
+                    }
                     return Ok(CreditOutcome::Duplicate(rec));
                 }
 
@@ -460,9 +508,27 @@ impl Treasury {
                     .ok_or_else(|| abort("balance key missing".into()))?;
                 let current = decode_u64_tx(&current_raw)?;
 
-                // Never wrap: an add that would overflow u64 is refused with no
-                // mutation, the mirror of the debit path's never-negative guard.
+                // Never wrap: an add that would overflow u64 is refused with no balance
+                // mutation, the mirror of the debit path's never-negative guard. But the
+                // token that drove this attempt is ALREADY redeemed (verify_settlement ran
+                // before us), so we write a DURABLE TERMINAL marker (finding-2): the charge
+                // is settled-dead. This is NOT a credit row (cost_sats=0, distinct proof
+                // marker, no balance change), so it credits nothing and the balance is
+                // untouched -- but `credit_lookup` and this dedupe now surface it, so a
+                // retry with a fresh token short-circuits and NEVER redeems again. The
+                // FIRST overflow returns `Overflow`; the row makes every RETRY `Terminal`.
                 let Some(next) = current.checked_add(amount_sats) else {
+                    let marker = PerformedRecord {
+                        cost_sats: 0,
+                        treasury_remaining_after: current,
+                        proof: CREDIT_TERMINAL_OVERFLOW_MARKER.to_vec(),
+                        completion: Vec::new(),
+                        memory: Vec::new(),
+                        request_hash: Vec::new(),
+                    };
+                    let marker_bytes = serde_json::to_vec(&marker)
+                        .map_err(|e| abort(format!("encode terminal-overflow marker: {e}")))?;
+                    credit_ledger.insert(key_bytes.as_slice(), marker_bytes)?;
                     return Ok(CreditOutcome::Overflow { remaining: current });
                 };
 
@@ -476,7 +542,7 @@ impl Treasury {
                 let rec = PerformedRecord {
                     cost_sats: 0,
                     treasury_remaining_after: next,
-                    proof: b"credit-verified".to_vec(),
+                    proof: CREDIT_PROOF_MARKER.to_vec(),
                     completion: Vec::new(),
                     memory: Vec::new(),
                     request_hash: Vec::new(),
@@ -566,16 +632,28 @@ pub enum DebitOutcome {
 
 /// The result of a `credit_verified` attempt. The mirror of `DebitOutcome`:
 /// `Credited` raised the balance, `Duplicate` is the no-double-credit no-op
-/// (this `credit_id` was already credited), and `Overflow` is the never-wrap
-/// refusal (an add that would exceed u64::MAX, with no mutation).
+/// (this `credit_id` was already credited), `Overflow` is the never-wrap
+/// refusal (an add that would exceed u64::MAX, with no mutation), and `Terminal`
+/// is the finding-2 dead-charge outcome (a prior attempt overflowed after redeeming
+/// a token, so this charge is settled-dead: no credit ever happened and none ever
+/// will, but the wallet must never be touched for it again).
 pub enum CreditOutcome {
     /// Credited successfully; the balance is now `remaining`.
     Credited { amount_sats: u64, remaining: u64 },
     /// This `credit_id` was already credited (re-delivered settlement or a
     /// restart mid-verify); no credit happened. Carries the stored record.
     Duplicate(PerformedRecord),
-    /// The credit would have overflowed u64; refused, no mutation.
+    /// The credit would have overflowed u64; refused, no mutation. On this outcome
+    /// `credit_verified` ALSO writes the durable terminal marker (finding-2), so the
+    /// FIRST overflow returns `Overflow` and any RETRY returns `Terminal`.
     Overflow { remaining: u64 },
+    /// This `charge_id` is settled-dead (finding-2): a prior settlement attempt
+    /// redeemed a token but the credit overflowed u64, so NOTHING was ever credited
+    /// and nothing ever will be -- yet the redeemed token is spent, so no future
+    /// attempt may reach the wallet. Distinct from `Duplicate` (which means a credit
+    /// DID happen): the caller/genome can tell "this charge is dead, nothing was
+    /// credited". Carries the stored terminal record. NEVER a credit (drain-only).
+    Terminal(PerformedRecord),
 }
 
 /// The result of a `reconcile_to_observed` sync. `Raised`/`Lowered` moved the balance to match

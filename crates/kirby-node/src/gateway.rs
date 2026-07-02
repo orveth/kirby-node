@@ -120,6 +120,20 @@ pub struct GatewayService {
     /// `None` for every other workload, where `IssueCharge` fails closed (debit 0,
     /// perform nothing). `Arc<dyn SettlementProvider>` keeps the service cheap to clone.
     settlement: Option<Arc<dyn SettlementProvider>>,
+    /// Per-`charge_id` settlement serialization (finding-1). `settle_charge`'s
+    /// lookup -> verify -> credit sequence is a check-then-act on the wallet: two
+    /// CONCURRENT settles for the SAME charge_id (two DISTINCT valid tokens) could BOTH
+    /// miss the `credit_lookup` and BOTH redeem into the wallet (a double WALLET
+    /// redemption -- the credit dedupe stops only the double CREDIT, not the double
+    /// redemption). This is a single-flight map: each `charge_id` maps to an
+    /// `Arc<tokio::Mutex<()>>`, and `settle_charge` holds that per-charge guard across the
+    /// WHOLE lookup -> verify -> credit sequence, re-running `credit_lookup` INSIDE the
+    /// lock, so exactly one settle per charge reaches the wallet at a time. tokio's Mutex
+    /// (not std's) is held across the `.await` on `verify_settlement` (house rule). The
+    /// outer `std::Mutex` guards only the map insert/remove -- it is NEVER held across an
+    /// await. Entries are removed when the last holder drops the guard (bounded memory);
+    /// see `settle_charge`. `Arc`-shared so the service stays cheap to clone.
+    settle_locks: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 /// The lease fence attached to a gateway (spec 4.3): the node's lease handle plus
@@ -171,6 +185,7 @@ impl GatewayService {
             inbox: None,
             allowlisted_inbound_kinds,
             settlement: None,
+            settle_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -971,34 +986,55 @@ impl GatewayService {
     /// `credit_verified` is idempotent on `charge_id` -- a double-settle attempt returns
     /// `CreditOutcome::Duplicate` with no double-credit.
     ///
-    /// ORDERING (money-MUST, finding-1 fix): settlement STATE is consulted FIRST, before
+    /// SERIALIZATION (money-MUST, finding-1 fix): the whole lookup -> verify -> credit
+    /// sequence is a check-then-act on the WALLET, so it is serialized PER `charge_id` by a
+    /// keyed async lock (`settle_locks`). Two CONCURRENT settles for the same `charge_id`
+    /// with two DISTINCT valid tokens would otherwise BOTH miss the `credit_lookup` and
+    /// BOTH redeem into the wallet -- a double WALLET redemption. `credit_verified`'s
+    /// in-txn dedupe stops only the double CREDIT, not the double redemption, so the second
+    /// token's sats would land in the wallet with no matching credit (a wallet/treasury
+    /// desync). Holding the per-charge guard across the whole sequence, and RE-RUNNING
+    /// `credit_lookup` INSIDE the lock, makes exactly one settle per charge reach the wallet
+    /// at a time; the loser sees the winner's durable row and short-circuits.
+    ///
+    /// ORDERING (money-MUST): settlement STATE is consulted FIRST (inside the lock), before
     /// any wallet/mint call. The treasury's `credit_ledger` (the same durable rows
     /// `credit_verified` writes) is the settled-charge record; `credit_lookup` reads it.
-    /// If a row already exists for this `charge_id`, the charge was ALREADY settled, so we
-    /// return `Duplicate` with the prior record and NEVER redeem the submitted token. This
+    /// If a row already exists for this `charge_id`, the charge was ALREADY resolved, so we
+    /// return the prior outcome and NEVER redeem the submitted token. A genuine-credit row
+    /// maps to `Duplicate`; a terminal-overflow marker (finding-2) maps to `Terminal`. This
     /// closes two holes in the old verify-then-dedupe order: (a) a same-token replay no
     /// longer hits the mint and errors -- it returns `Duplicate` cleanly; (b) a FRESH,
-    /// genuinely-valid token replayed against an already-settled charge is no longer
+    /// genuinely-valid token replayed against an already-resolved charge is no longer
     /// redeemed into the host wallet only to be dropped by the credit dedupe -- the wallet
     /// is never touched, so wallet funds cannot desync from the treasury.
     ///
-    /// Only the FIRST claimant (no prior credit row) proceeds to verify + credit.
+    /// Only the FIRST claimant (no prior row) proceeds to verify + credit.
     ///
-    /// CRASH WINDOWS (the retry path must never double-credit):
+    /// CRASH WINDOWS (the retry path must never double-credit or re-redeem):
     ///   - crash BEFORE `verify_settlement`: no wallet call happened, no row exists. A
     ///     retry re-runs from the top, verifies, credits once. Clean.
     ///   - crash AFTER `verify_settlement` (token redeemed into the wallet) but BEFORE
-    ///     `credit_verified`: the wallet holds the sats but NO credit row exists yet, so a
+    ///     `credit_verified`: the wallet holds the sats but NO row exists yet, so a
     ///     retry's `credit_lookup` misses and it re-enters verify_settlement. That retry
     ///     redeems a *different* token (the original token is now spent, so a same-token
     ///     retry fails at the mint and no credit occurs -- fail-closed); a genuine second
     ///     payment would be a NEW settlement. This is the one window where the treasury can
     ///     lag the wallet by one payment; it is bounded (single in-flight settle per
-    ///     charge) and never DOUBLE-credits, because the credit row, once written, is the
-    ///     durable wall for all subsequent retries.
+    ///     charge) and never DOUBLE-credits, because the row, once written, is the durable
+    ///     wall for all subsequent retries.
     ///   - crash AFTER `credit_verified` (row written + flushed) but before we return: a
-    ///     retry's `credit_lookup` HITS the row and returns `Duplicate` without touching
-    ///     the wallet. No double-credit. Clean.
+    ///     retry's `credit_lookup` HITS the row and returns `Duplicate`/`Terminal` without
+    ///     touching the wallet. No double-credit, no re-redemption. Clean.
+    ///
+    /// The `settle_locks` guard is a TOKIO Mutex held in-process only: it serializes
+    /// concurrent settles WITHIN one daemon process. It is NOT a durable lock, so a crash
+    /// while holding it releases everything (the map dies with the process) -- that is
+    /// fine, because the durable `credit_ledger` rows (written + flushed by
+    /// `credit_verified`) are the real cross-restart wall; the lock only closes the
+    /// same-process concurrent-redeem race the durable rows cannot (a token is redeemed
+    /// mid-flight, before any row exists). A crash mid-verify falls into the bounded window
+    /// above, unchanged by the lock.
     pub async fn settle_charge(
         &self,
         charge_id: &str,
@@ -1009,17 +1045,74 @@ impl GatewayService {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no settlement provider attached"))?;
 
-        // STATE FIRST (money-MUST): consult the durable settled-charge record BEFORE any
-        // wallet/mint call. An existing credit row means this charge already settled, so
-        // return the prior outcome and DO NOT redeem the submitted token (never touch the
-        // wallet). The original settlement already emitted its PAYMENT_SETTLED notice, so
-        // this replay emits NOTHING new.
+        // SERIALIZE per charge_id (finding-1): take (or create) the per-charge async lock,
+        // then hold its guard across the WHOLE lookup -> verify -> credit sequence so no
+        // two settles of the same charge_id can both redeem into the wallet. The outer
+        // std::Mutex guards only the map mutation and is dropped immediately (never held
+        // across the await below).
+        let charge_lock = {
+            let mut map = self
+                .settle_locks
+                .lock()
+                .expect("settle_locks mutex poisoned");
+            map.entry(charge_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = charge_lock.lock().await;
+
+        // Run the money-path under the guard, then clean up the map entry regardless of
+        // outcome. `settle_inner` never touches `settle_locks`, so the cleanup below is the
+        // sole remover -- no lock-ordering hazard.
+        let result = self
+            .settle_inner(settlement.as_ref(), charge_id, evidence)
+            .await;
+
+        // CLEANUP (bounded memory): drop this charge's map entry once no other waiter holds
+        // it. We still hold `_guard` (so `charge_lock` is one live Arc) and the map holds
+        // one more; a strong_count of exactly 2 means no OTHER settle is parked on this
+        // lock, so removing the entry cannot orphan a waiter. If a concurrent settle is
+        // waiting (count > 2), we leave the entry: that waiter will re-run the lookup, hit
+        // the durable row, short-circuit, and perform its own cleanup. This keeps the map
+        // from growing unbounded without ever dropping an entry a waiter still needs.
+        {
+            let mut map = self
+                .settle_locks
+                .lock()
+                .expect("settle_locks mutex poisoned");
+            if Arc::strong_count(&charge_lock) == 2 {
+                map.remove(charge_id);
+            }
+        }
+
+        result
+    }
+
+    /// The serialized body of `settle_charge`, run under the per-charge async guard. Split
+    /// out so the guard's scope and the map cleanup read cleanly; it assumes the caller
+    /// holds the `charge_id` guard, so its `credit_lookup` -> verify -> credit sequence is
+    /// exclusive for this charge_id.
+    async fn settle_inner(
+        &self,
+        settlement: &dyn SettlementProvider,
+        charge_id: &str,
+        evidence: &str,
+    ) -> anyhow::Result<CreditOutcome> {
+        // STATE FIRST (money-MUST): re-consult the durable settled-charge record INSIDE the
+        // lock, BEFORE any wallet/mint call. An existing row means this charge already
+        // resolved, so return the prior outcome and DO NOT redeem the submitted token (never
+        // touch the wallet). A genuine-credit row is a `Duplicate`; a terminal-overflow
+        // marker (finding-2) is `Terminal` -- the charge is settled-dead, nothing credited,
+        // and the wallet must not be touched again. The original settlement already emitted
+        // its PAYMENT_SETTLED notice (or none, for a terminal), so this path emits NOTHING.
         if let Some(prior) = self.treasury.credit_lookup(charge_id)? {
+            let outcome = self.treasury.classify_prior(prior);
             tracing::info!(
                 charge_id,
-                "settle_charge for an already-settled charge; returning Duplicate without touching the wallet"
+                terminal = matches!(outcome, CreditOutcome::Terminal(_)),
+                "settle_charge for an already-resolved charge; returning the prior outcome without touching the wallet"
             );
-            return Ok(CreditOutcome::Duplicate(prior));
+            return Ok(outcome);
         }
 
         // First claimant only past this point. verify_settlement calls the MINT and returns
@@ -1028,22 +1121,24 @@ impl GatewayService {
         let verified_sats = settlement.verify_settlement(charge_id, evidence).await?;
 
         // credit_verified is the sole sanctioned credit path (idempotent on charge_id). The
-        // in-txn dedupe here is the crash-safe backstop for a concurrent settle that raced
-        // past the credit_lookup above: it returns Duplicate with no double-credit.
+        // in-txn dedupe here is the crash-safe backstop for a settle that raced past the
+        // credit_lookup above: it returns Duplicate/Terminal with no double-credit. On
+        // overflow it also writes the durable terminal marker (finding-2).
         let outcome = self.treasury.credit_verified(charge_id, verified_sats)?;
 
         tracing::info!(
             charge_id,
             verified_sats,
             duplicate = matches!(outcome, CreditOutcome::Duplicate(_)),
+            terminal = matches!(outcome, CreditOutcome::Terminal(_)),
             "settlement verified and applied to treasury"
         );
 
         // Enqueue PAYMENT_SETTLED ONLY on a genuine credit (finding-2 fix): a Duplicate
-        // (concurrent race that lost) or an Overflow credited NOTHING, so emitting a
-        // settled notice would tell the genome money arrived when none did, and would carry
-        // this attempt's verified_sats rather than a credited amount. The notice carries the
-        // CREDITED amount, which for `Credited` equals verified_sats.
+        // (concurrent race that lost), an Overflow, or a Terminal credited NOTHING, so
+        // emitting a settled notice would tell the genome money arrived when none did, and
+        // would carry this attempt's verified_sats rather than a credited amount. The notice
+        // carries the CREDITED amount, which for `Credited` equals verified_sats.
         if let CreditOutcome::Credited { amount_sats, .. } = &outcome {
             if let Some(inbox) = &self.inbox {
                 let payload = PaymentSettled {
