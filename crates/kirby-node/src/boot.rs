@@ -188,7 +188,24 @@ pub struct ServeGuard {
     /// final "estate" flush via [`Self::flush_estate`] (rather than racing process exit through the
     /// detached drop task above). `None` when no cdk-wallet brain configured a flusher.
     nip60_flusher: Option<Arc<crate::rail::Nip60BackupFlusher>>,
+    /// Cut B (#115): the handles for a best-effort re-publish of the CURRENT kind:17375 counter
+    /// mirror at graceful teardown (via [`Self::flush_estate`], AFTER the proof flush). The boot
+    /// 17375 publish is a ONE-SHOT snapshot; this re-captures the counter mirror as it stands at
+    /// death (the shadow map has observed every increment this run) so a graceful death never leaves
+    /// the relay's counter floor behind the wallet's true derivation counter. Populated ONLY when
+    /// `[nip60]` is configured (the SAME opt-in gate as `nip60_flusher`); `None` for a bare /
+    /// non-nip60 host → no counter estate publish, unchanged behavior.
+    nip60_counter_estate: Option<Nip60CounterEstate>,
 }
+
+/// The handles a graceful teardown needs to re-publish the current kind:17375 counter mirror
+/// (Cut B, #115): the NIP-60 store to publish through, the counter decorator whose
+/// `keyset_counters()` is the current mirror, and the wallet's mint URL for the config's mint list.
+type Nip60CounterEstate = (
+    Arc<crate::nip60::Nip60Store>,
+    Arc<crate::nip60_counter::Nip60CounterDb>,
+    String,
+);
 
 impl ServeGuard {
     /// AWAIT one final NIP-60 backup "estate" flush at graceful teardown (#115 codex #3). Called by
@@ -211,6 +228,37 @@ impl ServeGuard {
                 tracing::debug!("NIP-60 estate flush at graceful teardown complete (awaited)");
             }
         }
+        // Cut B (#115): AFTER the proof flush, re-publish the CURRENT counter mirror (kind:17375).
+        // The boot publish is a one-shot; the shadow has since observed every increment this run, so
+        // this captures the true high-water counter at death — a graceful death then never leaves the
+        // relay's counter floor behind the wallet (which would let a same-seed reconstruct re-derive
+        // already-spent NUT-13 secrets). BEST-EFFORT + fail-soft (same posture as the proof flush): a
+        // publish error is logged, NEVER panics or blocks teardown. Ordered after the proof flush so
+        // the counter that ships reflects any last-interval mutation's proofs the flush just backed up.
+        //
+        // #125 BOUNDARY (freshness, NOT collision — do not delete/reorder this arm without reading):
+        // this estate publish covers GRACEFUL death (die-when-broke + the max_run ceiling); the next
+        // boot's publish covers reboot. What is NOT covered: counter advances lost to an ABRUPT death
+        // (panic / SIGKILL) after the last publish. That residual is SAFE because B1 (the union-max
+        // seed at open, mint_rig.rs) makes the published floor COMPLETE — so the lost advances are a
+        // CONTIGUOUS run of used counters ABOVE a present floor, never an omission-to-zero: a
+        // fresh-store NUT-13 restore scans forward through them (no unused gap to trip gap_limit) and
+        // the mint (NUT-07) rejects any re-issued secret → post-restore derivation FRICTION, never a
+        // double-spend / phantom / missed proof. Periodic + abrupt-death re-publish is deferred to
+        // #125 (aligned with #123's abrupt-death residual class).
+        if let Some((store, counter_db, mint_url)) = &self.nip60_counter_estate {
+            if let Err(e) = store
+                .publish_wallet_config(counter_db.keyset_counters(), vec![mint_url.clone()])
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "NIP-60 counter estate publish at graceful teardown failed (advisory; the mint remains truth and the next boot re-seeds the floor)"
+                );
+            } else {
+                tracing::debug!("NIP-60 counter estate publish at graceful teardown complete (awaited)");
+            }
+        }
     }
 
     /// TEST-ONLY: build a `ServeGuard` carrying just a NIP-60 flusher, so the estate-flush behavior
@@ -224,6 +272,23 @@ impl ServeGuard {
             _dm_shutdown: None,
             _nip60_shutdown: None,
             nip60_flusher: Some(nip60_flusher),
+            nip60_counter_estate: None,
+        }
+    }
+
+    /// TEST-ONLY (Cut B, #115): build a `ServeGuard` carrying ONLY the counter-estate bundle (no
+    /// proof flusher), so the graceful-teardown 17375 re-publish is exercisable WITHOUT booting a
+    /// VM. `flush_estate()` then publishes the given store's config from the counter decorator's
+    /// current mirror. RED-on-revert target for T5.
+    #[cfg(test)]
+    pub(crate) fn for_counter_estate_test(estate: Nip60CounterEstate) -> Self {
+        let noop = tokio::spawn(async {});
+        ServeGuard {
+            handle: noop.abort_handle(),
+            _dm_shutdown: None,
+            _nip60_shutdown: None,
+            nip60_flusher: None,
+            nip60_counter_estate: Some(estate),
         }
     }
 }
@@ -315,11 +380,13 @@ pub async fn boot_and_observe(
         // real Routstr node, paid from the treasury.
         Some(brain) if brain.backend == BrainBackendKind::Routstr => {
             let treasury_remaining = peek_treasury_remaining(&config).await?;
-            let (brain_backend, nip60_flusher) =
+            let (brain_backend, nip60_flusher, nip60_counter_estate) =
                 build_routstr_brain(brain, treasury_remaining, &config.nip60, &config.fleet_relay)
                     .await?;
-            // Carry the Cut A (#115) backup flusher (if NIP-60 is configured) into the run so a
-            // graceful shutdown fires ONE final snapshot flush (via the ServeGuard drop, below).
+            // Carry the Cut A (#115) backup flusher AND the Cut B counter-estate bundle (both `Some`
+            // only when NIP-60 is configured) into the run so a graceful shutdown fires ONE final
+            // proof-snapshot flush AND re-publishes the current 17375 counter mirror (both via the
+            // ServeGuard's awaited `flush_estate`, below).
             return boot_and_observe_with_rail(
                 config,
                 Arc::new(attach_actuator(
@@ -327,6 +394,7 @@ pub async fn boot_and_observe(
                     actuator,
                 )),
                 nip60_flusher,
+                nip60_counter_estate,
             )
             .await;
         }
@@ -396,9 +464,10 @@ pub async fn boot_and_observe(
             Arc::new(MockRail::new())
         }
     };
-    // The non-Routstr arms configure no NIP-60 backup flusher (only the real cdk-wallet brain has
-    // a wallet to back up); the Routstr arm returns early above with its flusher.
-    boot_and_observe_with_rail(config, rail, None).await
+    // The non-Routstr arms configure no NIP-60 backup flusher NOR counter estate (only the real
+    // cdk-wallet brain has a wallet + counter mirror to back up); the Routstr arm returns early above
+    // carrying both.
+    boot_and_observe_with_rail(config, rail, None, None).await
 }
 
 /// Attach an optional outward [`Actuator`] to a [`CompositeRail`] (the agent's voice), returning
@@ -644,7 +713,14 @@ async fn build_routstr_brain(
     treasury_remaining: u64,
     nip60: &crate::config::Nip60Config,
     fleet_relay: &str,
-) -> anyhow::Result<(Arc<dyn BrainBackend>, Option<Arc<crate::rail::Nip60BackupFlusher>>)> {
+) -> anyhow::Result<(
+    Arc<dyn BrainBackend>,
+    Option<Arc<crate::rail::Nip60BackupFlusher>>,
+    // Cut B (#115): the counter-estate bundle for the graceful-teardown 17375 re-publish
+    // (store + counter decorator + mint url). `Some` exactly when `[nip60]` is configured; threaded
+    // into the ServeGuard so `flush_estate` re-publishes the current counter mirror at death.
+    Option<Nip60CounterEstate>,
+)> {
     let db_path = Path::new(&brain.wallet_db_path);
     // Resolve the wallet spend seed ONCE through the WalletKey seam (interim: the byte-identical
     // sibling `<db_path>.seed` keyfile, load-or-create 0600, per-agent; the reconstruct-on-lease
@@ -803,7 +879,13 @@ async fn build_routstr_brain(
                 (Arc::new(routstr), None)
             }
         };
-    Ok((backend, flusher))
+    // Cut B (#115): the counter-estate bundle for the graceful-teardown 17375 re-publish, built
+    // ONLY when NIP-60 is configured (same gate as the flusher). `counter_db` is the SAME decorator
+    // the wallet writes through, so its `keyset_counters()` at death is the live high-water mirror.
+    let counter_estate = nip60_store
+        .as_ref()
+        .map(|store| (store.clone(), counter_db.clone(), brain.mint_url.clone()));
+    Ok((backend, flusher, counter_estate))
 }
 
 /// Build the [`RoutstrKeyBrain`] backend for `backend = "routstr_key"` (the prepaid,
@@ -934,6 +1016,11 @@ pub async fn boot_and_observe_with_rail(
     // drop below). `None` for every non-wallet path (nothing to back up). Only `boot_and_observe`'s
     // Routstr arm passes `Some`.
     nip60_flusher: Option<Arc<crate::rail::Nip60BackupFlusher>>,
+    // The Cut B (#115) counter-estate bundle (store + counter decorator + mint url), `Some` on the
+    // same NIP-60-configured Routstr path as `nip60_flusher`. Carried into the ServeGuard so the
+    // awaited `flush_estate` re-publishes the CURRENT 17375 counter mirror at graceful death. `None`
+    // for every other path → no counter estate publish, unchanged behavior.
+    nip60_counter_estate: Option<Nip60CounterEstate>,
 ) -> anyhow::Result<(Box<dyn SandboxInstance>, BootOutcome, Treasury, EventStream, ServeGuard)> {
     // The persisted, daemon-owned treasury (D-9). A per-node temp store keeps two
     // node processes distinct on one host. The session is the non-secret snapshot
@@ -1196,6 +1283,9 @@ pub async fn boot_and_observe_with_rail(
         // Held for the AWAITED graceful estate flush (codex #3). `nip60_shutdown` above already
         // consumed a clone into the abrupt-death fallback task; this keeps the original `Option`.
         nip60_flusher,
+        // Cut B (#115): the current-counter-mirror re-publish at graceful death, awaited inside the
+        // SAME `flush_estate` after the proof flush.
+        nip60_counter_estate,
     };
 
     // Wait for the genome's boot hello event (session=<task>). This is the G1

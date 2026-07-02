@@ -137,25 +137,47 @@ pub async fn open_persistent_wallet(
     }
 
     // The PERSISTENT (file) cdk-sqlite store — `WalletSqliteDatabase::new(path)` opens a
-    // file db (memory::empty passes ":memory:"); a file path persists the proofs.
+    // file db (memory::empty passes ":memory:"); a file path persists the proofs. On return the
+    // `keyset_counter` table exists + is committed (cdk runs its migrations in `new`), so the
+    // second-connection read below sees the live schema.
     let localstore = cdk_sqlite::wallet::WalletSqliteDatabase::new(db_path.to_path_buf())
         .await
         .map_err(|e| anyhow::anyhow!("open persistent wallet store {}: {e}", db_path.display()))?;
 
+    // COMPLETENESS (#115 Cut B): read EVERY local NUT-13 counter straight from the on-disk
+    // `keyset_counter` table. `initial_counters` (the 17375 FLOOR) only names keysets the relay has
+    // seen; a keyset with a live LOCAL counter that is absent from the floor and untouched this
+    // session would otherwise be OMITTED from the publish-mirror (and, if local > floor, published
+    // STALE) — a self-perpetuating gap across boots that re-collides a same-seed fresh-store
+    // re-derivation. `localstore` is STILL ALIVE here (moved into the decorator below), so this opens
+    // a SECOND connection to the same live WAL db — intentional, and it mirrors production (the
+    // background flusher + gateway share the store the same way). Fail-safe: an empty map on any
+    // error == today's floor-only behavior (the floor still applies).
+    let local_map = read_local_keyset_counters(db_path);
+
+    // Seed the mirror with the UNION-MAX of the loaded floor and the local counters: for every
+    // keyset in EITHER set, take the higher of the two. This makes the publish-mirror COMPLETE (no
+    // local-only keyset omitted) and NON-REGRESSING (never below the relay floor NOR below the local
+    // counter). max() also makes a stale local read harmless (the floor wins) and a stale floor
+    // harmless (the local counter wins).
+    let merged = union_max_counters(&initial_counters, &local_map);
+
     // Mirror the NUT-13 keyset counter through the NIP-60 decorator so it can travel in the
-    // 17375 wallet-config for a cross-machine reconstruct. `initial_counters` is the counter
-    // FLOOR loaded from the relay's 17375 head (empty on a fresh / non-reconstruct boot, where
-    // this is byte-identical to the plain store): the mirror is SEEDED with it so a later publish
-    // can never regress the counter below what the relay already recorded (the no-regress
-    // MONEY-MUST). The returned handle exposes `keyset_counters()` for the publisher.
+    // 17375 wallet-config for a cross-machine reconstruct. The mirror is SEEDED with `merged` (floor
+    // ∪ local, max per keyset) so a later publish can never regress the counter below what the relay
+    // OR the local store recorded (the no-regress + completeness MONEY-MUST). The returned handle
+    // exposes `keyset_counters()` for the publisher.
     let counter_db = Arc::new(crate::nip60_counter::Nip60CounterDb::with_counters(
         Arc::new(localstore),
-        initial_counters,
+        merged,
     ));
     // Fast-forward the INNER NUT-13 derivation counter to the seeded floor BEFORE the wallet
     // derives anything, so a fresh-store reconstruct never re-issues an already-used secret (the
-    // shadow seed alone fixes only the PUBLISH mirror, not what cdk derives from). No-op on a
-    // fresh / non-reconstruct boot (empty floor).
+    // shadow seed alone fixes only the PUBLISH mirror, not what cdk derives from). It now lifts the
+    // inner counter for the COMPLETE merged set (floor ∪ local); for a local-only keyset the merged
+    // value equals the inner counter already, so that arm is a no-op (never a spurious burn) — its
+    // purpose is a complete + non-regressing SHADOW for the publish, not to advance local keysets.
+    // No-op on a fresh / non-reconstruct boot (empty floor + empty local table).
     counter_db
         .fast_forward_inner_to_floor()
         .await
@@ -164,6 +186,127 @@ pub async fn open_persistent_wallet(
     let wallet = Wallet::new(mint_url, CurrencyUnit::Sat, counter_db.clone(), seed, None)
         .map_err(|e| anyhow::anyhow!("build persistent cdk wallet against {mint_url}: {e}"))?;
     Ok((Arc::new(wallet), counter_db))
+}
+
+/// The UNION-MAX merge of two keyset-counter maps: for every keyset present in EITHER `floor` (the
+/// 17375 relay floor) or `local` (the on-disk store's live counters), the result holds the HIGHER of
+/// the two values (a keyset absent from one side counts as 0 there). This is the completeness +
+/// no-regress seed for the publish-mirror (#115 Cut B): a local-only keyset is carried at its local
+/// value (completeness), and neither a stale floor nor a stale local read can pull a counter DOWN
+/// (max). Pure + total; unit-tested by the mint_rig teeth.
+fn union_max_counters(
+    floor: &HashMap<Id, u32>,
+    local: &HashMap<Id, u32>,
+) -> HashMap<Id, u32> {
+    let mut merged = floor.clone();
+    for (id, &local_c) in local {
+        let entry = merged.entry(*id).or_insert(0);
+        *entry = (*entry).max(local_c);
+    }
+    merged
+}
+
+/// Read EVERY local NUT-13 keyset counter directly from the cdk-sqlite wallet store at `db_path`.
+///
+/// WHY A DIRECT READ: the cdk-0.17.1 `WalletDatabase` trait exposes NO bulk enumeration of counters
+/// — only `increment_keyset_counter(&Id, u32)` (a read is an increment-by-0, which needs the keyset
+/// id up front) — and the concrete `WalletSqliteDatabase` (`SQLWalletDatabase<SqliteConnectionManager>`)
+/// exposes no pool/path accessor. So the on-disk table is the ONLY complete, unit-agnostic source of
+/// the local counters, which #115 Cut B needs to make the 17375 publish-mirror COMPLETE (the shadow
+/// map alone omits any keyset absent from the loaded floor + untouched this session).
+///
+/// SCHEMA COUPLING (cdk 0.17.1, migration `20251111000000_keyset_counter_table.sql` in
+/// `cdk-sql-common`): the counters live in a flat, unencrypted table
+/// `keyset_counter(keyset_id TEXT PRIMARY KEY, counter INTEGER NOT NULL DEFAULT 0)`, where
+/// `keyset_id` is exactly `Id::to_string()` (canonical hex; `Id::from_str` reverses it). kirby opens
+/// the store single-arg (`WalletSqliteDatabase::new(db_path)`, no password) so the db is NOT
+/// sqlcipher-encrypted and a plain rusqlite connection reads it. The `T4` schema-guard tooth
+/// exercises this SELECT against a REAL `WalletSqliteDatabase`, so a future cdk that renames the
+/// table/columns turns this SELECT into an error → an empty map → the tooth's `{K1,K2}` expectation
+/// fails LOUDLY (drift caught, not silently swallowed).
+///
+/// FLAG CHOICE: we open READ-ONLY (`SQLITE_OPEN_READ_ONLY`) — we only SELECT, and read-only makes the
+/// intent explicit + cannot mutate the live store the wallet still owns. If a read-only open fails
+/// (e.g. a `-wal`/`-shm` sidecar the SQLITE_OPEN_READ_ONLY path will not create), we retry with the
+/// DEFAULT read-write flags. That retry is safe here: nothing writes during this open window (the
+/// read happens synchronously at boot, before the wallet derives anything), so we still only SELECT;
+/// the read-write flags merely let sqlite materialize the WAL sidecar it needs to see committed data.
+///
+/// T6 FAIL-SAFE: on ANY error (open failure, missing table, unparseable keyset id) this WARNs and
+/// returns an EMPTY map — NEVER panics, NEVER propagates an error that could fail boot. An empty map
+/// degrades to today's floor-only seeding (the 17375 floor still applies), so completeness is a
+/// best-effort ADDITION that can only ever match-or-beat the prior behavior.
+fn read_local_keyset_counters(db_path: &Path) -> HashMap<Id, u32> {
+    use rusqlite::OpenFlags;
+    use std::str::FromStr as _;
+
+    // Open read-only first; fall back to read-write on failure (see the FLAG CHOICE note). A closure
+    // so both attempts share one body and any error lands in the single fail-safe below.
+    let open = || -> rusqlite::Result<rusqlite::Connection> {
+        rusqlite::Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .or_else(|_| rusqlite::Connection::open(db_path))
+    };
+
+    let read = || -> rusqlite::Result<HashMap<Id, u32>> {
+        let conn = open()?;
+        let mut stmt = conn.prepare("SELECT keyset_id, counter FROM keyset_counter")?;
+        let rows = stmt.query_map([], |row| {
+            let keyset_id: String = row.get(0)?;
+            let counter: i64 = row.get(1)?;
+            Ok((keyset_id, counter))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (keyset_hex, counter) = row?;
+            // Parse the hex id back to a cdk `Id`; a non-parseable id (only possible from a foreign
+            // writer / corruption — cdk always stores `Id::to_string()`) drops THAT keyset with a
+            // warn rather than failing the whole read (the floor still covers it).
+            // Validate BOTH the id parse and the u32 range before inserting; a bad row (only possible
+            // from a foreign writer / corruption — cdk always stores `Id::to_string()` and a u32
+            // counter) is SKIPPED with a warn, never inserted, never a panic. SKIPPING (not clamping)
+            // is the fail-safe direction: the 17375 floor still covers that keyset, and we never seed
+            // an INFLATED counter that `fast_forward_inner_to_floor` would then burn a huge derivation
+            // range to reach (clamping a corrupt value UP to u32::MAX would do exactly that).
+            let id = match Id::from_str(&keyset_hex) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        keyset_hex = %keyset_hex,
+                        error = %e,
+                        "NIP-60 counter read: skipping a local keyset_counter row with an unparseable keyset id (corruption)"
+                    );
+                    continue;
+                }
+            };
+            let counter = match u32::try_from(counter) {
+                Ok(c) => c,
+                Err(_) => {
+                    tracing::warn!(
+                        keyset_hex = %keyset_hex,
+                        counter,
+                        "NIP-60 counter read: skipping a keyset_counter row whose counter is out of u32 range (corruption); the 17375 floor still covers it"
+                    );
+                    continue;
+                }
+            };
+            map.insert(id, counter);
+        }
+        Ok(map)
+    };
+
+    match read() {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %e,
+                "NIP-60 counter read: could not read the local keyset_counter table; \
+                 seeding the mirror from the 17375 floor only (fail-safe — completeness is skipped, \
+                 no regression vs the prior floor-only behavior)"
+            );
+            HashMap::new()
+        }
+    }
 }
 
 /// Load the 64-byte wallet seed from `seed_path`, or generate-and-persist a fresh one
@@ -217,4 +360,226 @@ fn load_or_create_wallet_seed(seed_path: &Path) -> anyhow::Result<[u8; 64]> {
             .map_err(|e| anyhow::anyhow!("set 0600 on {}: {e}", seed_path.display()))?;
     }
     Ok(seed)
+}
+
+#[cfg(test)]
+mod tests {
+    //! #115 Cut B teeth: the 17375 counter-mirror COMPLETENESS + no-regress at wallet open.
+    //!
+    //! T1/T2/T3 exercise the REAL `open_persistent_wallet` seed path (create a persistent
+    //! `WalletSqliteDatabase`, write local counters, drop it, then reopen through
+    //! `open_persistent_wallet` with a floor and assert the resulting mirror). Reverting the
+    //! union-max merge to floor-only seeding makes T1/T2 RED. T4 is the schema-guard against a real
+    //! `WalletSqliteDatabase`; T6 is the fail-safe.
+
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    /// A unique temp path per call (pid + a process-global counter), removed on drop. Mirrors the
+    /// nip60 `mint_fixture::TempDir` idiom (no `tempfile` direct dep); unique so parallel tests never
+    /// collide on the same sqlite file.
+    struct TempDir {
+        path: PathBuf,
+    }
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::SeqCst);
+            let path =
+                std::env::temp_dir().join(format!("kirby-cutb-{tag}-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            TempDir { path }
+        }
+        /// The wallet sqlite file inside this temp dir.
+        fn db_path(&self) -> PathBuf {
+            self.path.join("wallet.sqlite")
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn kid(hex: &str) -> Id {
+        hex.parse().expect("valid keyset id")
+    }
+
+    /// Create a REAL persistent cdk-sqlite wallet store at `db_path`, write each `(keyset, counter)`
+    /// via `increment_keyset_counter` (cdk's only counter mutator; from a 0 base a single increment
+    /// sets the value), then DROP the store so the file is closed. This is the on-disk local state a
+    /// subsequent open reads back.
+    async fn seed_local_store(db_path: &Path, counters: &[(Id, u32)]) {
+        use cdk::cdk_database::WalletDatabase as _;
+        let store = cdk_sqlite::wallet::WalletSqliteDatabase::new(db_path.to_path_buf())
+            .await
+            .expect("open real persistent wallet store");
+        for (id, c) in counters {
+            store
+                .increment_keyset_counter(id, *c)
+                .await
+                .expect("increment local keyset counter");
+        }
+        // Drop closes the connection/pool so the reopen below is a clean second open.
+        drop(store);
+    }
+
+    /// A throwaway 64-byte seed for `open_persistent_wallet` (the seed is spend authority but these
+    /// teeth assert only on the counter mirror, never spend).
+    fn test_seed() -> [u8; 64] {
+        [7u8; 64]
+    }
+
+    // ---- T1 COMPLETENESS: a local-only keyset (absent from the floor) is in the mirror. ----------
+    // RED-on-revert: seed floor-only (drop the union-max merge) → K is absent from the mirror → the
+    // `Some(100)` assert fails.
+    #[tokio::test]
+    async fn t1_local_only_keyset_absent_from_floor_is_in_the_mirror() {
+        let tmp = TempDir::new("t1");
+        let db_path = tmp.db_path();
+        let k_local = kid("009a1f293253e41e");
+        // Local store has K at 100; the floor (17375) does NOT mention K.
+        seed_local_store(&db_path, &[(k_local, 100)]).await;
+        let floor: HashMap<Id, u32> = HashMap::new();
+
+        let (_wallet, counter_db) =
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor)
+                .await
+                .expect("open persistent wallet");
+
+        assert_eq!(
+            counter_db.keyset_counters().get(&k_local).copied(),
+            Some(100),
+            "COMPLETENESS: a local-only keyset (absent from the floor) must be carried into the \
+             publish-mirror at its local value (revert union-max → floor-only → this is None)"
+        );
+    }
+
+    // ---- T2 NO-REGRESS: local=100 > floor=50 → mirror holds 100, not the stale floor. ------------
+    // RED-on-revert: floor-only seeding → the mirror holds 50 → the `Some(100)` assert fails.
+    #[tokio::test]
+    async fn t2_local_higher_than_floor_is_not_regressed_to_the_floor() {
+        let tmp = TempDir::new("t2");
+        let db_path = tmp.db_path();
+        let k = kid("009a1f293253e41e");
+        seed_local_store(&db_path, &[(k, 100)]).await;
+        let floor = HashMap::from([(k, 50u32)]);
+
+        let (_wallet, counter_db) =
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor)
+                .await
+                .expect("open persistent wallet");
+
+        assert_eq!(
+            counter_db.keyset_counters().get(&k).copied(),
+            Some(100),
+            "NO-REGRESS: union-max keeps the higher local counter (100), never the stale floor (50) \
+             (revert union-max → floor-only → this is 50)"
+        );
+    }
+
+    // ---- T3 INNER NO-REGRESS / NO SPURIOUS BURN: fast-forward does not advance a local-only keyset.
+    // For a local-only keyset (local=100, absent from floor) the merged seed == the inner counter, so
+    // the fast-forward's lift arm is a no-op: reading the inner counter (increment by 0) after open is
+    // still exactly 100 — the union-max seeding never burns a derivation index.
+    #[tokio::test]
+    async fn t3_local_only_keyset_inner_counter_is_not_advanced_past_its_value() {
+        use cdk::cdk_database::WalletDatabase as _;
+        let tmp = TempDir::new("t3");
+        let db_path = tmp.db_path();
+        let k = kid("009a1f293253e41e");
+        seed_local_store(&db_path, &[(k, 100)]).await;
+        let floor: HashMap<Id, u32> = HashMap::new();
+
+        let (_wallet, counter_db) =
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor)
+                .await
+                .expect("open persistent wallet");
+
+        // A no-op read (increment by 0) of the INNER derivation counter must be EXACTLY 100 — not
+        // advanced. A spurious lift would derive swap outputs beyond used indices (waste) or, worse,
+        // any regression would re-derive spent secrets; union-max seeding does neither.
+        let inner_now = counter_db
+            .increment_keyset_counter(&k, 0)
+            .await
+            .expect("read inner counter");
+        assert_eq!(
+            inner_now, 100,
+            "the INNER counter for a local-only keyset stays at its local value (100) — fast-forward \
+             is a no-op there, never a spurious burn"
+        );
+    }
+
+    // ---- T4 SCHEMA GUARD: read_local_keyset_counters matches cdk-sqlite's real on-disk schema. ----
+    // Writing KNOWN counters first makes "empty" unambiguously a DRIFT (a renamed table/column errors
+    // the SELECT → fail-safe empty → this exact-match assert fails loudly), not merely "no data".
+    #[tokio::test]
+    async fn t4_read_local_keyset_counters_matches_real_cdk_sqlite_schema() {
+        use cdk::cdk_database::WalletDatabase as _;
+        let tmp = TempDir::new("t4");
+        let db_path = tmp.db_path();
+        let k1 = kid("009a1f293253e41e");
+        let k2 = kid("00ad268c4d1f5826");
+
+        // Create a REAL WalletSqliteDatabase, write known counters, and KEEP it alive/in scope so the
+        // read below is a genuine concurrent SECOND connection to the live WAL db.
+        let store = cdk_sqlite::wallet::WalletSqliteDatabase::new(db_path.to_path_buf())
+            .await
+            .expect("open real persistent wallet store");
+        store.increment_keyset_counter(&k1, 7).await.expect("k1");
+        store.increment_keyset_counter(&k2, 3).await.expect("k2");
+
+        let read = read_local_keyset_counters(&db_path);
+
+        assert_eq!(
+            read,
+            HashMap::from([(k1, 7u32), (k2, 3u32)]),
+            "the SELECT reads EXACTLY cdk's keyset_counter rows over a concurrent second connection; \
+             an empty/wrong map here means the on-disk schema drifted from the hard-coded SELECT"
+        );
+        drop(store);
+    }
+
+    // ---- T6 FAIL-SAFE: any read error → empty map, never a panic. ---------------------------------
+    #[tokio::test]
+    async fn t6_read_local_keyset_counters_is_fail_safe_on_missing_db_and_missing_table() {
+        // (a) A path with no db file at all → empty, no panic.
+        let tmp = TempDir::new("t6a");
+        let missing = tmp.db_path();
+        assert!(!missing.exists(), "precondition: no db file yet");
+        assert!(
+            read_local_keyset_counters(&missing).is_empty(),
+            "a nonexistent db path yields an empty map (fail-safe), not a panic"
+        );
+
+        // (b) A real sqlite file that LACKS the keyset_counter table → the SELECT errors → empty.
+        let tmp2 = TempDir::new("t6b");
+        let no_table = tmp2.db_path();
+        {
+            let conn = rusqlite::Connection::open(&no_table).expect("create bare sqlite db");
+            conn.execute_batch("CREATE TABLE unrelated (x INTEGER);")
+                .expect("make a table-less-of-keyset_counter db");
+        }
+        assert!(
+            read_local_keyset_counters(&no_table).is_empty(),
+            "a db missing the keyset_counter table yields an empty map (fail-safe), not a panic"
+        );
+    }
+
+    // ---- union_max_counters unit coverage (the pure merge under T1/T2). --------------------------
+    #[test]
+    fn union_max_takes_the_higher_over_the_union_of_keys() {
+        let a = kid("009a1f293253e41e");
+        let b = kid("00ad268c4d1f5826");
+        let c = kid("00c0ffee00c0ffee");
+        let floor = HashMap::from([(a, 50u32), (b, 200u32)]);
+        let local = HashMap::from([(a, 100u32), (c, 9u32)]);
+        let merged = union_max_counters(&floor, &local);
+        assert_eq!(merged.get(&a).copied(), Some(100), "a: max(50,100)=100 (local wins)");
+        assert_eq!(merged.get(&b).copied(), Some(200), "b: floor-only key carried (200)");
+        assert_eq!(merged.get(&c).copied(), Some(9), "c: local-only key carried (9)");
+        assert_eq!(merged.len(), 3, "the union of both key sets");
+    }
 }

@@ -2646,6 +2646,7 @@ dependencies = [
  "prost 0.13.5",
  "rand 0.9.4",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
