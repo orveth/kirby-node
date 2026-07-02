@@ -3272,7 +3272,7 @@ mod dm_actuator_tests {
 // MONEY-MUST: `verify_settlement` MUST return the MINT-VERIFIED amount (the sats
 // the mint reports as received), NEVER the genome's requested amount or the
 // IssueCharge.amount_sats. The gateway wires the return value DIRECTLY into
-// `credit_verified` — no re-interpretation, no re-cap.
+// `credit_verified` -- no re-interpretation, no re-cap.
 
 /// Data returned by `SettlementProvider::issue`, threaded into the proto `ChargeIssued`.
 pub struct ChargeIssuedData {
@@ -3295,7 +3295,7 @@ pub trait SettlementProvider: Send + Sync {
     async fn issue(&self, amount_sats: u64, memo: &str) -> anyhow::Result<ChargeIssuedData>;
 
     /// Verify that `evidence` (a cashu token or bolt11 preimage) settles `charge_id`.
-    /// Returns the MINT-VERIFIED sats — what the mint actually credited, NOT what was
+    /// Returns the MINT-VERIFIED sats -- what the mint actually credited, NOT what was
     /// requested. The gateway passes this value directly to `treasury.credit_verified`.
     async fn verify_settlement(&self, charge_id: &str, evidence: &str) -> anyhow::Result<u64>;
 }
@@ -3326,7 +3326,7 @@ impl SettlementProvider for CashuSettlement {
 
     async fn verify_settlement(&self, _charge_id: &str, evidence: &str) -> anyhow::Result<u64> {
         // wallet.receive calls the mint to verify the token and credit the wallet.
-        // The Amount it returns IS what the mint verified — NEVER the claimed amount.
+        // The Amount it returns IS what the mint verified -- NEVER the claimed amount.
         // This is the ONLY acceptable source of sats for credit_verified (money-MUST).
         let amount = self
             .wallet
