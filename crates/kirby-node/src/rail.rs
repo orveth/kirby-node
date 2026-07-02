@@ -1696,6 +1696,345 @@ impl EcashProvider for CdkEcash {
     }
 }
 
+// ============================================================================
+// NIP-60 backup write-half (Cut A, #115): keep the relay-backed proof snapshot
+// current AFTER each spend-path wallet mutation — WITHOUT ever blocking or
+// corrupting a spend.
+// ============================================================================
+
+/// The tiny state the [`Nip60BackedEcash`] decorator and its [`Nip60BackupFlusher`] SHARE
+/// (behind one `Arc<Mutex<_>>`): the ids of the token events currently LIVE on the relay set
+/// (the next rollover's del-chain), plus a `dirty` flag the hot path flips on any successful
+/// mutation. The flusher clears/re-sets `dirty` under the same lock; see the dirty protocol on
+/// [`Nip60BackupFlusher::flush`].
+struct BackupState {
+    /// The kind:7375 token-event ids currently live on the relay set. A flush's rollover
+    /// SUPERSEDES exactly these (its del-chain), then records the ONE new event id here.
+    live_ids: Vec<String>,
+    /// Set by the decorator on ANY successful spend-path mutation; consumed by the flusher.
+    /// The ONLY thing the money hot path touches (a cheap lock, no await, no network).
+    dirty: bool,
+}
+
+/// A transparent [`EcashProvider`] decorator that marks the shared [`BackupState`] DIRTY after
+/// each successful wallet mutation, so a background [`Nip60BackupFlusher`] can publish a fresh
+/// NIP-60 proof snapshot to the relay set. It slots in wherever a bare [`CdkEcash`] would (both
+/// impl [`EcashProvider`], and [`RoutstrBrain`] is generic over the seam).
+///
+/// ⚠️ MONEY-MUST: the inner cdk wallet mutation is the TRUTH and is durable BEFORE this decorator
+/// runs; the backup is PORTABILITY-ONLY and strictly downstream. The hot path here does NOTHING
+/// but flip a `bool` under a std `Mutex` on `Ok` (no await held while locked, no network) — a
+/// backup publish can NEVER block or fail a spend. If a mutation returns `Err`, `dirty` is left
+/// untouched (nothing changed to back up).
+pub struct Nip60BackedEcash<E: EcashProvider> {
+    inner: E,
+    state: Arc<Mutex<BackupState>>,
+}
+
+impl<E: EcashProvider> Nip60BackedEcash<E> {
+    /// Build the decorator + its flusher SHARING one [`BackupState`] (seeded with `initial_live_ids`
+    /// — the ids of every token event the boot reconcile already saw, so the first flush's rollover
+    /// del-chains them into one clean new snapshot; superseding an already-dead event is a harmless
+    /// no-op). Returns both: the decorator wraps the `CdkEcash` (pass it to [`RoutstrBrain::new`]),
+    /// and the `Arc<Nip60BackupFlusher>` is `spawn_periodic`'d AND kept for a final shutdown flush.
+    pub fn with_flusher(
+        inner: E,
+        wallet: Arc<cdk::Wallet>,
+        store: Arc<crate::nip60::Nip60Store>,
+        mint_url: String,
+        unit: String,
+        initial_live_ids: Vec<String>,
+    ) -> (Self, Arc<Nip60BackupFlusher>) {
+        // Seed dirty=true so the FIRST tick republishes a single clean snapshot that del-chains
+        // the reconcile's scattered events (harmless if there was nothing to consolidate).
+        let state = Arc::new(Mutex::new(BackupState {
+            live_ids: initial_live_ids,
+            dirty: true,
+        }));
+        let decorator = Nip60BackedEcash {
+            inner,
+            state: state.clone(),
+        };
+        let flusher = Arc::new(Nip60BackupFlusher {
+            wallet,
+            store,
+            mint_url,
+            unit,
+            state,
+            flush_lock: tokio::sync::Mutex::new(()),
+        });
+        (decorator, flusher)
+    }
+
+    /// Flip the shared `dirty` flag on a successful mutation. A CHEAP lock: no await is held while
+    /// locked and no network happens here — the actual relay publish is the flusher's job.
+    fn mark_dirty(&self) {
+        // A poisoned lock would only mean a flusher panicked mid-critical-section (it never holds
+        // the lock across await, so this is not expected); recover the guard rather than panic on
+        // the money hot path — worst case the flag is set on a poisoned-but-consistent state.
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.dirty = true;
+    }
+}
+
+#[async_trait::async_trait]
+impl<E: EcashProvider> EcashProvider for Nip60BackedEcash<E> {
+    async fn mint_send_token(&self, amount_sats: u64) -> anyhow::Result<SendHandle> {
+        // The spend is the truth: run it, and only on Ok mark the backup dirty. An Err changed
+        // nothing (no proofs moved), so there is nothing to back up.
+        let handle = self.inner.mint_send_token(amount_sats).await?;
+        self.mark_dirty();
+        Ok(handle)
+    }
+
+    async fn redeem_foreign(&self, token: &str) -> anyhow::Result<u64> {
+        let amount = self.inner.redeem_foreign(token).await?;
+        self.mark_dirty();
+        Ok(amount)
+    }
+
+    async fn revoke_send(&self, op: &OperationId) -> anyhow::Result<u64> {
+        let amount = self.inner.revoke_send(op).await?;
+        self.mark_dirty();
+        Ok(amount)
+    }
+
+    async fn recover_incomplete_sagas(&self) -> anyhow::Result<()> {
+        // Recovery can MATERIALIZE proofs back into the unspent set (a revoked/reclaimed send),
+        // so a successful recovery is a mutation worth backing up — mark dirty on Ok.
+        self.inner.recover_incomplete_sagas().await?;
+        self.mark_dirty();
+        Ok(())
+    }
+}
+
+/// The background half of Cut A: on a periodic tick (and once at graceful shutdown), if the shared
+/// [`BackupState`] is `dirty`, publish the wallet's CURRENT UNSPENT proof set as a NIP-60 rollover
+/// that del-chains the prior live events. Holds the SAME `Arc<Mutex<BackupState>>` the decorator
+/// flips.
+///
+/// ⚠️ MONEY-MUSTs (do not weaken):
+/// - The cdk wallet mutation is the TRUTH and is durable BEFORE any backup; this backup is
+///   portability-only and strictly downstream.
+/// - A publish failure NEVER blocks or fails a spend (the hot path only sets `dirty`; this flusher
+///   is background + best-effort, and its errors are logged, not propagated to a spend).
+/// - SNAPSHOT semantics: each flush publishes the current-unspent SET (not a delta), so missed /
+///   failed flushes COALESCE and self-heal; a mutation-then-crash-before-flush loses only backup
+///   FRESHNESS, never truth (the next flush re-snapshots from the wallet).
+/// - It leans on [`crate::nip60::Nip60Store::rollover`], which already does confirm-before-delete
+///   + a del-chain (money-safe supersede) — it is NOT reimplemented here.
+///
+// PR-BODY BOUNDARY: begin — the exact text below is reused verbatim in the #115 PR body (codex #1,
+// the DOCUMENT-and-DEFER disposition: we do NOT change what is backed up).
+/// 📦 WHAT THIS BACKS UP (#115 codex #1 — documented, deliberately NOT changed):
+/// - The backup is the wallet's CURRENT-UNSPENT snapshot: exactly the proofs that are spendable
+///   right now, published as one NIP-60 rollover that del-chains the prior live events.
+/// - CRASH WINDOW THAT LOSES MONEY: a crash AFTER `mint_send_token` (the send's proofs are now
+///   reserved/pending-spent at the mint), BEFORE that send is redeemed by the payee OR revoked by
+///   us, AND BEFORE the next flush, FOLLOWED BY a CROSS-MACHINE restore onto a FRESH store. That
+///   in-flight send is NOT recoverable from the backup: the snapshot only ever held UNSPENT proofs,
+///   and the send is reserved/pending at the mint, so NUT-07 filters it out on restore. Its
+///   recovery saga (the revoke/reclaim state) lives ONLY in the ORIGINAL local cdk store, which the
+///   fresh machine does not have — so those sats are stranded until the original store is seen
+///   again. Bounded loss: roughly one in-flight inference's worth of sats.
+/// - WHY UNSPENT-ONLY ANYWAY (we never trade corruption for freshness): including the in-flight
+///   pending-send proofs in the backup would let a cross-machine restore ADOPT proofs that may
+///   ALREADY be spent (the payee redeemed them) — a DOUBLE-SPEND risk that corrupts the wallet.
+///   A bounded, one-inference freshness loss is strictly preferable to a corruption/double-spend
+///   risk, so the snapshot is unspent-only BY DESIGN, not by omission.
+/// - SAME-STORE reboot (the COMMON case) DOES recover the in-flight send: `recover_incomplete_sagas`
+///   replays the saga from the local cdk store on the next boot and reclaims/settles it. The
+///   irrecoverable residual above is CROSS-MACHINE-ONLY (a fresh store with no local saga state).
+/// - SAME CLASS (#115 codex #1r2): an in-flight gateway mutation still completing during graceful
+///   teardown, cross-restored, has the identical residual — its recovery saga is local-only too. In
+///   practice near-unreachable: `vm.halt()` runs BEFORE the awaited estate flush, so no new genome
+///   request originates, and the budget-gate bounds it to one in-flight request.
+/// - Note: true cross-machine mid-operation recovery would require backing up the SAGA STATE too
+///   (not just the unspent snapshot) — a separate follow-up, filed as issue #123, NOT this cut.
+// PR-BODY BOUNDARY: end
+pub struct Nip60BackupFlusher {
+    wallet: Arc<cdk::Wallet>,
+    store: Arc<crate::nip60::Nip60Store>,
+    mint_url: String,
+    unit: String,
+    state: Arc<Mutex<BackupState>>,
+    /// SERIALIZES whole `flush()` bodies (#115 codex #2). The periodic flush and the graceful
+    /// "estate" flush can otherwise overlap: flush A consumes `dirty` + clones `live_ids`, a
+    /// mutation re-dirties, then flush B consumes the SAME `live_ids` and publishes — leaving a
+    /// second live snapshot on the relay that A's rollover never del-chained (an orphaned live
+    /// event that leaks + grows the relay set unbounded). Held (an ASYNC `tokio::sync::Mutex`, so
+    /// awaiting it is fine — unlike the std `Mutex<BackupState>`, which is NEVER held across an
+    /// await) for the entire flush body, a second concurrent flush waits and then sees `!dirty`
+    /// (no-op) or the post-A state, so at most one snapshot chain is ever live.
+    flush_lock: tokio::sync::Mutex<()>,
+}
+
+/// A rearm-on-drop guard for [`Nip60BackupFlusher::flush`] (#115 codex #2r2). Armed right after the
+/// `dirty` flag is consumed; if the flush exits before a committed publish — an `Err` return, a
+/// CANCEL (the flush future dropped mid-await), or a PANIC — its `Drop` RE-ARMS `dirty` so the
+/// consumed-but-unpublished snapshot is retried (next tick / next boot / the estate fallback) rather
+/// than silently lost. `disarm`ed only on the committed-Ok path, so a success never spuriously
+/// re-arms. Cheap: `Drop` takes the std `Mutex` for a non-await critical section only.
+struct RearmOnDrop<'a> {
+    state: &'a Arc<Mutex<BackupState>>,
+    armed: bool,
+}
+
+impl<'a> RearmOnDrop<'a> {
+    fn arm(state: &'a Arc<Mutex<BackupState>>) -> Self {
+        RearmOnDrop { state, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RearmOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .dirty = true;
+        }
+    }
+}
+
+impl Nip60BackupFlusher {
+    /// Publish a fresh snapshot IFF the state is dirty. Best-effort: returns the rollover error (for
+    /// the caller to log) but never touches the wallet's truth.
+    ///
+    /// The DIRTY PROTOCOL (guarantees a mutation during a flush is never lost, and a failed publish
+    /// stays dirty for retry):
+    /// (a) lock; if `!dirty` return `Ok(())`; else CONSUME the flag (`dirty = false`) and clone
+    ///     `live_ids`; unlock (never hold the std `Mutex` across an await);
+    /// (b) snapshot the wallet's current UNSPENT proofs and `rollover` them (del-chaining the
+    ///     cloned live ids);
+    /// (c) on `Ok(new_id)`: lock, set `live_ids = [new_id]`, and DO NOT touch `dirty` — a mutation
+    ///     that landed during the await has legitimately re-set it, so the next tick catches it;
+    /// (d) on ANY non-committed exit (an `Err` return, a CANCEL of the flush future, or a PANIC in
+    ///     the wallet/relay I/O): a [`RearmOnDrop`] guard (armed after step a, disarmed only on the
+    ///     step-c commit) re-sets `dirty = true`, so the consumed snapshot is retried — never
+    ///     silently lost. This closes the estate-flush freshness gap (#115 codex #2r2).
+    pub async fn flush(&self) -> anyhow::Result<()> {
+        // SERIALIZE (#115 codex #2): hold the async flush lock for the WHOLE body, so a concurrent
+        // periodic + estate flush can never both consume-then-publish from the same `live_ids`
+        // snapshot (which would strand a live event outside any del-chain). The second caller waits
+        // here, then observes either `!dirty` (a no-op) or the first flush's committed state. This
+        // is a `tokio::sync::Mutex`, so awaiting inside the guard is sound; the std
+        // `Mutex<BackupState>` below is STILL only held for cheap non-await critical sections.
+        let _flush_guard = self.flush_lock.lock().await;
+        // (a) Consume the dirty flag under the lock; snapshot the live ids. No await while locked.
+        let live_ids = {
+            let mut st = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !st.dirty {
+                return Ok(());
+            }
+            st.dirty = false;
+            st.live_ids.clone()
+        };
+
+        // REARM-ON-DROP (#115 codex #2r2): `dirty` was just consumed but NOTHING is published yet.
+        // ANY exit before the committed success below — an `Err` return, a CANCEL (this flush future
+        // dropped mid-await), or a PANIC in the wallet/relay I/O — must RE-ARM `dirty`, or the
+        // consumed-but-unpublished snapshot is lost. This matters most for the ESTATE flush (the LAST
+        // flush at a graceful death): a snapshot lost there has NO next mutation to re-dirty it →
+        // permanently stale. The guard re-arms on drop unless `disarm`ed; we disarm ONLY on the
+        // committed-Ok path. It subsumes the old explicit re-arm on the Err arms.
+        let mut rearm = RearmOnDrop::arm(&self.state);
+
+        // (b) Snapshot the CURRENT UNSPENT set (the spendable proofs only). In-flight pending-spent
+        //     sends are excluded here and return to the set on a revoke (which re-dirties), so the
+        //     backup tracks exactly what is spendable now. The mint (NUT-07) stays the truth; a read
+        //     error here is a best-effort miss — the `?` early-returns and the guard re-arms `dirty`.
+        let unspent = self
+            .wallet
+            .get_proofs_with(Some(vec![cdk::nuts::State::Unspent]), None)
+            .await
+            .map_err(|e| anyhow::anyhow!("NIP-60 backup: read current unspent proofs: {e}"))?;
+
+        // (c) rollover: confirm-before-delete + del-chain (money-safe supersede). An `Err`
+        //     early-returns and the guard re-arms `dirty` for retry.
+        let new_id = self
+            .store
+            .rollover(&self.mint_url, &self.unit, unspent, live_ids)
+            .await?;
+
+        // Committed. Record the ONE new event id as the live set — deliberately DO NOT clear `dirty`
+        // (a mutation during the await may have re-set it and MUST NOT be lost) — then DISARM the
+        // guard so a successful publish does not spuriously re-arm.
+        {
+            let mut st = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            st.live_ids = vec![new_id.to_hex()];
+        }
+        rearm.disarm();
+        Ok(())
+    }
+
+    /// TEST-ONLY: is the shared backup state currently dirty? Lets a tooth assert the hot-path
+    /// dirty-flag protocol (a mutation sets it; a failed flush keeps it) without exposing the
+    /// private `BackupState`.
+    #[cfg(test)]
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dirty
+    }
+
+    /// TEST-ONLY: clear the dirty flag (e.g. to start a tooth from a clean baseline after the
+    /// constructor's initial-snapshot seed), so a subsequent mutation's SET is observable.
+    #[cfg(test)]
+    pub(crate) fn force_clean(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dirty = false;
+    }
+
+    /// TEST-ONLY: the ids currently recorded as LIVE on the relay (the next rollover's del-chain).
+    /// Lets the codex-#2 serialization tooth assert `live_ids` ends pointing at the LAST published
+    /// snapshot event (never a stale set that would strand an orphaned live event).
+    #[cfg(test)]
+    pub(crate) fn live_ids(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .live_ids
+            .clone()
+    }
+
+    /// Spawn the background flush loop: every `interval`, best-effort `flush()`. A failure is
+    /// logged and retried on the next tick — the spend truth is unaffected (the wallet already
+    /// committed; only the relay backup lags). The returned handle is dropped by the caller (the
+    /// task lives for the run); the caller ALSO keeps the `Arc<Self>` for a final shutdown flush.
+    pub fn spawn_periodic(
+        self: std::sync::Arc<Self>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if let Err(e) = self.flush().await {
+                    tracing::warn!(
+                        error = %e,
+                        "NIP-60 backup flush failed; will retry next tick (spend truth is unaffected)"
+                    );
+                }
+            }
+        })
+    }
+}
+
 /// The never-overspend cost reconciliation (the money invariant, §4). `actual_cost =
 /// cap - change_received`, clamped to `[0, cap]`: change greater than the cap clamps to
 /// 0 (never a negative/underflowed debit), and zero change debits the full cap. PURE so
@@ -2236,6 +2575,7 @@ impl BrainBackend for RoutstrKeyBrain {
 #[cfg(test)]
 mod routstr_reconcile_tests {
     use super::reconcile_cost;
+    use super::{BackupState, RearmOnDrop};
 
     // The never-overspend money invariant (§4), tested as a pure fn (no HTTP, no cdk).
     #[test]
@@ -2261,6 +2601,39 @@ mod routstr_reconcile_tests {
         // A bogus change greater than the cap must clamp to 0, never underflow to a huge
         // debit (or panic in debug). D-20 floor.
         assert_eq!(reconcile_cost(64, 1000), 0);
+    }
+
+    #[test]
+    fn rearm_on_drop_rearms_dirty_unless_disarmed() {
+        // #115 codex #2r2: the flush's rearm-on-drop guard. An ARMED guard dropped (an Err return, a
+        // cancelled flush future, or a panic mid-flush) re-arms `dirty` so the consumed snapshot is
+        // retried; a DISARMED guard (a committed publish) leaves it. Directly tests the Drop
+        // semantics that close the estate-flush freshness gap. RED-on-revert: drop the `if
+        // self.armed { ..dirty=true }` body and the armed case fails.
+        let armed = std::sync::Arc::new(std::sync::Mutex::new(BackupState {
+            live_ids: Vec::new(),
+            dirty: false,
+        }));
+        {
+            let _g = RearmOnDrop::arm(&armed);
+        } // dropped ARMED — models a cancel / panic / Err before the commit
+        assert!(
+            armed.lock().unwrap().dirty,
+            "an armed guard re-arms dirty on drop — the consumed snapshot is retried, not lost"
+        );
+
+        let disarmed = std::sync::Arc::new(std::sync::Mutex::new(BackupState {
+            live_ids: Vec::new(),
+            dirty: false,
+        }));
+        {
+            let mut g = RearmOnDrop::arm(&disarmed);
+            g.disarm();
+        } // dropped DISARMED — models a committed-Ok publish
+        assert!(
+            !disarmed.lock().unwrap().dirty,
+            "a disarmed guard (committed success) does NOT spuriously re-arm dirty"
+        );
     }
 
     #[test]
