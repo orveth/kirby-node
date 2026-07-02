@@ -1,0 +1,313 @@
+//! E6: the earn-loop SETTLEMENT half, end-to-end against a local fakewallet mint.
+//!
+//! Proves the "earn" arc closes with NO real money and NO real relay: the genome asks
+//! the daemon to ISSUE a charge (an IssueCharge act through the gateway), a customer PAYS
+//! it (mints a real cashu token at the local fakewallet mint), and the daemon VERIFIES
+//! the settlement at the mint (`wallet.receive`), CREDITS the treasury with the
+//! MINT-VERIFIED amount, and enqueues a PAYMENT_SETTLED inbound event the genome can
+//! poll for.
+//!
+//! The money-MUSTs, each toothed:
+//!   - E6 the loop closes: issue -> settle -> treasury credited by the mint-verified
+//!     amount -> PAYMENT_SETTLED enqueued  .. `earn_loop_issue_settle_credit_notice`
+//!   - MONEY-MUST (over-claim): a settlement that redeems FEWER sats than the charge
+//!     requested credits ONLY what the mint proved, never the requested amount
+//!     .. `over_claimed_settlement_credits_only_mint_verified`
+//!   - E3 no double-credit: a re-delivered settlement for the same charge_id credits
+//!     EXACTLY ONCE (the second settle is a Duplicate no-op)
+//!     .. `double_settle_credits_exactly_once`
+//!
+//! Layer B (a real cdk-mintd fakewallet mint, no real money) mirrors the rig used by
+//! routstr_brain_ecash.rs / full_loop.rs. The mint boot is slow, so these are grouped in
+//! one module and share the fixture where practical (each test boots its own mint on a
+//! free port to stay independent).
+
+mod common;
+
+use std::sync::Arc;
+
+use cdk::wallet::SendOptions;
+use cdk::Amount;
+
+use kirby_node::gateway::{GatewayService, Session};
+use kirby_node::mint_rig::{build_wallet, fund_wallet};
+use kirby_node::nerve::InboundQueue;
+use kirby_node::rail::{CashuSettlement, MockRail, ISSUE_CHARGE_DESTINATION};
+use kirby_node::treasury::{CreditOutcome, Treasury};
+
+use kirby_proto::capability_request::Act;
+use kirby_proto::{
+    CapabilityRequest, ChargeMethod, InboundKind, IssueCharge, Outcome, PaymentSettled,
+};
+use prost::Message;
+
+use common::mint_fixture::FakeMint;
+
+/// Build a settlement-mode gateway: a treasury seeded at `initial_sats`, a `CashuSettlement`
+/// wrapping the daemon's (host-held) wallet, and an inbound queue so `settle_charge` can
+/// enqueue the PAYMENT_SETTLED notice. Returns the service + the shared queue handle.
+fn settlement_gateway(
+    initial_sats: u64,
+    node_wallet: Arc<cdk::Wallet>,
+) -> (GatewayService, InboundQueue) {
+    let treasury = Treasury::open_temporary(initial_sats).expect("open temporary treasury");
+    let session = Session {
+        task_descriptor: "earn-loop-e6".into(),
+        budget_sats: initial_sats,
+        allowlisted_destinations: vec![ISSUE_CHARGE_DESTINATION.to_string()],
+        allowlisted_inbound_kinds: vec![InboundKind::PaymentSettled],
+    };
+    let queue = InboundQueue::new();
+    let svc = GatewayService::new(treasury, Arc::new(MockRail::new()), session)
+        .with_settlement_provider(CashuSettlement::new(node_wallet))
+        .with_inbound_queue(queue.clone());
+    (svc, queue)
+}
+
+/// Issue a charge through the gateway (the genome's IssueCharge act) and return the
+/// daemon-assigned charge_id.
+async fn issue_charge_via_gateway(
+    svc: &GatewayService,
+    idempotency_key: &str,
+    amount_sats: u64,
+) -> String {
+    let req = CapabilityRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        idempotency_key: idempotency_key.to_string(),
+        act: Some(Act::IssueCharge(IssueCharge {
+            amount_sats,
+            memo: "render this job".into(),
+            method: ChargeMethod::Cashu as i32,
+        })),
+        budget_sats: 0,
+    };
+    let receipt = svc
+        .authorize_capability(&req)
+        .await
+        .expect("authorize IssueCharge");
+    assert_eq!(
+        receipt.outcome,
+        Outcome::AuthorizedAndPerformed as i32,
+        "IssueCharge must be authorized when a settlement provider is attached"
+    );
+    assert_eq!(receipt.cost_sats, 0, "issuing a charge is zero-cost");
+    let charge = receipt.charge.expect("receipt carries ChargeIssued");
+    assert_eq!(charge.amount_sats, amount_sats);
+    charge.charge_id
+}
+
+/// A customer PAYS a charge: mint a cashu token worth `amount_sats` from a funded payer
+/// wallet at the mint. This is the "evidence" the daemon verifies via `wallet.receive`.
+async fn customer_pays(payer: &Arc<cdk::Wallet>, amount_sats: u64) -> String {
+    let prepared = payer
+        .prepare_send(Amount::from(amount_sats), SendOptions::default())
+        .await
+        .expect("prepare the customer's payment token");
+    prepared
+        .confirm(None)
+        .await
+        .expect("confirm the customer's payment token")
+        .to_string()
+}
+
+/// Drain the inbox for PAYMENT_SETTLED events past `ack_seq` (non-blocking).
+async fn poll_payment_settled(svc: &GatewayService, ack_seq: u64) -> Vec<PaymentSettled> {
+    use kirby_proto::node_gateway_server::NodeGateway;
+    let resp = svc
+        .poll_inbox(tonic::Request::new(kirby_proto::InboxRequest {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            want_kinds: vec![InboundKind::PaymentSettled as i32],
+            ack_seq,
+            wait_ms: 0,
+        }))
+        .await
+        .expect("poll_inbox");
+    resp.into_inner()
+        .events
+        .into_iter()
+        .filter(|e| e.kind == InboundKind::PaymentSettled as i32)
+        .map(|e| PaymentSettled::decode(e.payload.as_slice()).expect("decode PaymentSettled"))
+        .collect()
+}
+
+/// E6 (the loop closes): issue a charge -> customer pays -> daemon settles -> treasury is
+/// credited by the MINT-VERIFIED amount -> a PAYMENT_SETTLED notice is enqueued for the
+/// genome, correlated to the charge_id.
+#[tokio::test]
+async fn earn_loop_issue_settle_credit_notice() {
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    // The daemon's (host-held) wallet: `CashuSettlement` redeems the customer's token INTO it.
+    let node_wallet = build_wallet(&mint.url()).await.expect("build node wallet");
+    // The customer's wallet, funded so it can pay the charge.
+    let payer = build_wallet(&mint.url()).await.expect("build payer wallet");
+    fund_wallet(payer.clone(), 500).await.expect("fund payer");
+
+    let (svc, _queue) = settlement_gateway(0, node_wallet);
+
+    // The treasury starts EMPTY: the agent has earned nothing yet.
+    assert_eq!(svc.treasury_remaining().unwrap(), 0);
+
+    // 1. The genome issues a 100-sat charge.
+    let charge_id = issue_charge_via_gateway(&svc, "earn-charge-1", 100).await;
+
+    // Issuing did NOT credit (money-MUST: only host-verified settlement credits).
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        0,
+        "issuing a charge must not credit the treasury"
+    );
+
+    // 2. The customer pays: mints a 100-sat token at the mint.
+    let token = customer_pays(&payer, 100).await;
+
+    // 3. The daemon settles: verifies at the mint + credits + enqueues PAYMENT_SETTLED.
+    let outcome = svc
+        .settle_charge(&charge_id, &token)
+        .await
+        .expect("settle the charge");
+    let credited = match outcome {
+        CreditOutcome::Credited { amount_sats, .. } => amount_sats,
+        _ => panic!("expected Credited"),
+    };
+
+    // The treasury rose by the MINT-VERIFIED amount (100, within any fakewallet fee).
+    let balance = svc.treasury_remaining().unwrap();
+    assert_eq!(
+        balance, credited,
+        "treasury balance equals the credited (mint-verified) amount"
+    );
+    assert!(
+        balance > 0 && balance <= 100,
+        "credited the mint-verified amount ({balance}), never more than requested"
+    );
+
+    // 4. A PAYMENT_SETTLED notice is enqueued, correlated to the charge_id, carrying the
+    //    mint-verified amount (NOT the requested amount, if they differ).
+    let notices = poll_payment_settled(&svc, 0).await;
+    assert_eq!(notices.len(), 1, "exactly one PAYMENT_SETTLED notice");
+    assert_eq!(
+        notices[0].charge_id, charge_id,
+        "PAYMENT_SETTLED correlates to the charge_id"
+    );
+    assert_eq!(
+        notices[0].verified_sats, balance,
+        "PAYMENT_SETTLED carries the mint-verified sats, matching what was credited"
+    );
+
+    mint.shutdown().await;
+}
+
+/// MONEY-MUST (over-claim): if the customer's token redeems FEWER sats than the charge
+/// requested, the treasury is credited ONLY by what the mint proved -- never by the
+/// requested amount. This is the tooth on "credit_verified receives the mint-verified
+/// amount ONLY". The charge asks for 100; the customer pays a 40-sat token; the credit
+/// is 40, not 100.
+///
+/// RED-on-revert: if `settle_charge` credited `IssueCharge.amount_sats` (100) instead of
+/// the `verify_settlement` return (40), the balance would be 100 and this fails.
+#[tokio::test]
+async fn over_claimed_settlement_credits_only_mint_verified() {
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    let node_wallet = build_wallet(&mint.url()).await.expect("build node wallet");
+    let payer = build_wallet(&mint.url()).await.expect("build payer wallet");
+    fund_wallet(payer.clone(), 500).await.expect("fund payer");
+
+    let (svc, _queue) = settlement_gateway(0, node_wallet);
+
+    // The genome issues a charge for 100 sats.
+    let charge_id = issue_charge_via_gateway(&svc, "earn-charge-overclaim", 100).await;
+
+    // The customer UNDER-pays: a token worth only 40 sats.
+    let underpaid = customer_pays(&payer, 40).await;
+
+    let outcome = svc
+        .settle_charge(&charge_id, &underpaid)
+        .await
+        .expect("settle the under-paid charge");
+    let credited = match outcome {
+        CreditOutcome::Credited { amount_sats, .. } => amount_sats,
+        _ => panic!("expected Credited"),
+    };
+
+    // The credit is the mint-verified 40 (within fee), NEVER the requested 100.
+    assert!(
+        (1..=40).contains(&credited),
+        "credited the mint-verified amount ({credited}), never the requested 100"
+    );
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        credited,
+        "treasury holds only the mint-verified sats"
+    );
+    assert!(
+        svc.treasury_remaining().unwrap() < 100,
+        "MONEY-MUST: an over-claimed charge never credits the requested amount"
+    );
+
+    // The PAYMENT_SETTLED notice also reports the mint-verified amount, not the request.
+    let notices = poll_payment_settled(&svc, 0).await;
+    assert_eq!(notices.len(), 1);
+    assert_eq!(
+        notices[0].verified_sats, credited,
+        "the notice reports the mint-verified sats, not the requested amount"
+    );
+
+    mint.shutdown().await;
+}
+
+/// E3 (no double-credit): a re-delivered settlement for the SAME charge_id credits EXACTLY
+/// ONCE. The first settle credits; a second settle of the same charge is a Duplicate no-op
+/// (the treasury does not rise again). This is the dedupe wall on the credit path.
+///
+/// RED-on-revert: break `credit_verified`'s dedupe and the balance doubles here.
+#[tokio::test]
+async fn double_settle_credits_exactly_once() {
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    let node_wallet = build_wallet(&mint.url()).await.expect("build node wallet");
+    let payer = build_wallet(&mint.url()).await.expect("build payer wallet");
+    fund_wallet(payer.clone(), 500).await.expect("fund payer");
+
+    let (svc, _queue) = settlement_gateway(0, node_wallet);
+
+    let charge_id = issue_charge_via_gateway(&svc, "earn-charge-dup", 50).await;
+
+    // First settle: the customer's 50-sat token is redeemed + credited.
+    let token = customer_pays(&payer, 50).await;
+    let first = svc
+        .settle_charge(&charge_id, &token)
+        .await
+        .expect("first settle");
+    let credited = match first {
+        CreditOutcome::Credited { amount_sats, .. } => amount_sats,
+        _ => panic!("expected Credited"),
+    };
+    let after_first = svc.treasury_remaining().unwrap();
+    assert_eq!(after_first, credited, "balance rose by the credited amount");
+    assert!(after_first > 0);
+
+    // The customer re-submits (a re-delivered settlement notice) for the SAME charge_id.
+    // Even a fresh, genuinely-valid token must NOT double-credit: the dedupe is on
+    // charge_id, so `credit_verified` returns Duplicate and the balance does not rise.
+    let replay_token = customer_pays(&payer, 50).await;
+    let second = svc
+        .settle_charge(&charge_id, &replay_token)
+        .await
+        .expect("second settle (same charge_id)");
+    assert!(
+        matches!(second, CreditOutcome::Duplicate(_)),
+        "a second settle of the same charge_id must be a Duplicate no-op"
+    );
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        after_first,
+        "E3: no double-credit -- the balance is unchanged after the re-delivered settlement"
+    );
+
+    mint.shutdown().await;
+}
