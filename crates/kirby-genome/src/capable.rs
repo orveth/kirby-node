@@ -2006,13 +2006,13 @@ pub(super) async fn capable_loop(
 
 // ---- The earn-loop workload (Component 2) ----
 //
-// earn_loop_tick: poll for a JOB_REQUEST → THINK on it → ISSUE a cashu charge.
+// earn_loop_tick: poll for a JOB_REQUEST -> THINK on it -> ISSUE a cashu charge.
 // The credit arrives asynchronously when the customer pays; the genome polls for
 // PAYMENT_SETTLED in the next tick (or the test drives it directly).
 //
 // MONEY-MUST (genome side): the genome NEVER credits itself. It only asks the daemon
 // to ISSUE a charge. The daemon calls credit_verified when the customer's token is
-// verified at the MINT. The genome's role is: receive job → think → issue charge.
+// verified at the MINT. The genome's role is: receive job -> think -> issue charge.
 
 /// A parsed JOB_REQUEST from the inbound inbox.
 pub(super) struct JobRequest {
@@ -2359,6 +2359,28 @@ mod tests {
             });
             self
         }
+
+        /// Script a waiting JOB_REQUEST into the mock's inbox (the daemon-verified,
+        /// size-capped shape the inbound pipeline enqueues for the earn loop).
+        fn with_job(mut self, inbox_seq: u64, requester: &str, job_text: &str) -> Self {
+            self.inbox.push(InboundEvent {
+                inbox_seq,
+                kind: InboundKind::JobRequest as i32,
+                payload: job_text.as_bytes().to_vec(),
+                source_pubkey: requester.to_string(),
+                created_at: 0,
+                correlation_id: String::new(),
+            });
+            self
+        }
+
+        /// The number of IssueCharge requests that reached the gateway.
+        fn issue_charge_requests(&self) -> usize {
+            self.requests
+                .iter()
+                .filter(|r| matches!(&r.act, Some(Act::IssueCharge(_))))
+                .count()
+        }
     }
 
     impl Gateway for MockGateway {
@@ -2473,6 +2495,40 @@ mod tests {
             let high_seq =
                 events.iter().map(|e| e.inbox_seq).max().unwrap_or(req.ack_seq);
             Ok(InboundBatch { schema_version: kirby_proto::SCHEMA_VERSION, events, high_seq })
+        }
+
+        async fn issue_charge(
+            &mut self,
+            amount_sats: u64,
+            memo: &str,
+            idempotency_key: &str,
+        ) -> Result<CapabilityReceipt, tonic::Status> {
+            // Record the request so a test can assert the amount + idempotency key.
+            self.requests.push(CapabilityRequest {
+                schema_version: kirby_proto::SCHEMA_VERSION,
+                idempotency_key: idempotency_key.to_string(),
+                act: Some(Act::IssueCharge(IssueCharge {
+                    amount_sats,
+                    memo: memo.to_string(),
+                    method: ChargeMethod::Cashu as i32,
+                })),
+                budget_sats: 0,
+            });
+            // The daemon mints a charge_id + payment request; mirror the ChargeIssued shape
+            // (echo the amount). The genome treats it opaquely.
+            Ok(CapabilityReceipt {
+                schema_version: kirby_proto::SCHEMA_VERSION,
+                outcome: Outcome::AuthorizedAndPerformed as i32,
+                cost_sats: 0,
+                treasury_remaining: self.think_treasury,
+                charge: Some(kirby_proto::ChargeIssued {
+                    charge_id: format!("mock-charge-{idempotency_key}"),
+                    invoice_or_request: format!("cashu:charge:{idempotency_key}:{amount_sats}"),
+                    amount_sats,
+                    method: ChargeMethod::Cashu as i32,
+                }),
+                ..Default::default()
+            })
         }
     }
 
@@ -3700,5 +3756,98 @@ mod tests {
             vec!["capable-post-1".to_string(), "capable-post-1".to_string()],
             "the retry REUSES the same post idempotency key (idempotent, at-most-once publish)"
         );
+    }
+
+    // ---- earn-loop (Component 2, genome side): parse + tick ----
+
+    /// The charge-amount parser is a TOTAL positive-allowlist: `CHARGE:<n>` on a line
+    /// yields n; a zero, non-numeric, missing, or garbage plan falls back to the default.
+    /// It NEVER panics and NEVER returns 0 (a 0-sat charge is meaningless).
+    #[test]
+    fn parse_inbound_job_request_positive_allowlist() {
+        // The happy path: an explicit CHARGE line.
+        assert_eq!(parse_inbound_job_request("CHARGE:42", 1), 42);
+        assert_eq!(parse_inbound_job_request("thinking...\nCHARGE:100\ndone", 1), 100);
+        // Case-insensitive prefix + surrounding whitespace.
+        assert_eq!(parse_inbound_job_request("  charge: 7  ", 1), 7);
+        // A zero amount is rejected -> fallback (a 0-sat charge earns nothing).
+        assert_eq!(parse_inbound_job_request("CHARGE:0", 5), 5);
+        // Non-numeric / missing / empty -> fallback (never a panic).
+        assert_eq!(parse_inbound_job_request("CHARGE:lots", 5), 5);
+        assert_eq!(parse_inbound_job_request("no charge line here", 5), 5);
+        assert_eq!(parse_inbound_job_request("", 5), 5);
+        // A huge but valid number parses (no cap here; the daemon owns the money bounds).
+        assert_eq!(parse_inbound_job_request("CHARGE:18446744073709551615", 1), u64::MAX);
+    }
+
+    /// One earn-loop tick with a waiting JOB_REQUEST: the genome THINKs, then ISSUES a
+    /// charge for the amount its plan named. The charge amount flows from the plan
+    /// (CHARGE:25), and the tick returns an EarnCharge action carrying the charge_id.
+    #[tokio::test]
+    async fn earn_loop_tick_issues_charge_from_job() {
+        let params = test_params();
+        // The brain plans a 25-sat charge for the job.
+        let mut gw = MockGateway::thinking("CHARGE:25").with_job(1, &dm_sender_hex(1), "render a haiku");
+        let mut job_ack_seq = 0u64;
+
+        let out = earn_loop_tick(&mut gw, 1, &mut job_ack_seq, &params, 1_000, 0).await;
+
+        match out {
+            TickOutcome::Lived { action: Action::EarnCharge { charge_id, amount_sats }, .. } => {
+                assert_eq!(amount_sats, 25, "the charge amount comes from the plan (CHARGE:25)");
+                assert!(!charge_id.is_empty());
+            }
+            other => panic!("expected Lived/EarnCharge, got {other:?}"),
+        }
+        // Exactly ONE charge issued, and the cursor advanced past the job (no re-process).
+        assert_eq!(gw.issue_charge_requests(), 1, "exactly one charge per job");
+        assert_eq!(job_ack_seq, 1, "the job cursor advanced past inbox_seq 1");
+
+        // The issue_charge request carried the plan's amount and its own idempotency key.
+        let ic = gw
+            .requests
+            .iter()
+            .find_map(|r| match &r.act {
+                Some(Act::IssueCharge(ic)) => Some((ic.amount_sats, r.idempotency_key.clone())),
+                _ => None,
+            })
+            .expect("an IssueCharge request was recorded");
+        assert_eq!(ic.0, 25);
+        assert_eq!(ic.1, "earn-charge-1");
+    }
+
+    /// An empty inbox is an IDLE tick: no THINK, no charge, no spend. The loop lives on.
+    #[tokio::test]
+    async fn earn_loop_tick_idle_when_inbox_empty() {
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10"); // no job scripted
+        let mut job_ack_seq = 0u64;
+
+        let out = earn_loop_tick(&mut gw, 1, &mut job_ack_seq, &params, 1_000, 0).await;
+        match out {
+            TickOutcome::Lived { action: Action::Note, think_cost, .. } => {
+                assert_eq!(think_cost, 0, "an idle tick spends nothing");
+            }
+            other => panic!("expected an idle Lived/Note, got {other:?}"),
+        }
+        assert_eq!(gw.issue_charge_requests(), 0, "no charge on an empty inbox");
+        assert_eq!(job_ack_seq, 0, "the cursor does not move on an idle tick");
+    }
+
+    /// A denied THINK (out of runway) makes the earn-loop tick return Dead: the genome
+    /// cannot earn if it cannot think, and it never issues a charge in that case.
+    #[tokio::test]
+    async fn earn_loop_tick_dead_when_think_denied() {
+        let params = test_params();
+        let mut gw = MockGateway {
+            think_outcome: Outcome::DeniedInsufficientTreasury as i32,
+            ..MockGateway::thinking("CHARGE:10")
+        }
+        .with_job(1, &dm_sender_hex(1), "render a haiku");
+        let mut job_ack_seq = 0u64;
+
+        let out = earn_loop_tick(&mut gw, 1, &mut job_ack_seq, &params, 1_000, 0).await;
+        assert!(matches!(out, TickOutcome::Dead), "a denied think is death, got {out:?}");
+        assert_eq!(gw.issue_charge_requests(), 0, "no charge issued when the think was denied");
     }
 }
