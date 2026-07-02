@@ -223,6 +223,46 @@ message NostrDmReply {
   string text      = 2;   // the reply text (re-sanitized + re-capped daemon-side)
 }
 
+// Daemon-produced payload for a PAYMENT_SETTLED inbound event (Component 2).
+// The genome correlates it back to its IssueCharge via InboundEvent.correlation_id
+// (which equals charge_id). verified_sats is ALWAYS the mint-verified amount the
+// daemon credited -- never the genome's requested amount or the IssueCharge amount.
+// create-fund's topup-reconcile seam will consume this to convert earned ecash into
+// inference runway; keep the shape clean and independent of the DM workload.
+message PaymentSettled {
+  string charge_id     = 1;   // echoes ChargeIssued.charge_id
+  uint64 verified_sats = 2;   // the mint-verified amount credited to the treasury
+}
+
+// The earn-loop OUTBOUND surface (Component 2): the genome asks the daemon to issue
+// a payment request for a completed job. The daemon mints or constructs the invoice
+// via the host-held settlement provider (no credentials leave the daemon) and returns
+// a ChargeIssued receipt the genome hands to the customer. The genome never sees the
+// wallet key or mint secret. On receipt of payment the daemon calls credit_verified
+// (the sole sanctioned credit path) and enqueues a PAYMENT_SETTLED inbound event.
+message IssueCharge {
+  uint64      amount_sats = 1;   // the genome's requested charge amount
+  string      memo        = 2;   // human-readable charge description (re-sanitized daemon-side)
+  ChargeMethod method     = 3;   // payment method the customer should use (CASHU for the earn loop)
+}
+
+enum ChargeMethod {
+  CHARGE_METHOD_UNSPECIFIED = 0;
+  LIGHTNING                 = 1;
+  CASHU                     = 2;
+}
+
+// The daemon's reply to an IssueCharge: the payment request the genome forwards to the
+// customer. charge_id ties the settlement notice (PAYMENT_SETTLED.correlation_id) back
+// to this charge so the genome can match the result. The genome treats this as opaque
+// and forwards it verbatim; daemon holds the settlement state.
+message ChargeIssued {
+  string       charge_id          = 1;   // daemon-assigned, unique per charge; echoed in PAYMENT_SETTLED.correlation_id
+  string       invoice_or_request = 2;   // the Cashu payment request or bolt11 (method-dependent)
+  uint64       amount_sats        = 3;   // the requested amount (mirrors IssueCharge.amount_sats)
+  ChargeMethod method             = 4;
+}
+
 // The earn-loop INBOUND surface (Component 1). The genome's poll request: which
 // inbound kinds it wants to be woken for, its consume cursor, and a long-poll budget.
 message InboxRequest {
@@ -284,6 +324,7 @@ message CapabilityRequest {
     Completion  completion   = 7;   // brain act -- field 7, NOT 6 (budget_sats holds 6; oneof + sibling fields share one number space)
     Memory      memory       = 8;   // memory act (durable mind-state) -- next free oneof field after completion=7
     Actuate     actuate      = 9;   // outward actuator envelope (the agent's first outward voice) -- next free oneof field after memory=8
+    IssueCharge issue_charge = 10;  // earn-loop: genome asks the daemon to issue a payment request for a job -- next free oneof field after actuate=9
   }
   uint64 budget_sats = 6;      // max the genome authorizes for THIS act; must be <= remaining treasury
 }
@@ -325,4 +366,6 @@ message CapabilityReceipt {
                                  // absent for every other act. Returned on a DUPLICATE_IGNORED write replay too
                                  // (the ledger persists the encoded result), so a resume re-issue gets the same
                                  // result, not just the proof. Reads carry it too (found/value/slugs) but are free.
+  ChargeIssued charge = 8;       // earn-loop: the payment request the daemon issued for an IssueCharge act.
+                                 // Absent for every other act.
 }

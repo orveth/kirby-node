@@ -382,6 +382,10 @@ fn assert_no_credential_on_the_wire() {
         completion: vec![],
         // The durable-mind-state result (absent for an ecash settle); still not a credential.
         memory: None,
+        // The earn-loop ChargeIssued (absent for an ecash settle): a charge_id + payment
+        // request STRING the genome hands a customer -- an invoice to be paid, never a
+        // credential to spend. The wallet that settles it lives only host-side.
+        charge: None,
     };
     let CapabilityReceipt {
         schema_version: _,
@@ -391,6 +395,7 @@ fn assert_no_credential_on_the_wire() {
         proof: _,
         completion: _,
         memory: _,
+        charge: _,
     } = &receipt;
 }
 

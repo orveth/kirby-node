@@ -290,6 +290,10 @@ async fn run() {
             // shared metabolism + checkpoint paths.
             capable::capable_loop(client, port, &ctx).await;
         }
+        Some("earn-loop") => {
+            boot_log("workload=earn-loop: Component 2 earn loop: poll JOB_REQUEST inbox -> THINK (life-gating) -> ISSUE a cashu charge; treasury credit arrives when the customer pays (PAYMENT_SETTLED inbound event); death is the daemon halting the VM when a THINK is unaffordable (F4)");
+            capable::earn_loop(client, port, &ctx).await;
+        }
         _ => {
             boot_log("no burn workload: idling (the daemon meters/halts or tears down)");
             idle_forever().await;

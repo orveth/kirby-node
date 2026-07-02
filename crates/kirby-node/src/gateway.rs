@@ -21,9 +21,9 @@ use std::sync::Arc;
 use kirby_proto::capability_request::Act;
 use kirby_proto::node_gateway_server::{NodeGateway, NodeGatewayServer};
 use kirby_proto::{
-    Ack, CapabilityReceipt, CapabilityRequest, CheckpointBlob, EntropyNonce, EntropyRequest, Event,
-    InboundBatch, InboundKind, InboxRequest, Memory, MemoryOp, MemoryResult, Outcome,
-    SessionContext, SessionRequest, WriteStatus,
+    Ack, CapabilityReceipt, CapabilityRequest, ChargeIssued, CheckpointBlob, EntropyNonce,
+    EntropyRequest, Event, InboundBatch, InboundKind, InboxRequest, Memory, MemoryOp, MemoryResult,
+    Outcome, PaymentSettled, SessionContext, SessionRequest, WriteStatus,
 };
 use prost::Message;
 use rand::TryRngCore;
@@ -32,8 +32,8 @@ use tonic::{Request, Response, Status};
 use crate::checkpoint::{CheckpointArtifact, LatestCheckpoint};
 use crate::lease::{FenceVerdict, LeaseAuthority};
 use crate::nerve::InboundQueue;
-use crate::rail::{self, MemoryBackend, MemoryWrite, Rail, RailOutcome};
-use crate::treasury::{DebitOutcome, Treasury, TreasuryError};
+use crate::rail::{self, ChargeIssuedData, MemoryBackend, MemoryWrite, Rail, RailOutcome, SettlementProvider};
+use crate::treasury::{CreditOutcome, DebitOutcome, Treasury, TreasuryError};
 
 /// The host ceiling on a `PollInbox` long-poll budget (1.2): the daemon CLAMPS the
 /// genome's `wait_ms` to this so a hostile value cannot pin a server task forever. 30s is
@@ -115,6 +115,66 @@ pub struct GatewayService {
     /// genome's `want_kinds` with this set; the genome can only NARROW. Empty => inbound
     /// disabled.
     allowlisted_inbound_kinds: Arc<Vec<InboundKind>>,
+    /// The OPTIONAL settlement provider (earn-loop Component 2). `Some` for a
+    /// settlement-mode gateway (injects a `CashuSettlement` wrapping the funded wallet);
+    /// `None` for every other workload, where `IssueCharge` fails closed (debit 0,
+    /// perform nothing). `Arc<dyn SettlementProvider>` keeps the service cheap to clone.
+    settlement: Option<Arc<dyn SettlementProvider>>,
+    /// Per-`charge_id` settlement serialization (finding-1). `settle_charge`'s
+    /// lookup -> verify -> credit sequence is a check-then-act on the wallet: two
+    /// CONCURRENT settles for the SAME charge_id (two DISTINCT valid tokens) could BOTH
+    /// miss the `credit_lookup` and BOTH redeem into the wallet (a double WALLET
+    /// redemption -- the credit dedupe stops only the double CREDIT, not the double
+    /// redemption). This is a single-flight map: each `charge_id` maps to an
+    /// `Arc<tokio::Mutex<()>>`, and `settle_charge` holds that per-charge guard across the
+    /// WHOLE lookup -> verify -> credit sequence, re-running `credit_lookup` INSIDE the
+    /// lock, so exactly one settle per charge reaches the wallet at a time. tokio's Mutex
+    /// (not std's) is held across the `.await` on `verify_settlement` (house rule). The
+    /// outer `std::Mutex` guards only the map insert/remove -- it is NEVER held across an
+    /// await. Entries are removed when the last holder drops the guard (bounded memory);
+    /// see `settle_charge`. `Arc`-shared so the service stays cheap to clone.
+    settle_locks: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+/// The type of the per-charge single-flight map inside [`GatewayService::settle_locks`].
+type SettleLocks = std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// A cleanup-on-drop guard for [`GatewayService::settle_charge`]'s `settle_locks` entry
+/// (round-3 finding). Constructed right after the per-charge lock is inserted into the map
+/// and held across `settle_inner`; its `Drop` removes the entry on EVERY exit -- a normal
+/// return, an error, a PANIC, or an async CANCELLATION (the settle future dropped mid-await).
+/// The old explicit post-await cleanup ran only after `settle_inner` returned, so a
+/// cancelled/panicking settle leaked its entry forever.
+///
+/// The removal is CONDITIONAL, mirroring the old bounded-memory logic: it removes the entry
+/// only when `strong_count == 2` (the map's Arc + this guard's `lock` Arc, i.e. no OTHER
+/// settle is parked on this lock). If a concurrent settle is waiting (count > 2) we leave the
+/// entry; that waiter re-runs the lookup, hits the durable row, short-circuits, and its own
+/// guard performs the final removal. Crucially it also `ptr_eq`-checks that the map's current
+/// entry is STILL this guard's Arc, so a NEWER entry for a reused charge_id (a fresh insert
+/// after this settle finished) is never removed by a stale guard. `Drop` is sync: it takes the
+/// std `Mutex` for a non-await critical section only.
+struct SettleLockCleanup<'a> {
+    map: &'a SettleLocks,
+    charge_id: &'a str,
+    lock: &'a Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for SettleLockCleanup<'_> {
+    fn drop(&mut self) {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only this guard's Arc (plus the map's) may remain, AND the map entry must still be
+        // OUR Arc -- otherwise a newer settle for a reused charge_id owns it and must survive.
+        let is_ours = map
+            .get(self.charge_id)
+            .is_some_and(|entry| Arc::ptr_eq(entry, self.lock));
+        if is_ours && Arc::strong_count(self.lock) == 2 {
+            map.remove(self.charge_id);
+        }
+    }
 }
 
 /// The lease fence attached to a gateway (spec 4.3): the node's lease handle plus
@@ -165,7 +225,35 @@ impl GatewayService {
             wseq_floor: Arc::new(AtomicU64::new(0)),
             inbox: None,
             allowlisted_inbound_kinds,
+            settlement: None,
+            settle_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Attach a settlement provider (earn-loop Component 2). An IssueCharge act is
+    /// served only when one is attached; without it IssueCharge fails closed (debit 0).
+    pub fn with_settlement_provider<S: SettlementProvider + 'static>(mut self, s: S) -> Self {
+        self.settlement = Some(Arc::new(s));
+        self
+    }
+
+    /// TEST-ONLY: does `settle_locks` currently hold an entry for `charge_id`? Lets a tooth
+    /// assert the per-charge map entry is cleaned up even when a settle is cancelled/panics.
+    #[cfg(test)]
+    pub(crate) fn settle_locks_contains(&self, charge_id: &str) -> bool {
+        self.settle_locks
+            .lock()
+            .expect("settle_locks mutex poisoned")
+            .contains_key(charge_id)
+    }
+
+    /// TEST-ONLY: the number of live `settle_locks` map entries.
+    #[cfg(test)]
+    pub(crate) fn settle_locks_len(&self) -> usize {
+        self.settle_locks
+            .lock()
+            .expect("settle_locks mutex poisoned")
+            .len()
     }
 
     /// Attach the per-genome INBOUND queue (earn-loop Component 1): the gateway's `PollInbox`
@@ -467,17 +555,24 @@ impl GatewayService {
                 );
                 return Ok(denied(Outcome::Unspecified, self.balance()?));
             }
-            return Ok(receipt(
-                Outcome::DuplicateIgnored,
-                prior.cost_sats,
-                prior.treasury_remaining_after,
-                prior.proof,
-                prior.completion,
-                // A Memory WRITE replay returns the SAME structured result (the ledger
-                // persists the encoded MemoryResult); decode it back (None for a brain or
-                // any non-memory act, whose `memory` is empty).
-                decode_memory(&prior.memory),
-            ));
+            // For an IssueCharge resume the genome MUST get the same ChargeIssued (same
+            // charge_id!) it received the first time. The first issue stored the prost-
+            // encoded ChargeIssued in the `proof` field; decode it back here.
+            let charge = decode_charge(&prior.proof, act);
+            return Ok(CapabilityReceipt {
+                charge,
+                ..receipt(
+                    Outcome::DuplicateIgnored,
+                    prior.cost_sats,
+                    prior.treasury_remaining_after,
+                    prior.proof,
+                    prior.completion,
+                    // A Memory WRITE replay returns the SAME structured result (the ledger
+                    // persists the encoded MemoryResult); decode it back (None for a brain or
+                    // any non-memory act, whose `memory` is empty).
+                    decode_memory(&prior.memory),
+                )
+            });
         }
 
         // STEP 2: allowlist the destination (mint id / invoice / URL host). Not
@@ -508,6 +603,15 @@ impl GatewayService {
         // concurrent same-key. STEP0/1/2 already ran above.
         if let Act::Actuate(a) = act {
             return self.authorize_actuate(req, act, a).await;
+        }
+
+        // FORK (earn-loop charge issuance): an IssueCharge act is ZERO-COST from the
+        // treasury's perspective (the genome issues a charge; the CREDIT arrives only when
+        // the customer settles). STEP0/1/2 already ran above. The idempotency key is
+        // recorded with cost=0 so a resume re-issue gets the SAME ChargeIssued (same
+        // charge_id) rather than a fresh one (which would lose the customer correlation).
+        if let Act::IssueCharge(ic) = act {
+            return self.authorize_issue_charge(req, ic).await;
         }
 
         // STEP 3: budget gate. The estimate must be within BOTH the genome's
@@ -849,6 +953,266 @@ impl GatewayService {
         }
     }
 
+    /// The IssueCharge act's authorize path (earn-loop Component 2): the genome asks the
+    /// daemon to generate a payment request for a completed job. STEP0 (lease), STEP1
+    /// (dedupe), STEP2 (allowlist) already ran in `authorize_capability`. Here:
+    ///   1. Fail closed if no settlement provider is attached (wiring guard, debit 0).
+    ///   2. Call `settlement.issue(amount_sats, memo)` to generate a `charge_id` + payment
+    ///      request string. The settlement provider is the host-held credential; it never
+    ///      crosses vsock.
+    ///   3. Record the charge with cost=0: `debit_and_record` with 0 sats stores a ledger
+    ///      row so STEP1 can dedupe a resume re-issue and return the SAME `ChargeIssued`
+    ///      (same `charge_id`). A charge that was never paid costs the genome nothing.
+    ///
+    /// MONEY-MUST: the credit path (treasury.credit_verified) is NOT on this path. It is
+    /// on `settle_charge`, which the daemon calls when the customer submits proof of
+    /// payment. The genome NEVER credits itself; the credit is daemon-gated.
+    async fn authorize_issue_charge(
+        &self,
+        req: &CapabilityRequest,
+        ic: &kirby_proto::IssueCharge,
+    ) -> Result<CapabilityReceipt, TreasuryError> {
+        let Some(settlement) = self.settlement.as_ref() else {
+            tracing::error!("IssueCharge on a gateway with no settlement provider; failing closed (debit 0)");
+            return Ok(denied(Outcome::UpstreamFailed, self.balance()?));
+        };
+
+        let issued: ChargeIssuedData = match settlement.issue(ic.amount_sats, &ic.memo).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(error = %e, "settlement.issue failed; debiting nothing");
+                return Ok(denied(Outcome::UpstreamFailed, self.balance()?));
+            }
+        };
+
+        let charge = ChargeIssued {
+            charge_id: issued.charge_id,
+            invoice_or_request: issued.invoice_or_request,
+            amount_sats: issued.amount_sats,
+            method: ic.method,
+        };
+
+        // Store the prost-encoded ChargeIssued in the proof field so STEP1 can reconstruct
+        // it verbatim on a resume replay (the genome needs the SAME charge_id for the same
+        // idempotency key, so the customer-correlation holds across a resume).
+        let proof = charge.encode_to_vec();
+
+        // Record with cost=0: issuing a charge costs the genome nothing. The ledger row
+        // dedupes resume re-issues at STEP1 (a Duplicate returns the same ChargeIssued).
+        match self.treasury.debit_and_record(
+            &req.idempotency_key,
+            0,
+            proof.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )? {
+            DebitOutcome::Debited { remaining, .. } => Ok(CapabilityReceipt {
+                schema_version: kirby_proto::SCHEMA_VERSION,
+                outcome: Outcome::AuthorizedAndPerformed as i32,
+                cost_sats: 0,
+                treasury_remaining: remaining,
+                proof,
+                completion: Vec::new(),
+                memory: None,
+                charge: Some(charge),
+            }),
+            // Concurrent same-key: the stored ChargeIssued is in proof.
+            DebitOutcome::Duplicate(prior) => Ok(CapabilityReceipt {
+                schema_version: kirby_proto::SCHEMA_VERSION,
+                outcome: Outcome::DuplicateIgnored as i32,
+                cost_sats: 0,
+                treasury_remaining: prior.treasury_remaining_after,
+                proof: prior.proof.clone(),
+                completion: Vec::new(),
+                memory: None,
+                charge: ChargeIssued::decode(prior.proof.as_slice()).ok(),
+            }),
+            // Unreachable (cost=0 can't go insufficient), but surfaced cleanly.
+            DebitOutcome::Insufficient { remaining } => {
+                Ok(denied(Outcome::DeniedInsufficientTreasury, remaining))
+            }
+        }
+    }
+
+    /// Daemon-side settlement: verify that `evidence` (a cashu token) settles `charge_id`,
+    /// credit the treasury with the MINT-VERIFIED amount (money-MUST: never the claimed
+    /// amount), and enqueue a `PAYMENT_SETTLED` inbound event -- only on a genuine credit --
+    /// so the genome knows the charge cleared.
+    ///
+    /// Called by the customer's settlement client (or the E6 integration test rig), NOT by
+    /// the genome. The genome polls the inbox for `PAYMENT_SETTLED` to learn the outcome.
+    ///
+    /// `credit_verified` is idempotent on `charge_id` -- a double-settle attempt returns
+    /// `CreditOutcome::Duplicate` with no double-credit.
+    ///
+    /// SERIALIZATION (money-MUST, finding-1 fix): the whole lookup -> verify -> credit
+    /// sequence is a check-then-act on the WALLET, so it is serialized PER `charge_id` by a
+    /// keyed async lock (`settle_locks`). Two CONCURRENT settles for the same `charge_id`
+    /// with two DISTINCT valid tokens would otherwise BOTH miss the `credit_lookup` and
+    /// BOTH redeem into the wallet -- a double WALLET redemption. `credit_verified`'s
+    /// in-txn dedupe stops only the double CREDIT, not the double redemption, so the second
+    /// token's sats would land in the wallet with no matching credit (a wallet/treasury
+    /// desync). Holding the per-charge guard across the whole sequence, and RE-RUNNING
+    /// `credit_lookup` INSIDE the lock, makes exactly one settle per charge reach the wallet
+    /// at a time; the loser sees the winner's durable row and short-circuits.
+    ///
+    /// ORDERING (money-MUST): settlement STATE is consulted FIRST (inside the lock), before
+    /// any wallet/mint call. The treasury's `credit_ledger` (the same durable rows
+    /// `credit_verified` writes) is the settled-charge record; `credit_lookup` reads it.
+    /// If a row already exists for this `charge_id`, the charge was ALREADY resolved, so we
+    /// return the prior outcome and NEVER redeem the submitted token. A genuine-credit row
+    /// maps to `Duplicate`; a terminal-overflow marker (finding-2) maps to `Terminal`. This
+    /// closes two holes in the old verify-then-dedupe order: (a) a same-token replay no
+    /// longer hits the mint and errors -- it returns `Duplicate` cleanly; (b) a FRESH,
+    /// genuinely-valid token replayed against an already-resolved charge is no longer
+    /// redeemed into the host wallet only to be dropped by the credit dedupe -- the wallet
+    /// is never touched, so wallet funds cannot desync from the treasury.
+    ///
+    /// Only the FIRST claimant (no prior row) proceeds to verify + credit.
+    ///
+    /// CRASH WINDOWS (the retry path must never double-credit or re-redeem):
+    ///   - crash BEFORE `verify_settlement`: no wallet call happened, no row exists. A
+    ///     retry re-runs from the top, verifies, credits once. Clean.
+    ///   - crash AFTER `verify_settlement` (token redeemed into the wallet) but BEFORE
+    ///     `credit_verified`: the wallet holds the sats but NO row exists yet, so a
+    ///     retry's `credit_lookup` misses and it re-enters verify_settlement. That retry
+    ///     redeems a *different* token (the original token is now spent, so a same-token
+    ///     retry fails at the mint and no credit occurs -- fail-closed); a genuine second
+    ///     payment would be a NEW settlement. This is the one window where the treasury can
+    ///     lag the wallet by one payment; it is bounded (single in-flight settle per
+    ///     charge) and never DOUBLE-credits, because the row, once written, is the durable
+    ///     wall for all subsequent retries.
+    ///   - crash AFTER `credit_verified` (row written + flushed) but before we return: a
+    ///     retry's `credit_lookup` HITS the row and returns `Duplicate`/`Terminal` without
+    ///     touching the wallet. No double-credit, no re-redemption. Clean.
+    ///
+    /// The `settle_locks` guard is a TOKIO Mutex held in-process only: it serializes
+    /// concurrent settles WITHIN one daemon process. It is NOT a durable lock, so a crash
+    /// while holding it releases everything (the map dies with the process) -- that is
+    /// fine, because the durable `credit_ledger` rows (written + flushed by
+    /// `credit_verified`) are the real cross-restart wall; the lock only closes the
+    /// same-process concurrent-redeem race the durable rows cannot (a token is redeemed
+    /// mid-flight, before any row exists). A crash mid-verify falls into the bounded window
+    /// above, unchanged by the lock.
+    pub async fn settle_charge(
+        &self,
+        charge_id: &str,
+        evidence: &str,
+    ) -> anyhow::Result<CreditOutcome> {
+        let settlement = self
+            .settlement
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no settlement provider attached"))?;
+
+        // SERIALIZE per charge_id (finding-1): take (or create) the per-charge async lock,
+        // then hold its guard across the WHOLE lookup -> verify -> credit sequence so no
+        // two settles of the same charge_id can both redeem into the wallet. The outer
+        // std::Mutex guards only the map mutation and is dropped immediately (never held
+        // across the await below).
+        let charge_lock = {
+            let mut map = self
+                .settle_locks
+                .lock()
+                .expect("settle_locks mutex poisoned");
+            map.entry(charge_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = charge_lock.lock().await;
+
+        // CLEANUP-ON-DROP (round-3 finding): construct the RAII guard NOW, right after the
+        // map insertion and before `settle_inner`, so it removes this charge's map entry on
+        // EVERY exit path -- a normal `Ok`/`Err` return, an `Err(?)` inside `settle_inner`,
+        // a PANIC, or an async CANCELLATION (the `settle_charge` future dropped mid-await).
+        // The old explicit post-await cleanup block ran only after `settle_inner` RETURNED,
+        // so a cancelled/panicking settle leaked the entry forever, growing the map unbounded
+        // for distinct cancelled charge_ids. `Drop` is sync -- it takes the std `Mutex` for a
+        // non-await critical section only, never across an await. `settle_inner` never touches
+        // `settle_locks`, so this guard is the sole remover -- no lock-ordering hazard.
+        let _cleanup = SettleLockCleanup {
+            map: &self.settle_locks,
+            charge_id,
+            lock: &charge_lock,
+        };
+
+        // Run the money-path under the guard. The cleanup guard above removes the map entry
+        // when this returns (or unwinds), so no explicit post-await cleanup is needed.
+        self.settle_inner(settlement.as_ref(), charge_id, evidence)
+            .await
+    }
+
+    /// The serialized body of `settle_charge`, run under the per-charge async guard. Split
+    /// out so the guard's scope and the map cleanup read cleanly; it assumes the caller
+    /// holds the `charge_id` guard, so its `credit_lookup` -> verify -> credit sequence is
+    /// exclusive for this charge_id.
+    async fn settle_inner(
+        &self,
+        settlement: &dyn SettlementProvider,
+        charge_id: &str,
+        evidence: &str,
+    ) -> anyhow::Result<CreditOutcome> {
+        // STATE FIRST (money-MUST): re-consult the durable settled-charge record INSIDE the
+        // lock, BEFORE any wallet/mint call. An existing row means this charge already
+        // resolved, so return the prior outcome and DO NOT redeem the submitted token (never
+        // touch the wallet). A genuine-credit row is a `Duplicate`; a terminal-overflow
+        // marker (finding-2) is `Terminal` -- the charge is settled-dead, nothing credited,
+        // and the wallet must not be touched again. The original settlement already emitted
+        // its PAYMENT_SETTLED notice (or none, for a terminal), so this path emits NOTHING.
+        if let Some(prior) = self.treasury.credit_lookup(charge_id)? {
+            let outcome = self.treasury.classify_prior(prior);
+            tracing::info!(
+                charge_id,
+                terminal = matches!(outcome, CreditOutcome::Terminal(_)),
+                "settle_charge for an already-resolved charge; returning the prior outcome without touching the wallet"
+            );
+            return Ok(outcome);
+        }
+
+        // First claimant only past this point. verify_settlement calls the MINT and returns
+        // the MINT-VERIFIED sats. MONEY-MUST: this is the ONLY source of the credit amount;
+        // we never use the genome's requested amount or the IssueCharge.amount_sats here.
+        let verified_sats = settlement.verify_settlement(charge_id, evidence).await?;
+
+        // credit_verified is the sole sanctioned credit path (idempotent on charge_id). The
+        // in-txn dedupe here is the crash-safe backstop for a settle that raced past the
+        // credit_lookup above: it returns Duplicate/Terminal with no double-credit. On
+        // overflow it also writes the durable terminal marker (finding-2).
+        let outcome = self.treasury.credit_verified(charge_id, verified_sats)?;
+
+        tracing::info!(
+            charge_id,
+            verified_sats,
+            duplicate = matches!(outcome, CreditOutcome::Duplicate(_)),
+            terminal = matches!(outcome, CreditOutcome::Terminal(_)),
+            "settlement verified and applied to treasury"
+        );
+
+        // Enqueue PAYMENT_SETTLED ONLY on a genuine credit (finding-2 fix): a Duplicate
+        // (concurrent race that lost), an Overflow, or a Terminal credited NOTHING, so
+        // emitting a settled notice would tell the genome money arrived when none did, and
+        // would carry this attempt's verified_sats rather than a credited amount. The notice
+        // carries the CREDITED amount, which for `Credited` equals verified_sats.
+        if let CreditOutcome::Credited { amount_sats, .. } = &outcome {
+            if let Some(inbox) = &self.inbox {
+                let payload = PaymentSettled {
+                    charge_id: charge_id.to_string(),
+                    verified_sats: *amount_sats,
+                }
+                .encode_to_vec();
+                inbox.push_typed(
+                    InboundKind::PaymentSettled,
+                    payload,
+                    String::new(),
+                    0,
+                    charge_id.to_string(),
+                );
+            }
+        }
+
+        Ok(outcome)
+    }
+
     fn balance(&self) -> Result<u64, TreasuryError> {
         self.treasury.remaining()
     }
@@ -1094,6 +1458,7 @@ fn receipt(
         proof,
         completion,
         memory,
+        charge: None,
     }
 }
 
@@ -1101,6 +1466,16 @@ fn receipt(
 /// (unchanged) treasury balance.
 fn denied(outcome: Outcome, treasury_remaining: u64) -> CapabilityReceipt {
     receipt(outcome, 0, treasury_remaining, Vec::new(), Vec::new(), None)
+}
+
+/// Decode a persisted `proof` field back to `ChargeIssued` for an IssueCharge STEP1
+/// resume replay, so the genome always receives the SAME `charge_id` for the same
+/// idempotency key. Returns `None` for all non-IssueCharge acts (or on a decode error).
+fn decode_charge(proof: &[u8], act: &Act) -> Option<ChargeIssued> {
+    match act {
+        Act::IssueCharge(_) => ChargeIssued::decode(proof).ok(),
+        _ => None,
+    }
 }
 
 /// Decode a persisted `PerformedRecord.memory` (the prost-encoded `MemoryResult` bytes)
@@ -1164,7 +1539,80 @@ pub fn firecracker_vsock_listen_path(uds_base: &std::path::Path, port: u32) -> s
 #[cfg(test)]
 mod tests {
     use super::firecracker_vsock_listen_path;
+    use super::{GatewayService, Session};
+    use crate::rail::{ChargeIssuedData, MockRail, SettlementProvider, ISSUE_CHARGE_DESTINATION};
+    use crate::treasury::Treasury;
     use std::path::Path;
+    use std::sync::Arc;
+
+    /// A settlement double whose `verify_settlement` NEVER resolves: it awaits a future that
+    /// stays `Pending` forever. Lets a tooth cancel a settle mid-`verify_settlement` (the one
+    /// await inside `settle_inner` for a fresh charge) and assert the map entry is still
+    /// cleaned up. `issue` is unused by the tooth.
+    struct HangingSettlement;
+
+    #[async_trait::async_trait]
+    impl SettlementProvider for HangingSettlement {
+        async fn issue(&self, amount_sats: u64, _memo: &str) -> anyhow::Result<ChargeIssuedData> {
+            Ok(ChargeIssuedData {
+                charge_id: "hang".to_string(),
+                invoice_or_request: format!("cashu:charge:hang:{amount_sats}"),
+                amount_sats,
+            })
+        }
+        async fn verify_settlement(&self, _charge_id: &str, _evidence: &str) -> anyhow::Result<u64> {
+            // Never resolves: park forever so the caller can cancel us mid-await.
+            std::future::pending::<()>().await;
+            unreachable!("pending future never resolves")
+        }
+    }
+
+    fn hanging_settlement_gateway() -> GatewayService {
+        let treasury = Treasury::open_temporary(1_000).expect("open temporary treasury");
+        let session = Session {
+            task_descriptor: "settle-lock-cleanup".into(),
+            budget_sats: 1_000,
+            allowlisted_destinations: vec![ISSUE_CHARGE_DESTINATION.to_string()],
+            allowlisted_inbound_kinds: Vec::new(),
+        };
+        GatewayService::new(treasury, Arc::new(MockRail::new()), session)
+            .with_settlement_provider(HangingSettlement)
+    }
+
+    /// ROUND-3 finding: the `settle_locks` map entry is removed even when a settle is
+    /// CANCELLED mid-flight. We start a settle whose `verify_settlement` never resolves, let
+    /// it park inside `settle_inner` (so the map entry exists), then cancel it via
+    /// `tokio::time::timeout`. The cleanup-on-drop guard must remove the entry as the settle
+    /// future is dropped.
+    ///
+    /// RED-on-revert: restore the OLD explicit post-await cleanup block (which runs only after
+    /// `settle_inner` RETURNS) in place of the guard, and the cancelled settle never reaches
+    /// that block -- the entry leaks and this assertion fails.
+    #[tokio::test]
+    async fn settle_lock_entry_cleaned_up_even_when_settle_is_cancelled() {
+        let svc = hanging_settlement_gateway();
+        let charge_id = "charge-cancelled";
+
+        // The settle parks forever inside verify_settlement; time out (= cancel) it. The
+        // future is dropped at the timeout, running the cleanup guard's Drop.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            svc.settle_charge(charge_id, "evidence"),
+        )
+        .await;
+        assert!(res.is_err(), "the hanging settle must be cancelled by the timeout");
+
+        // The map entry for the cancelled charge must be gone (leak fixed by the guard).
+        assert!(
+            !svc.settle_locks_contains(charge_id),
+            "settle_locks must not retain the cancelled charge's entry"
+        );
+        assert_eq!(
+            svc.settle_locks_len(),
+            0,
+            "no leaked settle_locks entries after a cancelled settle"
+        );
+    }
 
     /// The Firecracker host-side vsock socket for a guest-initiated connection to
     /// port P is the base uds with a `_P` suffix (the daemon binds this; the
