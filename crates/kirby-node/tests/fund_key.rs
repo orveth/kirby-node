@@ -19,7 +19,10 @@
 //!   (Kr) balance refuses a SYMLINKED `--key-path` — the keyfile read is hardened too, so the
 //!        bearer `sk-` at a symlink target is never followed and sent to the node;
 //!   (F6p) `poll` refuses a plaintext non-loopback RESOLVED node_url (poll's require_secure gate);
-//!   (F7x) `create` refuses (does NOT clobber) an existing pending sidecar (O_EXCL, no strand).
+//!   (F7x) `create` refuses (does NOT clobber) an existing pending sidecar (O_EXCL, no strand);
+//!   (E-mx) `create`/`topup` reject BOTH or NEITHER of --amount-sats/--from-token (exit 9);
+//!   (E-redact) neither the cashu token nor the minted sk- appears on stdout/stderr (ecash path);
+//!   (E-empty) an empty --from-token is a usage refusal (exit 9) with no network call.
 //! Teeth (a) write_key_atomic refuses to overwrite a DIFFERENT key, (b) the keyfile is
 //! 0600 raw sk- (boot.rs compat), plus the write_sidecar/idempotent-read/redaction/hardened-read/
 //! O_EXCL-pending/leave-the-partial/clear-invoice-state teeth are the `src/funding.rs` unit teeth.
@@ -30,7 +33,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{InvoiceBehavior, InvoiceCreate, MockNode, StatusStep};
+use common::{EcashCreate, EcashTopup, InvoiceBehavior, InvoiceCreate, MockNode, StatusStep};
 
 /// The compiled `kirby-node` binary under test (cargo sets this env for integration tests).
 fn bin() -> &'static str {
@@ -241,9 +244,10 @@ async fn create_pending_sidecar_is_0600_under_restrictive_umask() {
 
     // The hardened reader accepts it — a poll READS it (revert would leave 0400 and REJECT the
     // read as a key-write-failure). The mock never pays (empty status_script -> always pending),
-    // so poll times out UNPAID (exit 2) after one poll interval; the exit-2 (not exit-8
-    // key-write-failure) is the proof the 0600 sidecar was readable. A short --timeout-secs keeps
-    // the test to ~one poll interval.
+    // so poll times out UNPAID (exit 2) after the first poll interval; the exit-2 (not exit-8
+    // key-write-failure) is the proof the 0600 sidecar was readable. `--timeout-secs 1` is below
+    // the 5s poll interval, so poll runs one interval (~5s) then hits the deadline and returns
+    // unpaid on the first pass — the timeout bounds it to a single interval, not to one second.
     let (poll_code, poll_out, _pe) = run_fund_key(&[
         "poll",
         "--key-out",
@@ -1284,5 +1288,355 @@ async fn create_refuses_a_dangling_symlink_at_key_out() {
             .is_none(),
         "no invoice is created when --key-out is occupied by a dangling symlink"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- ecash path: create/topup --from-token (alongside the LN path) -------------------
+
+/// `create --from-token` redeems a Cashu token into a funded key in ONE call (no invoice/poll):
+/// it writes the sk- (0600 raw, boot.rs compat), binds the node_url beside it, and reports the
+/// PROBED balance — the SAME keyfile/binding/JSON machinery the LN `poll` path uses. It creates
+/// NO pending-invoice sidecar (the token redeems synchronously). The token is passed to the mock
+/// as the `initial_balance_token` URL query (and URL-encoded by reqwest).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_from_token_funds_key_writes_0600_and_probes_balance() {
+    let dir = temp_dir("ecash-create");
+    let key_out = dir.join("brain.key");
+    let node = MockNode::start_with_invoices(InvoiceBehavior {
+        // The empirical field name is `api_key`; the mock returns the minted key + raises the
+        // shared balance to 3210 sats so the follow-up balance probe reports the funded amount.
+        ecash_create: EcashCreate::Ok {
+            field: "api_key".into(),
+            key: "sk-ecash-minted".into(),
+            balance_msats: 3_210_000,
+        },
+        ..Default::default()
+    })
+    .await;
+
+    // A token with a reserved char (`+`) to exercise URL-encoding on the GET query.
+    let token = "cashuAeyJ0b2tlbiI6+SECRET";
+    let (code, stdout, stderr) = run_fund_key(&[
+        "create",
+        "--from-token",
+        token,
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--node-url",
+        &node.url(),
+    ]);
+    assert_eq!(
+        code, 0,
+        "ecash create funds synchronously; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let j = last_json(&stdout);
+    assert_eq!(j["status"], "funded");
+    assert_eq!(
+        j["balance_sats"], 3210,
+        "F6: the reported balance is the PROBED balance after redeem"
+    );
+    assert_eq!(j["key_path"], key_out.display().to_string());
+
+    // boot.rs compat: the keyfile is 0600 and holds ONLY the raw sk- (+ newline).
+    let raw = std::fs::read_to_string(&key_out).unwrap();
+    assert_eq!(raw, "sk-ecash-minted\n");
+    assert_eq!(file_mode(&key_out), 0o600);
+
+    // The bound node_url sidecar was written (after the key). NO pending-invoice sidecar is ever
+    // created on the ecash path (the token redeemed synchronously).
+    assert_eq!(
+        std::fs::read_to_string(dir.join("brain.key.node_url"))
+            .unwrap()
+            .trim(),
+        node.url()
+    );
+    assert!(
+        !dir.join("brain.key.invoice").exists(),
+        "the ecash path writes no pending-invoice sidecar"
+    );
+
+    // (E-redact) neither the cashu token nor the minted sk- leaks to stdout/stderr.
+    assert!(
+        !stdout.contains("sk-ecash-minted") && !stderr.contains("sk-ecash-minted"),
+        "the minted sk- must not leak"
+    );
+    assert!(
+        !stdout.contains(token) && !stderr.contains(token) && !stdout.contains("SECRET"),
+        "the cashu token must not leak to stdout/stderr"
+    );
+
+    // The mock received the token as the URL query value (URL-encoded: `+` -> %2B).
+    let req = node
+        .first_request_matching("/v1/balance/create")
+        .expect("an ecash create request was sent");
+    assert!(
+        req.path.contains("initial_balance_token="),
+        "the token rides the initial_balance_token query; path: {}",
+        req.path
+    );
+    assert!(
+        req.path.contains("%2B"),
+        "the reserved `+` in the token is URL-encoded (%2B); path: {}",
+        req.path
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `topup --from-token` credits an EXISTING key via `POST /v1/balance/topup` (token in the BODY,
+/// bearer-authed with the key), then confirms the balance ROSE above the pre-credit floor. The
+/// TopupRequest body carries `{cashu_token}` and the Authorization header carries the sk-.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topup_from_token_credits_key_and_confirms_rise() {
+    let dir = temp_dir("ecash-topup");
+    let key_path = dir.join("brain.key");
+    std::fs::write(&key_path, "sk-ecash-existing\n").unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let node = MockNode::start_with_invoices(InvoiceBehavior {
+        // The POST credits the key: raise the shared balance to 5000 sats (the credit landing).
+        ecash_topup: EcashTopup::Ok {
+            balance_msats: 5_000_000,
+        },
+        ..Default::default()
+    })
+    .await;
+    node.set_balance_msats(1_000_000); // 1000 sats before topup
+
+    // Bind the node_url beside the key (0600, as the hardened reader requires) so F9 lets the
+    // topup proceed without --node-url.
+    let binding = dir.join("brain.key.node_url");
+    std::fs::write(&binding, format!("{}\n", node.url())).unwrap();
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let token = "cashuBTOPUP-SECRET";
+    let (code, stdout, stderr) = run_fund_key(&[
+        "topup",
+        "--from-token",
+        token,
+        "--key-path",
+        key_path.to_str().unwrap(),
+        "--timeout-secs",
+        "60",
+    ]);
+    assert_eq!(
+        code, 0,
+        "ecash topup confirms the credit; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "funded");
+    assert_eq!(
+        last_json(&stdout)["balance_sats"],
+        5000,
+        "the new balance after the ecash credit"
+    );
+
+    // The topup POST carried the token in the BODY and the bearer key on Authorization.
+    let req = node
+        .first_request_matching("/v1/balance/topup")
+        .expect("an ecash topup request was sent");
+    assert_eq!(
+        req.method, "POST",
+        "ecash topup is a POST (token in the body)"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+    assert_eq!(
+        body["cashu_token"], token,
+        "the TopupRequest body carries the cashu token"
+    );
+    assert_eq!(
+        req.authorization.as_deref(),
+        Some("Bearer sk-ecash-existing"),
+        "the ecash topup is authenticated with the existing bearer key"
+    );
+
+    // (E-redact) neither the token nor the sk- leaks to stdout/stderr (the token is in the POST
+    // body to the node, never on our stdout/stderr).
+    assert!(
+        !stdout.contains("sk-ecash-existing") && !stderr.contains("sk-ecash-existing"),
+        "the sk- must not leak"
+    );
+    assert!(
+        !stdout.contains(token) && !stderr.contains(token) && !stdout.contains("SECRET"),
+        "the cashu token must not leak to stdout/stderr"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// TOOTH (E-mx): `create` with BOTH --amount-sats and --from-token is refused, and with NEITHER
+/// is refused (exit 9). Clap's `conflicts_with` rejects BOTH; `resolve_funding_source` rejects
+/// NEITHER. Reverting either guard (silently preferring one source, or defaulting) makes this RED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_requires_exactly_one_funding_source() {
+    let dir = temp_dir("ecash-mx-create");
+    let key_out = dir.join("brain.key");
+
+    // BOTH sources -> refused (a closed loopback so a reverted build never reaches a live node).
+    let (code, _stdout, _e) = run_fund_key(&[
+        "create",
+        "--amount-sats",
+        "2000",
+        "--from-token",
+        "cashuXYZ",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--node-url",
+        "http://127.0.0.1:1",
+    ]);
+    assert_eq!(code, 9, "both sources is a usage refusal (exit 9)");
+
+    // NEITHER source -> refused (our own usage error with the stable JSON status).
+    let (code, stdout, _e) = run_fund_key(&[
+        "create",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--node-url",
+        "http://127.0.0.1:1",
+    ]);
+    assert_eq!(
+        code, 9,
+        "no source is a usage refusal (exit 9); stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "usage-error");
+    assert!(!key_out.exists(), "no key is written on a usage refusal");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// TOOTH (E-mx): `topup` with BOTH sources is refused, and with NEITHER is refused (exit 9). The
+/// key must exist + be bound so the failure is specifically the source resolution, not a missing
+/// key (resolve_funding_source runs before any key load).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topup_requires_exactly_one_funding_source() {
+    let dir = temp_dir("ecash-mx-topup");
+    let key_path = dir.join("brain.key");
+    std::fs::write(&key_path, "sk-mx-key\n").unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let binding = dir.join("brain.key.node_url");
+    std::fs::write(&binding, "https://api.routstr.com\n").unwrap();
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    // BOTH -> refused.
+    let (code, _stdout, _e) = run_fund_key(&[
+        "topup",
+        "--amount-sats",
+        "1000",
+        "--from-token",
+        "cashuXYZ",
+        "--key-path",
+        key_path.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 9, "both sources is a usage refusal (exit 9)");
+
+    // NEITHER -> refused (our stable usage error).
+    let (code, stdout, _e) = run_fund_key(&["topup", "--key-path", key_path.to_str().unwrap()]);
+    assert_eq!(
+        code, 9,
+        "no source is a usage refusal (exit 9); stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "usage-error");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// TOOTH (E-empty): an empty `--from-token` is a usage refusal (exit 9) caught BEFORE any network
+/// call. The node_url is a closed loopback, so reverting the empty-token guard in
+/// `create_from_token` makes this RED via a network error (a refused connect), never a live call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_from_empty_token_is_refused() {
+    let dir = temp_dir("ecash-empty");
+    let key_out = dir.join("brain.key");
+    let (code, stdout, _e) = run_fund_key(&[
+        "create",
+        "--from-token",
+        "",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--node-url",
+        "http://127.0.0.1:1",
+    ]);
+    assert_eq!(
+        code, 9,
+        "an empty --from-token is a usage refusal (exit 9), no network call; stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "usage-error");
+    assert!(!key_out.exists(), "no key is written on a usage refusal");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `create --from-token` refuses an existing --key-out (F7): the ecash path shares the
+/// occupied-key-out guard with the LN path, so it never redeems a token onto a funded path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_from_token_refuses_an_existing_key_out() {
+    let dir = temp_dir("ecash-create-exists");
+    let key_out = dir.join("brain.key");
+    std::fs::write(&key_out, "sk-already-here\n").unwrap();
+    let node = MockNode::start_with_invoices(InvoiceBehavior {
+        ecash_create: EcashCreate::Ok {
+            field: "api_key".into(),
+            key: "sk-should-not-mint".into(),
+            balance_msats: 1_000_000,
+        },
+        ..Default::default()
+    })
+    .await;
+    let (code, stdout, _e) = run_fund_key(&[
+        "create",
+        "--from-token",
+        "cashuXYZ",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--node-url",
+        &node.url(),
+    ]);
+    assert_eq!(
+        code, 9,
+        "ecash create onto an existing key path is a usage refusal; stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "usage-error");
+    // The existing key is untouched, and no redeem was attempted.
+    assert_eq!(
+        std::fs::read_to_string(&key_out).unwrap().trim(),
+        "sk-already-here"
+    );
+    assert!(
+        node.first_request_matching("/v1/balance/create").is_none(),
+        "no ecash redeem when --key-out is occupied"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `topup --from-token` maps a 401 on the credit POST to an auth failure (exit 6) — a bad/unfunded
+/// key. Mirrors the LN auth-propagation tooth for the ecash primitive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topup_from_token_maps_401_to_auth_failure() {
+    let dir = temp_dir("ecash-topup-401");
+    let key_path = dir.join("brain.key");
+    std::fs::write(&key_path, "sk-bad-key\n").unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let node = MockNode::start_with_invoices(InvoiceBehavior {
+        ecash_topup: EcashTopup::Status(401),
+        ..Default::default()
+    })
+    .await;
+    node.set_balance_msats(1_000_000);
+    let binding = dir.join("brain.key.node_url");
+    std::fs::write(&binding, format!("{}\n", node.url())).unwrap();
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let (code, stdout, _e) = run_fund_key(&[
+        "topup",
+        "--from-token",
+        "cashuXYZ",
+        "--key-path",
+        key_path.to_str().unwrap(),
+        "--timeout-secs",
+        "60",
+    ]);
+    assert_eq!(
+        code, 6,
+        "a 401 on the ecash topup POST is an auth failure (exit 6); stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "auth-failure");
     std::fs::remove_dir_all(&dir).ok();
 }

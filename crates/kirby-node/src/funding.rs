@@ -1,17 +1,24 @@
 //! The Routstr FUNDING primitive: turn "N sats" into a funded prepaid bearer key
-//! (`sk-…`) by creating a Lightning invoice, letting the creator pay it, and polling the
-//! node until it mints the key. A pure Routstr HTTP client — no cluster, no relay, no mint.
-//! It backs both the `fund-key` CLI (the agent-native surface) and any in-process caller.
+//! (`sk-…`) either by creating a Lightning invoice (the creator pays it, then we poll the
+//! node until it mints the key) OR by redeeming a Cashu ECASH token the creator already holds.
+//! A pure Routstr HTTP client — no cluster, no relay, no mint. It backs both the `fund-key`
+//! CLI (the agent-native surface) and any in-process caller.
 //!
 //! The endpoints and response shapes mirror what the daemon already speaks
 //! ([`crate::rail::RoutstrKeyBrain`]):
-//!   - create: `POST {node}/v1/balance/lightning/invoice` body
+//!   - LN create: `POST {node}/v1/balance/lightning/invoice` body
 //!     `{amount_sats, purpose}` → `{invoice_id, bolt11, amount_sats, expires_at?}`.
 //!     `purpose = "create"` is UNAUTHENTICATED and mints a NEW key on payment;
 //!     `purpose = "topup"` is AUTHENTICATED with the existing `sk-` and credits its balance.
-//!   - poll: `GET {node}/v1/balance/lightning/invoice/{id}/status` →
+//!   - LN poll: `GET {node}/v1/balance/lightning/invoice/{id}/status` →
 //!     `{status, api_key?}`. A non-null `api_key` is the real "paid + minted" signal;
 //!     `expired|failed|error` are terminal-fail states.
+//!   - ecash create: `GET {node}/v1/balance/create?initial_balance_token=<cashu>[&balance_limit=<int>]`
+//!     → a loose JSON object carrying the minted `sk-` (redeems the token into a NEW key in one
+//!     call, no invoice/poll dance). GET-only (Routstr exposes no POST variant), so the token
+//!     rides the URL query — a documented bearer-in-logs exposure; the `topup` POST is cleaner.
+//!   - ecash topup: `POST {node}/v1/balance/topup` body `{cashu_token}` (Bearer `sk-`) → credits
+//!     the existing key. The token is in the request BODY (not the URL), so no query-log exposure.
 //!   - balance: `GET {node}/v1/balance/info` (Bearer `sk-`) → `{balance}` in MILLISATS.
 //!
 //! # Bearer-money discipline
@@ -128,6 +135,52 @@ impl std::fmt::Debug for InvoiceStatusResponse {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct BalanceInfo {
     pub balance: u64,
+}
+
+/// `POST /v1/balance/topup` request body: the Cashu ecash token to redeem into an EXISTING
+/// key's balance (the `TopupRequest` shape — `{cashu_token: string}`). The token is bearer
+/// money, so this type REDACTS it in `Debug` (a `{:?}` — an `assert_eq!` failure or a stray
+/// log — never leaks the token). It is serialized OUT as the request body (so it keeps
+/// `Serialize`); the bearer `sk-` that authorizes the credit rides the `Authorization`
+/// header, never this body.
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TopupRequest {
+    pub cashu_token: String,
+}
+
+impl std::fmt::Debug for TopupRequest {
+    /// Redacts `cashu_token` (bearer money).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TopupRequest")
+            .field("cashu_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The loose `GET /v1/balance/create` response (`additionalProperties: true` in the OpenAPI
+/// — an arbitrary JSON object). The minted `sk-` field name is EMPIRICAL: it is most likely
+/// `api_key` (mirroring the LN status path), confirmed at the C6 live smoke; this type
+/// tolerantly extracts it (see [`extract_minted_key`]). It carries the minted bearer key, so
+/// it is NEVER serialized out (no `Serialize` derive) and its `Debug` REDACTS the extracted
+/// key (a `{:?}` never leaks it). Deserialized as a free `serde_json::Value` so an unexpected
+/// shape parses rather than failing.
+#[derive(Clone, serde::Deserialize)]
+pub struct EcashCreateResponse {
+    /// The whole loose object, kept so [`extract_minted_key`] can search known field names.
+    #[serde(flatten)]
+    pub raw: serde_json::Map<String, serde_json::Value>,
+}
+
+impl std::fmt::Debug for EcashCreateResponse {
+    /// Redacts any extracted `sk-` (bearer money); shows only the set of top-level KEYS
+    /// present (their names, never their values — a value could be the minted key).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<&str> = self.raw.keys().map(|k| k.as_str()).collect();
+        f.debug_struct("EcashCreateResponse")
+            .field("keys", &keys)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
 }
 
 // ---- Outcomes + errors ---------------------------------------------------------------
@@ -468,6 +521,139 @@ pub async fn fetch_balance_sats(node_url: &str, api_key: &str) -> Result<u64, Fu
         .map_err(|_| FundingError::Network("parse balance-info response failed".to_string()))?;
     // msats -> whole spendable sats (a fractional sat is not spendable, so floor).
     Ok(info.balance / 1000)
+}
+
+// ---- Ecash operations (redeem a Cashu token → funded key / credit) -------------------
+
+/// The candidate field names the minted `sk-` may appear under in the loose
+/// `GET /v1/balance/create` response, in priority order. `api_key` is the empirical primary
+/// (it mirrors the LN status path's `api_key`, confirmed at the C6 smoke); the others are
+/// tolerant fallbacks a differently-named field would still be caught by.
+const MINTED_KEY_FIELDS: &[&str] = &["api_key", "sk", "key", "token", "apiKey", "api_token"];
+
+/// Extract the minted `sk-` from the loose ecash-create response (tolerant, F-empirical). It
+/// tries the known field names ([`MINTED_KEY_FIELDS`]) in order and returns the first non-empty
+/// STRING value; failing that, it accepts any top-level string value that looks like a Routstr
+/// key (`sk-…`), so an unexpected-but-obvious field name still funds. Returns `None` if nothing
+/// key-shaped is present (the caller maps that to a Network error — a malformed response).
+fn extract_minted_key(raw: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    for field in MINTED_KEY_FIELDS {
+        if let Some(s) = raw.get(*field).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    // Fallback: any top-level string value that is shaped like an `sk-…` key.
+    raw.values()
+        .filter_map(|v| v.as_str())
+        .find(|s| s.starts_with("sk-"))
+        .map(|s| s.to_string())
+}
+
+/// Create a funded key FROM a Cashu ecash token in ONE call:
+/// `GET {node}/v1/balance/create?initial_balance_token=<token>[&balance_limit=<int>]` redeems
+/// the token into a NEW prepaid key and returns the minted `sk-`. No invoice/poll dance (the
+/// token redeems synchronously). `require_secure_node_url` is enforced FIRST (the token is
+/// bearer money and the minted key is later bound to this node_url). An empty token is a usage
+/// error caught before the network. The `sk-` is bearer money — the caller writes it to a 0600
+/// keyfile, never logs it; the response type redacts it in `Debug`.
+///
+/// # Bearer-in-URL exposure
+/// This is a **GET with the token in the query string**, so the Cashu token (bearer money) can
+/// land in server/proxy access logs. Routstr exposes NO POST variant for create-from-token, so
+/// the exposure is unavoidable here — treat a create token as BURNED ON USE. The
+/// [`topup_from_token`] POST (token in the body) is the cleaner primitive when crediting an
+/// existing key. reqwest's `.query(&[..])` URL-encodes the token so it is transmitted safely
+/// even with reserved characters (the exposure is the logging, not malformed transport).
+pub async fn create_from_token(
+    node_url: &str,
+    token: &str,
+    balance_limit: Option<u64>,
+) -> Result<String, FundingError> {
+    if token.trim().is_empty() {
+        return Err(FundingError::Usage(
+            "an ecash create requires a non-empty cashu token (--from-token)".to_string(),
+        ));
+    }
+    // The minted key is later bound to this node_url (and the token is bearer money crossing
+    // the wire), so enforce https-or-loopback BEFORE the GET — no bearer secret over plaintext
+    // non-loopback http, and no key bound to a plaintext-http node.
+    require_secure_node_url(node_url)?;
+    let http = build_client()?;
+    let node = normalize_node_url(node_url);
+    // Build the query with reqwest's typed `.query`, which percent-encodes each value — the
+    // token (a base64-ish string that can contain reserved chars) is URL-encoded correctly.
+    // `balance_limit`, when set, ties to the capped child-key concept (a future per-agent budget).
+    let mut req = http
+        .get(format!("{node}/v1/balance/create"))
+        .query(&[("initial_balance_token", token)]);
+    if let Some(limit) = balance_limit {
+        req = req.query(&[("balance_limit", limit.to_string())]);
+    }
+    let resp = req
+        .send()
+        .await
+        // A reqwest error renders the request URL — which embeds the bearer token on this GET —
+        // so use a FIXED context string, never the error's `Display`, so the token cannot leak.
+        .map_err(|_| FundingError::Network("ecash create-from-token request failed".to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(status_error("ecash create", status));
+    }
+    let parsed: EcashCreateResponse = resp
+        .json()
+        .await
+        .map_err(|_| FundingError::Network("parse ecash create response failed".to_string()))?;
+    extract_minted_key(&parsed.raw).ok_or_else(|| {
+        // The response parsed but held no key-shaped field. Name the KEYS present (their names
+        // are not secret) so a field-name mismatch is diagnosable, but never a value (a value
+        // could be the minted key). This is the empirical-field-name guard for the C6 smoke.
+        let keys: Vec<&str> = parsed.raw.keys().map(|k| k.as_str()).collect();
+        FundingError::Network(format!(
+            "ecash create response carried no recognizable sk- field (top-level keys: {keys:?}); \
+             the minted-key field name is empirical — confirm it at the live smoke"
+        ))
+    })
+}
+
+/// Credit an EXISTING key's balance FROM a Cashu ecash token:
+/// `POST {node}/v1/balance/topup` body `{cashu_token}` authenticated with the key's `sk-`
+/// (`Authorization: Bearer …`). The token is in the request BODY (not the URL), so there is no
+/// query-log exposure — this is the cleaner ecash primitive. `require_secure_node_url` is
+/// enforced FIRST (the bearer `sk-` and the token both cross the wire). An empty token is a
+/// usage error caught before the network. On a non-2xx, a 401/403 maps to
+/// [`FundingError::Auth`] (a bad/unfunded key) and everything else to [`FundingError::Network`].
+/// Neither the token nor the `sk-` is ever logged (the token rides the redacting [`TopupRequest`]
+/// body; the `sk-` rides the `Authorization` header).
+pub async fn topup_from_token(
+    node_url: &str,
+    api_key: &str,
+    token: &str,
+) -> Result<(), FundingError> {
+    if token.trim().is_empty() {
+        return Err(FundingError::Usage(
+            "an ecash topup requires a non-empty cashu token (--from-token)".to_string(),
+        ));
+    }
+    // The bearer `sk-` (and the token) cross the wire — never over plaintext non-loopback http.
+    require_secure_node_url(node_url)?;
+    let http = build_client()?;
+    let node = normalize_node_url(node_url);
+    let resp = http
+        .post(format!("{node}/v1/balance/topup"))
+        .bearer_auth(api_key)
+        .json(&TopupRequest {
+            cashu_token: token.to_string(),
+        })
+        .send()
+        .await
+        .map_err(|_| FundingError::Network("ecash topup request failed".to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(status_error("ecash topup", status));
+    }
+    Ok(())
 }
 
 // ---- Keyfile + sidecar persistence (F8 / F9 / F2) ------------------------------------
@@ -1550,9 +1736,9 @@ mod tests {
     #[test]
     fn write_key_atomic_leaves_a_partial_file_and_never_path_unlinks() {
         // TOOTH (fresh-create TOCTOU elimination): on a fresh-create write/fsync FAILURE,
-        // write_key_atomic must LEAVE the partial file in place — it must NOT unlink by path (the
-        // old `remove_if_same_inode` path-unlink was a TOCTOU: an entry swapped between the failed
-        // write and the cleanup would delete a DIFFERENT file). Forcing a real fsync failure on a
+        // write_key_atomic must LEAVE the partial file in place — it must NOT unlink by path (a
+        // path-based unlink here is a TOCTOU: an entry swapped between the failed write and the
+        // cleanup would delete a DIFFERENT file). Forcing a real fsync failure on a
         // normal fd is not portable, so the write-failure branch is covered BY INSPECTION (the
         // error path now returns without any `remove_file(path)`), and this asserts the two
         // observable safety consequences that make "leave the partial" safe:
@@ -1643,6 +1829,89 @@ mod tests {
             .unwrap();
         let err = rt
             .block_on(create_invoice("http://127.0.0.1:1", 100, "topup", None))
+            .unwrap_err();
+        assert_eq!(err.exit_code(), exit_code::USAGE_ERROR);
+    }
+
+    // ---- ecash: minted-key extraction + secret redaction + empty-token guards -------
+
+    #[test]
+    fn extract_minted_key_finds_the_empirical_field_and_tolerates_others() {
+        // The empirical primary is `api_key` (mirroring the LN status path).
+        let m: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"api_key":"sk-ecash-primary","balance":2000}"#).unwrap();
+        assert_eq!(extract_minted_key(&m).as_deref(), Some("sk-ecash-primary"));
+
+        // A tolerant fallback field name still funds.
+        let m: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"key":"sk-ecash-fallback"}"#).unwrap();
+        assert_eq!(extract_minted_key(&m).as_deref(), Some("sk-ecash-fallback"));
+
+        // An UNKNOWN field name whose value is nonetheless `sk-…`-shaped is still caught.
+        let m: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"surprise_field":"sk-shaped-value","x":1}"#).unwrap();
+        assert_eq!(extract_minted_key(&m).as_deref(), Some("sk-shaped-value"));
+
+        // An empty string in the primary field is NOT accepted (a blank is not a key); nothing
+        // key-shaped -> None (the caller maps that to a Network/malformed error).
+        let m: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"api_key":"","detail":"nope"}"#).unwrap();
+        assert_eq!(extract_minted_key(&m), None);
+    }
+
+    #[test]
+    fn ecash_secret_types_redact_in_debug() {
+        // TOOTH: the ecash secret-bearing types must NOT print their secret via `{:?}`
+        // (an assert failure or a stray log renders Debug). Reverting either custom `Debug`
+        // to a derived one makes this RED — the raw cashu token / minted sk- would appear.
+        let req = TopupRequest {
+            cashu_token: "cashuBSECRET-TOKEN".into(),
+        };
+        let d = format!("{req:?}");
+        assert!(
+            !d.contains("cashuBSECRET-TOKEN"),
+            "the cashu token must not appear in Debug: {d}"
+        );
+        assert!(d.contains("<redacted>"), "the token is redacted: {d}");
+
+        let raw: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"api_key":"sk-ECASH-SECRET","balance":10}"#).unwrap();
+        let resp = EcashCreateResponse { raw };
+        let d = format!("{resp:?}");
+        assert!(
+            !d.contains("sk-ECASH-SECRET"),
+            "the minted sk- must not appear in Debug: {d}"
+        );
+        assert!(d.contains("<redacted>"), "the key is redacted: {d}");
+        // The KEY NAMES (not values) are shown for diagnosis.
+        assert!(d.contains("api_key"), "the field names are shown: {d}");
+    }
+
+    #[test]
+    fn create_from_token_rejects_an_empty_token() {
+        // TOOTH: an empty cashu token is a USAGE error caught BEFORE any network call. The url is
+        // a closed loopback (nothing listening), so reverting the empty-token guard makes this RED
+        // via a NETWORK error (a refused connection), never a live api.routstr.com call.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(create_from_token("http://127.0.0.1:1", "   ", None))
+            .unwrap_err();
+        assert_eq!(err.exit_code(), exit_code::USAGE_ERROR);
+    }
+
+    #[test]
+    fn topup_from_token_rejects_an_empty_token() {
+        // TOOTH: an empty cashu token is a USAGE error caught BEFORE any network call (same
+        // closed-loopback guarantee as above — never a live call).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(topup_from_token("http://127.0.0.1:1", "sk-key", ""))
             .unwrap_err();
         assert_eq!(err.exit_code(), exit_code::USAGE_ERROR);
     }

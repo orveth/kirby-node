@@ -108,6 +108,44 @@ pub struct InvoiceBehavior {
     /// (before the caller can capture a pre-invoice balance floor). Drives the topup
     /// baseline-race tooth: only a caller that reads the floor BEFORE this create confirms.
     pub create_raises_balance_msats: Option<u64>,
+    /// `GET /v1/balance/create` (the ECASH create-from-token path): how the mock answers the
+    /// synchronous token-redeem. Also records the received `initial_balance_token` query value so
+    /// a test can assert the token was passed (and URL-encoded).
+    pub ecash_create: EcashCreate,
+    /// `POST /v1/balance/topup` (the ECASH topup-from-token path): how the mock answers, and the
+    /// balance (millisats) it RAISES the shared balance to on a successful credit.
+    pub ecash_topup: EcashTopup,
+}
+
+/// The `GET /v1/balance/create?initial_balance_token=…` mock response (ecash create).
+#[derive(Clone, Default)]
+pub enum EcashCreate {
+    /// 404 — the route is not configured (the default; LN-only tests never hit it).
+    #[default]
+    NotConfigured,
+    /// 200 with a LOOSE JSON object carrying the minted `sk-` under `field` (empirically
+    /// `api_key`), and RAISING the shared balance to `balance_msats` (so a subsequent
+    /// `/v1/balance/info` probe reports the funded amount).
+    Ok {
+        field: String,
+        key: String,
+        balance_msats: u64,
+    },
+    /// A non-2xx status (e.g. 400 for a bad/spent token, 500 for a mint error).
+    Status(u16),
+}
+
+/// The `POST /v1/balance/topup` mock response (ecash topup).
+#[derive(Clone, Default)]
+pub enum EcashTopup {
+    /// 404 — the route is not configured (the default; LN-only tests never hit it).
+    #[default]
+    NotConfigured,
+    /// 200 (`{}`) and RAISE the shared balance to `balance_msats` (the credit landing), so the
+    /// caller's post-credit balance probe sees the rise above its pre-credit floor.
+    Ok { balance_msats: u64 },
+    /// A non-2xx status (e.g. 401/403 for a bad key, 400 for a spent token).
+    Status(u16),
 }
 
 /// The `POST /v1/balance/lightning/invoice` mock response.
@@ -469,6 +507,72 @@ async fn handle_conn(
                     body.as_bytes(),
                 )
                 .await;
+            }
+        }
+        return;
+    }
+
+    // The ECASH create-from-token endpoint (`GET /v1/balance/create?initial_balance_token=…`).
+    // The token rides the URL query, so it is captured in the recorded request's `path`. On a
+    // configured Ok it returns a LOOSE JSON object with the minted `sk-` under the given field and
+    // raises the shared balance so a follow-up `/v1/balance/info` probe reports the funded amount.
+    if path.contains("/v1/balance/create") {
+        match invoices.ecash_create.clone() {
+            EcashCreate::NotConfigured => {
+                write_response(&mut stream, 404, "Not Found", &[], b"").await;
+            }
+            EcashCreate::Ok {
+                field,
+                key,
+                balance_msats,
+            } => {
+                invoices
+                    .balance_msats
+                    .store(balance_msats, Ordering::SeqCst);
+                // A LOOSE object (additionalProperties): the minted key under `field`, plus a
+                // couple of decoy fields so the extractor's field-priority is genuinely exercised.
+                let body =
+                    serde_json::json!({ field: key, "balance": balance_msats, "unit": "sat" })
+                        .to_string();
+                write_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &[("Content-Type", "application/json")],
+                    body.as_bytes(),
+                )
+                .await;
+            }
+            EcashCreate::Status(code) => {
+                write_response(&mut stream, code, "Error", &[], b"{\"detail\":\"mock\"}").await;
+            }
+        }
+        return;
+    }
+
+    // The ECASH topup-from-token endpoint (`POST /v1/balance/topup {cashu_token}`). On a
+    // configured Ok it raises the shared balance (the credit landing) so the caller's
+    // post-credit `/v1/balance/info` probe sees the rise above its pre-credit floor.
+    if path.contains("/v1/balance/topup") {
+        match invoices.ecash_topup.clone() {
+            EcashTopup::NotConfigured => {
+                write_response(&mut stream, 404, "Not Found", &[], b"").await;
+            }
+            EcashTopup::Ok { balance_msats } => {
+                invoices
+                    .balance_msats
+                    .store(balance_msats, Ordering::SeqCst);
+                write_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &[("Content-Type", "application/json")],
+                    b"{}",
+                )
+                .await;
+            }
+            EcashTopup::Status(code) => {
+                write_response(&mut stream, code, "Error", &[], b"{\"detail\":\"mock\"}").await;
             }
         }
         return;

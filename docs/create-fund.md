@@ -7,14 +7,19 @@ CLI (`fund-key` + `--json` + exit codes), and a human can run the same one-shot.
 Published code funds nothing -- each creator funds their OWN agent's key; no
 money is ever baked in.
 
-The shape of it:
+The shape of it -- two funding sources, one keyfile:
 
 ```
-fund-key create --key-out K   -->  {bolt11}   (the creator pays the bolt11)
+# Lightning (pay an invoice):
+fund-key create --amount-sats N --key-out K  -->  {bolt11}  (the creator pays it)
    -->  fund-key poll --key-out K   -->  the node mints the sk- on payment
    -->  the sk- is written to a 0600 keyfile (K)
+
+# OR ecash (redeem a Cashu token you already hold -- one call, no poll):
+fund-key create --from-token <cashu> --key-out K  -->  the sk- is written to K
+
    -->  point an agent at it ([brain] backend = "routstr_key", api_key_path)
-   -->  fund-key topup   -->  credit the key's balance to keep it alive.
+   -->  fund-key topup (--amount-sats N | --from-token <cashu>)  -->  keep it alive.
 ```
 
 The `sk-` is **bearer money**. It only ever lands in a **0600 keyfile** -- never
@@ -26,12 +31,17 @@ on the unauthenticated `create` path (it is what a `poll` exchanges for the
 `sk-`), so it is **never printed** -- it is persisted (with the `node_url`) to a
 0600 sidecar beside `--key-out` and `poll` reads it back from there.
 
-> **Live-smoke caveat (C6).** `topup` is spec-ready but un-exercised against the
-> live node; and as of this writing `POST /v1/balance/lightning/invoice
+> **Live-smoke caveat (C6).** The LN `topup` is spec-ready but un-exercised against
+> the live node; and as of this writing `POST /v1/balance/lightning/invoice
 > {purpose:"create"}` has been failing Routstr-side (`{"detail":"Failed to
 > create Lightning invoice"}`) -- the request shape is accepted but invoice
-> creation fails on their end. The flow is tested end-to-end against an offline
-> mock; a live smoke (a few real sats) is the last gate before it is demoable.
+> creation fails on their end. **The ECASH path routes around that outage** (mint a
+> token at minibits, then `create/topup --from-token`) and is the live-smoke path
+> that works today -- see "Fund with ECASH" below. All flows are tested end-to-end
+> against an offline mock; a live smoke (a few real sats) is the last gate before a
+> flow is demoable. One ecash detail is empirical until the smoke: the minted-key
+> field name in the loose `GET /v1/balance/create` response (kirby parses it
+> tolerantly, expecting `api_key`).
 
 ## The commands
 
@@ -40,11 +50,19 @@ default `--node-url` is `https://api.routstr.com`.
 
 | Subcommand | Does | Blocks? |
 |---|---|---|
-| `create --amount-sats N --key-out PATH` | Create an invoice (mints a NEW key on payment). Persists the `invoice_id` + `node_url` to a 0600 sidecar beside `--key-out`. Refuses if `--key-out` already exists. | no |
-| `poll --key-out PATH` | Poll the created invoice (invoice_id + node_url from the sidecar); on payment, write the `sk-` to `--key-out` (0600), bind the `node_url` beside it, and report the probed balance. | yes |
-| `provision --amount-sats N --key-out PATH` | One-shot: `create` + emit the bolt11 early + `poll` + write. | yes |
-| `topup --amount-sats N --key-path PATH` | Credit an EXISTING key's balance (authenticated with its `sk-`). | yes |
+| `create --amount-sats N --key-out PATH` | LN: create an invoice (mints a NEW key on payment). Persists the `invoice_id` + `node_url` to a 0600 sidecar beside `--key-out`. Refuses if `--key-out` already exists. | no |
+| `create --from-token <cashu> --key-out PATH` | Ecash: redeem a Cashu token into a NEW funded key in ONE call (no invoice/poll). Writes the `sk-` (0600) + binds the `node_url`, reports the probed balance. Refuses if `--key-out` already exists. | yes (synchronous) |
+| `poll --key-out PATH` | LN only: poll the created invoice (invoice_id + node_url from the sidecar); on payment, write the `sk-` to `--key-out` (0600), bind the `node_url` beside it, and report the probed balance. | yes |
+| `provision --amount-sats N --key-out PATH` | LN one-shot: `create` + emit the bolt11 early + `poll` + write. | yes |
+| `topup --amount-sats N --key-path PATH` | LN: credit an EXISTING key's balance (authenticated with its `sk-`). | yes |
+| `topup --from-token <cashu> --key-path PATH` | Ecash: credit an EXISTING key's balance from a Cashu token (POST, token in the body). | yes |
 | `balance --key-path PATH` | Read an existing key's spendable balance. | no |
+
+`create` and `topup` each take a funding SOURCE: `--amount-sats N` (Lightning) **or**
+`--from-token <cashu>` (ecash). They are **mutually exclusive — pass exactly one**; both or
+neither is a usage error (exit 9). Both sources share the same keyfile write, `node_url`
+binding, JSON contract, and exit codes — only the "obtain the `sk-` / credit the balance" step
+differs.
 
 > **No `recover`.** Recovering a key from its `bolt11` is **deferred** (pending
 > C7): a paid invoice's `bolt11` is public (it is handed to wallets / QR / NWC),
@@ -122,6 +140,64 @@ they never send the bearer key to a different server. To override it you must
 pass BOTH `--node-url <url>` and `--allow-node-url-override` (a loud, deliberate
 choice); a mismatched `--node-url` without the flag is refused.
 
+## Fund with ECASH: `create`/`topup --from-token`
+
+A second, live-proven funding path runs **alongside** Lightning: fund a key from a
+Cashu **ecash token** you already hold. It is a first-class source on `create` and
+`topup` (via `--from-token <cashu>`), and it **routes around the current Routstr
+LN-`create` outage** (see the caveat above) -- the ecash path is the live-smoke (C6)
+path that works today.
+
+```sh
+# Create a NEW funded key from a token (ONE call, synchronous -- no invoice/poll):
+kirby-node fund-key create --from-token cashuB... --key-out ./agent/brain.key
+# -> {"status":"funded","key_path":"./agent/brain.key","balance_sats":2000}
+
+# Credit an EXISTING key from a token:
+kirby-node fund-key topup --from-token cashuB... --key-path ./agent/brain.key
+# -> {"status":"funded","balance_sats":4000}
+```
+
+Ecash `create` redeems the token into a new key in a single call -- there is **no
+invoice, no poll, and no pending-invoice sidecar** (the token redeems synchronously).
+It runs the same hardened machinery as the LN `poll`: it writes the `sk-` to a 0600
+keyfile, binds the `node_url` beside it, and reports the **probed** balance (the
+token's redeemed value, minus any mint/routing rounding). Ecash `topup` POSTs the
+token to `/v1/balance/topup` authenticated with the key, then confirms the balance
+rose (the same balance-rise confirmation the LN topup uses).
+
+### The creator brings the token (C5)
+
+kirby does **not** build a mint or a payment rail -- the creator brings the funds, so
+the creator mints the ecash token first. With [minibits](https://minibits.cash) (Routstr
+accepts it, first in its mints list):
+
+```
+1) POST {minibits}/v1/mint/quote/bolt11 {amount_sats}  -> a bolt11 + a quote id
+2) Pay that bolt11 from your Lightning wallet (NWC, LNC, a QR, ...).
+3) Mint the ecash token against the paid quote (your Cashu wallet does this).
+4) Redeem it: kirby-node fund-key create/topup --from-token <that token>
+```
+
+That is a complete "N sats -> funded key" loop **today**, even while Routstr's LN
+`create` is failing on their end. (A future enhancement, E2, folds the minibits mint
+flow into `fund-key` directly -- `--via ecash --amount N` -- for a one-command path.)
+
+### Security: the create-token rides the URL (a log exposure)
+
+Ecash **`create` is a GET with the token in the query string**
+(`/v1/balance/create?initial_balance_token=<token>`). Routstr exposes **no POST
+variant** for create-from-token, so the Cashu token (bearer money) can land in
+server/proxy **access logs** -- unavoidable for `create`. Treat a create token as
+**burned on use** (single-use, redeemed immediately, never reused). The token is
+URL-encoded on the wire and never printed by kirby, but the server-side log exposure is
+inherent to the GET.
+
+**Prefer `topup --from-token`** when crediting an existing key: the topup **POST** puts
+the token in the request **body**, so there is no URL/query-log exposure -- it is the
+clean ecash primitive. (LN `create` carries no bearer secret on the request, so it has
+no such exposure either.)
+
 ## The `fund -> run one agent` recipe (Layer 1)
 
 `provision --emit-config <path>` writes a minimal, runnable kirby config for a
@@ -163,7 +239,7 @@ it is stable:
 | 6 | `auth-failure` | Bad/empty/unfunded/revoked key (401/403). |
 | 7 | `insufficient-balance` | The custodial balance is too low for the operation. |
 | 8 | `key-write-failure` | Writing the keyfile/sidecar failed (e.g. a DIFFERENT key already exists there). |
-| 9 | `usage-error` | A bad argument caught before any network call (bad amount, node_url mismatch, a plaintext non-loopback node_url, an existing `--key-out`, no pending state). |
+| 9 | `usage-error` | A bad argument caught before any network call (bad amount, node_url mismatch, a plaintext non-loopback node_url, an existing `--key-out`, no pending state, an empty `--from-token`, or not exactly one of `--amount-sats`/`--from-token`). |
 
 On a failure the object is `{"status":"<tag>","error":"<message>"}`. The `sk-`
 and `invoice_id` never appear in any JSON line, and no error message carries the
