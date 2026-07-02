@@ -292,6 +292,15 @@ enum Command {
         #[arg(long)]
         genome_config: Option<String>,
     },
+    /// Fund a prepaid Routstr bearer key (`sk-…`) by paying a Lightning invoice: the
+    /// agent-native funding primitive. Turn "N sats" into a funded key the agent thinks on.
+    /// Every subcommand emits a stable JSON object on stdout and returns a distinct exit code
+    /// so a driving agent branches on the exit alone (0 funded; non-zero per failure). The
+    /// minted `sk-` only ever lands in a 0600 keyfile — never printed, logged, or in a TOML.
+    FundKey {
+        #[command(subcommand)]
+        cmd: FundKeyCmd,
+    },
     /// INTERNAL (not for direct use): the privileged eBPF egress-byte meter, run
     /// by the daemon through sudo (the D-7 path) because loading and attaching
     /// eBPF needs CAP_BPF the unprivileged daemon lacks. It loads the embedded TC
@@ -305,6 +314,154 @@ enum Command {
         /// The reporting tick in milliseconds.
         #[arg(long, default_value_t = 100)]
         tick_ms: u64,
+    },
+}
+
+/// The `fund-key` subcommands (the Layer-0 funding atom). The split `create`+`poll` is the
+/// primary agent-native path (an agent with an LN wallet does `create → pay(bolt11) → poll`
+/// fully programmatically); `provision` is the one-shot for humans/simple scripts. `topup` and
+/// `balance` operate on an already-funded key. (There is no `recover`: a paid invoice's bolt11
+/// is public, so recover-by-bolt11 would return bearer money to anyone holding it, and
+/// Routstr's recover-auth is unverified — recover is DEFERRED. The 0600 pending-invoice sidecar
+/// makes `create → poll` crash-resumable, so it is rarely needed.)
+#[derive(Subcommand)]
+enum FundKeyCmd {
+    /// Create a funded key. Two mutually-exclusive sources (exactly one required):
+    /// `--amount-sats N` mints an LN invoice (purpose="create", UNAUTHENTICATED — the NEW key is
+    /// minted on payment; NON-BLOCKING: prints `{status, bolt11, amount_sats}` + a hint to run
+    /// `fund-key poll --key-out PATH`), while `--from-token <cashu>` redeems a Cashu ecash token
+    /// into a funded key in ONE call (SYNCHRONOUS — no invoice/poll; writes the key + node_url
+    /// binding immediately and prints `{status:"funded", key_path, balance_sats}`). On the LN
+    /// path the `invoice_id` is bearer-sensitive: it (with the node_url) is persisted to a 0600
+    /// pending-invoice sidecar beside `--key-out` and NEVER printed or logged. Both paths refuse
+    /// if `--key-out` already exists (never create onto a funded key). The ecash create is a GET
+    /// with the token in the URL query (a bearer-in-logs exposure — prefer `topup --from-token`).
+    Create {
+        /// LN source: the invoice amount in sats (1..=1_000_000, the node's bounds). Mutually
+        /// exclusive with `--from-token` (exactly one required; both/neither is a usage error
+        /// exit 9, resolved in the handler so the failure carries the stable JSON contract).
+        #[arg(long)]
+        amount_sats: Option<u64>,
+        /// Ecash source: a Cashu token to redeem into a funded key (SYNCHRONOUS, no poll).
+        /// Mutually exclusive with `--amount-sats`.
+        #[arg(long)]
+        from_token: Option<String>,
+        /// Ecash source only: an optional per-key balance cap (the capped child-key concept) —
+        /// passed as `balance_limit` on the create. Ignored on the LN path.
+        #[arg(long)]
+        balance_limit: Option<u64>,
+        /// Where the funded key WILL be written (by a later `poll` on the LN path, or
+        /// immediately on the ecash path). On the LN path it is used now only to persist the
+        /// pending invoice-state (0600). Must NOT already exist.
+        #[arg(long)]
+        key_out: std::path::PathBuf,
+        /// The Routstr node base URL. Defaults to https://api.routstr.com. On the LN path it is
+        /// persisted into the pending sidecar so `poll` targets THIS node; on the ecash path it
+        /// is bound beside the key.
+        #[arg(long, default_value = kirby_node::funding::DEFAULT_NODE_URL)]
+        node_url: String,
+        /// Emit the result as a JSON object on stdout (the default; kept for symmetry).
+        #[arg(long, default_value_t = true)]
+        json: bool,
+    },
+    /// Poll a created invoice until it is paid + the key is minted, then write the `sk-` to
+    /// `--key-out` (0600). BLOCKS up to `--timeout-secs`. The invoice_id AND the node_url are
+    /// read from the pending sidecar `create` wrote beside `--key-out` (there is no
+    /// `--invoice-id`). On success prints `{status:"funded", key_path, balance_sats}` (balance
+    /// PROBED post-payment); a terminal expired/failed status or a timeout exits non-zero.
+    Poll {
+        /// Where to write the minted key (0600). The pending sidecar beside it supplies the
+        /// invoice_id + node_url.
+        #[arg(long)]
+        key_out: std::path::PathBuf,
+        /// Optional node_url override. If given it MUST match the node_url in the pending
+        /// sidecar UNLESS `--allow-node-url-override` is also set (never poll a different node
+        /// by accident — the invoice lives on the node it was created against).
+        #[arg(long)]
+        node_url: Option<String>,
+        /// Explicitly allow a `--node-url` that differs from the pending sidecar's node_url.
+        #[arg(long, default_value_t = false)]
+        allow_node_url_override: bool,
+        /// The wait budget in seconds (default ~20 min, the invoice lifetime).
+        #[arg(long, default_value_t = 1200)]
+        timeout_secs: u64,
+        #[arg(long, default_value_t = true)]
+        json: bool,
+    },
+    /// One-shot: create + emit the bolt11 (as an early JSONL line, BEFORE it blocks) + poll +
+    /// write the key. The simple/blocking path for a human (pay the QR) or a small script.
+    /// With `--emit-config` it also writes a minimal runnable kirby config (Layer 1) whose
+    /// treasury `initial_sats` is the CONFIRMED probed balance.
+    Provision {
+        /// The invoice amount in sats (1..=1_000_000).
+        #[arg(long)]
+        amount_sats: u64,
+        /// Where to write the minted key (0600).
+        #[arg(long)]
+        key_out: std::path::PathBuf,
+        /// The Routstr node base URL. Defaults to https://api.routstr.com.
+        #[arg(long, default_value = kirby_node::funding::DEFAULT_NODE_URL)]
+        node_url: String,
+        /// The wait budget in seconds (default ~20 min).
+        #[arg(long, default_value_t = 1200)]
+        timeout_secs: u64,
+        /// ALSO write a minimal runnable kirby config to this path (Layer 1): brain.backend =
+        /// routstr_key, api_key_path = key_out, node_url, treasury initial_sats = the
+        /// confirmed probed balance.
+        #[arg(long)]
+        emit_config: Option<std::path::PathBuf>,
+        #[arg(long, default_value_t = true)]
+        json: bool,
+    },
+    /// Top up an EXISTING funded key (authenticated with the key at `--key-path`). Two
+    /// mutually-exclusive sources (exactly one required): `--amount-sats N` creates a
+    /// purpose="topup" LN invoice, emits the bolt11 early, then polls to confirm the balance
+    /// credit; `--from-token <cashu>` POSTs the Cashu token to `/v1/balance/topup` (token in the
+    /// BODY — no URL exposure) and confirms the balance rose. Client-side only — it does NOT
+    /// touch any agent treasury counter. On success prints `{status:"funded", balance_sats}`
+    /// (the new probed balance).
+    Topup {
+        /// LN source: the top-up amount in sats (1..=1_000_000). Mutually exclusive with
+        /// `--from-token` (exactly one required; both/neither is a usage error exit 9, resolved
+        /// in the handler so the failure carries the stable JSON contract).
+        #[arg(long)]
+        amount_sats: Option<u64>,
+        /// Ecash source: a Cashu token to credit the key's balance (token in the POST body).
+        /// Mutually exclusive with `--amount-sats`.
+        #[arg(long)]
+        from_token: Option<String>,
+        /// The existing key to top up (holds the raw `sk-`).
+        #[arg(long)]
+        key_path: std::path::PathBuf,
+        /// The wait budget in seconds (default ~20 min).
+        #[arg(long, default_value_t = 1200)]
+        timeout_secs: u64,
+        /// Override the key's BOUND node_url (F9). Refused unless it matches the binding
+        /// UNLESS `--allow-node-url-override` is also set (never send a bearer key elsewhere
+        /// by accident).
+        #[arg(long)]
+        node_url: Option<String>,
+        /// Explicitly allow sending the bearer key to a node_url that differs from the one
+        /// bound beside the key. A loud, deliberate override (F9).
+        #[arg(long, default_value_t = false)]
+        allow_node_url_override: bool,
+        #[arg(long, default_value_t = true)]
+        json: bool,
+    },
+    /// Read an existing key's spendable balance from the node (Bearer auth). Prints
+    /// `{balance_sats}`. Uses the key's BOUND node_url (F9).
+    Balance {
+        /// The key to query (holds the raw `sk-`).
+        #[arg(long)]
+        key_path: std::path::PathBuf,
+        /// Override the key's bound node_url (F9). See `topup --node-url`.
+        #[arg(long)]
+        node_url: Option<String>,
+        /// Explicitly allow a node_url that differs from the binding (F9).
+        #[arg(long, default_value_t = false)]
+        allow_node_url_override: bool,
+        #[arg(long, default_value_t = true)]
+        json: bool,
     },
 }
 
@@ -446,6 +603,10 @@ fn main() -> anyhow::Result<()> {
         Command::SpawnRequest { relay, operator_key, agent_id, image_ref, seed_sats, genome_config } => {
             init_tracing();
             run_spawn_request_cmd(relay, operator_key, agent_id, image_ref, seed_sats, genome_config)
+        }
+        Command::FundKey { cmd } => {
+            init_tracing();
+            run_fund_key_cmd(cmd)
         }
         Command::EbpfEgress { iface, tick_ms } => run_ebpf_egress(iface, tick_ms),
     }
@@ -1219,6 +1380,692 @@ async fn run_spawn_request_cmd(
     println!("published KIND_KIRBY_SPAWN_REQUEST (31003) for agent_id={agent_id} to {relay}");
     println!("event id: {event_id}");
     println!("a listening node that allowlists this operator (or runs open) + has image + capacity will spawn it.");
+    Ok(())
+}
+
+/// The `fund-key` entry: run the requested funding subcommand, print its stable JSON to
+/// stdout, and EXIT with the distinct code (F10) — success is 0, each failure a distinct
+/// non-zero. The `sk-` is never printed; the `invoice_id` is never logged (it lands in a
+/// 0600 sidecar). This owns the Tokio runtime for the whole flow (create/poll are async).
+#[tokio::main]
+async fn run_fund_key_cmd(cmd: FundKeyCmd) -> anyhow::Result<()> {
+    // Every arm returns a Result mapping to the exit-code contract; a top-level match keeps
+    // the exit-on-error in one place so no arm can forget it.
+    let result = fund_key_dispatch(cmd).await;
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // The failure JSON went to stdout at the failing site (so a driving agent always
+            // gets a machine object); here we only translate to the process exit code.
+            std::process::exit(e.exit_code());
+        }
+    }
+}
+
+/// Print one JSON object to stdout (the stable machine surface). A serialization failure is
+/// impossible for the flat maps we build; if it ever were, fall back to a minimal literal.
+fn emit_json(value: &serde_json::Value) {
+    match serde_json::to_string(value) {
+        Ok(s) => println!("{s}"),
+        Err(_) => println!("{{\"status\":\"failed\"}}"),
+    }
+}
+
+/// The funding SOURCE for `create`/`topup`: an LN invoice (amount in sats) or a Cashu ecash
+/// token. Both sources feed the SAME keyfile-write / node_url-binding / JSON / exit-code
+/// machinery — only the "obtain the sk- / credit the balance" step differs. Modeling the source
+/// as one type keeps the two paths from duplicating any policy.
+enum FundingSource {
+    /// The LN path: mint an invoice for `amount_sats`, the creator pays it, we poll for the key.
+    LnInvoice { amount_sats: u64 },
+    /// The ecash path: redeem a Cashu `token` (create → mints a key; topup → credits a key).
+    EcashToken { token: String },
+}
+
+/// Resolve the mutually-exclusive `--amount-sats` / `--from-token` flags into exactly one
+/// [`FundingSource`]. Both flags are plain optionals (NOT clap `conflicts_with`), so this owns
+/// the mutual-exclusion policy and BOTH the both-set and neither-set errors are a
+/// [`FundingError::Usage`] (exit 9) that emits the stable JSON contract — rather than clap's own
+/// error (exit 2), which a driving agent could not branch on the same way. `context` names the
+/// subcommand for the message.
+fn resolve_funding_source(
+    amount_sats: Option<u64>,
+    from_token: Option<String>,
+    context: &str,
+) -> Result<FundingSource, kirby_node::funding::FundingError> {
+    use kirby_node::funding::FundingError;
+    match (amount_sats, from_token) {
+        (Some(amount_sats), None) => Ok(FundingSource::LnInvoice { amount_sats }),
+        (None, Some(token)) => Ok(FundingSource::EcashToken { token }),
+        // BOTH set — refuse (never silently prefer one source).
+        (Some(_), Some(_)) => Err(FundingError::Usage(format!(
+            "{context}: --amount-sats and --from-token are mutually exclusive; pass exactly one"
+        ))),
+        (None, None) => Err(FundingError::Usage(format!(
+            "{context}: exactly one funding source is required — pass --amount-sats <N> (Lightning) \
+             or --from-token <cashu> (ecash)"
+        ))),
+    }
+}
+
+/// Dispatch a `fund-key` subcommand. On any [`FundingError`] it FIRST emits the stable error
+/// JSON (`{status:"<tag>", error:"<message>"}`) to stdout, then propagates the error so the
+/// caller maps it to the exit code. The `sk-` and `invoice_id` never appear in this JSON.
+async fn fund_key_dispatch(cmd: FundKeyCmd) -> Result<(), kirby_node::funding::FundingError> {
+    use kirby_node::funding::{self, FundingError};
+
+    // Run one arm's fallible body; on error, emit the error JSON before returning it.
+    async fn guarded<F>(fut: F) -> Result<(), FundingError>
+    where
+        F: std::future::Future<Output = Result<(), FundingError>>,
+    {
+        match fut.await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                emit_json(&serde_json::json!({
+                    "status": e.status_tag(),
+                    "error": e.to_string(),
+                }));
+                Err(e)
+            }
+        }
+    }
+
+    match cmd {
+        FundKeyCmd::Create {
+            amount_sats,
+            from_token,
+            balance_limit,
+            key_out,
+            node_url,
+            json: _,
+        } => {
+            guarded(async move {
+                let source = resolve_funding_source(amount_sats, from_token, "fund-key create")?;
+                // F7: refuse to create a NEW key onto a path that already holds one (that is a
+                // usage error, not a silent second invoice/redeem against a funded key). Uses
+                // symlink_metadata (lstat) so a DANGLING symlink at --key-out is also caught —
+                // `exists()` follows symlinks and returns false for one, which would let create
+                // mint against a path write_key_atomic's O_NOFOLLOW create later refuses,
+                // spending funding onto an occupied path. Applies to BOTH sources.
+                refuse_if_key_out_occupied(&key_out, "create a new key")?;
+                // F2/F7: refuse BEFORE any network call if a pending invoice already sits beside
+                // --key-out (a paid-but-unpolled LN invoice whose funds a fresh create would
+                // strand). `read_invoice_state` also fails closed on a tampered pending sidecar.
+                // The ecash path never writes a pending sidecar, but it still refuses here so it
+                // does not fund a key beside an unresolved LN invoice on the same path.
+                refuse_if_pending_invoice(&key_out)?;
+                match source {
+                    FundingSource::LnInvoice { amount_sats } => {
+                        let created =
+                            funding::create_invoice(&node_url, amount_sats, "create", None).await?;
+                        // F2/F4: persist the bearer-sensitive invoice_id AND the node_url it was
+                        // created against to the 0600 pending sidecar so `poll` finds both.
+                        // NEITHER is printed. The write is O_EXCL (refuses an existing pending
+                        // sidecar), and the BOUND node_url sidecar is NOT written here — only
+                        // after the key lands (F4), so no binding ever exists without a key.
+                        funding::write_invoice_state(&key_out, &created.invoice_id, &node_url)?;
+                        // The invoice_id is a capability — deliberately NOT on stdout (F1). A
+                        // human/agent resumes with `fund-key poll --key-out <same path>`.
+                        emit_json(&serde_json::json!({
+                            "status": "invoice-created",
+                            "bolt11": created.bolt11,
+                            "amount_sats": created.amount_sats,
+                            "hint": format!(
+                                "pay the bolt11, then run: fund-key poll --key-out {}",
+                                key_out.display()
+                            ),
+                        }));
+                    }
+                    FundingSource::EcashToken { token } => {
+                        // The token redeems SYNCHRONOUSLY into a minted key — no invoice, no poll,
+                        // no pending sidecar. Obtain the sk-, then run the SAME keyfile-write +
+                        // node_url-binding + balance-probe machinery the LN `poll` path uses.
+                        let key =
+                            funding::create_from_token(&node_url, &token, balance_limit).await?;
+                        // F4: write the minted key (0600, O_EXCL/fingerprint) FIRST, then bind the
+                        // node_url beside it (never a binding without a key).
+                        funding::write_key_atomic(&key_out, &key)?;
+                        funding::write_node_url_binding(&key_out, &node_url)?;
+                        // Probe the CONFIRMED balance (F6): the authoritative funded amount (the
+                        // token's redeemed value, minus any mint/routing rounding). The sk- is
+                        // never printed; the token was bearer money, consumed on redeem.
+                        let balance_sats = funding::fetch_balance_sats(&node_url, &key).await?;
+                        emit_json(&serde_json::json!({
+                            "status": "funded",
+                            "key_path": key_out.display().to_string(),
+                            "balance_sats": balance_sats,
+                        }));
+                    }
+                }
+                Ok(())
+            })
+            .await
+        }
+
+        FundKeyCmd::Poll {
+            key_out,
+            node_url,
+            allow_node_url_override,
+            timeout_secs,
+            json: _,
+        } => {
+            guarded(async move {
+                // F1/F4/F9: the invoice_id AND the node_url both come from the pending sidecar
+                // `create` wrote beside --key-out (there is no --invoice-id). The read is
+                // hardened (no symlink-follow, mode 0600); a present-but-tampered sidecar is a
+                // hard error (fail closed), distinct from "absent". An explicit --node-url must
+                // MATCH the pending node_url unless the override flag is set (never poll a
+                // different node than the invoice was created against).
+                let pending = funding::read_invoice_state(&key_out)?.ok_or_else(|| {
+                    FundingError::Usage(format!(
+                        "no pending invoice state beside --key-out ({}); run `fund-key create` \
+                         first (its 0600 sidecar carries the invoice_id + node_url)",
+                        key_out.display()
+                    ))
+                })?;
+                let effective_url = resolve_pending_node_url(
+                    &pending,
+                    node_url.as_deref(),
+                    allow_node_url_override,
+                )?;
+                let key = funding::poll_invoice(
+                    &effective_url,
+                    &pending.invoice_id,
+                    Duration::from_secs(timeout_secs),
+                    |_elapsed| {},
+                )
+                .await?;
+                // F4: write the minted key (0600, O_EXCL/fingerprint) FIRST, then bind the
+                // node_url beside it (never a binding without a key), then clear the pending
+                // capability (the invoice is claimed).
+                funding::write_key_atomic(&key_out, &key)?;
+                funding::write_node_url_binding(&key_out, &effective_url)?;
+                // The key IS written (the money landed), so a failed clear does NOT fail the op —
+                // but the lingering invoice_id capability must not be silent: warn LOUDLY so the
+                // operator removes it (a stale capability on disk while we report "funded").
+                warn_if_clear_failed(&key_out);
+                // Probe the CONFIRMED balance (F6): the authoritative funded amount.
+                let balance_sats = funding::fetch_balance_sats(&effective_url, &key).await?;
+                emit_json(&serde_json::json!({
+                    "status": "funded",
+                    "key_path": key_out.display().to_string(),
+                    "balance_sats": balance_sats,
+                }));
+                Ok(())
+            })
+            .await
+        }
+
+        FundKeyCmd::Provision {
+            amount_sats,
+            key_out,
+            node_url,
+            timeout_secs,
+            emit_config,
+            json: _,
+        } => {
+            guarded(async move {
+                // F7: refuse onto an existing key path (provision writes a NEW key). Uses
+                // symlink_metadata (lstat) so a DANGLING symlink at --key-out is caught too (see
+                // `refuse_if_key_out_occupied`) — never spend an invoice onto an occupied path.
+                refuse_if_key_out_occupied(&key_out, "provision a new key")?;
+                // F2/F7: refuse BEFORE any network call if a pending invoice already sits beside
+                // --key-out — a crash mid-poll is resumed with `fund-key poll`, NOT a fresh
+                // provision (which would strand the paid-but-unpolled invoice's funds).
+                refuse_if_pending_invoice(&key_out)?;
+                let created =
+                    funding::create_invoice(&node_url, amount_sats, "create", None).await?;
+                // F2: persist the pending invoice-state (invoice_id + node_url, 0600, O_EXCL) so a
+                // crash between create and mint is recoverable via `poll`. The BOUND node_url
+                // sidecar is NOT written yet — only after the key lands (F4).
+                funding::write_invoice_state(&key_out, &created.invoice_id, &node_url)?;
+                // F10: emit the bolt11 as an EARLY JSONL line BEFORE blocking on poll, so a
+                // driving agent (or a human) can pay while this waits. The invoice_id is NOT
+                // in this line (it is bearer-sensitive; it lives in the sidecar).
+                emit_json(&serde_json::json!({
+                    "status": "invoice-created",
+                    "bolt11": created.bolt11,
+                    "amount_sats": created.amount_sats,
+                }));
+                let key = funding::poll_invoice(
+                    &node_url,
+                    &created.invoice_id,
+                    Duration::from_secs(timeout_secs),
+                    |_elapsed| {},
+                )
+                .await?;
+                // F4: write the key FIRST, then bind the node_url beside it, then clear the
+                // pending capability.
+                funding::write_key_atomic(&key_out, &key)?;
+                funding::write_node_url_binding(&key_out, &node_url)?;
+                // The key IS written — a failed clear does not fail the op, but warn LOUDLY so the
+                // lingering invoice_id capability is never silent (see the poll path).
+                warn_if_clear_failed(&key_out);
+                let balance_sats = funding::fetch_balance_sats(&node_url, &key).await?;
+                // Layer 1: optionally emit a minimal runnable kirby config whose treasury
+                // initial_sats is the CONFIRMED probed balance (F6), never the requested N.
+                let config_path = match emit_config {
+                    Some(path) => {
+                        write_minimal_agent_config(&path, &key_out, &node_url, balance_sats)?;
+                        Some(path.display().to_string())
+                    }
+                    None => None,
+                };
+                emit_json(&serde_json::json!({
+                    "status": "funded",
+                    "key_path": key_out.display().to_string(),
+                    "balance_sats": balance_sats,
+                    "config_path": config_path,
+                }));
+                Ok(())
+            })
+            .await
+        }
+
+        FundKeyCmd::Topup {
+            amount_sats,
+            from_token,
+            key_path,
+            timeout_secs,
+            node_url,
+            allow_node_url_override,
+            json: _,
+        } => {
+            guarded(async move {
+                let source = resolve_funding_source(amount_sats, from_token, "fund-key topup")?;
+                // F9: send the bearer key ONLY to its bound node_url unless an explicit
+                // override flag is set (and then warn loudly). Shared by both sources.
+                let effective_url = funding::resolve_bound_node_url(
+                    &key_path,
+                    node_url.as_deref(),
+                    allow_node_url_override,
+                )?;
+                if allow_node_url_override && node_url.is_some() {
+                    tracing::warn!(
+                        "fund-key topup: sending the bearer key to an OVERRIDDEN node_url \
+                         ({effective_url}) that may differ from the one bound beside the key"
+                    );
+                }
+                let sk = load_raw_key(&key_path)?;
+                // Capture the pre-credit balance floor BEFORE any payable artifact is emitted or
+                // any redeem is sent: the credit is CONFIRMED by watching the balance RISE above
+                // this floor. Capturing it first defeats a fast payer/redeem that credits the key
+                // before the read (which would fold the credit into the floor and hide the rise).
+                // This race fix is identical for both sources; only the credit step differs.
+                let balance_before = funding::fetch_balance_sats(&effective_url, &sk).await?;
+                match source {
+                    FundingSource::LnInvoice { amount_sats } => {
+                        // purpose="topup" is authenticated with the existing key.
+                        let created = funding::create_invoice(
+                            &effective_url,
+                            amount_sats,
+                            "topup",
+                            Some(&sk),
+                        )
+                        .await?;
+                        // Emit the bolt11 early (F10) before blocking on the credit poll — now that
+                        // the pre-invoice floor is captured, a payment against it is confirmable.
+                        emit_json(&serde_json::json!({
+                            "status": "invoice-created",
+                            "bolt11": created.bolt11,
+                            "amount_sats": created.amount_sats,
+                            "expires_at": created.expires_at,
+                        }));
+                        // A topup mints no NEW key; the status poll simply confirms payment (its
+                        // api_key stays null on this path), so poll for a terminal state then
+                        // re-probe the balance to confirm the credit landed above the floor.
+                        confirm_topup_credit(
+                            &effective_url,
+                            &created.invoice_id,
+                            &sk,
+                            balance_before,
+                            Duration::from_secs(timeout_secs),
+                        )
+                        .await?;
+                    }
+                    FundingSource::EcashToken { token } => {
+                        // The token credits the key SYNCHRONOUSLY (POST /v1/balance/topup, token in
+                        // the body — no invoice, no poll). After the POST returns 2xx, confirm the
+                        // balance actually ROSE above the pre-credit floor (mirroring the LN race
+                        // fix): a 2xx alone is not proof the credit is spendable, so require the
+                        // observable rise before reporting funded.
+                        funding::topup_from_token(&effective_url, &sk, &token).await?;
+                        confirm_balance_rose(
+                            &effective_url,
+                            &sk,
+                            balance_before,
+                            Duration::from_secs(timeout_secs),
+                        )
+                        .await?;
+                    }
+                }
+                let balance_sats = funding::fetch_balance_sats(&effective_url, &sk).await?;
+                emit_json(&serde_json::json!({
+                    "status": "funded",
+                    "balance_sats": balance_sats,
+                }));
+                Ok(())
+            })
+            .await
+        }
+
+        FundKeyCmd::Balance {
+            key_path,
+            node_url,
+            allow_node_url_override,
+            json: _,
+        } => {
+            guarded(async move {
+                let effective_url = funding::resolve_bound_node_url(
+                    &key_path,
+                    node_url.as_deref(),
+                    allow_node_url_override,
+                )?;
+                let sk = load_raw_key(&key_path)?;
+                let balance_sats = funding::fetch_balance_sats(&effective_url, &sk).await?;
+                emit_json(&serde_json::json!({
+                    "status": "ok",
+                    "balance_sats": balance_sats,
+                }));
+                Ok(())
+            })
+            .await
+        }
+    }
+}
+
+/// Refuse `create`/`provision` if ANY final-path entry already occupies `key_out` (F7). Uses
+/// [`std::fs::symlink_metadata`] (lstat), NOT [`std::path::Path::exists`] (stat): `exists()`
+/// FOLLOWS symlinks and returns false for a DANGLING symlink, so it would let create mint an
+/// invoice for a path [`funding::write_key_atomic`]'s `O_NOFOLLOW` create later refuses —
+/// spending an invoice onto an occupied path. `symlink_metadata` succeeds for a regular file, a
+/// directory, or a symlink (dangling or not), so any of those refuse here with a usage error
+/// (exit 9) BEFORE the network call. A genuinely-absent path returns `NotFound` and proceeds; any
+/// OTHER stat error (e.g. a permission error on the parent) is surfaced as a key-write failure
+/// rather than being mistaken for "absent". This is SEPARATE from the pending-invoice-sidecar
+/// check ([`refuse_if_pending_invoice`]); both must pass.
+fn refuse_if_key_out_occupied(
+    key_out: &std::path::Path,
+    action: &str,
+) -> Result<(), kirby_node::funding::FundingError> {
+    use kirby_node::funding::FundingError;
+    match std::fs::symlink_metadata(key_out) {
+        Ok(_) => Err(FundingError::Usage(format!(
+            "--key-out {} already exists; refusing to {action} onto an existing (possibly funded) \
+             key path (this includes a dangling symlink)",
+            key_out.display()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(FundingError::KeyWrite(format!(
+            "stat --key-out {}: {e}",
+            key_out.display()
+        ))),
+    }
+}
+
+/// Refuse `create`/`provision` if a pending invoice already sits beside `key_out` (F2/F7): an
+/// existing pending sidecar is a paid-but-unpolled invoice, and overwriting its capability would
+/// STRAND those funds (there is no `recover`). The fix is to RESUME with `fund-key poll`, not to
+/// mint a fresh invoice. Checked before any network call. `read_invoice_state` also fails closed
+/// on a tampered pending sidecar, so a present-but-unsafe sidecar surfaces here rather than being
+/// silently overwritten. (`write_invoice_state`'s O_EXCL is the belt-and-suspenders backstop.)
+fn refuse_if_pending_invoice(
+    key_out: &std::path::Path,
+) -> Result<(), kirby_node::funding::FundingError> {
+    use kirby_node::funding::FundingError;
+    if kirby_node::funding::read_invoice_state(key_out)?.is_some() {
+        return Err(FundingError::Usage(format!(
+            "a pending invoice already exists beside --key-out ({}); resume it with \
+             `fund-key poll --key-out {}` — a fresh create/provision would overwrite the pending \
+             capability and strand a paid-but-unpolled invoice",
+            key_out.display(),
+            key_out.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve the node_url a `poll` targets: the pending sidecar's node_url is authoritative (the
+/// invoice lives on the node it was created against). An explicit `override_url` must MATCH it
+/// (normalized) unless `allow_override` is set — never poll a different node by accident.
+fn resolve_pending_node_url(
+    pending: &kirby_node::funding::PendingInvoice,
+    override_url: Option<&str>,
+    allow_override: bool,
+) -> Result<String, kirby_node::funding::FundingError> {
+    use kirby_node::funding::FundingError;
+    let bound = pending.node_url.trim_end_matches('/').to_string();
+    match override_url {
+        None => Ok(bound),
+        Some(over) => {
+            let over = over.trim_end_matches('/').to_string();
+            if over == bound {
+                Ok(bound)
+            } else if allow_override {
+                Ok(over)
+            } else {
+                Err(FundingError::Usage(format!(
+                    "the requested --node-url ({over}) does not match the pending invoice's \
+                     node_url ({bound}); the invoice lives on the node it was created against — \
+                     pass --allow-node-url-override to poll a different node deliberately"
+                )))
+            }
+        }
+    }
+}
+
+/// Load the raw `sk-` from a keyfile (the same shape [`kirby_node::boot`]'s `load_api_key`
+/// reads: a raw trimmed one-line key). The read goes through [`kirby_node::funding::read_key_file`]
+/// — the SAME hardened path (O_RDONLY|O_NOFOLLOW|O_CLOEXEC, fstat regular file exactly 0600) as
+/// the fingerprint read — so `balance`/`topup` never follow a symlinked `--key-path` and send the
+/// resolved node's `sk-` elsewhere. A read failure (missing / symlinked / wrong-mode) or an empty
+/// file is surfaced as an auth failure (the credential is unusable). The key is never logged.
+fn load_raw_key(path: &std::path::Path) -> Result<String, kirby_node::funding::FundingError> {
+    use kirby_node::funding::FundingError;
+    // The hardened reader refuses a symlink / wrong-mode / non-regular file (a bearer-secret
+    // redirection); map any such refusal to an auth failure — an unusable credential, not a
+    // key-write error — so `balance`/`topup` exit 6 as before on a bad/missing key.
+    let raw = kirby_node::funding::read_key_file(path)
+        .map_err(|e| FundingError::Auth(format!("read key {}: {e}", path.display())))?;
+    let key = raw.trim().to_string();
+    if key.is_empty() {
+        return Err(FundingError::Auth(format!(
+            "key file {} is empty (expected a raw sk-… bearer key)",
+            path.display()
+        )));
+    }
+    Ok(key)
+}
+
+/// Clear the pending-invoice sidecar after the key has landed, WARNING LOUDLY (stderr) if the
+/// unlink fails instead of failing the op. The key is already written (the money landed), so a
+/// failed clear must not fail the flow — but a silently-lingering `invoice_id` capability while
+/// we report "funded" is unacceptable, so [`funding::clear_invoice_state`] now returns a Result
+/// and this surfaces any non-`NotFound` failure as a loud warning naming the path the operator
+/// must remove by hand. The capability path itself is a lingering on-disk secret, so the warning
+/// names the sidecar PATH (safe to print) but never its contents.
+fn warn_if_clear_failed(key_out: &std::path::Path) {
+    if let Err(e) = kirby_node::funding::clear_invoice_state(key_out) {
+        let sidecar = kirby_node::funding::invoice_state_path(key_out);
+        tracing::warn!(
+            "fund-key: the key was written and funded, but the pending-invoice capability could \
+             NOT be cleared ({e}); it LINGERS at {} — remove that file by hand (it is a stale \
+             invoice_id capability, no longer needed now the key exists)",
+            sidecar.display()
+        );
+    }
+}
+
+/// Poll a topup invoice to confirmation. A topup mints no new key, so the status poll's
+/// `api_key` stays null; instead we watch for the node's balance to RISE above the
+/// pre-topup floor within the wait budget (the credit landing). A terminal expired/failed
+/// status short-circuits to the matching outcome; the budget elapsing is an unpaid-timeout.
+///
+/// F8: the balance probe's errors are NOT silently ignored. A 401/403 (`Auth`) propagates
+/// immediately (a bad credential will not fix itself). A transient network/parse error is
+/// remembered and surfaced at the deadline (a persistently-failing probe reports its real
+/// error, not a misleading unpaid-timeout); only a clean probe that simply shows "no credit
+/// yet" (balance not risen) keeps retrying to the deadline.
+async fn confirm_topup_credit(
+    node_url: &str,
+    invoice_id: &str,
+    api_key: &str,
+    balance_before: u64,
+    timeout: Duration,
+) -> Result<(), kirby_node::funding::FundingError> {
+    use kirby_node::funding::{self, FundingError};
+    let deadline = tokio::time::Instant::now() + timeout;
+    // The most recent balance-probe error (None once a probe succeeds). Surfaced at the
+    // deadline if the FINAL probe failed, so a persistently-failing probe reports its real
+    // error rather than a bare unpaid-timeout.
+    let mut last_probe_err: Option<FundingError>;
+    loop {
+        // Drive the invoice status FIRST: it surfaces a terminal expired/failed quickly
+        // (poll_invoice returns Ok(key) only on a mint, which a topup never produces, so a
+        // short per-iteration budget just advances to the balance re-check). An auth failure or
+        // a terminal fail from the status poll is surfaced immediately; a transient network
+        // error there is ignored in favor of the authoritative balance probe that runs next.
+        match funding::poll_invoice(node_url, invoice_id, funding::POLL_INTERVAL, |_| {}).await {
+            // A topup never mints a key; treat an unexpected key as a confirmed credit.
+            Ok(_key) => return Ok(()),
+            // Not terminal / a transient status failure — fall through to the balance probe.
+            Err(FundingError::UnpaidTimeout) | Err(FundingError::Network(_)) => {}
+            // A terminal expired/failed, or an auth failure — surface immediately.
+            Err(other) => return Err(other),
+        }
+        // The authoritative signal for a topup: the spendable balance rose. A bad credential is
+        // terminal; a transient probe error is remembered; a clean "not risen yet" retries.
+        match funding::fetch_balance_sats(node_url, api_key).await {
+            Ok(now) => {
+                last_probe_err = None;
+                if now > balance_before {
+                    return Ok(());
+                }
+            }
+            Err(auth @ FundingError::Auth(_)) => return Err(auth),
+            Err(transient) => last_probe_err = Some(transient),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // A persistently-failing probe reports its real error; otherwise the credit simply
+            // never landed within the budget (unpaid-timeout).
+            return Err(last_probe_err.unwrap_or(FundingError::UnpaidTimeout));
+        }
+    }
+}
+
+/// Confirm an ECASH topup credit landed by watching the spendable balance RISE above the
+/// pre-credit floor. Unlike [`confirm_topup_credit`] there is NO invoice to poll — the token
+/// credited synchronously via `POST /v1/balance/topup` — so this only re-probes the balance.
+/// It mirrors the LN path's discipline: a 401/403 (`Auth`) is terminal (surfaced immediately),
+/// a transient probe error is remembered and surfaced at the deadline (a persistently-failing
+/// probe reports its real error, not a misleading unpaid-timeout), and a clean "not risen yet"
+/// retries. The first probe usually already shows the rise (the credit is synchronous); the
+/// retry loop just tolerates a node that reflects the credit a beat late.
+async fn confirm_balance_rose(
+    node_url: &str,
+    api_key: &str,
+    balance_before: u64,
+    timeout: Duration,
+) -> Result<(), kirby_node::funding::FundingError> {
+    use kirby_node::funding::{self, FundingError};
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_probe_err: Option<FundingError>;
+    loop {
+        match funding::fetch_balance_sats(node_url, api_key).await {
+            Ok(now) => {
+                last_probe_err = None;
+                if now > balance_before {
+                    return Ok(());
+                }
+            }
+            // A bad credential is terminal; a transient probe error is remembered and retried.
+            Err(auth @ FundingError::Auth(_)) => return Err(auth),
+            Err(transient) => last_probe_err = Some(transient),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // A persistently-failing probe reports its real error; otherwise the credit never
+            // became observable within the budget (unpaid-timeout).
+            return Err(last_probe_err.unwrap_or(FundingError::UnpaidTimeout));
+        }
+        tokio::time::sleep(funding::POLL_INTERVAL).await;
+    }
+}
+
+/// Layer 1: write a minimal, runnable kirby config for a single `routstr_key` agent funded
+/// by `key_out`. The treasury `initial_sats` is the CONFIRMED probed balance (F6). This is
+/// the smallest config `kirby-node agent --config <path>` validates as Standalone: the
+/// `capable` workload with a `routstr_key` brain (node_url + api_key_path), a funding block,
+/// and the identity/relay/genome_image a real run needs. The genome_image is a PLACEHOLDER a
+/// human must point at the built image; everything else is complete.
+fn write_minimal_agent_config(
+    config_path: &std::path::Path,
+    key_out: &std::path::Path,
+    node_url: &str,
+    initial_sats: u64,
+) -> Result<(), kirby_node::funding::FundingError> {
+    use kirby_node::funding::FundingError;
+    let node_url = node_url.trim_end_matches('/');
+    let api_key_path = key_out.display();
+    // The per-call think cap must be <= the treasury (config validation). The daemon default
+    // is 64 sats; if the funded balance is smaller, emit a cap that fits so a tiny-balance
+    // provision still produces a config that validates (the emitted config always runs).
+    let max_cost_sats = initial_sats.clamp(1, 64);
+    // A hand-written TOML (not a serialized full KirbyConfig) so the emitted file is small,
+    // annotated, and holds ONLY the keys a single funded agent needs; every other key keeps
+    // its documented default. The bearer key stays in its 0600 FILE — never inlined here.
+    let toml = format!(
+        r#"# Minimal runnable kirby config emitted by `kirby-node fund-key provision`.
+# Run one funded sovereign agent:
+#   kirby-node agent --config {config}
+#
+# The prepaid bearer key lives in its own 0600 file (api_key_path); it is NEVER inlined here.
+# `initial_sats` below is the CONFIRMED on-node balance probed after payment (not the amount
+# requested), so the treasury counter is backed by the custodial balance at boot.
+
+# The v0 agentic workload (think/act loop) — required for a routstr_key brain to think.
+workload = "capable"
+
+[brain]
+# The prepaid Routstr API-key backend: a balance-bearing bearer key on the Authorization
+# header (mint-independent). The key was funded by the Lightning invoice you just paid.
+backend = "routstr_key"
+node_url = "{node_url}"
+api_key_path = "{api_key_path}"
+# The per-think budget cap (sats), fit to the funded balance so it never exceeds the treasury.
+max_cost_sats = {max_cost_sats}
+
+[funding]
+# Seeded from the CONFIRMED probed balance (F6). A resume keeps the persisted balance.
+initial_sats = {initial_sats}
+
+# --- You MUST set these for a real run ------------------------------------------------------
+# The genome image to boot (the `nix build .#genome-image` output directory):
+genome_image = {{ path = "./.kirby/genome-image" }}
+
+[identity]
+# This agent's Nostr identity key (minted 0600 on first run, reused after).
+key_path = "./.kirby/state/agent.nostr.key"
+
+[relay]
+# The fleet relay websocket (ws:// or wss://). Point at your relay before running.
+url = "ws://127.0.0.1:7777"
+"#,
+        config = config_path.display(),
+        node_url = node_url,
+        api_key_path = api_key_path,
+        max_cost_sats = max_cost_sats,
+        initial_sats = initial_sats,
+    );
+    if let Some(parent) = config_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                FundingError::KeyWrite(format!("create config parent dir {}: {e}", parent.display()))
+            })?;
+        }
+    }
+    std::fs::write(config_path, toml)
+        .map_err(|e| FundingError::KeyWrite(format!("write config {}: {e}", config_path.display())))?;
     Ok(())
 }
 

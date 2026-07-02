@@ -16,6 +16,14 @@ The spec, the design records, and the macOS-backend plan for kirby-node.
 - [`build-spec.md`](build-spec.md) -- the frozen build spec. Gates G1-G10, the decisions, the
   money-paths, and the honest boundary (what the spike does NOT prove). Everything else points here.
 
+## Funding + spawning agents
+
+- [`create-fund.md`](create-fund.md) -- fund an agent's prepaid Routstr key with N sats over
+  Lightning (`fund-key`): the split create/pay/poll path, the `provision` one-shot, topup, the
+  JSON + exit-code contract, and the fund-then-run-one-agent recipe.
+- [`spawn-over-nostr.md`](spawn-over-nostr.md) -- spawn an agent onto a running fleet by
+  publishing one signed kind:31003 event.
+
 ## Running on macOS
 
 - [`mac-build-and-run.md`](mac-build-and-run.md) -- the verified clean-clone cold-boot

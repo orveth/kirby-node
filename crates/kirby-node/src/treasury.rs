@@ -2,24 +2,32 @@
 //!
 //! The treasury is a single authoritative counter `remaining_sats` that lives
 //! ON THE DAEMON (host), never in the VM. The genome can observe it (the
-//! `treasury_remaining` field on a receipt) but cannot mutate it: there is no
-//! public method on this type that lets a gateway request ADD balance or SET
-//! `remaining` directly. The debit paths (`debit_metered`, `debit_and_record`)
-//! only ever decrease the balance, and they are reachable only from daemon-side
-//! code that holds a `&Treasury`. This is the unforgeability core (D-9, gate G3b).
+//! `treasury_remaining` field on a receipt) but cannot mutate it: NO gateway RPC
+//! or genome-reachable path adds, sets, or subtracts `remaining`. Every mutating
+//! method (`debit_metered`, `debit_and_record`, `credit_verified`,
+//! `reconcile_to_observed`) is reachable only from daemon-side code that holds a
+//! `&Treasury`. This is the unforgeability core (D-9, gate G3b).
 //!
-//! The balance INCREASES through exactly one path: `credit_verified`. It is the
-//! sole credit path and it is NARROW and daemon-only:
-//! - It is callable only by daemon-side settlement-verification code holding a
+//! Two daemon-only paths RAISE (or, for a sync, SET) the balance, and neither
+//! widens the genome's authority by one sat -- the only callers are host code:
+//!
+//! `credit_verified` -- the sole idempotent ADD (a verified inbound settlement):
+//! - Callable only by daemon-side settlement-verification code holding a
 //!   `&Treasury` (e.g. the host has independently verified an inbound ecash /
 //!   lightning settlement). NO gateway RPC reaches it -- the genome cannot ASSERT
 //!   a credit any more than it can assert a debit; a self-reported "I was paid"
-//!   over ReportEvent moves nothing (gate G3c). Adding `credit_verified` does not
-//!   widen the genome's authority by one sat: the only NEW caller is host code.
-//! - It is idempotent on `credit_id`: a re-delivered settlement, or a daemon
-//!   restart mid-verify, credits EXACTLY ONCE (the no-double-credit wall, deduped
-//!   inside the same transaction that mutates the balance).
-//! - It never wraps: an add that would overflow u64 is refused with no mutation.
+//!   over ReportEvent moves nothing (gate G3c).
+//! - Idempotent on `credit_id`: a re-delivered settlement, or a daemon restart
+//!   mid-verify, credits EXACTLY ONCE (the no-double-credit wall, deduped inside
+//!   the same transaction that mutates the balance).
+//! - Never wraps: an add that would overflow u64 is refused with no mutation.
+//!
+//! `reconcile_to_observed` -- a daemon-only SET that syncs the counter to an
+//! externally-probed spendable truth (BOTH directions), for the prepaid-key brain
+//! where the external key balance is authoritative. Callable only by daemon-side
+//! boot code holding a `&Treasury` (no gateway RPC); the caller MUST pass a
+//! verified, successful probe and is fail-closed on a failed / zero reading. It is
+//! idempotent -- re-observing the same total is a no-op.
 //!
 //! Invariants this module enforces (spec 4.2):
 //! - Unforgeable: only daemon-side code debits or credits; no genome-reachable
@@ -472,6 +480,55 @@ impl Treasury {
         self.inner.db.flush()?;
         Ok(outcome)
     }
+
+    /// Reconcile the balance to an externally-observed spendable truth (e.g. a prepaid Routstr
+    /// key balance probed at boot). Transactional SET: `balance := observed_sats`, BOTH directions
+    /// -- it RAISES on a topup and LOWERS if the external source truly holds less.
+    ///
+    /// CONTRACT -- the caller MUST pass a VERIFIED external balance (a successful, non-zero probe
+    /// of the authoritative source). Because this SETS unconditionally, a stale / failed / zero
+    /// reading would wrongly brick or inflate the counter; the caller is fail-closed and does NOT
+    /// call this on a probe error or a zero reading.
+    ///
+    /// This is the EXTERNAL-BALANCE-IS-TRUTH model (the prepaid-key brain): the key balance is the
+    /// authoritative spendable money and the local counter mirrors it. It is NOT the cashu model
+    /// -- there the local wallet proofs are truth and a shortfall REFUSES to boot
+    /// (`assert_wallet_backs_counter`); do NOT use this to paper over a cashu shortfall.
+    ///
+    /// Idempotent: re-observing the same total is a no-op (`Unchanged`). Daemon-only (never
+    /// genome-reachable, like the debit/credit paths). Durable (`db.flush()`).
+    pub fn reconcile_to_observed(
+        &self,
+        observed_sats: u64,
+    ) -> Result<ReconcileOutcome, TreasuryError> {
+        let outcome = self.inner.balance.transaction(|balance| {
+            let current_raw = balance
+                .get(BALANCE_KEY)?
+                .ok_or_else(|| abort("balance key missing".into()))?;
+            let current = decode_u64_tx(&current_raw)?;
+
+            if observed_sats == current {
+                return Ok(ReconcileOutcome::Unchanged { at: current });
+            }
+            balance.insert(BALANCE_KEY, &observed_sats.to_be_bytes())?;
+            Ok(if observed_sats > current {
+                ReconcileOutcome::Raised { from: current, to: observed_sats }
+            } else {
+                ReconcileOutcome::Lowered { from: current, to: observed_sats }
+            })
+        });
+
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(TransactionError::Abort(msg)) => return Err(TreasuryError::Corrupt(msg)),
+            Err(TransactionError::Storage(e)) => return Err(TreasuryError::Storage(e)),
+        };
+
+        // Durability: flush so a crash after a reconcile cannot lose it, exactly as the
+        // debit/credit paths do.
+        self.inner.db.flush()?;
+        Ok(outcome)
+    }
 }
 
 /// The result of a `debit_and_record` attempt.
@@ -498,6 +555,18 @@ pub enum CreditOutcome {
     Overflow { remaining: u64 },
 }
 
+/// The result of a `reconcile_to_observed` sync. `Raised`/`Lowered` moved the balance to match
+/// the observed external truth; `Unchanged` is the idempotent no-op (already equal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// The observed balance was HIGHER (e.g. a topup); the counter rose to `to`.
+    Raised { from: u64, to: u64 },
+    /// The observed balance was LOWER (an external spend not yet in the counter); counter fell to `to`.
+    Lowered { from: u64, to: u64 },
+    /// The observed balance already equalled the counter; no mutation.
+    Unchanged { at: u64 },
+}
+
 /// Abort a sled transaction with a corruption message (host-side fault).
 fn abort(msg: String) -> ConflictableTransactionError<String> {
     ConflictableTransactionError::Abort(msg)
@@ -521,7 +590,7 @@ fn decode_u64_tx(raw: &[u8]) -> Result<u64, ConflictableTransactionError<String>
 
 #[cfg(test)]
 mod tests {
-    use super::{is_lock_contention, TreasuryError};
+    use super::{is_lock_contention, ReconcileOutcome, Treasury, TreasuryError};
 
     #[test]
     fn lock_contention_matches_sled_lock_message() {
@@ -539,5 +608,39 @@ mod tests {
         )));
 
         assert!(!is_lock_contention(&err));
+    }
+
+    #[test]
+    fn reconcile_raises_the_balance_to_a_higher_observed_truth() {
+        let t = Treasury::open_temporary(700).unwrap();
+        let out = t.reconcile_to_observed(1000).unwrap();
+        assert_eq!(out, ReconcileOutcome::Raised { from: 700, to: 1000 });
+        assert_eq!(t.remaining().unwrap(), 1000);
+    }
+
+    #[test]
+    fn reconcile_lowers_the_balance_to_a_lower_observed_truth() {
+        // The external source truly holds less than the counter believed -- mirror DOWN (no
+        // phantom balance / overdraft) rather than refuse to boot (the key-brain truth model).
+        let t = Treasury::open_temporary(700).unwrap();
+        let out = t.reconcile_to_observed(500).unwrap();
+        assert_eq!(out, ReconcileOutcome::Lowered { from: 700, to: 500 });
+        assert_eq!(t.remaining().unwrap(), 500);
+    }
+
+    #[test]
+    fn reconcile_is_idempotent_and_survives_a_revisited_value() {
+        // The lost-reconcile bug a value-keyed credit_id would have hit: re-observing the same
+        // total is a clean no-op, AND a topup BACK to a previously-seen total still reconciles
+        // (no value-keyed dedup to collide with).
+        let t = Treasury::open_temporary(1000).unwrap();
+        assert_eq!(
+            t.reconcile_to_observed(1000).unwrap(),
+            ReconcileOutcome::Unchanged { at: 1000 }
+        );
+        t.reconcile_to_observed(700).unwrap(); // a spend the counter now mirrors
+        let out = t.reconcile_to_observed(1000).unwrap(); // topup back to a seen total
+        assert_eq!(out, ReconcileOutcome::Raised { from: 700, to: 1000 });
+        assert_eq!(t.remaining().unwrap(), 1000);
     }
 }
