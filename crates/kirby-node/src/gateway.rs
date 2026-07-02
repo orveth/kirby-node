@@ -136,6 +136,47 @@ pub struct GatewayService {
     settle_locks: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
+/// The type of the per-charge single-flight map inside [`GatewayService::settle_locks`].
+type SettleLocks = std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// A cleanup-on-drop guard for [`GatewayService::settle_charge`]'s `settle_locks` entry
+/// (round-3 finding). Constructed right after the per-charge lock is inserted into the map
+/// and held across `settle_inner`; its `Drop` removes the entry on EVERY exit -- a normal
+/// return, an error, a PANIC, or an async CANCELLATION (the settle future dropped mid-await).
+/// The old explicit post-await cleanup ran only after `settle_inner` returned, so a
+/// cancelled/panicking settle leaked its entry forever.
+///
+/// The removal is CONDITIONAL, mirroring the old bounded-memory logic: it removes the entry
+/// only when `strong_count == 2` (the map's Arc + this guard's `lock` Arc, i.e. no OTHER
+/// settle is parked on this lock). If a concurrent settle is waiting (count > 2) we leave the
+/// entry; that waiter re-runs the lookup, hits the durable row, short-circuits, and its own
+/// guard performs the final removal. Crucially it also `ptr_eq`-checks that the map's current
+/// entry is STILL this guard's Arc, so a NEWER entry for a reused charge_id (a fresh insert
+/// after this settle finished) is never removed by a stale guard. `Drop` is sync: it takes the
+/// std `Mutex` for a non-await critical section only.
+struct SettleLockCleanup<'a> {
+    map: &'a SettleLocks,
+    charge_id: &'a str,
+    lock: &'a Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for SettleLockCleanup<'_> {
+    fn drop(&mut self) {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only this guard's Arc (plus the map's) may remain, AND the map entry must still be
+        // OUR Arc -- otherwise a newer settle for a reused charge_id owns it and must survive.
+        let is_ours = map
+            .get(self.charge_id)
+            .is_some_and(|entry| Arc::ptr_eq(entry, self.lock));
+        if is_ours && Arc::strong_count(self.lock) == 2 {
+            map.remove(self.charge_id);
+        }
+    }
+}
+
 /// The lease fence attached to a gateway (spec 4.3): the node's lease handle plus
 /// the term its VM was started under. The gateway debits only if the handle's fence
 /// for `vm_term` returns `Active` (this node still holds the committed lease at a
@@ -194,6 +235,25 @@ impl GatewayService {
     pub fn with_settlement_provider<S: SettlementProvider + 'static>(mut self, s: S) -> Self {
         self.settlement = Some(Arc::new(s));
         self
+    }
+
+    /// TEST-ONLY: does `settle_locks` currently hold an entry for `charge_id`? Lets a tooth
+    /// assert the per-charge map entry is cleaned up even when a settle is cancelled/panics.
+    #[cfg(test)]
+    pub(crate) fn settle_locks_contains(&self, charge_id: &str) -> bool {
+        self.settle_locks
+            .lock()
+            .expect("settle_locks mutex poisoned")
+            .contains_key(charge_id)
+    }
+
+    /// TEST-ONLY: the number of live `settle_locks` map entries.
+    #[cfg(test)]
+    pub(crate) fn settle_locks_len(&self) -> usize {
+        self.settle_locks
+            .lock()
+            .expect("settle_locks mutex poisoned")
+            .len()
     }
 
     /// Attach the per-genome INBOUND queue (earn-loop Component 1): the gateway's `PollInbox`
@@ -1061,31 +1121,25 @@ impl GatewayService {
         };
         let _guard = charge_lock.lock().await;
 
-        // Run the money-path under the guard, then clean up the map entry regardless of
-        // outcome. `settle_inner` never touches `settle_locks`, so the cleanup below is the
-        // sole remover -- no lock-ordering hazard.
-        let result = self
-            .settle_inner(settlement.as_ref(), charge_id, evidence)
-            .await;
+        // CLEANUP-ON-DROP (round-3 finding): construct the RAII guard NOW, right after the
+        // map insertion and before `settle_inner`, so it removes this charge's map entry on
+        // EVERY exit path -- a normal `Ok`/`Err` return, an `Err(?)` inside `settle_inner`,
+        // a PANIC, or an async CANCELLATION (the `settle_charge` future dropped mid-await).
+        // The old explicit post-await cleanup block ran only after `settle_inner` RETURNED,
+        // so a cancelled/panicking settle leaked the entry forever, growing the map unbounded
+        // for distinct cancelled charge_ids. `Drop` is sync -- it takes the std `Mutex` for a
+        // non-await critical section only, never across an await. `settle_inner` never touches
+        // `settle_locks`, so this guard is the sole remover -- no lock-ordering hazard.
+        let _cleanup = SettleLockCleanup {
+            map: &self.settle_locks,
+            charge_id,
+            lock: &charge_lock,
+        };
 
-        // CLEANUP (bounded memory): drop this charge's map entry once no other waiter holds
-        // it. We still hold `_guard` (so `charge_lock` is one live Arc) and the map holds
-        // one more; a strong_count of exactly 2 means no OTHER settle is parked on this
-        // lock, so removing the entry cannot orphan a waiter. If a concurrent settle is
-        // waiting (count > 2), we leave the entry: that waiter will re-run the lookup, hit
-        // the durable row, short-circuit, and perform its own cleanup. This keeps the map
-        // from growing unbounded without ever dropping an entry a waiter still needs.
-        {
-            let mut map = self
-                .settle_locks
-                .lock()
-                .expect("settle_locks mutex poisoned");
-            if Arc::strong_count(&charge_lock) == 2 {
-                map.remove(charge_id);
-            }
-        }
-
-        result
+        // Run the money-path under the guard. The cleanup guard above removes the map entry
+        // when this returns (or unwinds), so no explicit post-await cleanup is needed.
+        self.settle_inner(settlement.as_ref(), charge_id, evidence)
+            .await
     }
 
     /// The serialized body of `settle_charge`, run under the per-charge async guard. Split
@@ -1485,7 +1539,80 @@ pub fn firecracker_vsock_listen_path(uds_base: &std::path::Path, port: u32) -> s
 #[cfg(test)]
 mod tests {
     use super::firecracker_vsock_listen_path;
+    use super::{GatewayService, Session};
+    use crate::rail::{ChargeIssuedData, MockRail, SettlementProvider, ISSUE_CHARGE_DESTINATION};
+    use crate::treasury::Treasury;
     use std::path::Path;
+    use std::sync::Arc;
+
+    /// A settlement double whose `verify_settlement` NEVER resolves: it awaits a future that
+    /// stays `Pending` forever. Lets a tooth cancel a settle mid-`verify_settlement` (the one
+    /// await inside `settle_inner` for a fresh charge) and assert the map entry is still
+    /// cleaned up. `issue` is unused by the tooth.
+    struct HangingSettlement;
+
+    #[async_trait::async_trait]
+    impl SettlementProvider for HangingSettlement {
+        async fn issue(&self, amount_sats: u64, _memo: &str) -> anyhow::Result<ChargeIssuedData> {
+            Ok(ChargeIssuedData {
+                charge_id: "hang".to_string(),
+                invoice_or_request: format!("cashu:charge:hang:{amount_sats}"),
+                amount_sats,
+            })
+        }
+        async fn verify_settlement(&self, _charge_id: &str, _evidence: &str) -> anyhow::Result<u64> {
+            // Never resolves: park forever so the caller can cancel us mid-await.
+            std::future::pending::<()>().await;
+            unreachable!("pending future never resolves")
+        }
+    }
+
+    fn hanging_settlement_gateway() -> GatewayService {
+        let treasury = Treasury::open_temporary(1_000).expect("open temporary treasury");
+        let session = Session {
+            task_descriptor: "settle-lock-cleanup".into(),
+            budget_sats: 1_000,
+            allowlisted_destinations: vec![ISSUE_CHARGE_DESTINATION.to_string()],
+            allowlisted_inbound_kinds: Vec::new(),
+        };
+        GatewayService::new(treasury, Arc::new(MockRail::new()), session)
+            .with_settlement_provider(HangingSettlement)
+    }
+
+    /// ROUND-3 finding: the `settle_locks` map entry is removed even when a settle is
+    /// CANCELLED mid-flight. We start a settle whose `verify_settlement` never resolves, let
+    /// it park inside `settle_inner` (so the map entry exists), then cancel it via
+    /// `tokio::time::timeout`. The cleanup-on-drop guard must remove the entry as the settle
+    /// future is dropped.
+    ///
+    /// RED-on-revert: restore the OLD explicit post-await cleanup block (which runs only after
+    /// `settle_inner` RETURNS) in place of the guard, and the cancelled settle never reaches
+    /// that block -- the entry leaks and this assertion fails.
+    #[tokio::test]
+    async fn settle_lock_entry_cleaned_up_even_when_settle_is_cancelled() {
+        let svc = hanging_settlement_gateway();
+        let charge_id = "charge-cancelled";
+
+        // The settle parks forever inside verify_settlement; time out (= cancel) it. The
+        // future is dropped at the timeout, running the cleanup guard's Drop.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            svc.settle_charge(charge_id, "evidence"),
+        )
+        .await;
+        assert!(res.is_err(), "the hanging settle must be cancelled by the timeout");
+
+        // The map entry for the cancelled charge must be gone (leak fixed by the guard).
+        assert!(
+            !svc.settle_locks_contains(charge_id),
+            "settle_locks must not retain the cancelled charge's entry"
+        );
+        assert_eq!(
+            svc.settle_locks_len(),
+            0,
+            "no leaked settle_locks entries after a cancelled settle"
+        );
+    }
 
     /// The Firecracker host-side vsock socket for a guest-initiated connection to
     /// port P is the base uds with a `_P` suffix (the daemon binds this; the
