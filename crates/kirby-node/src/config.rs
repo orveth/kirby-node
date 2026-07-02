@@ -1014,9 +1014,11 @@ impl Nip60Durability {
 }
 
 impl Nip60Config {
-    /// Resolve the effective relay set + K-of-N threshold + durability verdict. With no
-    /// `[nip60].relays`, falls back to the single node relay `fleet_relay` (k=1) — DEV-ONLY. PURE
-    /// (the caller emits [`Nip60Durability::warning`]), so it is unit-testable.
+    /// Resolve the effective relay set + K-of-N threshold + durability verdict for a NON-EMPTY relay
+    /// set. NOTE: at BOOT an empty `[nip60].relays` means NIP-60 is OFF (opt-in — the wallet is
+    /// local-only), and boot never calls `resolve` in that case (see `build_routstr_brain`). The
+    /// empty→`fleet_relay` fallback below is a lower-level dev convenience ONLY, not the boot posture.
+    /// PURE (the caller emits [`Nip60Durability::warning`]), so it is unit-testable.
     pub fn resolve(&self, fleet_relay: &str) -> (Vec<String>, usize, Nip60Durability) {
         let relays = if self.relays.is_empty() {
             vec![fleet_relay.to_string()]
@@ -1062,6 +1064,39 @@ mod nip60_config_tests {
         assert_eq!(k, 2, "default K = strict majority floor(3/2)+1");
         assert_eq!(durability, Nip60Durability::Quorum);
         assert!(durability.warning().is_none(), "a >=3 quorum is money-durable, no warning");
+    }
+
+    /// R1 posture-visibility tooth: `resolve` yields the exact `(n, k, tier)` triple the boot
+    /// posture line logs, across all three durability tiers (n=1 dev-only, n=2 below-quorum, n=3
+    /// quorum), each via an EXPLICIT relay set — the posture boot actually resolves. (Empty relays
+    /// is a distinct case: boot disables NIP-60 entirely / opt-in, so it never reaches `resolve` on
+    /// the boot path — see docs/config.md.) This pins the resolved posture the operator reads in the
+    /// boot log so a tier/threshold regression is caught here, not in prod.
+    #[test]
+    fn resolve_yields_the_posture_triple_for_n_1_2_3() {
+        // n = 1: an EXPLICIT single relay — SingleRelayDevOnly, k clamps to 1.
+        let one = Nip60Config {
+            relays: vec!["a".into()],
+            ..Default::default()
+        };
+        let (r1, k1, t1) = one.resolve("ws://fleet:7777");
+        assert_eq!((r1.len(), k1, t1), (1, 1, Nip60Durability::SingleRelayDevOnly));
+
+        // n = 2: two explicit relays — BelowQuorum, majority k = 2.
+        let two = Nip60Config {
+            relays: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        let (r2, k2, t2) = two.resolve("ws://fleet:7777");
+        assert_eq!((r2.len(), k2, t2), (2, 2, Nip60Durability::BelowQuorum));
+
+        // n = 3: three explicit relays — Quorum, majority k = 2.
+        let three = Nip60Config {
+            relays: vec!["a".into(), "b".into(), "c".into()],
+            ..Default::default()
+        };
+        let (r3, k3, t3) = three.resolve("ws://fleet:7777");
+        assert_eq!((r3.len(), k3, t3), (3, 2, Nip60Durability::Quorum));
     }
 
     #[test]

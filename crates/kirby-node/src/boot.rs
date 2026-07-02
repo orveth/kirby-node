@@ -741,7 +741,19 @@ async fn build_routstr_brain(
         if let Some(warning) = durability.warning() {
             tracing::warn!(nip60_durability = %warning, "NIP-60 wallet backup: sub-quorum durability");
         }
-        tracing::info!(n = relays.len(), k = write_k, "NIP-60 wallet backup enabled");
+        // POSTURE VISIBILITY (R1 / D3): log the RESOLVED relay set + the durability TIER, not just
+        // n/k, so the backup posture is auditable in every boot log — an operator can SEE at a
+        // glance which relays their money durability rides and whether that set clears the >=3
+        // quorum. Deliberately COUNT-only (n/k/tier + the URLs), NO per-relay team/non-team marker:
+        // a "this one's mine" flag would be operator self-attestation the daemon can't verify —
+        // enforcement theater. The tier is the honest, machine-derived verdict.
+        tracing::info!(
+            relays = ?relays,
+            n = relays.len(),
+            k = write_k,
+            tier = ?durability,
+            "NIP-60 wallet backup relay posture"
+        );
         // Arc so the boot-time reconcile/publish AND the Cut A (#115) background backup flusher
         // can share ONE store (all its methods take `&self`).
         Some(Arc::new(

@@ -570,13 +570,16 @@ impl Nip60Store {
     /// Roll over token events: replace the `superseded` events (their proofs consolidated into
     /// `new_proofs`) with ONE new kind:7375 event, CONFIRM-BEFORE-DELETE.
     ///
-    /// ⚠️ MONEY-SAFETY ORDERING (design doc point 6): (1) the new event carries `del = superseded`
-    /// — the del-chain, the AUTHORITATIVE supersede honored by [`reconcile_token_set`] even if the
-    /// NIP-09 delete is ignored; (2) it is published and MUST reach >=k relays
-    /// ([`Self::publish_token`] ERRORS otherwise) BEFORE anything is deleted, so a non-durable new
-    /// event leaves the OLD events LIVE (never delete an input until its replacement is durable on
-    /// quorum); (3) ONLY THEN are the old events NIP-09-deleted — best-effort + advisory (relays
-    /// may ignore; the del-chain + the mint are the real supersede/truth), so a delete failure is
+    /// ⚠️ MONEY-SAFETY ORDERING (design doc point 6, + R1 read-after-write): (1) the new event
+    /// carries `del = superseded` — the del-chain, the AUTHORITATIVE supersede honored by
+    /// [`reconcile_token_set`] even if the NIP-09 delete is ignored; (2) it is published and MUST
+    /// reach >=k relays ([`Self::publish_token`] ERRORS otherwise) BEFORE anything is deleted, so a
+    /// non-durable new event leaves the OLD events LIVE (never delete an input until its replacement
+    /// is durable on quorum); (2b, R1) then a bounded READ-AFTER-WRITE confirms the new event is
+    /// actually RETRIEVABLE (not merely acked) — if it is not, nothing is deleted and this returns
+    /// an Err the flusher retries (closing the acked-but-not-served → delete-old → backup-GONE
+    /// hole); (3) ONLY THEN are the old events NIP-09-deleted — best-effort + advisory (relays may
+    /// ignore; the del-chain + the mint are the real supersede/truth), so a delete failure is
     /// logged, NOT fatal.
     pub async fn rollover(
         &self,
@@ -591,14 +594,67 @@ impl Nip60Store {
             proofs: new_proofs,
             del: superseded.clone(),
         };
-        // CONFIRM: the new event must be >=k durable before ANYTHING is deleted. `?` returns here
-        // on a sub-quorum publish → nothing is deleted and the old proofs stay live (money-safe).
+        // CONFIRM (1/2 — DURABLE): the new event must be >=k durable before ANYTHING is deleted.
+        // `?` returns here on a sub-quorum publish → nothing is deleted and the old proofs stay
+        // live (money-safe).
         let new_id = self.publish_token(&content).await.context(
             "rollover: the new token event is NOT durable on >=k relays — deleted NOTHING, the old \
              proofs stay live",
         )?;
-        // Only now (the new event is >=k durable) prune the superseded events. Advisory — never
-        // trusted; a failure is logged, not fatal.
+
+        // CONFIRM (2/2 — RETRIEVABLE, R1): >=k ACKED is not the same as SERVED. A relay can ack a
+        // write yet not serve it back (acked-but-not-served); if we deleted the old events on the
+        // strength of the ack alone and the new event were unretrievable, the ONLY backup would be
+        // gone. So before deleting anything, do a bounded read (author + kind:7375, read_timeout)
+        // and CONFIRM the just-published id is in the returned (unioned) set. If it is NOT present
+        // (or the read errored) we DO NOT delete the superseded events (the old backup stays
+        // intact), warn, and return an Err — the SAME self-heal posture as a sub-quorum publish:
+        // the backup flusher's `?` re-arms its dirty flag (see `crate::rail::Nip60BackupFlusher::
+        // flush`, RearmOnDrop) so the snapshot is retried next tick. This is off the spend hot path
+        // (rollover is only ever called by the flusher/estate/boot, never a spend), so the extra
+        // read costs a spend nothing.
+        //
+        // R1 SCOPE: this confirms RETRIEVABLE (present on >=1 relay of the union) — it upgrades the
+        // guard from "confirmed ACKED" to "confirmed RETRIEVABLE", closing the acked-but-not-served
+        // → delete-old → backup-GONE hole. A true ">=k SERVED" read-quorum needs per-relay READ
+        // visibility (a `Nip60Transport` extension), which R2 adds for its read-quorum reconcile;
+        // R1 deliberately stays minimal and trait-compatible.
+        let confirm_filter = Filter::new()
+            .kind(Kind::from(KIND_NIP60_TOKEN))
+            .author(self.crypto.public_key());
+        match self.transport.fetch_events(confirm_filter, self.read_timeout).await {
+            Ok(events) if events.iter().any(|e| e.id == new_id) => {
+                // Retrievable — fall through to the (advisory) prune below.
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    new_event_id = %new_id,
+                    "rollover: the new token event ACKED >=k but is NOT retrievable yet \
+                     (acked-but-not-served) — KEEPING the prior events, deleted NOTHING; the backup \
+                     flusher will retry the snapshot next tick"
+                );
+                anyhow::bail!(
+                    "rollover: the new token event {new_id} is not retrievable after publish \
+                     (acked-but-not-served) — deleted NOTHING, the old proofs stay live"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    new_event_id = %new_id,
+                    error = %e,
+                    "rollover: the read-after-write confirm FETCH errored — cannot confirm the new \
+                     token event is retrievable, so KEEPING the prior events, deleted NOTHING; the \
+                     backup flusher will retry next tick"
+                );
+                return Err(e).context(
+                    "rollover: read-after-write confirm failed — deleted NOTHING, the old proofs \
+                     stay live",
+                );
+            }
+        }
+
+        // Only now (the new event is >=k durable AND retrievable) prune the superseded events.
+        // Advisory — never trusted; a failure is logged, not fatal.
         if !superseded.is_empty() {
             if let Err(e) = self.delete_events(&superseded).await {
                 tracing::warn!(
@@ -970,23 +1026,33 @@ mod tests {
     #[tokio::test]
     async fn rollover_confirms_publish_before_delete_and_skips_delete_when_not_durable() {
         let crypto = Nip60Crypto::from_event_key(&derive_nip60_event_key(&[5u8; 64])).unwrap();
-        let superseded =
-            vec!["0000000000000000000000000000000000000000000000000000000000000001".to_string()];
 
-        // Durable (2 == k): the new token event is published, THEN the old is deleted — in order.
-        let durable = Arc::new(MockTransport::new(2));
+        // Durable (2 == k) AND retrievable: over a round-tripping multi-relay double, the new token
+        // event publishes to >=k relays, the read-after-write confirm finds it, THEN the old event
+        // is deleted — in order. (First seed a real prior snapshot to supersede; a MockTransport
+        // does NOT round-trip writes to reads, so the R1 RAW confirm needs the storing double here.)
+        let durable = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
         let store = Nip60Store::with_transport(crypto.clone(), durable.clone(), 3, 2, allow_m());
-        store
-            .rollover("https://m", "sat", Vec::new(), superseded.clone())
+        let first_id = store
+            .rollover("https://m", "sat", vec![dummy_proof("s1")], Vec::new())
             .await
-            .expect("a durable rollover succeeds");
-        assert_eq!(
-            durable.sent_kinds(),
-            vec![KIND_NIP60_TOKEN, KIND_NIP09_DELETE],
-            "confirm-before-delete: the new token event is published BEFORE the NIP-09 delete"
+            .expect("seed a real prior snapshot");
+        assert!(!durable.any_delete_sent(), "no delete on the first snapshot (no superseded input)");
+        store
+            .rollover("https://m", "sat", vec![dummy_proof("s2")], vec![first_id.to_hex()])
+            .await
+            .expect("a durable + retrievable rollover succeeds");
+        assert!(
+            durable.any_delete_sent(),
+            "confirm-before-delete: the new token event is published + confirmed retrievable BEFORE \
+             the NIP-09 delete is sent"
         );
 
-        // Sub-quorum (1 < k): the new event is NOT durable → rollover errors and NEVER deletes.
+        // Sub-quorum (1 < k): the new event is NOT durable → rollover errors and NEVER deletes. A
+        // MockTransport records sends in order; the sub-quorum publish fails the >=k gate BEFORE the
+        // RAW confirm is ever reached, so exactly one send (the failed token publish) is recorded.
+        let superseded =
+            vec!["0000000000000000000000000000000000000000000000000000000000000001".to_string()];
         let sub = Arc::new(MockTransport::new(1));
         let store2 = Nip60Store::with_transport(crypto, sub.clone(), 3, 2, allow_m());
         assert!(
@@ -1117,7 +1183,7 @@ mod tests {
     // live here, so the end-to-end round-trip is exercised without a live relay.
     // ========================================================================
 
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
     use crate::rail::{EcashProvider, Nip60BackedEcash, OperationId, SendHandle};
 
@@ -1185,11 +1251,13 @@ mod tests {
     struct InMemoryRelay {
         acks: usize,
         crypto: Nip60Crypto,
-        // (assigned event id, kind, ciphertext) in send order. The id is EXACTLY what `send_event`
-        // returned (the id a rollover recorded into `live_ids`), so a test can pair each published
-        // token event with the id the flusher tracks and run `live_token_event_ids` on the chain.
-        sends: Mutex<Vec<(EventId, u16, String)>>,
-        counter: AtomicU64,
+        // The fully-signed events stored, in send order. Each is SIGNED ONCE in `send_event` and
+        // served back VERBATIM on fetch — so the id `send_event` returns (the id a rollover records
+        // into `live_ids`) is EXACTLY the id a fetch serves back (as in the production
+        // `ClientTransport`). This id-stability is what the R1 read-after-write confirm inside
+        // `rollover` relies on, and it lets the codex-#2 tooth pair each published token event with
+        // the id the flusher tracks and run `live_token_event_ids` on the chain.
+        sends: Mutex<Vec<Event>>,
     }
 
     impl InMemoryRelay {
@@ -1198,12 +1266,11 @@ mod tests {
                 acks,
                 crypto,
                 sends: Mutex::new(Vec::new()),
-                counter: AtomicU64::new(1),
             }
         }
         /// The kinds sent so far, in order (asserts publish count / sequencing).
         fn sent_kinds(&self) -> Vec<u16> {
-            self.sends.lock().unwrap().iter().map(|(_, k, _)| *k).collect()
+            self.sends.lock().unwrap().iter().map(|ev| ev.kind.as_u16()).collect()
         }
         /// How many kind:7375 token events were published (the rollover snapshots).
         fn token_publishes(&self) -> usize {
@@ -1219,8 +1286,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(_, k, _)| *k == KIND_NIP60_WALLET_CONFIG)
-                .map(|(_, _, ct)| self.crypto.decrypt_config(ct).expect("decrypt a config event"))
+                .filter(|ev| ev.kind == Kind::from(KIND_NIP60_WALLET_CONFIG))
+                .map(|ev| self.crypto.decrypt_config(&ev.content).expect("decrypt a config event"))
                 .collect()
         }
     }
@@ -1231,13 +1298,16 @@ mod tests {
             &self,
             kind: u16,
             content: String,
-            _tags: Vec<Tag>,
+            tags: Vec<Tag>,
         ) -> anyhow::Result<SendOutcome> {
-            let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
-            let mut bytes = [0u8; 32];
-            bytes[..8].copy_from_slice(&n.to_be_bytes());
-            let event_id = EventId::from_slice(&bytes).expect("a 32-byte event id");
-            self.sends.lock().unwrap().push((event_id, kind, content));
+            // Sign ONCE; the id is the real NIP-01 id (as `ClientTransport` returns), served back
+            // verbatim on fetch so the send id and the fetch id are the same event.
+            let event = EventBuilder::new(Kind::from(kind), content)
+                .tags(tags)
+                .sign_with_keys(&self.crypto.signer_keys())
+                .expect("sign the event");
+            let event_id = event.id;
+            self.sends.lock().unwrap().push(event);
             Ok(SendOutcome {
                 event_id,
                 acks: self.acks,
@@ -1249,19 +1319,16 @@ mod tests {
             _filter: Filter,
             _timeout: Duration,
         ) -> anyhow::Result<Vec<Event>> {
-            // Replay every stored TOKEN event as a signed, author-matching event (so the reconcile's
-            // author filter + decrypt succeed). The ciphertext is exactly what was published.
+            // Serve every stored TOKEN event back VERBATIM (already signed + author-matching, so the
+            // reconcile's author filter + decrypt succeed, and each id equals what `send_event`
+            // returned).
             let events = self
                 .sends
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(_, k, _)| *k == KIND_NIP60_TOKEN)
-                .map(|(_, _, ct)| {
-                    EventBuilder::new(Kind::from(KIND_NIP60_TOKEN), ct.clone())
-                        .sign_with_keys(&self.crypto.signer_keys())
-                        .expect("sign replayed token event")
-                })
+                .filter(|ev| ev.kind == Kind::from(KIND_NIP60_TOKEN))
+                .cloned()
                 .collect();
             Ok(events)
         }
@@ -1516,13 +1583,13 @@ mod tests {
     /// A gating relay for the codex-#2 serialization tooth: it BLOCKS the FIRST `send_event` on a
     /// `Notify` (until the test releases it) and lets every later send through immediately. That
     /// deterministically pins flush A INSIDE its rollover publish while flush B runs, so the test
-    /// can force the exact interleave the `flush_lock` must prevent. Records `(id, kind, ciphertext)`
-    /// like [`InMemoryRelay`] so `decoded_token_events` computes the live set.
+    /// can force the exact interleave the `flush_lock` must prevent. Stores the fully-signed events
+    /// (like [`InMemoryRelay`]) so `decoded_token_events` computes the live set and the R1
+    /// read-after-write confirm serves back the same id `send_event` returned.
     struct GatedRelay {
         acks: usize,
         crypto: Nip60Crypto,
-        sends: Mutex<Vec<(EventId, u16, String)>>,
-        counter: AtomicU64,
+        sends: Mutex<Vec<Event>>,
         // Fires when the FIRST send may proceed (the test controls when flush A leaves its publish).
         release_first: tokio::sync::Notify,
         // Signals that flush A has ENTERED its (blocked) first send — so the test can start flush B
@@ -1537,7 +1604,6 @@ mod tests {
                 acks,
                 crypto,
                 sends: Mutex::new(Vec::new()),
-                counter: AtomicU64::new(1),
                 release_first: tokio::sync::Notify::new(),
                 first_entered: tokio::sync::Notify::new(),
                 sends_started: AtomicU64::new(0),
@@ -1548,10 +1614,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(_, k, _)| *k == KIND_NIP60_TOKEN)
-                .map(|(id, _, ct)| {
-                    let content = self.crypto.decrypt(ct).expect("decrypt a token event");
-                    (id.to_hex(), content)
+                .filter(|ev| ev.kind == Kind::from(KIND_NIP60_TOKEN))
+                .map(|ev| {
+                    let content = self.crypto.decrypt(&ev.content).expect("decrypt a token event");
+                    (ev.id.to_hex(), content)
                 })
                 .collect()
         }
@@ -1563,7 +1629,7 @@ mod tests {
             &self,
             kind: u16,
             content: String,
-            _tags: Vec<Tag>,
+            tags: Vec<Tag>,
         ) -> anyhow::Result<SendOutcome> {
             let started = self.sends_started.fetch_add(1, AtomicOrdering::SeqCst);
             if started == 0 {
@@ -1572,11 +1638,13 @@ mod tests {
                 self.first_entered.notify_one();
                 self.release_first.notified().await;
             }
-            let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
-            let mut bytes = [0u8; 32];
-            bytes[..8].copy_from_slice(&n.to_be_bytes());
-            let event_id = EventId::from_slice(&bytes).expect("a 32-byte event id");
-            self.sends.lock().unwrap().push((event_id, kind, content));
+            // Sign ONCE; the real id is served back verbatim on fetch (R1 read-after-write id-match).
+            let event = EventBuilder::new(Kind::from(kind), content)
+                .tags(tags)
+                .sign_with_keys(&self.crypto.signer_keys())
+                .expect("sign the event");
+            let event_id = event.id;
+            self.sends.lock().unwrap().push(event);
             Ok(SendOutcome {
                 event_id,
                 acks: self.acks,
@@ -1588,7 +1656,19 @@ mod tests {
             _filter: Filter,
             _timeout: Duration,
         ) -> anyhow::Result<Vec<Event>> {
-            Ok(Vec::new())
+            // Serve stored TOKEN events back VERBATIM (like `InMemoryRelay`) so the R1
+            // read-after-write confirm inside `rollover` retrieves the just-published event (same id)
+            // and the flush commits. This does not perturb the serialization tooth (it reads
+            // `decoded_token_events()` off `sends`).
+            let events = self
+                .sends
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|ev| ev.kind == Kind::from(KIND_NIP60_TOKEN))
+                .cloned()
+                .collect();
+            Ok(events)
         }
     }
 
@@ -1789,6 +1869,310 @@ mod tests {
 
     fn ecash_healthy() -> CountingEcash {
         CountingEcash::healthy()
+    }
+
+    // ============================================================================================
+    // R1 (#40 reliability leg): write-durability made RETRIEVABLE + the multi-relay drill harness.
+    //
+    // `MultiRelayTransport` models N DISTINCT relays (unlike `InMemoryRelay`'s single scalar-ack
+    // log): a per-relay event log + a per-relay UP flag, so a test can express "relay 0 has the
+    // latest, the rest are down", "an outage drops a publish below k", and "acked-but-not-served"
+    // (phantom-ack). It is the harness for the read-after-write tooth (c) and the outage drill (d),
+    // and for R2's read-quorum drills.
+    // ============================================================================================
+
+    /// A [`Nip60Transport`] over N DISTINCT relays, each with its own event log + an UP flag.
+    ///
+    /// - `send_event` SIGNS the event once (so its id is the REAL NIP-01 id — exactly what the
+    ///   production [`ClientTransport`] returns as `output.val`), STORES that signed event on every
+    ///   UP relay, and returns `acks` = the count of UP relays it landed on (a DOWN relay neither
+    ///   acks nor stores). Storing the signed event (not just the ciphertext) is what lets the R1
+    ///   read-after-write confirm work: the id `send_event` returns is the id `fetch_events` serves
+    ///   back, matching production — unlike a double that re-signs on fetch and mints a fresh id.
+    /// - `fetch_events` UNIONS the signed events stored across all UP relays, DEDUPS by event id
+    ///   (mimicking the SDK pool union of overlapping relays), and filters to the filter's kinds. A
+    ///   DOWN relay contributes nothing to the union.
+    /// - PHANTOM-ACK mode (`set_phantom_ack(true)`): `send_event` returns `acks = n_relays` (as if
+    ///   every relay acked) but STORES NOTHING — the "acked but not served/persisted" failure the
+    ///   read-after-write confirm exists to catch.
+    struct MultiRelayTransport {
+        crypto: Nip60Crypto,
+        /// One event log per relay: the fully-signed events stored, in send order.
+        relays: Vec<Mutex<Vec<Event>>>,
+        /// Per-relay outage flag (true = up = acks + stores).
+        up: Vec<AtomicBool>,
+        /// When set, `send_event` reports a full-quorum ack but stores nothing (acked-but-not-served).
+        phantom_ack: AtomicBool,
+        /// Every send's KIND, recorded at send time BEFORE the phantom/up branching — so a tooth can
+        /// assert on what was ATTEMPTED (e.g. "no NIP-09 delete was attempted") independent of whether
+        /// phantom-ack or an outage suppressed the actual storage.
+        attempts: Mutex<Vec<u16>>,
+    }
+
+    impl MultiRelayTransport {
+        fn new(n_relays: usize, crypto: Nip60Crypto) -> Self {
+            let mut relays = Vec::with_capacity(n_relays);
+            let mut up = Vec::with_capacity(n_relays);
+            for _ in 0..n_relays {
+                relays.push(Mutex::new(Vec::new()));
+                up.push(AtomicBool::new(true));
+            }
+            Self {
+                crypto,
+                relays,
+                up,
+                phantom_ack: AtomicBool::new(false),
+                attempts: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Bring relay `idx` up (`true`) or down (`false`). A down relay neither acks nor serves.
+        fn set_up(&self, idx: usize, up: bool) {
+            self.up[idx].store(up, AtomicOrdering::SeqCst);
+        }
+
+        /// Toggle acked-but-not-served: sends report a full-quorum ack but store nothing.
+        fn set_phantom_ack(&self, on: bool) {
+            self.phantom_ack.store(on, AtomicOrdering::SeqCst);
+        }
+
+        /// The number of UP relays (the ack count a normal send reaches).
+        fn up_count(&self) -> usize {
+            self.up.iter().filter(|u| u.load(AtomicOrdering::SeqCst)).count()
+        }
+
+        /// Total kind:7375 token events currently stored across ALL relays (up or down), deduped by
+        /// id — lets a tooth assert the OLD backup is still on the relays after a retained rollover.
+        fn distinct_token_ids(&self) -> std::collections::HashSet<EventId> {
+            let mut set = std::collections::HashSet::new();
+            for log in &self.relays {
+                for ev in log.lock().unwrap().iter() {
+                    if ev.kind == Kind::from(KIND_NIP60_TOKEN) {
+                        set.insert(ev.id);
+                    }
+                }
+            }
+            set
+        }
+
+        /// Whether a kind:5 NIP-09 delete was ever ATTEMPTED (recorded at send time, independent of
+        /// per-relay up/down or phantom-ack — both of which suppress the actual STORAGE, so scanning
+        /// stored events would falsely report "no delete"). The retain tooth's "no delete" assertion
+        /// must catch an ATTEMPTED prune: the rollover must not even attempt `delete_events` when the
+        /// new event is not durable+retrievable.
+        fn any_delete_sent(&self) -> bool {
+            self.attempts.lock().unwrap().contains(&KIND_NIP09_DELETE)
+        }
+    }
+
+    #[async_trait]
+    impl Nip60Transport for MultiRelayTransport {
+        async fn send_event(
+            &self,
+            kind: u16,
+            content: String,
+            tags: Vec<Tag>,
+        ) -> anyhow::Result<SendOutcome> {
+            // Record the send ATTEMPT (every kind) BEFORE the phantom/up branching, so a tooth can
+            // assert "no NIP-09 delete was attempted" even under phantom-ack (which stores nothing).
+            self.attempts.lock().unwrap().push(kind);
+            // Sign the event ONCE — its id is the real NIP-01 id (what `ClientTransport` returns and
+            // what a real fetch serves back), so the R1 read-after-write id-match holds as in prod.
+            let event = EventBuilder::new(Kind::from(kind), content)
+                .tags(tags)
+                .sign_with_keys(&self.crypto.signer_keys())
+                .expect("sign the event");
+            let event_id = event.id;
+
+            // PHANTOM-ACK: report a full-quorum ack but persist NOTHING (acked-but-not-served).
+            if self.phantom_ack.load(AtomicOrdering::SeqCst) {
+                return Ok(SendOutcome {
+                    event_id,
+                    acks: self.relays.len(),
+                });
+            }
+
+            // Normal path: store the signed event on every UP relay; ack = the number that stored it.
+            let mut acks = 0usize;
+            for (log, up) in self.relays.iter().zip(self.up.iter()) {
+                if up.load(AtomicOrdering::SeqCst) {
+                    log.lock().unwrap().push(event.clone());
+                    acks += 1;
+                }
+            }
+            Ok(SendOutcome { event_id, acks })
+        }
+
+        async fn fetch_events(&self, filter: Filter, _timeout: Duration) -> anyhow::Result<Vec<Event>> {
+            // UNION across UP relays, dedup by event id (the SDK pool union of overlapping relays);
+            // a DOWN relay contributes nothing. Honor the filter's kinds when set (so a token fetch
+            // does not pull config events and vice-versa); an unset kinds replays everything.
+            let mut seen: std::collections::HashSet<EventId> = std::collections::HashSet::new();
+            let mut events = Vec::new();
+            for (log, up) in self.relays.iter().zip(self.up.iter()) {
+                if !up.load(AtomicOrdering::SeqCst) {
+                    continue;
+                }
+                for ev in log.lock().unwrap().iter() {
+                    if let Some(kinds) = &filter.kinds {
+                        if !kinds.contains(&ev.kind) {
+                            continue;
+                        }
+                    }
+                    // Honor the author filter too (production fetches by author via `.author(pk)`), so
+                    // the double cannot mask a foreign-author pollution bug in a reconcile drill.
+                    if let Some(authors) = &filter.authors {
+                        if !authors.contains(&ev.pubkey) {
+                            continue;
+                        }
+                    }
+                    if seen.insert(ev.id) {
+                        events.push(ev.clone());
+                    }
+                }
+            }
+            Ok(events)
+        }
+    }
+
+    // ---- Tooth (c): READ-AFTER-WRITE in rollover — an acked-but-not-served new event is caught. --
+    //
+    // In PHANTOM-ACK mode the transport reports acks >= k (so the >=k publish gate PASSES) but stores
+    // the new event NOWHERE, so a follow-up fetch cannot retrieve it. `rollover` must then treat the
+    // new backup as NOT-yet-durable: it must NOT delete the superseded events (the old backup stays
+    // intact) and it must take the retain/retry path. First we seed a real prior backup (phantom OFF),
+    // then flip phantom ON and roll it over.
+    //
+    // RED-on-revert: remove the read-after-write confirm block in `rollover` (go straight to
+    // delete_events after publish_token) and this fails — the superseded delete IS sent even though
+    // the new event is not retrievable, and `rollover` returns Ok, so the only backup on the relays
+    // is an event no relay actually serves (backup silently LOST).
+    #[tokio::test]
+    async fn rollover_retains_the_old_backup_when_the_new_event_is_acked_but_not_served() {
+        let crypto = test_crypto(0x60);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        // n=3, k=2. Phantom OFF: publish a REAL first snapshot (lands on all 3 up relays, acks=3>=k).
+        let store = Nip60Store::with_transport(crypto, transport.clone(), 3, 2, allow_m());
+        let first_id = store
+            .rollover("https://m", "sat", vec![dummy_proof("s1")], Vec::new())
+            .await
+            .expect("the first (real) snapshot publishes durably");
+        assert_eq!(
+            transport.distinct_token_ids().len(),
+            1,
+            "the first snapshot is stored on the relays"
+        );
+        assert!(!transport.any_delete_sent(), "no delete on the first snapshot (no superseded input)");
+
+        // Now the new event is ACKED-BUT-NOT-SERVED: the publish reports full quorum, but the event
+        // is stored NOWHERE, so the read-after-write confirm cannot retrieve it.
+        transport.set_phantom_ack(true);
+        let superseded = vec![first_id.to_hex()];
+        let result = store
+            .rollover("https://m", "sat", vec![dummy_proof("s2")], superseded.clone())
+            .await;
+
+        // The RAW confirm caught it: the rollover did NOT commit the delete, so the old backup is
+        // retained. The flusher tolerates the returned Err by re-arming dirty (retry next tick).
+        assert!(
+            result.is_err(),
+            "an acked-but-not-served new event must NOT be treated as a committed rollover — the \
+             read-after-write confirm fails, leaving the old backup intact for a retry"
+        );
+        assert!(
+            !transport.any_delete_sent(),
+            "MONEY-SAFETY: the superseded events are NOT deleted when the new event is not \
+             retrievable — the old backup stays live (revert the RAW confirm and a delete IS sent)"
+        );
+        // The old snapshot is STILL the only real backup on the relays (phantom stored nothing new).
+        assert!(
+            transport.distinct_token_ids().contains(&first_id),
+            "the prior snapshot event is still stored on the relays (never pruned)"
+        );
+
+        // Recovery: turn phantom OFF and roll over again → the new event is really served → the RAW
+        // confirm passes, the rollover commits, and a reconcile sees the new snapshot's proof.
+        transport.set_phantom_ack(false);
+        store
+            .rollover("https://m", "sat", vec![dummy_proof("s2")], superseded)
+            .await
+            .expect("with the event really served, the rollover commits");
+        let restored = store.reconcile_on_load().await.expect("reconcile after recovery");
+        assert!(
+            !restored.is_empty(),
+            "once the new event is actually served, the backup converges (reconcile is non-empty)"
+        );
+    }
+
+    // ---- Tooth (d): DRILL — estate-flush RACED a relay outage. ----------------------------------
+    //
+    // Enough relays DOWN that a publish reaches < k. `rollover` must HARD-ERROR on the existing >=k
+    // gate, delete NOTHING (the existing backup is never corrupted), and lose nothing. Then the
+    // outage clears (relays back UP) and a re-publish reaches >=k and succeeds; a subsequent
+    // reconcile sees the event (the backup converges once the outage clears).
+    //
+    // RED-on-revert: this leans on the SAME >=k ensure the `publish_token` tooth already guards
+    // (removing it makes the sub-quorum publish silently "succeed"); here the drill additionally
+    // proves the OLD backup is not corrupted by the failed publish and that recovery converges.
+    #[tokio::test]
+    async fn drill_estate_flush_raced_a_relay_outage_never_corrupts_the_backup() {
+        let crypto = test_crypto(0x61);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        // n=3, k=2. Seed a real prior backup while all relays are UP (acks=3 >= k).
+        let store = Nip60Store::with_transport(crypto, transport.clone(), 3, 2, allow_m());
+        let first_id = store
+            .rollover("https://m", "sat", vec![dummy_proof("s1")], Vec::new())
+            .await
+            .expect("the prior backup lands durably before the outage");
+        let before = transport.distinct_token_ids();
+        assert!(before.contains(&first_id), "the prior backup is on the relays before the outage");
+
+        // OUTAGE: two of three relays go down → only 1 up → a publish reaches acks=1 < k=2.
+        transport.set_up(1, false);
+        transport.set_up(2, false);
+        assert_eq!(transport.up_count(), 1, "the outage leaves a sub-quorum relay set");
+        let superseded = vec![first_id.to_hex()];
+        let outage = store
+            .rollover("https://m", "sat", vec![dummy_proof("s2")], superseded.clone())
+            .await;
+        assert!(
+            outage.is_err(),
+            "a below-k publish HARD-ERRORS (the >=k durability gate) — the new event is not durable"
+        );
+        assert!(
+            !transport.any_delete_sent(),
+            "the failed rollover deleted NOTHING — the existing backup is not corrupted"
+        );
+        assert!(
+            transport.distinct_token_ids().contains(&first_id),
+            "the prior backup is still intact after the failed sub-quorum publish"
+        );
+
+        // RECOVERY: the outage clears (relays back up) → a re-publish reaches >=k → succeeds, and a
+        // reconcile sees the new snapshot's proof (the backup converges).
+        transport.set_up(1, true);
+        transport.set_up(2, true);
+        assert_eq!(transport.up_count(), 3, "the outage cleared");
+        store
+            .rollover("https://m", "sat", vec![dummy_proof("s2")], superseded)
+            .await
+            .expect("once the outage clears the re-publish reaches >=k and succeeds");
+        let restored = store.reconcile_on_load().await.expect("reconcile after recovery");
+        // CONVERGENCE (stronger than !is_empty): reconcile recovers EXACTLY the committed snapshot —
+        // one proof. The sub-quorum publish during the outage partially stored an ORPHAN token event
+        // on the one up relay; it is never superseded (the failed rollover returned Err before
+        // recording its id, so the flusher's live_ids never advanced to it). Its proof is IDENTICAL to
+        // the committed retry's, so reconcile's proof-level dedup collapses them → len 1. A DIVERGENT
+        // orphan would be over-included, then filtered by the mint (NUT-07) on import — never a
+        // double-spend or phantom. Event-level orphan cleanup (del-chaining partial-publish ids) is
+        // deferred to #127 (relay hygiene; needs flusher plumbing = rail.rs, out of R1 scope).
+        assert_eq!(
+            restored.len(),
+            1,
+            "after the outage clears, reconcile converges to EXACTLY the committed snapshot proof — \
+             the sub-quorum partial-publish orphan's identical proof deduped away (no phantom/extra \
+             proof); !is_empty alone would not prove convergence (see #127)"
+        );
     }
 
     /// The compact local fakewallet mint fixture for tooth 2 (real unspent proofs need a live mint).
