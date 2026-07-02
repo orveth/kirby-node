@@ -1212,6 +1212,17 @@ mod tests {
                 .filter(|k| **k == KIND_NIP60_TOKEN)
                 .count()
         }
+        /// Every kind:17375 wallet-config published, decrypted (Cut B, #115: the counter-estate
+        /// re-publish carries the current counter mirror; a tooth asserts on its `counters`).
+        fn decoded_config_events(&self) -> Vec<WalletConfigContent> {
+            self.sends
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, k, _)| *k == KIND_NIP60_WALLET_CONFIG)
+                .map(|(_, _, ct)| self.crypto.decrypt_config(ct).expect("decrypt a config event"))
+                .collect()
+        }
     }
 
     #[async_trait]
@@ -1708,6 +1719,71 @@ mod tests {
             relay.token_publishes(),
             1,
             "the drop-fired fallback no-ops after the awaited estate flush → EXACTLY one publish on the graceful path"
+        );
+    }
+
+    // ---- T5 (Cut B, #115): the graceful estate flush re-publishes the CURRENT counter mirror. -----
+    //
+    // At graceful teardown `ServeGuard::flush_estate()` must, AFTER the proof flush, publish a
+    // kind:17375 wallet-config carrying the counter decorator's current `keyset_counters()` — so the
+    // relay's counter floor never lags the wallet's true derivation counter at death. This drives the
+    // seam directly (a full VM boot is far too heavy for a unit test): a `ServeGuard` carrying ONLY
+    // the counter-estate bundle, over the in-memory relay double.
+    //
+    // RED-on-revert: neuter the counter-publish arm in `flush_estate` (drop the
+    // `store.publish_wallet_config(...)` call) → NO 17375 is published → `config_events` is empty →
+    // the `Some(4096)` assert fails.
+    #[tokio::test]
+    async fn t5_flush_estate_republishes_the_current_counter_mirror() {
+        let crypto = test_crypto(0x5b);
+        let relay = Arc::new(InMemoryRelay::new(2, crypto.clone()));
+        let store = Arc::new(Nip60Store::with_transport(
+            crypto,
+            relay.clone(),
+            3,
+            2,
+            allow_m(),
+        ));
+        // A counter decorator whose mirror already holds a known high-water counter (as it would
+        // after a run of increments). The wrapped inner store is irrelevant to the publish — the
+        // publish reads the SHADOW via `keyset_counters()`.
+        let k: Id = "009a1f293253e41e".parse().unwrap();
+        let inner = cdk_sqlite::wallet::memory::empty().await.unwrap();
+        let counter_db = Arc::new(Nip60CounterDb::with_counters(
+            Arc::new(inner),
+            HashMap::from([(k, 4096u32)]),
+        ));
+
+        assert_eq!(
+            relay.decoded_config_events().len(),
+            0,
+            "nothing published before the estate flush"
+        );
+
+        // The graceful-teardown seam: a guard carrying only the counter estate, then AWAIT it.
+        let guard = crate::boot::ServeGuard::for_counter_estate_test((
+            store,
+            counter_db,
+            "https://m".to_string(),
+        ));
+        guard.flush_estate().await;
+
+        let configs = relay.decoded_config_events();
+        assert_eq!(
+            configs.len(),
+            1,
+            "the awaited estate flush published exactly one kind:17375 counter mirror (revert the \
+             counter-publish arm → 0)"
+        );
+        assert_eq!(
+            configs[0].counters.get(&k.to_string()).copied(),
+            Some(4096),
+            "the published 17375 carries the CURRENT counter mirror (the decorator's high-water 4096)"
+        );
+        assert_eq!(
+            configs[0].mints,
+            vec!["https://m".to_string()],
+            "the published config carries the wallet's mint"
         );
     }
 

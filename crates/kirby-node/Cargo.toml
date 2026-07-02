@@ -81,6 +81,16 @@ futures = "0.3"
 cdk = { workspace = true }
 cdk-sqlite = { workspace = true }
 cdk-fake-wallet = { workspace = true }
+# rusqlite is a DIRECT read of the cdk-sqlite wallet store's `keyset_counter` table for the
+# NIP-60 kind:17375 counter-mirror COMPLETENESS (#115 Cut B). cdk's `WalletDatabase` trait has NO
+# bulk enumeration (only `increment_keyset_counter`, i.e. read == increment-by-0) and the concrete
+# `WalletSqliteDatabase` exposes no pool/path getter, so the ONLY complete, unit-agnostic source of
+# EVERY local counter is the on-disk table. Pinned to "0.31.0" with the SAME `bundled` feature
+# cdk-sqlite (0.17.1) declares (`rusqlite = { version = "0.31", features = ["bundled"] }`), so the
+# lock resolves ONE rusqlite / ONE libsqlite3-sys — no second bundled sqlite enters the tree.
+# `read_local_keyset_counters` (mint_rig.rs) is the single reader; it is fail-safe (empty map on
+# ANY error) so a schema drift can never fail boot. Host-side only; never crosses vsock.
+rusqlite = { version = "0.31.0", features = ["bundled"] }
 # The lease + no-split-brain fence (#9, gate G8 / F9) is now relay-native + FROST-signed
 # (`relay_lease`): a Lease event is published to the SAME Nostr relay the nerve uses, so it
 # works across LAN/NAT. The loopback Raft cluster was CUT (it was same-host only). The
