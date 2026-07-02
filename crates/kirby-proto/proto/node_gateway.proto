@@ -223,6 +223,17 @@ message NostrDmReply {
   string text      = 2;   // the reply text (re-sanitized + re-capped daemon-side)
 }
 
+// Daemon-produced payload for a PAYMENT_SETTLED inbound event (Component 2).
+// The genome correlates it back to its IssueCharge via InboundEvent.correlation_id
+// (which equals charge_id). verified_sats is ALWAYS the mint-verified amount the
+// daemon credited -- never the genome's requested amount or the IssueCharge amount.
+// create-fund's topup-reconcile seam will consume this to convert earned ecash into
+// inference runway; keep the shape clean and independent of the DM workload.
+message PaymentSettled {
+  string charge_id     = 1;   // echoes ChargeIssued.charge_id
+  uint64 verified_sats = 2;   // the mint-verified amount credited to the treasury
+}
+
 // The earn-loop OUTBOUND surface (Component 2): the genome asks the daemon to issue
 // a payment request for a completed job. The daemon mints or constructs the invoice
 // via the host-held settlement provider (no credentials leave the daemon) and returns

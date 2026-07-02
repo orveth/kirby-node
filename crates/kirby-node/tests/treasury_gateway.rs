@@ -606,6 +606,102 @@ async fn end_to_end_over_in_process_tonic() {
     assert_eq!(rail.perform_count(), 1);
 }
 
+// ---- E1: IssueCharge through the gateway leaves the balance UNCHANGED ----
+//
+// This is the drain-only re-statement for the IssueCharge act: issuing a charge
+// is zero-cost to the genome. No debit occurs at issuance time. The credit path
+// (credit_verified) is separate, daemon-gated, and proven by
+// `credit_is_only_via_host_verified_settlement`. A duplicate IssueCharge key is
+// also zero-cost (the idempotency record stores 0). Balance monotonically
+// NON-INCREASING through any genome-reachable path (IssueCharge does not raise it).
+
+/// Stub settlement provider for the E1 gate: returns a deterministic charge_id
+/// without touching a real wallet. Verify_settlement is not called in E1.
+struct StubSettlement;
+
+#[async_trait::async_trait]
+impl kirby_node::rail::SettlementProvider for StubSettlement {
+    async fn issue(
+        &self,
+        amount_sats: u64,
+        _memo: &str,
+    ) -> anyhow::Result<kirby_node::rail::ChargeIssuedData> {
+        Ok(kirby_node::rail::ChargeIssuedData {
+            charge_id: "stub-charge-1".to_string(),
+            invoice_or_request: format!("cashu:charge:stub-charge-1:{amount_sats}"),
+            amount_sats,
+        })
+    }
+    async fn verify_settlement(&self, _charge_id: &str, _evidence: &str) -> anyhow::Result<u64> {
+        anyhow::bail!("verify_settlement not called in the E1 gate")
+    }
+}
+
+/// E1 (earn-loop gate): `IssueCharge` through the gateway leaves the treasury balance
+/// UNCHANGED. Issuing a charge is zero-cost; it records a ledger row with cost=0 so
+/// the idempotency key dedupes a resume replay, but the balance never decreases.
+///
+/// RED-on-revert: if `authorize_issue_charge` were to debit `amount_sats`, the final
+/// balance would be 900, not 1000. The assertion below would fail.
+#[tokio::test]
+async fn issue_charge_through_gateway_does_not_raise_balance() {
+    use kirby_node::rail::ISSUE_CHARGE_DESTINATION;
+    use kirby_proto::{ChargeMethod, IssueCharge};
+
+    let treasury = Treasury::open_temporary(1_000).expect("open temporary treasury");
+    let session = Session {
+        task_descriptor: "earn-loop-e1".into(),
+        budget_sats: 1_000,
+        // Allowlist must include the IssueCharge destination sentinel.
+        allowlisted_destinations: vec![ISSUE_CHARGE_DESTINATION.to_string()],
+        allowlisted_inbound_kinds: Vec::new(),
+    };
+    let svc = GatewayService::new(treasury, Arc::new(MockRail::new()), session)
+        .with_settlement_provider(StubSettlement);
+
+    let before = svc.treasury_remaining().unwrap();
+    assert_eq!(before, 1_000);
+
+    let req = CapabilityRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        idempotency_key: "earn-charge-1".into(),
+        act: Some(Act::IssueCharge(IssueCharge {
+            amount_sats: 100,
+            memo: "test job".into(),
+            method: ChargeMethod::Cashu as i32,
+        })),
+        budget_sats: 0,
+    };
+
+    let receipt = svc.authorize_capability(&req).await.unwrap();
+    assert_eq!(
+        receipt.outcome,
+        Outcome::AuthorizedAndPerformed as i32,
+        "IssueCharge must be authorized when the settlement provider is attached"
+    );
+    // E1 gate: balance is UNCHANGED after IssueCharge.
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        before,
+        "IssueCharge must NOT debit the treasury (E1: drain-only re-statement for the charge act)"
+    );
+    assert_eq!(receipt.cost_sats, 0, "IssueCharge cost is always 0");
+
+    // The receipt carries the ChargeIssued data (charge_id + payment request).
+    let charge = receipt.charge.expect("IssueCharge receipt must carry ChargeIssued");
+    assert!(!charge.charge_id.is_empty(), "charge_id must be non-empty");
+    assert!(!charge.invoice_or_request.is_empty(), "invoice_or_request must be non-empty");
+    assert_eq!(charge.amount_sats, 100);
+
+    // RED-on-revert check: duplicate IssueCharge key also costs 0.
+    let dup = svc.authorize_capability(&req).await.unwrap();
+    assert_eq!(dup.outcome, Outcome::DuplicateIgnored as i32);
+    assert_eq!(svc.treasury_remaining().unwrap(), before, "duplicate IssueCharge must not debit either");
+    // Duplicate returns the SAME ChargeIssued (same charge_id for resume-replay correlation).
+    let dup_charge = dup.charge.expect("duplicate IssueCharge receipt must also carry ChargeIssued");
+    assert_eq!(dup_charge.charge_id, charge.charge_id, "duplicate must return the SAME charge_id");
+}
+
 // ---- a tiny temp-dir helper (no external dev-dependency) ----
 
 /// A unique temp directory removed on drop. Keeps the test free of an external

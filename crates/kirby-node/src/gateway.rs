@@ -21,9 +21,9 @@ use std::sync::Arc;
 use kirby_proto::capability_request::Act;
 use kirby_proto::node_gateway_server::{NodeGateway, NodeGatewayServer};
 use kirby_proto::{
-    Ack, CapabilityReceipt, CapabilityRequest, CheckpointBlob, EntropyNonce, EntropyRequest, Event,
-    InboundBatch, InboundKind, InboxRequest, Memory, MemoryOp, MemoryResult, Outcome,
-    SessionContext, SessionRequest, WriteStatus,
+    Ack, CapabilityReceipt, CapabilityRequest, ChargeIssued, CheckpointBlob, EntropyNonce,
+    EntropyRequest, Event, InboundBatch, InboundKind, InboxRequest, Memory, MemoryOp, MemoryResult,
+    Outcome, PaymentSettled, SessionContext, SessionRequest, WriteStatus,
 };
 use prost::Message;
 use rand::TryRngCore;
@@ -32,8 +32,8 @@ use tonic::{Request, Response, Status};
 use crate::checkpoint::{CheckpointArtifact, LatestCheckpoint};
 use crate::lease::{FenceVerdict, LeaseAuthority};
 use crate::nerve::InboundQueue;
-use crate::rail::{self, MemoryBackend, MemoryWrite, Rail, RailOutcome};
-use crate::treasury::{DebitOutcome, Treasury, TreasuryError};
+use crate::rail::{self, ChargeIssuedData, MemoryBackend, MemoryWrite, Rail, RailOutcome, SettlementProvider};
+use crate::treasury::{CreditOutcome, DebitOutcome, Treasury, TreasuryError};
 
 /// The host ceiling on a `PollInbox` long-poll budget (1.2): the daemon CLAMPS the
 /// genome's `wait_ms` to this so a hostile value cannot pin a server task forever. 30s is
@@ -115,6 +115,11 @@ pub struct GatewayService {
     /// genome's `want_kinds` with this set; the genome can only NARROW. Empty => inbound
     /// disabled.
     allowlisted_inbound_kinds: Arc<Vec<InboundKind>>,
+    /// The OPTIONAL settlement provider (earn-loop Component 2). `Some` for a
+    /// settlement-mode gateway (injects a `CashuSettlement` wrapping the funded wallet);
+    /// `None` for every other workload, where `IssueCharge` fails closed (debit 0,
+    /// perform nothing). `Arc<dyn SettlementProvider>` keeps the service cheap to clone.
+    settlement: Option<Arc<dyn SettlementProvider>>,
 }
 
 /// The lease fence attached to a gateway (spec 4.3): the node's lease handle plus
@@ -165,7 +170,15 @@ impl GatewayService {
             wseq_floor: Arc::new(AtomicU64::new(0)),
             inbox: None,
             allowlisted_inbound_kinds,
+            settlement: None,
         }
+    }
+
+    /// Attach a settlement provider (earn-loop Component 2). An IssueCharge act is
+    /// served only when one is attached; without it IssueCharge fails closed (debit 0).
+    pub fn with_settlement_provider<S: SettlementProvider + 'static>(mut self, s: S) -> Self {
+        self.settlement = Some(Arc::new(s));
+        self
     }
 
     /// Attach the per-genome INBOUND queue (earn-loop Component 1): the gateway's `PollInbox`
@@ -467,17 +480,24 @@ impl GatewayService {
                 );
                 return Ok(denied(Outcome::Unspecified, self.balance()?));
             }
-            return Ok(receipt(
-                Outcome::DuplicateIgnored,
-                prior.cost_sats,
-                prior.treasury_remaining_after,
-                prior.proof,
-                prior.completion,
-                // A Memory WRITE replay returns the SAME structured result (the ledger
-                // persists the encoded MemoryResult); decode it back (None for a brain or
-                // any non-memory act, whose `memory` is empty).
-                decode_memory(&prior.memory),
-            ));
+            // For an IssueCharge resume the genome MUST get the same ChargeIssued (same
+            // charge_id!) it received the first time. The first issue stored the prost-
+            // encoded ChargeIssued in the `proof` field; decode it back here.
+            let charge = decode_charge(&prior.proof, act);
+            return Ok(CapabilityReceipt {
+                charge,
+                ..receipt(
+                    Outcome::DuplicateIgnored,
+                    prior.cost_sats,
+                    prior.treasury_remaining_after,
+                    prior.proof,
+                    prior.completion,
+                    // A Memory WRITE replay returns the SAME structured result (the ledger
+                    // persists the encoded MemoryResult); decode it back (None for a brain or
+                    // any non-memory act, whose `memory` is empty).
+                    decode_memory(&prior.memory),
+                )
+            });
         }
 
         // STEP 2: allowlist the destination (mint id / invoice / URL host). Not
@@ -508,6 +528,15 @@ impl GatewayService {
         // concurrent same-key. STEP0/1/2 already ran above.
         if let Act::Actuate(a) = act {
             return self.authorize_actuate(req, act, a).await;
+        }
+
+        // FORK (earn-loop charge issuance): an IssueCharge act is ZERO-COST from the
+        // treasury's perspective (the genome issues a charge; the CREDIT arrives only when
+        // the customer settles). STEP0/1/2 already ran above. The idempotency key is
+        // recorded with cost=0 so a resume re-issue gets the SAME ChargeIssued (same
+        // charge_id) rather than a fresh one (which would lose the customer correlation).
+        if let Act::IssueCharge(ic) = act {
+            return self.authorize_issue_charge(req, ic).await;
         }
 
         // STEP 3: budget gate. The estimate must be within BOTH the genome's
@@ -849,6 +878,142 @@ impl GatewayService {
         }
     }
 
+    /// The IssueCharge act's authorize path (earn-loop Component 2): the genome asks the
+    /// daemon to generate a payment request for a completed job. STEP0 (lease), STEP1
+    /// (dedupe), STEP2 (allowlist) already ran in `authorize_capability`. Here:
+    ///   1. Fail closed if no settlement provider is attached (wiring guard, debit 0).
+    ///   2. Call `settlement.issue(amount_sats, memo)` to generate a `charge_id` + payment
+    ///      request string. The settlement provider is the host-held credential; it never
+    ///      crosses vsock.
+    ///   3. Record the charge with cost=0: `debit_and_record` with 0 sats stores a ledger
+    ///      row so STEP1 can dedupe a resume re-issue and return the SAME `ChargeIssued`
+    ///      (same `charge_id`). A charge that was never paid costs the genome nothing.
+    ///
+    /// MONEY-MUST: the credit path (treasury.credit_verified) is NOT on this path. It is
+    /// on `settle_charge`, which the daemon calls when the customer submits proof of
+    /// payment. The genome NEVER credits itself; the credit is daemon-gated.
+    async fn authorize_issue_charge(
+        &self,
+        req: &CapabilityRequest,
+        ic: &kirby_proto::IssueCharge,
+    ) -> Result<CapabilityReceipt, TreasuryError> {
+        let Some(settlement) = self.settlement.as_ref() else {
+            tracing::error!("IssueCharge on a gateway with no settlement provider; failing closed (debit 0)");
+            return Ok(denied(Outcome::UpstreamFailed, self.balance()?));
+        };
+
+        let issued: ChargeIssuedData = match settlement.issue(ic.amount_sats, &ic.memo).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(error = %e, "settlement.issue failed; debiting nothing");
+                return Ok(denied(Outcome::UpstreamFailed, self.balance()?));
+            }
+        };
+
+        let charge = ChargeIssued {
+            charge_id: issued.charge_id,
+            invoice_or_request: issued.invoice_or_request,
+            amount_sats: issued.amount_sats,
+            method: ic.method,
+        };
+
+        // Store the prost-encoded ChargeIssued in the proof field so STEP1 can reconstruct
+        // it verbatim on a resume replay (the genome needs the SAME charge_id for the same
+        // idempotency key, so the customer-correlation holds across a resume).
+        let proof = charge.encode_to_vec();
+
+        // Record with cost=0: issuing a charge costs the genome nothing. The ledger row
+        // dedupes resume re-issues at STEP1 (a Duplicate returns the same ChargeIssued).
+        match self.treasury.debit_and_record(
+            &req.idempotency_key,
+            0,
+            proof.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )? {
+            DebitOutcome::Debited { remaining, .. } => Ok(CapabilityReceipt {
+                schema_version: kirby_proto::SCHEMA_VERSION,
+                outcome: Outcome::AuthorizedAndPerformed as i32,
+                cost_sats: 0,
+                treasury_remaining: remaining,
+                proof,
+                completion: Vec::new(),
+                memory: None,
+                charge: Some(charge),
+            }),
+            // Concurrent same-key: the stored ChargeIssued is in proof.
+            DebitOutcome::Duplicate(prior) => Ok(CapabilityReceipt {
+                schema_version: kirby_proto::SCHEMA_VERSION,
+                outcome: Outcome::DuplicateIgnored as i32,
+                cost_sats: 0,
+                treasury_remaining: prior.treasury_remaining_after,
+                proof: prior.proof.clone(),
+                completion: Vec::new(),
+                memory: None,
+                charge: ChargeIssued::decode(prior.proof.as_slice()).ok(),
+            }),
+            // Unreachable (cost=0 can't go insufficient), but surfaced cleanly.
+            DebitOutcome::Insufficient { remaining } => {
+                Ok(denied(Outcome::DeniedInsufficientTreasury, remaining))
+            }
+        }
+    }
+
+    /// Daemon-side settlement: verify that `evidence` (a cashu token) settles `charge_id`,
+    /// credit the treasury with the MINT-VERIFIED amount (money-MUST: never the claimed
+    /// amount), and enqueue a `PAYMENT_SETTLED` inbound event so the genome knows the
+    /// charge cleared.
+    ///
+    /// Called by the customer's settlement client (or the E6 integration test rig), NOT by
+    /// the genome. The genome polls the inbox for `PAYMENT_SETTLED` to learn the outcome.
+    ///
+    /// `credit_verified` is idempotent on `charge_id` — a double-settle attempt returns
+    /// `CreditOutcome::Duplicate` with no double-credit.
+    pub async fn settle_charge(
+        &self,
+        charge_id: &str,
+        evidence: &str,
+    ) -> anyhow::Result<CreditOutcome> {
+        let settlement = self
+            .settlement
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no settlement provider attached"))?;
+
+        // verify_settlement calls the MINT and returns the MINT-VERIFIED sats.
+        // MONEY-MUST: this is the ONLY source of the credit amount; we never use
+        // the genome's requested amount or the IssueCharge.amount_sats here.
+        let verified_sats = settlement.verify_settlement(charge_id, evidence).await?;
+
+        // credit_verified is the sole sanctioned credit path (idempotent on charge_id).
+        let outcome = self.treasury.credit_verified(charge_id, verified_sats)?;
+
+        tracing::info!(
+            charge_id,
+            verified_sats,
+            duplicate = matches!(outcome, CreditOutcome::Duplicate(_)),
+            "settlement verified and applied to treasury"
+        );
+
+        // Enqueue PAYMENT_SETTLED so the genome's inbox poll wakes with the news.
+        if let Some(inbox) = &self.inbox {
+            let payload = PaymentSettled {
+                charge_id: charge_id.to_string(),
+                verified_sats,
+            }
+            .encode_to_vec();
+            inbox.push_typed(
+                InboundKind::PaymentSettled,
+                payload,
+                String::new(),
+                0,
+                charge_id.to_string(),
+            );
+        }
+
+        Ok(outcome)
+    }
+
     fn balance(&self) -> Result<u64, TreasuryError> {
         self.treasury.remaining()
     }
@@ -1094,6 +1259,7 @@ fn receipt(
         proof,
         completion,
         memory,
+        charge: None,
     }
 }
 
@@ -1101,6 +1267,16 @@ fn receipt(
 /// (unchanged) treasury balance.
 fn denied(outcome: Outcome, treasury_remaining: u64) -> CapabilityReceipt {
     receipt(outcome, 0, treasury_remaining, Vec::new(), Vec::new(), None)
+}
+
+/// Decode a persisted `proof` field back to `ChargeIssued` for an IssueCharge STEP1
+/// resume replay, so the genome always receives the SAME `charge_id` for the same
+/// idempotency key. Returns `None` for all non-IssueCharge acts (or on a decode error).
+fn decode_charge(proof: &[u8], act: &Act) -> Option<ChargeIssued> {
+    match act {
+        Act::IssueCharge(_) => ChargeIssued::decode(proof).ok(),
+        _ => None,
+    }
 }
 
 /// Decode a persisted `PerformedRecord.memory` (the prost-encoded `MemoryResult` bytes)

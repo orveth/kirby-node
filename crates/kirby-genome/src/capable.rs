@@ -50,9 +50,10 @@
 use kirby_proto::capability_request::Act;
 use kirby_proto::node_gateway_client::NodeGatewayClient;
 use kirby_proto::{
-    Actuate, CapabilityReceipt, CapabilityRequest, ChatMessage, Completion, Event, InboundBatch,
-    InboundKind, InboxRequest, Memory, MemoryOp, NostrDmReply, NostrPublish,
-    ACTUATE_KIND_NOSTR_DM_REPLY, ACTUATE_KIND_NOSTR_PUBLISH, NOSTR_KIND_TEXT_NOTE,
+    Actuate, CapabilityReceipt, CapabilityRequest, ChargeMethod, ChatMessage, Completion, Event,
+    InboundBatch, InboundKind, InboxRequest, IssueCharge, Memory, MemoryOp, NostrDmReply,
+    NostrPublish, PaymentSettled, ACTUATE_KIND_NOSTR_DM_REPLY, ACTUATE_KIND_NOSTR_PUBLISH,
+    NOSTR_KIND_TEXT_NOTE,
 };
 // `prost::Message` (brought in unnamed) for `encode_to_vec`: the genome prost-encodes the
 // typed POST payload into the opaque `Actuate.payload`, staying JSON-free (F5).
@@ -166,6 +167,11 @@ pub(super) enum Action {
     /// A malformed, unknown, or GUARD-REJECTED plan. The loop treats it as a safe no-op for the
     /// tick and feeds `reason` into the next prompt; it NEVER actuates and NEVER ends life.
     Invalid { reason: String },
+    /// The earn-loop charge issuance: the genome asked the daemon to issue a payment request
+    /// for a completed job. The daemon's `IssueCharge` act returned a charge_id + invoice_or_request
+    /// (payment request string). Zero cost to the genome at issuance; treasury credit arrives
+    /// when the customer pays (PAYMENT_SETTLED).
+    EarnCharge { charge_id: String, amount_sats: u64 },
 }
 
 impl Action {
@@ -179,6 +185,7 @@ impl Action {
             Action::DmReply { .. } => "DM_REPLY",
             Action::ReadMore => "READ_MORE",
             Action::Invalid { .. } => "INVALID",
+            Action::EarnCharge { .. } => "EARN_CHARGE",
         }
     }
 }
@@ -660,6 +667,16 @@ pub(super) trait Gateway {
     /// surface, task #12). Named `read_inbox` (not `poll_inbox`) to avoid clashing with the inherent
     /// tonic client method of that name (same idiom as `call`/`send_event`).
     async fn read_inbox(&mut self, req: InboxRequest) -> Result<InboundBatch, tonic::Status>;
+    /// Issue an earn-loop charge (IssueCharge act, Component 2): ask the daemon to generate a
+    /// payment request for `amount_sats`. Returns the `CapabilityReceipt`; the `charge` field
+    /// carries `ChargeIssued` on success (charge_id + invoice_or_request). Zero cost to the
+    /// treasury at issuance; the credit arrives when the customer pays (PAYMENT_SETTLED).
+    async fn issue_charge(
+        &mut self,
+        amount_sats: u64,
+        memo: &str,
+        idempotency_key: &str,
+    ) -> Result<CapabilityReceipt, tonic::Status>;
 }
 
 impl Gateway for NodeGatewayClient<tonic::transport::Channel> {
@@ -673,6 +690,24 @@ impl Gateway for NodeGatewayClient<tonic::transport::Channel> {
     async fn read_inbox(&mut self, req: InboxRequest) -> Result<InboundBatch, tonic::Status> {
         // The inherent tonic `poll_inbox` (takes priority over this trait method of the other name).
         self.poll_inbox(req).await.map(|r| r.into_inner())
+    }
+    async fn issue_charge(
+        &mut self,
+        amount_sats: u64,
+        memo: &str,
+        idempotency_key: &str,
+    ) -> Result<CapabilityReceipt, tonic::Status> {
+        let req = CapabilityRequest {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            idempotency_key: idempotency_key.to_string(),
+            act: Some(Act::IssueCharge(IssueCharge {
+                amount_sats,
+                memo: memo.to_string(),
+                method: ChargeMethod::Cashu as i32,
+            })),
+            budget_sats: 0,
+        };
+        self.request_capability(req).await.map(|r| r.into_inner())
     }
 }
 
@@ -1591,6 +1626,11 @@ async fn execute_action<G: Gateway>(
             }
         }
         Action::Remember { key, value } => execute_remember(gw, seq, key, value, params).await,
+        // EarnCharge is only meaningful in the earn-loop tick (it is driven there directly, not
+        // via execute_action). In the ordinary capable tick it is a guarded no-op.
+        Action::EarnCharge { .. } => {
+            ActionOutcome::Done { recorded_write: false, verify: None, feedback: "EARN_CHARGE is only valid in the earn-loop workload".into() }
+        }
     }
 }
 
@@ -1960,6 +2000,261 @@ pub(super) async fn capable_loop(
             committed = seq;
         }
 
+        tokio::time::sleep(params.tick).await;
+    }
+}
+
+// ---- The earn-loop workload (Component 2) ----
+//
+// earn_loop_tick: poll for a JOB_REQUEST → THINK on it → ISSUE a cashu charge.
+// The credit arrives asynchronously when the customer pays; the genome polls for
+// PAYMENT_SETTLED in the next tick (or the test drives it directly).
+//
+// MONEY-MUST (genome side): the genome NEVER credits itself. It only asks the daemon
+// to ISSUE a charge. The daemon calls credit_verified when the customer's token is
+// verified at the MINT. The genome's role is: receive job → think → issue charge.
+
+/// A parsed JOB_REQUEST from the inbound inbox.
+pub(super) struct JobRequest {
+    /// Daemon-assigned inbox_seq (for cursor advancement).
+    pub(super) inbox_seq: u64,
+    /// The NIP-90 job request text (daemon-size-capped, UTF-8 lossy).
+    pub(super) text: String,
+    /// Source pubkey of the requester (informational, already daemon-verified).
+    pub(super) _requester_pubkey: String,
+}
+
+/// Parse the `amount_sats` the genome should charge from the brain's plan text.
+/// Positive allowlist: the brain replies with `CHARGE:<amount_sats>` on its own line.
+/// Anything else (unknown action, non-numeric amount, zero amount, over-cap amount)
+/// returns `fallback_sats` so the loop always issues a charge (never dies on a bad plan).
+pub(super) fn parse_inbound_job_request(reply: &str, fallback_sats: u64) -> u64 {
+    for line in reply.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("CHARGE:").or_else(|| trimmed.strip_prefix("charge:")) else {
+            continue;
+        };
+        let rest = rest.trim();
+        if let Ok(n) = rest.parse::<u64>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    fallback_sats
+}
+
+/// Build the earn-loop THINK prompt from a JOB_REQUEST.
+fn build_earn_loop_plan_prompt(
+    job: &JobRequest,
+    seq: u64,
+    last_treasury_remaining: u64,
+    last_think_cost: u64,
+) -> Vec<ChatMessage> {
+    let system = format!(
+        "You are a Kirby earn-loop agent. A customer has sent a job request. \
+         Decide how many satoshis to charge for completing the job. \
+         Respond with exactly one line: CHARGE:<amount_sats> (e.g. CHARGE:10). \
+         seq={seq} treasury_remaining={last_treasury_remaining} last_think_cost={last_think_cost}"
+    );
+    let user = format!("JOB REQUEST:\n{}", job.text);
+    vec![
+        ChatMessage { role: "system".into(), content: system },
+        ChatMessage { role: "user".into(), content: user },
+    ]
+}
+
+/// Poll the inbox for ONE JOB_REQUEST, non-blocking (wait_ms=0). Returns `None` when there is
+/// nothing waiting or on a soft poll error. `ack_seq` is the cursor: only events with
+/// inbox_seq > ack_seq are returned.
+async fn poll_one_job_request<G: Gateway>(gw: &mut G, ack_seq: u64) -> Option<JobRequest> {
+    let req = InboxRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        want_kinds: vec![InboundKind::JobRequest as i32],
+        ack_seq,
+        wait_ms: 0,
+    };
+    let batch = match gw.read_inbox(req).await {
+        Ok(b) => b,
+        Err(status) => {
+            boot_log(&format!("earn_loop: poll_inbox errored ({status}); no job this tick"));
+            return None;
+        }
+    };
+    let ev = batch.events.into_iter().find(|e| e.kind == InboundKind::JobRequest as i32)?;
+    Some(JobRequest {
+        inbox_seq: ev.inbox_seq,
+        text: String::from_utf8_lossy(&ev.payload).into_owned(),
+        _requester_pubkey: ev.source_pubkey,
+    })
+}
+
+/// ONE earn-loop tick: poll for a JOB_REQUEST, THINK on it, ISSUE a cashu charge.
+/// Generic over [`Gateway`] so the real vsock client and the E6 test mock drive identical
+/// logic.
+///
+/// Returns:
+/// - `TickOutcome::Lived { action: Action::EarnCharge { .. }, .. }` when a charge was issued.
+/// - `TickOutcome::Lived { action: Action::Note, .. }` when the inbox was empty (idle tick).
+/// - `TickOutcome::Dead` when the THINK was denied (out of runway).
+/// - `TickOutcome::Transient` on a channel error.
+pub(super) async fn earn_loop_tick<G: Gateway>(
+    gw: &mut G,
+    seq: u64,
+    job_ack_seq: &mut u64,
+    params: &DiaristParams,
+    last_treasury_remaining: u64,
+    last_think_cost: u64,
+) -> TickOutcome {
+    // Non-blocking poll: pick up the oldest waiting JOB_REQUEST.
+    let Some(job) = poll_one_job_request(gw, *job_ack_seq).await else {
+        // Nothing in the inbox: idle tick, no spend.
+        return TickOutcome::Lived {
+            think_cost: 0,
+            treasury_remaining: last_treasury_remaining,
+            recorded_write: false,
+            action: Action::Note,
+            verify: None,
+            feedback: "inbox empty; no job to process this tick".into(),
+        };
+    };
+
+    boot_log(&format!(
+        "earn_loop seq={seq}: got JOB_REQUEST (inbox_seq={}), thinking...",
+        job.inbox_seq
+    ));
+
+    // THINK: the life-gating act. The genome earns or dies; a denied think is death.
+    let prompt = build_earn_loop_plan_prompt(&job, seq, last_treasury_remaining, last_think_cost);
+    let think_req =
+        build_think_request(&params.model, &prompt, params.brain_max_cost, &format!("earn-think-{seq}"));
+    let think_receipt = match gw.call(think_req).await {
+        Ok(r) => r,
+        Err(status) => {
+            boot_log(&format!("earn_loop seq={seq}: think errored ({status}); transient"));
+            return TickOutcome::Transient;
+        }
+    };
+
+    let (reply, cost_sats, treasury_remaining) = match classify_think(&think_receipt) {
+        ThinkOutcome::Broke => return TickOutcome::Dead,
+        ThinkOutcome::Transient => return TickOutcome::Transient,
+        ThinkOutcome::Performed { reply, cost_sats, treasury_remaining } => {
+            (reply, cost_sats, treasury_remaining)
+        }
+    };
+
+    // Parse the charge amount from the plan (positive allowlist: CHARGE:<n>).
+    // Fallback to 1 sat so a malformed plan still produces a sensible charge rather than dying.
+    let amount_sats = parse_inbound_job_request(&reply, 1);
+
+    // ISSUE CHARGE: daemon-side, zero cost to the genome (IssueCharge is free).
+    let charge_key = format!("earn-charge-{seq}");
+    let charge_receipt = match gw.issue_charge(amount_sats, &job.text, &charge_key).await {
+        Ok(r) => r,
+        Err(status) => {
+            boot_log(&format!("earn_loop seq={seq}: issue_charge errored ({status}); transient"));
+            return TickOutcome::Transient;
+        }
+    };
+
+    let Some(charge) = charge_receipt.charge else {
+        boot_log(&format!(
+            "earn_loop seq={seq}: IssueCharge returned no ChargeIssued (no settlement provider?); transient"
+        ));
+        return TickOutcome::Transient;
+    };
+
+    // Advance the job cursor past this job so the next tick doesn't re-process it.
+    *job_ack_seq = job.inbox_seq;
+
+    boot_log(&format!(
+        "earn_loop seq={seq}: issued charge {} for {amount_sats} sats; waiting for customer payment",
+        charge.charge_id
+    ));
+
+    TickOutcome::Lived {
+        think_cost: cost_sats,
+        treasury_remaining,
+        recorded_write: true,
+        action: Action::EarnCharge {
+            charge_id: charge.charge_id,
+            amount_sats: charge.amount_sats,
+        },
+        verify: None,
+        feedback: format!("issued charge for {amount_sats} sats; invoice={}", charge.invoice_or_request),
+    }
+}
+
+/// Poll the inbox for ONE PAYMENT_SETTLED event past `ack_seq` (non-blocking, wait_ms=0).
+/// Returns the parsed `PaymentSettled` payload, or `None` if none is waiting. Soft errors
+/// (transport, decode) return `None` (never death: settlement delivery is best-effort at the genome).
+/// Used by the E6 integration test and future genome-side settle-confirmation logic.
+#[allow(dead_code)]
+pub(super) async fn poll_one_payment_settled<G: Gateway>(
+    gw: &mut G,
+    ack_seq: u64,
+) -> Option<PaymentSettled> {
+    let req = InboxRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        want_kinds: vec![InboundKind::PaymentSettled as i32],
+        ack_seq,
+        wait_ms: 0,
+    };
+    let batch = match gw.read_inbox(req).await {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+    let ev = batch.events.into_iter().find(|e| e.kind == InboundKind::PaymentSettled as i32)?;
+    PaymentSettled::decode(ev.payload.as_slice()).ok()
+}
+
+/// The earn-loop workload entry point. Drives `earn_loop_tick` in a loop until the VM halts.
+/// Concrete (not generic): the testable piece is `earn_loop_tick`; this is the glue loop.
+pub(super) async fn earn_loop(
+    mut client: NodeGatewayClient<tonic::transport::Channel>,
+    port: u32,
+    ctx: &kirby_proto::SessionContext,
+) -> ! {
+    let params = diarist_params_from_cmdline();
+    let mut committed: u64 = 0;
+    let mut job_ack_seq: u64 = 0;
+    let mut treasury_remaining = ctx.budget_sats;
+    let mut last_think_cost = 0u64;
+
+    loop {
+        let seq = committed + 1;
+        let outcome = earn_loop_tick(
+            &mut client,
+            seq,
+            &mut job_ack_seq,
+            &params,
+            treasury_remaining,
+            last_think_cost,
+        )
+        .await;
+
+        let commits = tick_commits_seq(&outcome);
+        match outcome {
+            TickOutcome::Lived { think_cost, treasury_remaining: tr, .. } => {
+                treasury_remaining = tr;
+                last_think_cost = think_cost;
+            }
+            TickOutcome::Dead => {
+                boot_log("earn_loop: out of runway; parking for the daemon to halt the VM");
+                idle_forever().await;
+            }
+            TickOutcome::Transient => {
+                boot_log("earn_loop: transient hiccup; re-dialing");
+                if let Some(c) = redial(port).await {
+                    client = c;
+                }
+            }
+            TickOutcome::ReadMore { .. } => {}
+        }
+        if commits {
+            committed = seq;
+        }
         tokio::time::sleep(params.tick).await;
     }
 }

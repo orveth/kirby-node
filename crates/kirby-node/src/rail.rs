@@ -59,6 +59,11 @@ pub const BRAIN_COMPLETION_DESTINATION: &str = "brain.completion";
 /// so this destination/allowlist API never changes when the real backend swaps in.
 pub const MEMORY_DESTINATION: &str = "memory.store";
 
+/// The fixed allowlist sentinel for an [`Act::IssueCharge`] (earn-loop Component 2). The
+/// act generates a payment request daemon-side; there is no external endpoint. A
+/// settlement-mode gateway allowlists EXACTLY this string.
+pub const ISSUE_CHARGE_DESTINATION: &str = "settlement.issue_charge";
+
 /// The allowlist key for an act: the destination the daemon would reach. The
 /// gateway allowlist step (spec step 2) matches this against its static set.
 /// For a BOLT11 invoice the "destination" is the node it pays; the spike does
@@ -81,6 +86,8 @@ pub fn destination(act: &Act) -> String {
         // gateway allowlist step (DENIED_NOT_ALLOWLISTED, before perform). One envelope, many
         // outward actions, each independently gated.
         Act::Actuate(a) => a.kind.clone(),
+        // IssueCharge generates a payment request daemon-side; no external endpoint.
+        Act::IssueCharge(_) => ISSUE_CHARGE_DESTINATION.to_string(),
     }
 }
 
@@ -126,6 +133,9 @@ pub fn act_max_sats(act: &Act) -> Option<u64> {
         // error), never silently clamped + undercharged. The per-act ceiling rides in
         // `budget_sats` (the genome sets it = `Actuate.max_cost_sats`), which the gate enforces.
         Act::Actuate(_) => None,
+        // IssueCharge is zero-cost (the gateway forks it before the generic budget gate);
+        // this arm satisfies exhaustiveness only.
+        Act::IssueCharge(_) => None,
     }
 }
 
@@ -256,6 +266,9 @@ impl Rail for MockRail {
             // actuator) BEFORE it could reach this base rail, so this arm only satisfies the
             // match; the value is the caller's declared ceiling.
             Act::Actuate(a) => a.max_cost_sats,
+            // Exhaustiveness only: IssueCharge is forked in the gateway before the generic
+            // budget gate and NEVER reaches a rail.
+            Act::IssueCharge(_) => 0,
         }
     }
 
@@ -428,6 +441,9 @@ impl Rail for CdkEcashRail {
             // actuator) BEFORE it could reach this base rail, so this arm only satisfies the
             // match; the value is the caller's declared ceiling.
             Act::Actuate(a) => a.max_cost_sats,
+            // Exhaustiveness only: IssueCharge is forked in the gateway before the generic
+            // budget gate and NEVER reaches a rail.
+            Act::IssueCharge(_) => 0,
         }
     }
 
@@ -3243,5 +3259,94 @@ mod dm_actuator_tests {
         assert_ne!(unwrapped.sender.to_hex(), q_hex, "the FROST money key Q never signs a DM");
         assert_eq!(unwrapped.rumor.kind, Kind::PrivateDirectMessage, "the rumor is a kind:14 DM");
         assert_eq!(unwrapped.rumor.content, "the threshold key never touched this");
+    }
+}
+
+// ---- The earn-loop settlement seam (Component 2) ----
+//
+// `SettlementProvider` is the swap-ready seam for payment-request issuance and
+// settlement verification. The gateway holds `Arc<dyn SettlementProvider>`; no
+// credential crosses vsock. The first impl is `CashuSettlement` (wraps a CDK wallet);
+// `LightningSettlement` is a stub for future NUT-xx work.
+//
+// MONEY-MUST: `verify_settlement` MUST return the MINT-VERIFIED amount (the sats
+// the mint reports as received), NEVER the genome's requested amount or the
+// IssueCharge.amount_sats. The gateway wires the return value DIRECTLY into
+// `credit_verified` — no re-interpretation, no re-cap.
+
+/// Data returned by `SettlementProvider::issue`, threaded into the proto `ChargeIssued`.
+pub struct ChargeIssuedData {
+    pub charge_id: String,
+    pub invoice_or_request: String,
+    pub amount_sats: u64,
+}
+
+/// The daemon-side authority on issuing a payment request and verifying that a
+/// customer's payment reached the mint. Held behind a trait so tests can inject a
+/// stub, and `LightningSettlement` drops in without touching the gateway.
+#[async_trait::async_trait]
+pub trait SettlementProvider: Send + Sync {
+    /// Issue a payment request for `amount_sats`. Returns a `ChargeIssuedData`
+    /// carrying a daemon-assigned `charge_id` and the payment request string to hand
+    /// to the customer. The genome forwards it verbatim; the daemon holds the settlement
+    /// state. The caller (gateway) persists the `ChargeIssuedData` for resume-replay
+    /// dedupe so the genome always receives the SAME `charge_id` for the same
+    /// idempotency key.
+    async fn issue(&self, amount_sats: u64, memo: &str) -> anyhow::Result<ChargeIssuedData>;
+
+    /// Verify that `evidence` (a cashu token or bolt11 preimage) settles `charge_id`.
+    /// Returns the MINT-VERIFIED sats — what the mint actually credited, NOT what was
+    /// requested. The gateway passes this value directly to `treasury.credit_verified`.
+    async fn verify_settlement(&self, charge_id: &str, evidence: &str) -> anyhow::Result<u64>;
+}
+
+/// Cashu settlement: issues a simple payment request and verifies by calling
+/// `wallet.receive` (the CDK mint-verified path). The wallet is host-held and
+/// never crosses vsock.
+pub struct CashuSettlement {
+    wallet: Arc<cdk::Wallet>,
+}
+
+impl CashuSettlement {
+    pub fn new(wallet: Arc<cdk::Wallet>) -> Self {
+        Self { wallet }
+    }
+}
+
+#[async_trait::async_trait]
+impl SettlementProvider for CashuSettlement {
+    async fn issue(&self, amount_sats: u64, _memo: &str) -> anyhow::Result<ChargeIssuedData> {
+        let charge_id = uuid::Uuid::new_v4().to_string();
+        // Simple payment request: the payer sends a cashu token worth `amount_sats`
+        // to the daemon's settle endpoint, quoting this charge_id. NUT-18 payment
+        // request construction (which requires a transport seam) is future work.
+        let invoice_or_request = format!("cashu:charge:{charge_id}:{amount_sats}");
+        Ok(ChargeIssuedData { charge_id, invoice_or_request, amount_sats })
+    }
+
+    async fn verify_settlement(&self, _charge_id: &str, evidence: &str) -> anyhow::Result<u64> {
+        // wallet.receive calls the mint to verify the token and credit the wallet.
+        // The Amount it returns IS what the mint verified — NEVER the claimed amount.
+        // This is the ONLY acceptable source of sats for credit_verified (money-MUST).
+        let amount = self
+            .wallet
+            .receive(evidence, cdk::wallet::ReceiveOptions::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("cashu settlement receive: {e}"))?;
+        Ok(amount.into())
+    }
+}
+
+/// Stub for a future Lightning settlement path. Fails closed until implemented.
+pub struct LightningSettlement;
+
+#[async_trait::async_trait]
+impl SettlementProvider for LightningSettlement {
+    async fn issue(&self, _amount_sats: u64, _memo: &str) -> anyhow::Result<ChargeIssuedData> {
+        anyhow::bail!("lightning settlement not yet implemented")
+    }
+
+    async fn verify_settlement(&self, _charge_id: &str, _evidence: &str) -> anyhow::Result<u64> {
+        anyhow::bail!("lightning settlement not yet implemented")
     }
 }
