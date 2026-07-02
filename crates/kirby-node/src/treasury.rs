@@ -218,6 +218,29 @@ impl Treasury {
         }
     }
 
+    /// If `credit_id` was already credited, return its stored credit record; else
+    /// `None`. The read-only mirror of `lookup()` for the CREDIT namespace: it scans
+    /// the SEPARATE `credit_ledger` tree (never the debit `ledger`), so it is blind to
+    /// genome-supplied capability keys exactly as `lookup()` is blind to credit rows.
+    ///
+    /// This is the durable settled-charge query the settlement path consults BEFORE
+    /// touching the wallet/mint: if a `charge_id` already has a credit row, the
+    /// settlement was already applied, so the caller returns the prior outcome without
+    /// redeeming any (fresh or replayed) token. It reads the SAME rows
+    /// `credit_verified` writes, so it can never disagree with the durable credit wall.
+    /// A stored `Overflow`-only history leaves no row (credit_verified writes none on
+    /// overflow), so an overflowed charge is correctly seen as not-yet-credited here.
+    pub fn credit_lookup(&self, credit_id: &str) -> Result<Option<PerformedRecord>, TreasuryError> {
+        match self.inner.credit_ledger.get(credit_id.as_bytes())? {
+            Some(raw) => {
+                let rec: PerformedRecord = serde_json::from_slice(&raw)
+                    .map_err(|e| TreasuryError::Corrupt(format!("credit record: {e}")))?;
+                Ok(Some(rec))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// The maximum numeric suffix among recorded ledger keys with `prefix` (e.g.
     /// `"mem-write-"`), or `None` if none exist. The gateway seeds the wseq_floor boot
     /// barrier from this (R2-7): on resume `wseq_floor = 1 + max(mem-write-* in ledger)`,

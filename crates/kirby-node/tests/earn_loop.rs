@@ -311,3 +311,140 @@ async fn double_settle_credits_exactly_once() {
 
     mint.shutdown().await;
 }
+
+/// MONEY-MUST (finding-1, the money tooth): a FRESH, genuinely-valid token replayed
+/// against an ALREADY-SETTLED charge_id must NEVER be redeemed into the host wallet.
+/// Settle charge X with token A (credited), then replay charge X with a DIFFERENT valid
+/// token B. Because settlement STATE is consulted first, the replay short-circuits to the
+/// prior settled record: token B is never redeemed, the daemon wallet balance does not
+/// change, and the treasury is unchanged. This is the wallet-treasury desync guard.
+///
+/// RED-on-revert: with the old verify-then-dedupe order, `settle_charge` would call
+/// `wallet.receive` on token B (redeeming its sats into the wallet) BEFORE the credit
+/// dedupe dropped it as Duplicate. The wallet balance would then rise by ~50 while the
+/// treasury stayed flat -- the desync this tooth forbids -- and the wallet-balance
+/// assertion below fails.
+#[tokio::test]
+async fn fresh_token_replay_of_settled_charge_never_touches_the_wallet() {
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    let node_wallet = build_wallet(&mint.url()).await.expect("build node wallet");
+    let payer = build_wallet(&mint.url()).await.expect("build payer wallet");
+    fund_wallet(payer.clone(), 500).await.expect("fund payer");
+
+    // Keep a handle to the daemon's wallet so we can observe its balance across the settle
+    // and the replay; the gateway takes its own Arc clone.
+    let node_wallet_probe = node_wallet.clone();
+    let (svc, _queue) = settlement_gateway(0, node_wallet);
+
+    let charge_id = issue_charge_via_gateway(&svc, "earn-charge-fresh-replay", 50).await;
+
+    // First settle with token A: the wallet redeems it, the treasury is credited.
+    let token_a = customer_pays(&payer, 50).await;
+    let first = svc
+        .settle_charge(&charge_id, &token_a)
+        .await
+        .expect("first settle with token A");
+    let credited = match first {
+        CreditOutcome::Credited { amount_sats, .. } => amount_sats,
+        _ => panic!("expected Credited on the first settle"),
+    };
+    let treasury_after_first = svc.treasury_remaining().unwrap();
+    assert_eq!(treasury_after_first, credited, "treasury rose by the credited amount");
+    let wallet_after_first: u64 = node_wallet_probe
+        .total_balance()
+        .await
+        .expect("read node wallet balance after the first settle")
+        .into();
+    assert!(wallet_after_first > 0, "the daemon wallet holds token A's redeemed sats");
+
+    // Replay the SAME charge_id with a DIFFERENT, genuinely-valid token B. Settlement state
+    // is consulted first, so this returns Duplicate WITHOUT redeeming token B.
+    let token_b = customer_pays(&payer, 50).await;
+    let replay = svc
+        .settle_charge(&charge_id, &token_b)
+        .await
+        .expect("replay settle with token B");
+    assert!(
+        matches!(replay, CreditOutcome::Duplicate(_)),
+        "a replay of an already-settled charge is a Duplicate no-op"
+    );
+
+    // The money tooth: token B was NEVER redeemed, so the wallet balance is UNCHANGED.
+    let wallet_after_replay: u64 = node_wallet_probe
+        .total_balance()
+        .await
+        .expect("read node wallet balance after the replay")
+        .into();
+    assert_eq!(
+        wallet_after_replay, wallet_after_first,
+        "MONEY-MUST: the fresh replay token was never redeemed -- wallet balance unchanged"
+    );
+
+    // Token B is still spendable at the mint (the daemon never touched it): the payer can
+    // still redeem it back, proving it was not silently consumed by the daemon.
+    let reclaim: u64 = payer
+        .receive(&token_b, cdk::wallet::ReceiveOptions::default())
+        .await
+        .expect("token B is still valid and unspent")
+        .into();
+    assert!(reclaim > 0, "token B was never redeemed by the daemon -- still spendable");
+
+    // The treasury is unchanged by the replay (the prior settled outcome, no new credit).
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        treasury_after_first,
+        "treasury unchanged: the replay returned the prior settled record, credited nothing"
+    );
+
+    mint.shutdown().await;
+}
+
+/// Finding-2 tooth: a Duplicate settle attempt emits NO second PAYMENT_SETTLED. After a
+/// fresh-token replay of an already-settled charge, exactly ONE PAYMENT_SETTLED sits in the
+/// queue -- the one the original settlement emitted. The replay (a Duplicate) enqueues
+/// nothing new.
+///
+/// RED-on-revert: if PAYMENT_SETTLED were enqueued for every CreditOutcome (the old
+/// behaviour), the Duplicate replay would push a SECOND notice and this asserts 2, failing.
+#[tokio::test]
+async fn duplicate_settle_emits_no_second_payment_settled() {
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    let node_wallet = build_wallet(&mint.url()).await.expect("build node wallet");
+    let payer = build_wallet(&mint.url()).await.expect("build payer wallet");
+    fund_wallet(payer.clone(), 500).await.expect("fund payer");
+
+    let (svc, _queue) = settlement_gateway(0, node_wallet);
+
+    let charge_id = issue_charge_via_gateway(&svc, "earn-charge-dup-notice", 50).await;
+
+    // First settle: credited, emits its one PAYMENT_SETTLED.
+    let token_a = customer_pays(&payer, 50).await;
+    let first = svc
+        .settle_charge(&charge_id, &token_a)
+        .await
+        .expect("first settle");
+    assert!(matches!(first, CreditOutcome::Credited { .. }), "first settle credits");
+
+    // Replay with a fresh token B: a Duplicate no-op that must emit NOTHING new.
+    let token_b = customer_pays(&payer, 50).await;
+    let replay = svc
+        .settle_charge(&charge_id, &token_b)
+        .await
+        .expect("replay settle");
+    assert!(matches!(replay, CreditOutcome::Duplicate(_)), "replay is a Duplicate");
+
+    // Exactly ONE PAYMENT_SETTLED in the queue -- the original's. The Duplicate added none.
+    let notices = poll_payment_settled(&svc, 0).await;
+    assert_eq!(
+        notices.len(),
+        1,
+        "exactly one PAYMENT_SETTLED: the original settlement's, none from the Duplicate replay"
+    );
+    assert_eq!(notices[0].charge_id, charge_id);
+
+    mint.shutdown().await;
+}

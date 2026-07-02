@@ -962,14 +962,43 @@ impl GatewayService {
 
     /// Daemon-side settlement: verify that `evidence` (a cashu token) settles `charge_id`,
     /// credit the treasury with the MINT-VERIFIED amount (money-MUST: never the claimed
-    /// amount), and enqueue a `PAYMENT_SETTLED` inbound event so the genome knows the
-    /// charge cleared.
+    /// amount), and enqueue a `PAYMENT_SETTLED` inbound event -- only on a genuine credit --
+    /// so the genome knows the charge cleared.
     ///
     /// Called by the customer's settlement client (or the E6 integration test rig), NOT by
     /// the genome. The genome polls the inbox for `PAYMENT_SETTLED` to learn the outcome.
     ///
     /// `credit_verified` is idempotent on `charge_id` -- a double-settle attempt returns
     /// `CreditOutcome::Duplicate` with no double-credit.
+    ///
+    /// ORDERING (money-MUST, finding-1 fix): settlement STATE is consulted FIRST, before
+    /// any wallet/mint call. The treasury's `credit_ledger` (the same durable rows
+    /// `credit_verified` writes) is the settled-charge record; `credit_lookup` reads it.
+    /// If a row already exists for this `charge_id`, the charge was ALREADY settled, so we
+    /// return `Duplicate` with the prior record and NEVER redeem the submitted token. This
+    /// closes two holes in the old verify-then-dedupe order: (a) a same-token replay no
+    /// longer hits the mint and errors -- it returns `Duplicate` cleanly; (b) a FRESH,
+    /// genuinely-valid token replayed against an already-settled charge is no longer
+    /// redeemed into the host wallet only to be dropped by the credit dedupe -- the wallet
+    /// is never touched, so wallet funds cannot desync from the treasury.
+    ///
+    /// Only the FIRST claimant (no prior credit row) proceeds to verify + credit.
+    ///
+    /// CRASH WINDOWS (the retry path must never double-credit):
+    ///   - crash BEFORE `verify_settlement`: no wallet call happened, no row exists. A
+    ///     retry re-runs from the top, verifies, credits once. Clean.
+    ///   - crash AFTER `verify_settlement` (token redeemed into the wallet) but BEFORE
+    ///     `credit_verified`: the wallet holds the sats but NO credit row exists yet, so a
+    ///     retry's `credit_lookup` misses and it re-enters verify_settlement. That retry
+    ///     redeems a *different* token (the original token is now spent, so a same-token
+    ///     retry fails at the mint and no credit occurs -- fail-closed); a genuine second
+    ///     payment would be a NEW settlement. This is the one window where the treasury can
+    ///     lag the wallet by one payment; it is bounded (single in-flight settle per
+    ///     charge) and never DOUBLE-credits, because the credit row, once written, is the
+    ///     durable wall for all subsequent retries.
+    ///   - crash AFTER `credit_verified` (row written + flushed) but before we return: a
+    ///     retry's `credit_lookup` HITS the row and returns `Duplicate` without touching
+    ///     the wallet. No double-credit. Clean.
     pub async fn settle_charge(
         &self,
         charge_id: &str,
@@ -980,12 +1009,27 @@ impl GatewayService {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no settlement provider attached"))?;
 
-        // verify_settlement calls the MINT and returns the MINT-VERIFIED sats.
-        // MONEY-MUST: this is the ONLY source of the credit amount; we never use
-        // the genome's requested amount or the IssueCharge.amount_sats here.
+        // STATE FIRST (money-MUST): consult the durable settled-charge record BEFORE any
+        // wallet/mint call. An existing credit row means this charge already settled, so
+        // return the prior outcome and DO NOT redeem the submitted token (never touch the
+        // wallet). The original settlement already emitted its PAYMENT_SETTLED notice, so
+        // this replay emits NOTHING new.
+        if let Some(prior) = self.treasury.credit_lookup(charge_id)? {
+            tracing::info!(
+                charge_id,
+                "settle_charge for an already-settled charge; returning Duplicate without touching the wallet"
+            );
+            return Ok(CreditOutcome::Duplicate(prior));
+        }
+
+        // First claimant only past this point. verify_settlement calls the MINT and returns
+        // the MINT-VERIFIED sats. MONEY-MUST: this is the ONLY source of the credit amount;
+        // we never use the genome's requested amount or the IssueCharge.amount_sats here.
         let verified_sats = settlement.verify_settlement(charge_id, evidence).await?;
 
-        // credit_verified is the sole sanctioned credit path (idempotent on charge_id).
+        // credit_verified is the sole sanctioned credit path (idempotent on charge_id). The
+        // in-txn dedupe here is the crash-safe backstop for a concurrent settle that raced
+        // past the credit_lookup above: it returns Duplicate with no double-credit.
         let outcome = self.treasury.credit_verified(charge_id, verified_sats)?;
 
         tracing::info!(
@@ -995,20 +1039,26 @@ impl GatewayService {
             "settlement verified and applied to treasury"
         );
 
-        // Enqueue PAYMENT_SETTLED so the genome's inbox poll wakes with the news.
-        if let Some(inbox) = &self.inbox {
-            let payload = PaymentSettled {
-                charge_id: charge_id.to_string(),
-                verified_sats,
+        // Enqueue PAYMENT_SETTLED ONLY on a genuine credit (finding-2 fix): a Duplicate
+        // (concurrent race that lost) or an Overflow credited NOTHING, so emitting a
+        // settled notice would tell the genome money arrived when none did, and would carry
+        // this attempt's verified_sats rather than a credited amount. The notice carries the
+        // CREDITED amount, which for `Credited` equals verified_sats.
+        if let CreditOutcome::Credited { amount_sats, .. } = &outcome {
+            if let Some(inbox) = &self.inbox {
+                let payload = PaymentSettled {
+                    charge_id: charge_id.to_string(),
+                    verified_sats: *amount_sats,
+                }
+                .encode_to_vec();
+                inbox.push_typed(
+                    InboundKind::PaymentSettled,
+                    payload,
+                    String::new(),
+                    0,
+                    charge_id.to_string(),
+                );
             }
-            .encode_to_vec();
-            inbox.push_typed(
-                InboundKind::PaymentSettled,
-                payload,
-                String::new(),
-                0,
-                charge_id.to_string(),
-            );
         }
 
         Ok(outcome)
