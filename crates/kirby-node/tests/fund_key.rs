@@ -1098,3 +1098,191 @@ async fn create_refuses_second_create_then_poll_resumes_and_provisions() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- fourth-round Codex teeth --------------------------------------------------------
+
+/// TOOTH (topup baseline race): `topup` captures the pre-invoice balance floor BEFORE it
+/// creates the invoice or emits any payable bolt11, so a FAST payer who credits the key the
+/// instant the invoice exists is still CONFIRMED (not timed out into a double-payment invite).
+/// The mock raises the shared balance to 9000 sats as it answers the invoice-create POST
+/// (`create_raises_balance_msats`), simulating a payment that lands before any post-invoice
+/// read could run. Because the handler reads the floor (0 sats) BEFORE the create, the
+/// subsequent rise to 9000 is observed and the topup reports `funded`.
+///
+/// RED-on-revert: moving the `balance_before = fetch_balance_sats(...)` read to AFTER
+/// `create_invoice` (the pre-fix order) makes this RED — the floor would be read as 9000 (the
+/// fast payer already credited), `confirm_topup_credit` would wait for the balance to rise
+/// ABOVE 9000, the rise never comes, and the topup TIMES OUT (exit 2) within `--timeout-secs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topup_captures_baseline_before_emitting_bolt11() {
+    let dir = temp_dir("topup-baseline-race");
+    let key_path = dir.join("brain.key");
+    std::fs::write(&key_path, "sk-race-key\n").unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let node = MockNode::start_with_invoices(InvoiceBehavior {
+        create: InvoiceCreate::Ok {
+            invoice_id: "inv-RACE".into(),
+            bolt11: "lnbcRACE".into(),
+        },
+        // A topup mints no key; the status poll stays pending. The credit is the balance RISE
+        // the fast-payer create triggers, NOT a status step.
+        status_script: vec![StatusStep::pending()],
+        // The fast payer: the invoice-create response raises the shared balance to 9000 sats.
+        create_raises_balance_msats: Some(9_000_000),
+        ..Default::default()
+    })
+    .await;
+    // The pre-invoice floor: 0 sats (the create will raise it to 9000).
+    node.set_balance_msats(0);
+
+    // Bind the node_url beside the key so topup proceeds without --node-url (0600, as the
+    // hardened sidecar reader requires).
+    let binding = dir.join("brain.key.node_url");
+    std::fs::write(&binding, format!("{}\n", node.url())).unwrap();
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    // A SHORT timeout so a reverted (post-invoice floor) build fails fast: it would read the
+    // floor as 9000, never see a rise above it, and time out. The fixed build confirms on the
+    // first balance probe (floor 0 < 9000) regardless of the deadline.
+    let (code, stdout, stderr) = run_fund_key(&[
+        "topup",
+        "--amount-sats",
+        "8000",
+        "--key-path",
+        key_path.to_str().unwrap(),
+        "--timeout-secs",
+        "1",
+    ]);
+    assert_eq!(
+        code, 0,
+        "topup confirms the fast-payer credit because the floor was read pre-invoice; \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "funded");
+    assert_eq!(
+        last_json(&stdout)["balance_sats"],
+        9000,
+        "the confirmed balance after the fast-payer credit"
+    );
+    assert!(!stdout.contains("sk-race-key") && !stderr.contains("sk-race-key"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// TOOTH (keyfile umask): `write_key_atomic` fchmods the freshly-created FUNDED key to EXACTLY
+/// 0600 on the opened fd BEFORE writing, so a restrictive umask never lands the key at a mode
+/// the hardened reader (which requires exactly 0600) would later reject. `provision` runs the
+/// whole create->poll->write_key_atomic in one process, so a child umask of 0277 (which strips
+/// owner-write from the `.mode(0o600)` create, yielding 0400) exercises the key write. The mock
+/// pays the invoice, the key lands, and it is asserted 0600.
+///
+/// RED-on-revert: removing the `set_permissions(0o600)` fchmod in `write_key_atomic`'s
+/// fresh-create arm makes this RED — under umask 0277 the key would land 0400, failing the
+/// `0o600` assertion (and a later hardened read of that key would reject it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_key_atomic_key_is_0600_under_restrictive_umask() {
+    let dir = temp_dir("key-umask");
+    let key_out = dir.join("brain.key");
+
+    let node = MockNode::start_with_invoices(InvoiceBehavior {
+        create: InvoiceCreate::Ok {
+            invoice_id: "inv-UMASK".into(),
+            bolt11: "lnbcUMASK".into(),
+        },
+        // First poll pending, second poll pays + mints the key write_key_atomic persists.
+        status_script: vec![
+            StatusStep::pending(),
+            StatusStep::paid_with_key("sk-umask-key"),
+        ],
+        ..Default::default()
+    })
+    .await;
+    node.set_balance_msats(2_500_000); // 2500 sats confirmed after payment
+
+    // provision under a restrictive umask (0277 includes 0200, so it strips owner-write from a
+    // 0600 create -> 0400 without the fchmod). The umask is isolated to the child via pre_exec.
+    let (code, stdout, _e) = run_fund_key_with_umask(
+        0o277,
+        &[
+            "provision",
+            "--amount-sats",
+            "2000",
+            "--key-out",
+            key_out.to_str().unwrap(),
+            "--node-url",
+            &node.url(),
+            "--timeout-secs",
+            "60",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "provision under a restrictive umask still mints the key; stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "funded");
+    assert_eq!(
+        file_mode(&key_out),
+        0o600,
+        "the funded key is fchmod'd to exactly 0600, defeating the umask"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// TOOTH (dangling symlink at key_out): `create` refuses a DANGLING symlink planted at
+/// --key-out BEFORE any network call, so it never mints an invoice for a path
+/// `write_key_atomic`'s O_NOFOLLOW create would later refuse (spending an invoice onto an
+/// occupied path). The refusal is a usage error (exit 9); the mock records NO invoice-create
+/// request.
+///
+/// RED-on-revert: reverting `refuse_if_key_out_occupied` to `key_out.exists()` makes this RED —
+/// `exists()` follows the symlink and returns false for a dangling one, so `create` would
+/// proceed, hit the network, and create an invoice (exit 0, an invoice-create request recorded).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_refuses_a_dangling_symlink_at_key_out() {
+    let dir = temp_dir("create-dangling-symlink");
+    let key_out = dir.join("brain.key");
+    // Plant a DANGLING symlink at --key-out: the target does not exist, so `exists()` (stat)
+    // returns false while `symlink_metadata` (lstat) sees the link itself.
+    let missing_target = dir.join("nowhere.key");
+    std::os::unix::fs::symlink(&missing_target, &key_out).unwrap();
+    assert!(
+        !key_out.exists(),
+        "precondition: the dangling symlink is invisible to exists() (stat)"
+    );
+    assert!(
+        std::fs::symlink_metadata(&key_out).is_ok(),
+        "precondition: symlink_metadata (lstat) sees the dangling symlink"
+    );
+
+    // A live mock is bound so a REVERTED (exists()-based) build would actually reach the network
+    // and create an invoice — the clean RED. The fixed build refuses before any request.
+    let node = MockNode::start_with_invoices(InvoiceBehavior {
+        create: InvoiceCreate::Ok {
+            invoice_id: "inv-DANGLE".into(),
+            bolt11: "lnbcDANGLE".into(),
+        },
+        ..Default::default()
+    })
+    .await;
+
+    let (code, stdout, _e) = run_fund_key(&[
+        "create",
+        "--amount-sats",
+        "2000",
+        "--key-out",
+        key_out.to_str().unwrap(),
+        "--node-url",
+        &node.url(),
+    ]);
+    assert_eq!(
+        code, 9,
+        "a dangling symlink at --key-out is a usage refusal, with NO network call; stdout:\n{stdout}"
+    );
+    assert_eq!(last_json(&stdout)["status"], "usage-error");
+    assert!(
+        node.first_request_matching("/v1/balance/lightning/invoice")
+            .is_none(),
+        "no invoice is created when --key-out is occupied by a dangling symlink"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

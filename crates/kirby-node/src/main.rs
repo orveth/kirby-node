@@ -1417,14 +1417,12 @@ async fn fund_key_dispatch(cmd: FundKeyCmd) -> Result<(), kirby_node::funding::F
         } => {
             guarded(async move {
                 // F7: refuse to create a NEW key onto a path that already holds one (that is a
-                // usage error, not a silent second invoice against a funded key).
-                if key_out.exists() {
-                    return Err(FundingError::Usage(format!(
-                        "--key-out {} already exists; refusing to create a new invoice onto an \
-                         existing (possibly funded) key path",
-                        key_out.display()
-                    )));
-                }
+                // usage error, not a silent second invoice against a funded key). Uses
+                // symlink_metadata (lstat) so a DANGLING symlink at --key-out is also caught —
+                // `exists()` follows symlinks and returns false for one, which would let create
+                // mint an invoice for a path write_key_atomic's O_NOFOLLOW create later refuses,
+                // spending an invoice onto an occupied path.
+                refuse_if_key_out_occupied(&key_out, "create a new invoice")?;
                 // F2/F7: refuse BEFORE any network call if a pending invoice already sits beside
                 // --key-out (a paid-but-unpolled invoice whose funds a fresh create would strand).
                 // `read_invoice_state` also fails closed on a tampered pending sidecar.
@@ -1516,14 +1514,10 @@ async fn fund_key_dispatch(cmd: FundKeyCmd) -> Result<(), kirby_node::funding::F
             json: _,
         } => {
             guarded(async move {
-                // F7: refuse onto an existing key path (provision writes a NEW key).
-                if key_out.exists() {
-                    return Err(FundingError::Usage(format!(
-                        "--key-out {} already exists; refusing to provision a new key onto an \
-                         existing (possibly funded) key path",
-                        key_out.display()
-                    )));
-                }
+                // F7: refuse onto an existing key path (provision writes a NEW key). Uses
+                // symlink_metadata (lstat) so a DANGLING symlink at --key-out is caught too (see
+                // `refuse_if_key_out_occupied`) — never spend an invoice onto an occupied path.
+                refuse_if_key_out_occupied(&key_out, "provision a new key")?;
                 // F2/F7: refuse BEFORE any network call if a pending invoice already sits beside
                 // --key-out — a crash mid-poll is resumed with `fund-key poll`, NOT a fresh
                 // provision (which would strand the paid-but-unpolled invoice's funds).
@@ -1600,10 +1594,18 @@ async fn fund_key_dispatch(cmd: FundKeyCmd) -> Result<(), kirby_node::funding::F
                     );
                 }
                 let sk = load_raw_key(&key_path)?;
+                // Capture the pre-invoice balance floor BEFORE creating the invoice or emitting
+                // any payable bolt11: `confirm_topup_credit` confirms the credit by watching the
+                // balance RISE above this floor. If the bolt11 were emitted first, a fast payer
+                // could credit the key before this read, so the floor would already include the
+                // credit and the rise would never be observed — the paid topup would time out and
+                // invite a second payment. No payable artifact is shown until the floor is read.
+                let balance_before = funding::fetch_balance_sats(&effective_url, &sk).await?;
                 // purpose="topup" is authenticated with the existing key.
                 let created =
                     funding::create_invoice(&effective_url, amount_sats, "topup", Some(&sk)).await?;
-                // Emit the bolt11 early (F10) before blocking on the credit poll.
+                // Emit the bolt11 early (F10) before blocking on the credit poll — now that the
+                // pre-invoice floor is captured, a payment against this bolt11 is confirmable.
                 emit_json(&serde_json::json!({
                     "status": "invoice-created",
                     "bolt11": created.bolt11,
@@ -1612,8 +1614,7 @@ async fn fund_key_dispatch(cmd: FundKeyCmd) -> Result<(), kirby_node::funding::F
                 }));
                 // A topup mints no NEW key; the status poll simply confirms payment (its
                 // api_key stays null on this path), so poll for a terminal state then re-probe
-                // the balance to confirm the credit landed.
-                let balance_before = funding::fetch_balance_sats(&effective_url, &sk).await?;
+                // the balance to confirm the credit landed above the pre-invoice floor.
                 confirm_topup_credit(
                     &effective_url,
                     &created.invoice_id,
@@ -1654,6 +1655,35 @@ async fn fund_key_dispatch(cmd: FundKeyCmd) -> Result<(), kirby_node::funding::F
             })
             .await
         }
+    }
+}
+
+/// Refuse `create`/`provision` if ANY final-path entry already occupies `key_out` (F7). Uses
+/// [`std::fs::symlink_metadata`] (lstat), NOT [`std::path::Path::exists`] (stat): `exists()`
+/// FOLLOWS symlinks and returns false for a DANGLING symlink, so it would let create mint an
+/// invoice for a path [`funding::write_key_atomic`]'s `O_NOFOLLOW` create later refuses —
+/// spending an invoice onto an occupied path. `symlink_metadata` succeeds for a regular file, a
+/// directory, or a symlink (dangling or not), so any of those refuse here with a usage error
+/// (exit 9) BEFORE the network call. A genuinely-absent path returns `NotFound` and proceeds; any
+/// OTHER stat error (e.g. a permission error on the parent) is surfaced as a key-write failure
+/// rather than being mistaken for "absent". This is SEPARATE from the pending-invoice-sidecar
+/// check ([`refuse_if_pending_invoice`]); both must pass.
+fn refuse_if_key_out_occupied(
+    key_out: &std::path::Path,
+    action: &str,
+) -> Result<(), kirby_node::funding::FundingError> {
+    use kirby_node::funding::FundingError;
+    match std::fs::symlink_metadata(key_out) {
+        Ok(_) => Err(FundingError::Usage(format!(
+            "--key-out {} already exists; refusing to {action} onto an existing (possibly funded) \
+             key path (this includes a dangling symlink)",
+            key_out.display()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(FundingError::KeyWrite(format!(
+            "stat --key-out {}: {e}",
+            key_out.display()
+        ))),
     }
 }
 

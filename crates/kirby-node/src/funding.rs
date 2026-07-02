@@ -518,6 +518,14 @@ pub fn write_key_atomic(path: &Path, key: &str) -> Result<(), FundingError> {
     match create {
         Ok(mut f) => {
             let write_and_sync = (|| {
+                // The `.mode(0o600)` on the O_EXCL create is masked by the process umask, so a
+                // restrictive umask (e.g. 0277) could create the FUNDED key as 0400 — which the
+                // hardened reader (which requires exactly 0600) would then reject. fchmod the
+                // OPENED fd to exactly 0600 BEFORE writing (mirroring `write_sidecar_exclusive`),
+                // binding the mode to the same inode that is written — the key is 0600 regardless
+                // of umask.
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| FundingError::KeyWrite(format!("chmod key file 0600: {e}")))?;
                 writeln!(f, "{key}")
                     .map_err(|e| FundingError::KeyWrite(format!("write key: {e}")))?;
                 f.sync_all()

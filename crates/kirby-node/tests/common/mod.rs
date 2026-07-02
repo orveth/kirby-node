@@ -103,6 +103,11 @@ pub struct InvoiceBehavior {
     /// A shared spendable balance (millisats) that a poll step can RAISE (the topup-credit
     /// signal: `GET /v1/balance/info` reads this).
     pub balance_msats: Arc<AtomicU64>,
+    /// When `Some(msats)`, the `POST .../lightning/invoice` create RAISES the shared balance to
+    /// `msats` as it responds — a FAST PAYER crediting the key the instant the invoice exists
+    /// (before the caller can capture a pre-invoice balance floor). Drives the topup
+    /// baseline-race tooth: only a caller that reads the floor BEFORE this create confirms.
+    pub create_raises_balance_msats: Option<u64>,
 }
 
 /// The `POST /v1/balance/lightning/invoice` mock response.
@@ -509,6 +514,12 @@ async fn handle_conn(
             .ok()
             .and_then(|v| v.get("amount_sats").and_then(|a| a.as_u64()))
             .unwrap_or(0);
+        // A FAST PAYER: raise the shared balance the instant the invoice is created (the
+        // topup baseline-race tooth). A caller that captured the balance floor BEFORE this
+        // create still sees the rise; one that reads it AFTER already includes the credit.
+        if let Some(raise) = invoices.create_raises_balance_msats {
+            invoices.balance_msats.store(raise, Ordering::SeqCst);
+        }
         match invoices.create.clone() {
             InvoiceCreate::Ok { invoice_id, bolt11 } => {
                 let resp = serde_json::json!({
