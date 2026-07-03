@@ -294,6 +294,10 @@ async fn run() {
             boot_log("workload=earn-loop: Component 2 earn loop: poll JOB_REQUEST inbox -> THINK (life-gating) -> ISSUE a cashu charge; treasury credit arrives when the customer pays (PAYMENT_SETTLED inbound event); death is the daemon halting the VM when a THINK is unaffordable (F4)");
             capable::earn_loop(client, port, &ctx).await;
         }
+        Some("oracle") => {
+            boot_log("workload=oracle: Milestone 2 product 1 -- a DM-native price-quote oracle. poll DM -> THINK (life-gating) -> ISSUE a cashu charge -> invoice the customer; WAIT for the matching PAYMENT_SETTLED, then ANSWER (charge->settle->answer, never answer-then-hope). O1 ships the ordering state machine + a canned-price stub; the live egress fetch lands in O2. Death is the daemon halting the VM when a THINK is unaffordable (F4)");
+            capable::oracle_loop(client, port, &ctx).await;
+        }
         _ => {
             boot_log("no burn workload: idling (the daemon meters/halts or tears down)");
             idle_forever().await;

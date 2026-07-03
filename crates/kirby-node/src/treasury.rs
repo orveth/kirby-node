@@ -140,6 +140,36 @@ pub struct PerformedRecord {
     pub request_hash: Vec<u8>,
 }
 
+/// A READ-ONLY economics snapshot derived from the treasury's own ledgers plus the caller's
+/// authoritative rent + initial figures. NOT a money door: nothing here mutates the balance -- it
+/// only reads trees that already exist, so the report surfaces (B2) and the runway estimate can
+/// reason over one consistent view. `rent_sats` (the meter's cumulative `burned_sats`) and
+/// `initial_sats` (the genesis budget) are the CALLER's authoritative figures; the treasury does
+/// not hold them (rent lives in the meter, initial in config).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EconomicsSnapshot {
+    /// The live balance == [`Treasury::remaining`] (the ground truth).
+    pub remaining_sats: u64,
+    /// Total mint-verified income this life. DERIVED from the balance identity
+    /// (`remaining + spent + rent - initial`) -- the read-only equivalent of summing credits.
+    /// A credit row records NO amount (its `cost_sats` is 0), so income cannot be summed
+    /// directly; but `credit_verified` is the ONLY balance-raising path besides `initial`, so the
+    /// identity recovers it exactly. Because it is derived from the DAEMON's authoritative balance
+    /// and ledger (never a genome-supplied number), a genome cannot inflate it (the no-self-credit
+    /// property is structural). CAVEAT: `reconcile_to_observed` SETS the balance out-of-band,
+    /// which would break this derivation; the cashu treasury the oracle uses never calls it (that
+    /// path is the prepaid-Routstr-key brain's).
+    pub income_sats: u64,
+    /// Total capability-act spend this life == Σ of the debit `ledger` rows' `cost_sats` (think +
+    /// egress + publish + memory writes). EXCLUDES rent: rent debits via `debit_metered`, which
+    /// writes NO ledger row, so it never appears here (and is passed in separately as `rent_sats`).
+    pub spent_sats: u64,
+    /// The count of genuine settled credits (credit rows carrying the credit-verified proof
+    /// marker; terminal-overflow markers are excluded -- they credited nothing). "How many
+    /// strangers actually paid."
+    pub jobs_settled: u64,
+}
+
 /// The daemon-owned treasury. Cheap to clone (an `Arc` over the sled handles),
 /// so the gateway service can hold one per VM/CID.
 #[derive(Clone)]
@@ -295,6 +325,64 @@ impl Treasury {
             }
         }
         Ok(max)
+    }
+
+    /// Σ of the debit `ledger` rows' `cost_sats`: total capability-act spend this life (think,
+    /// egress, publish, memory writes). READ-ONLY. EXCLUDES rent (rent debits via `debit_metered`,
+    /// which writes no ledger row) and free reads (they bypass the ledger). Used by
+    /// [`Treasury::economics_snapshot`] and by the meter's total-burn runway estimate (F0-C).
+    pub fn spent_sats(&self) -> Result<u64, TreasuryError> {
+        let mut total: u64 = 0;
+        for item in self.inner.ledger.iter() {
+            let (_key, raw) = item?;
+            let rec: PerformedRecord = serde_json::from_slice(&raw)
+                .map_err(|e| TreasuryError::Corrupt(format!("ledger record: {e}")))?;
+            total = total.saturating_add(rec.cost_sats);
+        }
+        Ok(total)
+    }
+
+    /// A READ-ONLY economics snapshot (B1): fold the debit + credit ledgers and derive income
+    /// from the balance identity. Adds NO mutation and NO money door -- it only reads trees that
+    /// already exist. `initial_sats` (the genesis budget) and `rent_sats` (the meter's cumulative
+    /// `burned_sats`) are the caller's authoritative figures, combined here so the snapshot is
+    /// self-contained. NOT for the hot path: summing the ledgers is O(rows), so call it on the
+    /// agent-state emission cadence, not per meter tick.
+    ///
+    /// The identity it upholds (design B.3): `initial + income - spent - rent == remaining`.
+    /// `spent` is Σ of the debit `ledger` (capability acts; rent is excluded because
+    /// `debit_metered` writes no ledger row). `income` is derived so it can never be inflated by a
+    /// genome self-report (it reads only the daemon's authoritative balance + ledger).
+    pub fn economics_snapshot(
+        &self,
+        initial_sats: u64,
+        rent_sats: u64,
+    ) -> Result<EconomicsSnapshot, TreasuryError> {
+        let remaining_sats = self.remaining()?;
+
+        // Σ capability-act debits (rent excluded -- debit_metered writes no ledger row).
+        let spent_sats = self.spent_sats()?;
+
+        // Count genuine credits (a terminal-overflow marker credited nothing -- exclude it).
+        let mut jobs_settled: u64 = 0;
+        for item in self.inner.credit_ledger.iter() {
+            let (_key, raw) = item?;
+            let rec: PerformedRecord = serde_json::from_slice(&raw)
+                .map_err(|e| TreasuryError::Corrupt(format!("credit record: {e}")))?;
+            if rec.proof == CREDIT_PROOF_MARKER {
+                jobs_settled = jobs_settled.saturating_add(1);
+            }
+        }
+
+        // income = remaining + spent + rent - initial (the balance identity, rearranged).
+        // Saturating so a balance that (via reconcile_to_observed) dropped below `initial` cannot
+        // underflow -- income floors at 0 rather than wrapping.
+        let income_sats = remaining_sats
+            .saturating_add(spent_sats)
+            .saturating_add(rent_sats)
+            .saturating_sub(initial_sats);
+
+        Ok(EconomicsSnapshot { remaining_sats, income_sats, spent_sats, jobs_settled })
     }
 
     /// Debit `amount_sats` of metered burn (CPU time, memory time, egress bytes)
@@ -692,6 +780,73 @@ fn decode_u64_tx(raw: &[u8]) -> Result<u64, ConflictableTransactionError<String>
 #[cfg(test)]
 mod tests {
     use super::{is_lock_contention, ReconcileOutcome, Treasury, TreasuryError};
+
+    // ---- B1 economics snapshot (Milestone 2 axis-2: the agent keeps its own books) ----
+
+    /// TOOTH (B1): NO-SELF-CREDIT. `income_sats` reflects ONLY mint-verified credits
+    /// (`credit_verified`, the daemon-only income path) -- never a capability debit, and never a
+    /// genome-supplied number (the snapshot reads only the daemon's balance + ledger). RED on any
+    /// income figure that counts a debit or a self-report as income.
+    #[test]
+    fn economics_income_only_reflects_credits_not_debits() {
+        let t = Treasury::open_temporary(1_000).unwrap();
+
+        // No credits yet: nothing earned.
+        let snap = t.economics_snapshot(1_000, 0).unwrap();
+        assert_eq!(snap.income_sats, 0, "no credit -> no income");
+        assert_eq!(snap.jobs_settled, 0);
+
+        // A capability DEBIT is spend, NOT income.
+        let _ = t.debit_and_record("think-1", 50, b"proof".to_vec(), vec![], vec![], vec![]).unwrap();
+        let snap = t.economics_snapshot(1_000, 0).unwrap();
+        assert_eq!(snap.spent_sats, 50, "the debit is counted as spend");
+        assert_eq!(snap.income_sats, 0, "a debit must NOT be counted as income (no-self-credit)");
+        assert_eq!(snap.jobs_settled, 0, "a debit is not a settled job");
+
+        // Only credit_verified (the daemon-only income path) raises income.
+        let _ = t.credit_verified("charge-1", 200).unwrap();
+        let snap = t.economics_snapshot(1_000, 0).unwrap();
+        assert_eq!(snap.income_sats, 200, "the mint-verified credit is income");
+        assert_eq!(snap.jobs_settled, 1, "one stranger paid");
+        assert_eq!(snap.spent_sats, 50, "spend is unchanged by a credit");
+    }
+
+    /// TOOTH (B1): BOOKS RECONCILE. The snapshot's figures satisfy the design B.3 identity
+    /// `initial + income - spent - rent == remaining` against the daemon's authoritative balance,
+    /// and each fold matches its known ground truth (rent, debited via `debit_metered`, is
+    /// EXCLUDED from `spent`). RED on a fold that miscounts (e.g. counting rent as spend, or
+    /// summing credits wrong).
+    #[test]
+    fn economics_books_reconcile_against_the_identity() {
+        let initial = 10_000u64;
+        let rent = 300u64; // the meter's cumulative burn (passed in; the treasury does not hold it)
+        let t = Treasury::open_temporary(initial).unwrap();
+
+        // Two strangers pay; the agent spends on a couple of capability acts.
+        let _ = t.credit_verified("c1", 500).unwrap();
+        let _ = t.credit_verified("c2", 300).unwrap();
+        let _ = t.debit_and_record("a1", 120, b"p".to_vec(), vec![], vec![], vec![]).unwrap();
+        let _ = t.debit_and_record("a2", 80, b"p".to_vec(), vec![], vec![], vec![]).unwrap();
+        // Rent: debit_metered writes NO ledger row (mirrors real VM-rent), so it must NOT appear
+        // in `spent` -- it is accounted separately as `rent`.
+        let _ = t.debit_metered(rent).unwrap();
+
+        let snap = t.economics_snapshot(initial, rent).unwrap();
+
+        // Every fold matches its known ground truth.
+        assert_eq!(snap.remaining_sats, t.remaining().unwrap(), "remaining == the treasury truth");
+        assert_eq!(snap.spent_sats, 200, "Σ ledger debits (120+80); rent EXCLUDED");
+        assert_eq!(snap.jobs_settled, 2, "two credits settled");
+        assert_eq!(snap.income_sats, 800, "Σ credited (500+300), derived read-only");
+
+        // THE identity (design B.3): initial + income - spent - rent == remaining.
+        assert_eq!(
+            initial + snap.income_sats - snap.spent_sats - rent,
+            snap.remaining_sats,
+            "books reconcile against the daemon's authoritative balance"
+        );
+        assert_eq!(snap.remaining_sats, 10_000 + 800 - 200 - 300, "direct cross-check");
+    }
 
     #[test]
     fn lock_contention_matches_sled_lock_message() {

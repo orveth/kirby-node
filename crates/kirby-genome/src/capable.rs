@@ -2512,6 +2512,503 @@ pub(super) async fn earn_loop(
     }
 }
 
+// ===========================================================================================
+// The ORACLE workload (Milestone 2, product 1): a DM-native price-quote oracle. It sells a
+// signed price attestation for ecash, riding EXISTING doors only (PollInbox + Completion +
+// IssueCharge + nostr.dm_reply) -- it adds NO membrane door. The one genuinely-new piece is the
+// money-safety ORDERING: charge -> WAIT for the matching PAYMENT_SETTLED -> answer, never
+// answer-then-hope. This is O1 (the ordering state machine + a canned-price STUB standing in for
+// the fetch); the live egress fetch + real medianized attestation land in O2, the
+// failure/refund paths in O3, and the economics report surfaces in B2. Design:
+// plans/kirby-oracle-product-design-20260702.md.
+// ===========================================================================================
+
+/// The MVP per-quote charge (sats) when the plan does not quote one (design A.5; the
+/// `oracle_min_charge_sats` floor lands in O3).
+const ORACLE_DEFAULT_CHARGE_SATS: u64 = 10;
+
+/// How many ticks an issued-but-unpaid charge stays in the in-memory waiting-set before it is
+/// aged out (design A.6: the customer-never-pays path costs the agent one think + one invoice
+/// DM, already spent, never an unbounded memory leak). Seq advances ~once per tick, so this is a
+/// tick-count TTL. There is deliberately no cross-boot durability of pending charges: a reboot
+/// forgets them, and an unpaid charge holds no sats the agent could reclaim anyway.
+const ORACLE_PENDING_TTL_TICKS: u64 = 240;
+
+/// A classified inbound oracle request. The parser is TOTAL (every input maps to one variant; an
+/// unrecognized query is [`OracleRequest::Unsupported`], never a panic), mirroring the
+/// capable-loop [`Action`] grammar's discipline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OracleRequest {
+    /// A price quote: `PRICE <PAIR> [@<source>]`. `pair` is uppercased; `source` (optional) is
+    /// lowercased for host matching. MVP supports only `BTC/USD` (design A.1); any other pair is
+    /// [`OracleRequest::Unsupported`] so the agent never silently answers a feed it cannot serve.
+    Price { pair: String, source: Option<String> },
+    /// A books/status self-report query (`STATUS` | `BOOKS`). Recognized in O1; the actual report
+    /// is a FREE reply built from the economics snapshot in B2.
+    Status,
+    /// Anything else: not a supported query (no charge, no think).
+    Unsupported,
+}
+
+/// Parse a DM into an [`OracleRequest`] (TOTAL, str-only, no JSON -- F5). Case-insensitive on the
+/// keyword; the pair is uppercased and an optional `@source` lowercased.
+pub(super) fn parse_oracle_request(text: &str) -> OracleRequest {
+    let trimmed = text.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if matches!(upper.as_str(), "STATUS" | "BOOKS" | "HOW'S BUSINESS" | "HOWS BUSINESS") {
+        return OracleRequest::Status;
+    }
+    let mut tokens = trimmed.split_whitespace();
+    match tokens.next() {
+        Some(kw) if kw.eq_ignore_ascii_case("PRICE") => {}
+        _ => return OracleRequest::Unsupported,
+    }
+    let Some(pair_tok) = tokens.next() else {
+        return OracleRequest::Unsupported;
+    };
+    let pair = pair_tok.to_ascii_uppercase();
+    // MVP: only BTC/USD (design A.1). Any other pair is honestly Unsupported, never mis-served.
+    if pair != "BTC/USD" {
+        return OracleRequest::Unsupported;
+    }
+    let source = match tokens.next() {
+        Some(tok) if tok.len() > 1 && tok.starts_with('@') => Some(tok[1..].to_ascii_lowercase()),
+        Some(_) => return OracleRequest::Unsupported, // trailing junk after the pair
+        None => None,
+    };
+    if tokens.next().is_some() {
+        return OracleRequest::Unsupported; // more than one trailing token
+    }
+    OracleRequest::Price { pair, source }
+}
+
+/// Build the oracle THINK prompt: the life-gating act that decides the per-quote charge. Mirrors
+/// [`build_earn_loop_plan_prompt`]; the price VALUE is stubbed in O1 (egress lands in O2), so the
+/// think's only job here is to quote a charge.
+fn build_oracle_plan_prompt(
+    query: &str,
+    seq: u64,
+    last_treasury_remaining: u64,
+    last_think_cost: u64,
+) -> Vec<ChatMessage> {
+    let system = format!(
+        "You are a Kirby oracle agent. A customer has DMed a price-quote request. \
+         Decide how many satoshis to charge for the quote. \
+         Respond with exactly one line: CHARGE:<amount_sats> (e.g. CHARGE:{ORACLE_DEFAULT_CHARGE_SATS}). \
+         seq={seq} treasury_remaining={last_treasury_remaining} last_think_cost={last_think_cost}"
+    );
+    let user = format!("PRICE REQUEST:\n{query}");
+    vec![
+        ChatMessage { role: "system".into(), content: system },
+        ChatMessage { role: "user".into(), content: user },
+    ]
+}
+
+/// Build the O1 answer: a CANNED-price attestation stub, the stand-in for the live egress fetch
+/// (O2 replaces it with the real medianized quote + the full A.4 attestation). Labeled loudly as
+/// a stub so it can never be mistaken for a real quote.
+fn build_oracle_answer_stub(request: &OracleRequest, charge_id: &str) -> String {
+    let pair = match request {
+        OracleRequest::Price { pair, .. } => pair.as_str(),
+        _ => "BTC/USD",
+    };
+    format!(
+        "KIRBY ORACLE ATTESTATION (O1 stub)\n\
+         query:  PRICE {pair}\n\
+         answer: 108000.00 USD  (CANNED STUB -- live egress fetch lands in O2)\n\
+         charge: {charge_id}\n\
+         note:   development stub, not a real quote."
+    )
+}
+
+/// An issued-but-unsettled charge the oracle is waiting on (the in-memory waiting-set, A.6).
+pub(super) struct PendingCharge {
+    /// The SEAL-VERIFIED sender to answer (from the inbound DM; NEVER brain-chosen).
+    sender: String,
+    /// The classified request, so the answer (O2's real fetch) knows what to serve.
+    request: OracleRequest,
+    /// The tick seq at which the charge was issued (for the TTL age-out).
+    issued_seq: u64,
+    /// The QUOTED charge (sats). The answer is gated on the mint-verified settlement clearing
+    /// this amount, so an underpayment never buys a full answer.
+    amount_sats: u64,
+}
+
+/// Poll the inbox for the OLDEST waiting DM or PAYMENT_SETTLED past `ack_seq` (non-blocking).
+/// ONE cursor spans BOTH kinds by design: the daemon queue prunes by seq (kind-agnostic -- see
+/// [`crate`]'s `InboundQueue::drain_after`), so two independent per-kind cursors would let
+/// advancing one past an unconsumed event of the OTHER kind silently drop it. A single cursor +
+/// oldest-first consumption is the money-safe discipline. Soft errors return `None` (best-effort,
+/// never death: inbound delivery is at-least-once on the wire and the cursor is exactly-once).
+async fn poll_one_oracle_event<G: Gateway>(
+    gw: &mut G,
+    ack_seq: u64,
+) -> Option<kirby_proto::InboundEvent> {
+    let req = InboxRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        want_kinds: vec![
+            InboundKind::DirectMessage as i32,
+            InboundKind::PaymentSettled as i32,
+        ],
+        ack_seq,
+        wait_ms: 0,
+    };
+    let batch = match gw.read_inbox(req).await {
+        Ok(b) => b,
+        Err(status) => {
+            boot_log(&format!("oracle: poll_inbox errored ({status}); no event this tick"));
+            return None;
+        }
+    };
+    // Oldest-first: the lowest seq wins, so the single cursor advances by one event and can never
+    // step over an unconsumed event of the other kind.
+    batch
+        .events
+        .into_iter()
+        .filter(|e| {
+            e.kind == InboundKind::DirectMessage as i32
+                || e.kind == InboundKind::PaymentSettled as i32
+        })
+        .min_by_key(|e| e.inbox_seq)
+}
+
+/// ONE oracle tick. Processes the OLDEST waiting inbox event (a DM starts a job; a
+/// PAYMENT_SETTLED finishes a paid one) and advances the single cursor. THE money-safety
+/// invariant, enforced structurally: an answer DM is emitted ONLY from the settlement branch, and
+/// ONLY when a settled charge_id matches a tracked pending charge -- so the agent never answers
+/// before it is paid (charge -> settle -> answer, never answer-then-hope). Generic over
+/// [`Gateway`] so the real vsock client and the test mock drive identical logic.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn oracle_tick<G: Gateway>(
+    gw: &mut G,
+    seq: u64,
+    inbox_ack_seq: &mut u64,
+    pending: &mut HashMap<String, PendingCharge>,
+    params: &DiaristParams,
+    last_treasury_remaining: u64,
+    last_think_cost: u64,
+) -> TickOutcome {
+    // Age out unpaid charges (bounded waiting-set, A.6): a customer who never pays cost the agent
+    // one think + one invoice DM (already spent), never an unbounded leak.
+    pending.retain(|_id, pc| seq <= pc.issued_seq.saturating_add(ORACLE_PENDING_TTL_TICKS));
+
+    let Some(ev) = poll_one_oracle_event(gw, *inbox_ack_seq).await else {
+        return TickOutcome::Lived {
+            think_cost: 0,
+            treasury_remaining: last_treasury_remaining,
+            recorded_write: false,
+            action: Action::Note,
+            verify: None,
+            feedback: "oracle: inbox empty; nothing to do this tick".into(),
+        };
+    };
+
+    // ---- SETTLEMENT branch: the ONLY place an answer is emitted. ----
+    if ev.kind == InboundKind::PaymentSettled as i32 {
+        let settled = match PaymentSettled::decode(ev.payload.as_slice()) {
+            Ok(s) => s,
+            Err(_) => {
+                // Undecodable settlement: consume it (never wedge) and note.
+                *inbox_ack_seq = ev.inbox_seq;
+                return TickOutcome::Lived {
+                    think_cost: 0,
+                    treasury_remaining: last_treasury_remaining,
+                    recorded_write: false,
+                    action: Action::Note,
+                    verify: None,
+                    feedback: "oracle: undecodable PAYMENT_SETTLED; skipped".into(),
+                };
+            }
+        };
+        // Defense-in-depth (codex #4): the daemon sets the enqueued event's correlation_id to the
+        // charge_id; a present-but-divergent id is an anomaly -- reject rather than answer against it.
+        if !ev.correlation_id.is_empty() && ev.correlation_id != settled.charge_id {
+            boot_log(&format!(
+                "oracle: PAYMENT_SETTLED correlation_id {} != payload charge_id {}; ignoring (anomaly)",
+                ev.correlation_id, settled.charge_id
+            ));
+            *inbox_ack_seq = ev.inbox_seq;
+            return TickOutcome::Lived {
+                think_cost: 0,
+                treasury_remaining: last_treasury_remaining,
+                recorded_write: false,
+                action: Action::Note,
+                verify: None,
+                feedback: "oracle: settlement correlation_id mismatch; ignored".into(),
+            };
+        }
+        // Match the settlement to a charge WE issued and are still waiting on. Clone the fields so
+        // the `pending` borrow ends before the mutable remove below.
+        let Some((sender, request, quoted)) = pending
+            .get(&settled.charge_id)
+            .map(|pc| (pc.sender.clone(), pc.request.clone(), pc.amount_sats))
+        else {
+            // Unmatched settlement (codex #2): already-answered / TTL-aged / reboot-lost (pending
+            // is RAM-only, A.6). We cannot answer (we don't hold the job) and MVP does not
+            // auto-refund (gudnuf) -- surface it LOUDLY so the loss is observable, not silent.
+            // Durable pending + dead-letter is a tracked follow-up.
+            boot_log(&format!(
+                "oracle: PAYMENT_SETTLED (charge {}, verified {} sats) has NO pending job (already-answered / TTL-aged / reboot-lost); consuming, no answer",
+                settled.charge_id, settled.verified_sats
+            ));
+            *inbox_ack_seq = ev.inbox_seq;
+            return TickOutcome::Lived {
+                think_cost: 0,
+                treasury_remaining: last_treasury_remaining,
+                recorded_write: false,
+                action: Action::Note,
+                verify: None,
+                feedback: format!(
+                    "oracle: settlement for unmatched charge {}; consumed, no answer",
+                    settled.charge_id
+                ),
+            };
+        };
+        // Underpayment gate (codex #1): only answer when the MINT-VERIFIED amount clears the quote.
+        // A token worth less than the quote is honest-failure (kept, no answer, no refund per MVP),
+        // never a full answer for a partial payment.
+        if settled.verified_sats < quoted {
+            boot_log(&format!(
+                "oracle: charge {} UNDERPAID (verified {} < quoted {} sats); no answer (honest-failure, no refund per MVP)",
+                settled.charge_id, settled.verified_sats, quoted
+            ));
+            pending.remove(&settled.charge_id);
+            *inbox_ack_seq = ev.inbox_seq;
+            return TickOutcome::Lived {
+                think_cost: 0,
+                treasury_remaining: last_treasury_remaining,
+                recorded_write: false,
+                action: Action::Note,
+                verify: None,
+                feedback: format!(
+                    "oracle: charge {} underpaid ({} < {}); no answer",
+                    settled.charge_id, settled.verified_sats, quoted
+                ),
+            };
+        }
+        // Paid in full: build the answer (O1 canned stub) and DM it to the seal-verified sender.
+        let answer = build_oracle_answer_stub(&request, &settled.charge_id);
+        match execute_dm_reply(gw, seq, &sender, &answer, params).await {
+            // Transport error (the call never reached the daemon): do NOT consume, do NOT remove
+            // -> retry the SAME settlement next tick (seq reused on Transient -> at-most-once dedupe).
+            ActionOutcome::Transient => TickOutcome::Transient,
+            // DELIVERED (performed or dedup-confirmed sent): remove + advance so a duplicate
+            // settlement (a fresh queue entry, same charge_id) finds nothing (exactly-once).
+            ActionOutcome::Done { recorded_write: true, verify, feedback } => {
+                pending.remove(&settled.charge_id);
+                *inbox_ack_seq = ev.inbox_seq;
+                TickOutcome::Lived {
+                    think_cost: 0,
+                    treasury_remaining: last_treasury_remaining,
+                    recorded_write: true,
+                    action: Action::DmReply { text: answer },
+                    verify,
+                    feedback,
+                }
+            }
+            // PAID BUT NOT DELIVERED (codex #3): broke / not-allowlisted / over-budget /
+            // upstream-failed. At-most-once forbids a safe blind retry (an upstream-failed send
+            // burns the idempotency key, so a retry would phantom as delivered), so we do NOT
+            // silently treat this as answered -- consume + remove and surface the loss LOUDLY.
+            // Durable retry/refund of a paid-undelivered answer is a tracked follow-up (A.6 / O3).
+            ActionOutcome::Done { recorded_write: false, .. } => {
+                boot_log(&format!(
+                    "oracle: charge {} PAID (verified {} sats) but the answer DM did NOT deliver; surfaced, not silently answered (no safe retry under at-most-once)",
+                    settled.charge_id, settled.verified_sats
+                ));
+                pending.remove(&settled.charge_id);
+                *inbox_ack_seq = ev.inbox_seq;
+                TickOutcome::Lived {
+                    think_cost: 0,
+                    treasury_remaining: last_treasury_remaining,
+                    recorded_write: false,
+                    action: Action::Note,
+                    verify: None,
+                    feedback: format!(
+                        "oracle: PAID-UNDELIVERED charge {}: answer send failed",
+                        settled.charge_id
+                    ),
+                }
+            }
+        }
+    } else {
+        // ---- DIRECT_MESSAGE branch: classify; a PRICE query STARTS a job (charge + invoice). ----
+        let text = String::from_utf8_lossy(&ev.payload).into_owned();
+        let sender = ev.source_pubkey;
+        let request = parse_oracle_request(&text);
+        match &request {
+            OracleRequest::Status => {
+                // Recognized in O1; the real books report is a FREE reply built in B2.
+                *inbox_ack_seq = ev.inbox_seq;
+                TickOutcome::Lived {
+                    think_cost: 0,
+                    treasury_remaining: last_treasury_remaining,
+                    recorded_write: false,
+                    action: Action::Note,
+                    verify: None,
+                    feedback: "oracle: STATUS/BOOKS recognized (the books report lands in B2)"
+                        .into(),
+                }
+            }
+            OracleRequest::Unsupported => {
+                *inbox_ack_seq = ev.inbox_seq;
+                TickOutcome::Lived {
+                    think_cost: 0,
+                    treasury_remaining: last_treasury_remaining,
+                    recorded_write: false,
+                    action: Action::Note,
+                    verify: None,
+                    feedback: "oracle: unsupported query; ignored (supported: PRICE BTC/USD)".into(),
+                }
+            }
+            OracleRequest::Price { .. } => {
+                // THINK: the life-gating act (earn or die). A denied think is death (F4).
+                let prompt =
+                    build_oracle_plan_prompt(&text, seq, last_treasury_remaining, last_think_cost);
+                let think_req = build_think_request(
+                    &params.model,
+                    &prompt,
+                    params.brain_max_cost,
+                    &format!("oracle-think-{seq}"),
+                );
+                let (reply, think_cost, treasury_after_think) = match gw.call(think_req).await {
+                    Err(status) => {
+                        boot_log(&format!("oracle seq={seq}: think errored ({status}); transient"));
+                        return TickOutcome::Transient;
+                    }
+                    Ok(receipt) => match classify_think(&receipt) {
+                        ThinkOutcome::Broke => return TickOutcome::Dead,
+                        ThinkOutcome::Transient => return TickOutcome::Transient,
+                        ThinkOutcome::Performed { reply, cost_sats, treasury_remaining } => {
+                            (reply, cost_sats, treasury_remaining)
+                        }
+                    },
+                };
+                // The charge amount rides the plan (CHARGE:<n>, positive allowlist), falling back
+                // to the MVP default so a malformed plan still quotes a sensible price.
+                let amount_sats = parse_inbound_job_request(&reply, ORACLE_DEFAULT_CHARGE_SATS);
+
+                // ISSUE CHARGE: daemon-side, zero cost to the genome; keyed per seq (idempotent on
+                // a Transient replay -> the SAME charge_id, never a second charge).
+                let charge_key = format!("oracle-charge-{seq}");
+                let charge_receipt = match gw
+                    .issue_charge(amount_sats, &format!("oracle: {text}"), &charge_key)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(status) => {
+                        boot_log(&format!(
+                            "oracle seq={seq}: issue_charge errored ({status}); transient"
+                        ));
+                        return TickOutcome::Transient;
+                    }
+                };
+                let Some(charge) = charge_receipt.charge else {
+                    boot_log(&format!(
+                        "oracle seq={seq}: IssueCharge returned no ChargeIssued (no settlement provider?); transient"
+                    ));
+                    return TickOutcome::Transient;
+                };
+
+                // INVOICE the customer (a metered dm_reply; a broke send is a soft-skip, a
+                // transport error retries). ARM the pending charge + consume the DM only once the
+                // invoice SETTLES, so a Transient invoice replays the whole job at the same seq
+                // (think + charge dedupe on their keys; no double-charge, no lost job).
+                let invoice = format!(
+                    "To answer your PRICE quote, pay this request quoting charge {}:\n{}",
+                    charge.charge_id, charge.invoice_or_request
+                );
+                match execute_dm_reply(gw, seq, &sender, &invoice, params).await {
+                    ActionOutcome::Transient => TickOutcome::Transient,
+                    ActionOutcome::Done { .. } => {
+                        let charge_id = charge.charge_id.clone();
+                        let amount = charge.amount_sats;
+                        pending.insert(
+                            charge.charge_id,
+                            PendingCharge {
+                                sender,
+                                request: request.clone(),
+                                issued_seq: seq,
+                                amount_sats: amount,
+                            },
+                        );
+                        *inbox_ack_seq = ev.inbox_seq;
+                        TickOutcome::Lived {
+                            think_cost,
+                            treasury_remaining: treasury_after_think,
+                            recorded_write: true,
+                            action: Action::EarnCharge { charge_id: charge_id.clone(), amount_sats: amount },
+                            verify: None,
+                            feedback: format!(
+                                "oracle: issued charge {charge_id} for {amount} sats; invoiced the customer; awaiting PAYMENT_SETTLED"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The oracle workload entry point: drives [`oracle_tick`] forever (PID 1). Concrete glue (the
+/// testable unit is `oracle_tick`), mirroring [`earn_loop`]. Owns the persistent state the tick
+/// does not: the monotonic `seq` (think/charge/reply dedup keys), the single inbox cursor, the
+/// in-memory waiting-set of unpaid charges, and the runway carry.
+pub(super) async fn oracle_loop(
+    mut client: NodeGatewayClient<tonic::transport::Channel>,
+    port: u32,
+    ctx: &kirby_proto::SessionContext,
+) -> ! {
+    let params = diarist_params_from_cmdline();
+    boot_log(&format!(
+        "workload=oracle: DM price-quote oracle (Milestone 2). poll DM -> THINK (life-gating) -> ISSUE charge -> invoice; then WAIT for the matching PAYMENT_SETTLED -> ANSWER (charge->settle->answer, never answer-then-hope). O1 = canned-price stub; live egress fetch lands in O2. model={} tick_secs={}",
+        params.model,
+        params.tick.as_secs()
+    ));
+    let mut committed: u64 = 0;
+    let mut inbox_ack_seq: u64 = 0;
+    let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+    let mut treasury_remaining = ctx.budget_sats;
+    let mut last_think_cost = 0u64;
+
+    loop {
+        let seq = committed + 1;
+        let outcome = oracle_tick(
+            &mut client,
+            seq,
+            &mut inbox_ack_seq,
+            &mut pending,
+            &params,
+            treasury_remaining,
+            last_think_cost,
+        )
+        .await;
+
+        let commits = tick_commits_seq(&outcome);
+        match outcome {
+            TickOutcome::Lived { think_cost, treasury_remaining: tr, .. } => {
+                treasury_remaining = tr;
+                last_think_cost = think_cost;
+            }
+            TickOutcome::Dead => {
+                boot_log("oracle: out of runway; parking for the daemon to halt the VM");
+                idle_forever().await;
+            }
+            TickOutcome::Transient => {
+                boot_log("oracle: transient hiccup; re-dialing");
+                if let Some(c) = redial(port).await {
+                    client = c;
+                }
+            }
+            TickOutcome::ReadMore { .. } => {}
+        }
+        if commits {
+            committed = seq;
+        }
+        tokio::time::sleep(params.tick).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2627,6 +3124,28 @@ mod tests {
                 source_pubkey: requester.to_string(),
                 created_at: 0,
                 correlation_id: String::new(),
+            });
+            self
+        }
+
+        /// Script a waiting PAYMENT_SETTLED into the mock's inbox (the shape `settle_charge`
+        /// enqueues after `credit_verified`: `correlation_id` = the charge_id, payload = the
+        /// encoded [`PaymentSettled`]). Drives the oracle charge->settle->answer teeth.
+        fn with_payment_settled(
+            mut self,
+            inbox_seq: u64,
+            charge_id: &str,
+            verified_sats: u64,
+        ) -> Self {
+            let payload =
+                PaymentSettled { charge_id: charge_id.to_string(), verified_sats }.encode_to_vec();
+            self.inbox.push(InboundEvent {
+                inbox_seq,
+                kind: InboundKind::PaymentSettled as i32,
+                payload,
+                source_pubkey: String::new(),
+                created_at: 0,
+                correlation_id: charge_id.to_string(),
             });
             self
         }
@@ -2907,6 +3426,254 @@ mod tests {
         let params = test_params();
         let out = execute_fetch(&mut gw, 3, "https://api.example.com/price", &params).await;
         assert!(matches!(out, ActionOutcome::Transient), "a transport error is transient");
+    }
+
+    // ---- ORACLE workload (Milestone 2, product 1): the charge -> settle -> answer money spine ----
+
+    /// The deterministic charge_id the MockGateway's `issue_charge` returns for a given oracle
+    /// tick seq (`mock-charge-<idempotency_key>`, key = `oracle-charge-<seq>`), so a test can
+    /// inject a settlement that matches the charge the tick issued.
+    fn oracle_charge_id(seq: u64) -> String {
+        format!("mock-charge-oracle-charge-{seq}")
+    }
+
+    /// TOOTH (O1, THE money spine): CHARGE-BEFORE-ANSWER. The oracle emits NO answer DM until a
+    /// PAYMENT_SETTLED matching the issued charge is consumed. An unpaid job = one think + one
+    /// invoice DM, then silence. RED on reverting the settlement gate (answering on the DM tick).
+    #[tokio::test]
+    async fn oracle_never_answers_before_payment_settles() {
+        let sender = dm_sender_hex(1);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10").with_dm(1, &sender, "PRICE BTC/USD");
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        // Tick 1: the DM starts a job -> think + issue charge + INVOICE dm. NO answer yet.
+        let out = oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        assert!(
+            matches!(out, TickOutcome::Lived { action: Action::EarnCharge { .. }, .. }),
+            "tick 1 should issue a charge, got {out:?}"
+        );
+        assert_eq!(gw.issue_charge_requests(), 1, "exactly one charge issued");
+        assert_eq!(gw.dm_reply_requests(), 1, "exactly one DM this tick: the invoice");
+        assert!(
+            gw.dm_replies[0].text.contains("pay this request"),
+            "the only DM so far is the INVOICE, not an answer: {:?}",
+            gw.dm_replies[0].text
+        );
+        assert!(
+            !gw.dm_replies.iter().any(|d| d.text.contains("ATTESTATION")),
+            "NO attestation/answer DM before settlement -- charge-before-answer"
+        );
+        assert_eq!(pending.len(), 1, "the charge is tracked as pending payment");
+        assert_eq!(ack, 1, "the DM was consumed");
+
+        // Tick 2: still no settlement in the inbox -> idle, still no answer.
+        let out = oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(matches!(out, TickOutcome::Lived { action: Action::Note, .. }));
+        assert_eq!(gw.dm_reply_requests(), 1, "still only the invoice; no answer without payment");
+
+        // Now the customer pays: enqueue the matching PAYMENT_SETTLED.
+        gw = gw.with_payment_settled(2, &oracle_charge_id(1), 10);
+
+        // Tick 3: the settlement matches the pending charge -> the answer DM goes out.
+        let out = oracle_tick(&mut gw, 3, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(
+            matches!(out, TickOutcome::Lived { action: Action::DmReply { .. }, .. }),
+            "tick 3 should answer, got {out:?}"
+        );
+        assert_eq!(gw.dm_reply_requests(), 2, "now the answer DM is sent (invoice + answer)");
+        assert!(
+            gw.dm_replies[1].text.contains("ATTESTATION"),
+            "the second DM is the attestation answer: {:?}",
+            gw.dm_replies[1].text
+        );
+        assert!(pending.is_empty(), "the answered charge is cleared from the waiting-set");
+        assert_eq!(ack, 2, "the settlement was consumed");
+    }
+
+    /// TOOTH (O1): CORRELATION EXACTLY-ONCE. A duplicate PAYMENT_SETTLED for an already-answered
+    /// charge produces NO second answer (and no re-charge). RED on reverting the pending-removal
+    /// or the unknown-charge guard so a replayed settlement re-answers.
+    #[tokio::test]
+    async fn oracle_duplicate_settlement_answers_at_most_once() {
+        let sender = dm_sender_hex(2);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &sender, "PRICE BTC/USD")
+            .with_payment_settled(2, &oracle_charge_id(1), 10)
+            .with_payment_settled(3, &oracle_charge_id(1), 10); // a duplicate (fresh queue entry)
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        // Tick 1: DM -> charge + invoice.
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        // Tick 2: the first settlement -> answer.
+        oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert_eq!(gw.dm_reply_requests(), 2, "invoice + one answer");
+
+        // Tick 3: the DUPLICATE settlement -> the charge is no longer pending -> no second answer.
+        let out = oracle_tick(&mut gw, 3, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(matches!(out, TickOutcome::Lived { action: Action::Note, .. }));
+        assert_eq!(
+            gw.dm_reply_requests(),
+            2,
+            "the duplicate settlement must NOT produce a second answer (exactly-once)"
+        );
+        assert_eq!(gw.issue_charge_requests(), 1, "and it must not re-charge");
+    }
+
+    /// The oracle query parser is TOTAL and case/whitespace-tolerant, and never mis-classifies an
+    /// unsupported query as a supported one (which would let the agent charge for a feed it cannot
+    /// serve).
+    #[test]
+    fn oracle_parser_classifies_the_grammar() {
+        assert_eq!(
+            parse_oracle_request("PRICE BTC/USD"),
+            OracleRequest::Price { pair: "BTC/USD".into(), source: None }
+        );
+        assert_eq!(
+            parse_oracle_request("  price   btc/usd  "),
+            OracleRequest::Price { pair: "BTC/USD".into(), source: None },
+            "keyword + pair are case-insensitive and whitespace-tolerant"
+        );
+        assert_eq!(
+            parse_oracle_request("PRICE BTC/USD @Coinbase"),
+            OracleRequest::Price { pair: "BTC/USD".into(), source: Some("coinbase".into()) },
+            "an @source is captured and lowercased"
+        );
+        assert_eq!(parse_oracle_request("STATUS"), OracleRequest::Status);
+        assert_eq!(parse_oracle_request("books"), OracleRequest::Status);
+        // Unsupported: unknown pair, bare keyword, junk, empty, trailing junk.
+        assert_eq!(parse_oracle_request("PRICE ETH/USD"), OracleRequest::Unsupported);
+        assert_eq!(parse_oracle_request("PRICE"), OracleRequest::Unsupported);
+        assert_eq!(parse_oracle_request("hello there"), OracleRequest::Unsupported);
+        assert_eq!(parse_oracle_request(""), OracleRequest::Unsupported);
+        assert_eq!(
+            parse_oracle_request("PRICE BTC/USD extra"),
+            OracleRequest::Unsupported,
+            "trailing junk after the pair is rejected, not silently answered"
+        );
+    }
+
+    /// The unpaid-charge waiting-set ages out after the TTL (bounded memory, A.6).
+    #[tokio::test]
+    async fn oracle_unpaid_charge_ages_out() {
+        let sender = dm_sender_hex(3);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10").with_dm(1, &sender, "PRICE BTC/USD");
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        assert_eq!(pending.len(), 1, "charge tracked after issuance");
+
+        // A tick far past the TTL sweeps the never-paid charge out of the waiting-set.
+        let out = oracle_tick(
+            &mut gw,
+            1 + ORACLE_PENDING_TTL_TICKS + 1,
+            &mut ack,
+            &mut pending,
+            &params,
+            1_000,
+            5,
+        )
+        .await;
+        assert!(matches!(out, TickOutcome::Lived { .. }));
+        assert!(pending.is_empty(), "the unpaid charge aged out of the waiting-set");
+    }
+
+    /// TOOTH (O1, codex #1): UNDERPAYMENT never buys an answer. A settlement whose mint-verified
+    /// amount is below the quoted charge produces NO answer DM (honest-failure, no refund per MVP).
+    /// RED on removing the `verified_sats >= quoted` gate.
+    #[tokio::test]
+    async fn oracle_underpayment_gets_no_answer() {
+        let sender = dm_sender_hex(4);
+        let params = test_params();
+        // Quote 10 sats (the plan says CHARGE:10) but the customer settles only 3.
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &sender, "PRICE BTC/USD")
+            .with_payment_settled(2, &oracle_charge_id(1), 3);
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        assert_eq!(gw.dm_reply_requests(), 1, "tick 1: the invoice");
+
+        let out = oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(
+            matches!(out, TickOutcome::Lived { action: Action::Note, .. }),
+            "an underpaid settlement must NOT answer, got {out:?}"
+        );
+        assert_eq!(gw.dm_reply_requests(), 1, "still only the invoice; no answer for an underpayment");
+        assert!(pending.is_empty(), "the underpaid charge is cleared (kept sats, no answer, no refund)");
+    }
+
+    /// TOOTH (O1, codex #3): a PAID answer that fails to DELIVER is surfaced, never silently
+    /// treated as answered. When the answer DM's daemon outcome is a soft-skip (here: insufficient
+    /// treasury), the tick settles as a Note (NOT a delivered DmReply) and clears pending. RED on
+    /// treating any `Done` (including not-delivered) as a delivered answer.
+    #[tokio::test]
+    async fn oracle_paid_but_undelivered_answer_is_not_a_silent_success() {
+        let sender = dm_sender_hex(5);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &sender, "PRICE BTC/USD")
+            .with_payment_settled(2, &oracle_charge_id(1), 10);
+        // Force every actuate (invoice + answer) to a NOT-DELIVERED daemon outcome.
+        gw.actuate_outcome = Outcome::DeniedInsufficientTreasury as i32;
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        assert_eq!(pending.len(), 1, "the charge arms even if the invoice send soft-skipped");
+
+        let out = oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(
+            matches!(out, TickOutcome::Lived { action: Action::Note, .. }),
+            "a non-delivered answer must NOT report as a delivered DmReply, got {out:?}"
+        );
+        assert!(pending.is_empty(), "the settled charge is consumed (no unsafe retry under at-most-once)");
+    }
+
+    /// TOOTH (O1): OLDEST-FIRST across interleaved kinds. When a PAID settlement (older seq) and a
+    /// fresh DM (newer seq) are both waiting, the tick MUST process the older settlement first —
+    /// else advancing the single cursor past it STRANDS a paid job (answered never). This is the
+    /// money-safety reason `poll_one_oracle_event` uses `min_by_key`. RED on flipping the poll from
+    /// `min_by_key` -> `max_by_key` (newest-first): B's newer DM is charged at tick 2 and A's paid
+    /// settlement is pruned unanswered.
+    #[tokio::test]
+    async fn oracle_interleaved_settlement_and_dm_process_oldest_first() {
+        let a = dm_sender_hex(6);
+        let b = dm_sender_hex(7);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10").with_dm(1, &a, "PRICE BTC/USD");
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        // Tick 1: A's DM -> charge A + invoice. pending = { charge A }.
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        assert_eq!(gw.issue_charge_requests(), 1, "A is charged");
+
+        // Interleave: A's settlement (seq 2) AND a fresh DM from B (seq 3) are BOTH waiting.
+        gw = gw
+            .with_payment_settled(2, &oracle_charge_id(1), 10)
+            .with_dm(3, &b, "PRICE BTC/USD");
+
+        // Tick 2: oldest-first MUST take A's settlement (seq 2), not B's newer DM (seq 3).
+        let out2 = oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(
+            matches!(out2, TickOutcome::Lived { action: Action::DmReply { .. }, .. }),
+            "tick 2 must answer A's settlement (the oldest event), got {out2:?}"
+        );
+        assert!(
+            gw.dm_replies.iter().any(|d| d.text.contains("ATTESTATION")),
+            "A's PAID job is answered, not stranded by processing B's newer DM first"
+        );
+
+        // Tick 3: B's DM (seq 3) is now the oldest unconsumed -> charge B.
+        oracle_tick(&mut gw, 3, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert_eq!(gw.issue_charge_requests(), 2, "B's job is charged after A is answered");
     }
 
     // ---- NIP-17 DM arm (task #12): busy-flag one-at-a-time + reply-to-the-seal-verified-sender ----
