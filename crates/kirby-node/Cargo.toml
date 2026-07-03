@@ -211,3 +211,8 @@ hyper-util = "0.1"
 # TEST-ONLY (the daemon never embeds a mint); only the fakewallet + sqlite
 # features, to keep the cln/lnd/ldk/bitcoind backends out of the build.
 cdk-mintd = { workspace = true }
+# lightning-invoice parses/validates the bolt11 string a NUT-04 mint quote returns
+# (the LightningSettlement issue tooth: assert `invoice_or_request` is a real bolt11).
+# Pinned to the version ALREADY in the lock (transitive via cdk/nostr-sdk) so this adds
+# NO new resolution and no lock churn. TEST-ONLY: prod code never parses the invoice.
+lightning-invoice = "=0.34.0"

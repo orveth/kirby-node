@@ -3439,16 +3439,194 @@ impl SettlementProvider for CashuSettlement {
     }
 }
 
-/// Stub for a future Lightning settlement path. Fails closed until implemented.
-pub struct LightningSettlement;
+/// Lightning settlement: an agent QUOTES a bolt11 (a cashu NUT-04 mint quote) that a
+/// stranger pays with ANY Lightning wallet; settlement asks the MINT whether the quote is
+/// PAID and, when it is, MINTS the ecash into the daemon's (host-held) wallet BEFORE the
+/// gateway credits the treasury. The wallet is the same host-only credential the genome
+/// never sees.
+///
+/// The bolt11 charge model, contrasted with [`CashuSettlement`]:
+/// - `CashuSettlement`: the payer hands us a cashu token; `verify_settlement`'s `evidence`
+///   IS that token and `wallet.receive` redeems it. The customer had to hold cashu already.
+/// - `LightningSettlement`: the payer needs no cashu — they pay a bolt11 invoice. The mint
+///   quote's `id` IS the `charge_id`, so `verify_settlement` looks the quote up by id and
+///   the `evidence` argument is UNUSED (payment is proven by asking the mint, not by a token
+///   the payer supplies).
+///
+/// MONEY-MUST: `verify_settlement` returns the MINT-VERIFIED amount (the total of the proofs
+/// the mint actually minted, or the already-issued amount on the recovery path), NEVER the
+/// requested `amount_sats`. The gateway wires that value straight into `credit_verified`.
+///
+/// NIP-60 PERSISTENCE: the minted proofs land in the wallet's cdk store (the truth) exactly
+/// like `CashuSettlement`'s received proofs. The relay MIRROR is NOT inline here: the
+/// background [`Nip60BackupFlusher`] snapshots the wallet's CURRENT UNSPENT set
+/// (`get_proofs_with(State::Unspent)`) on its cadence + at graceful death, so a minted proof
+/// that is unspent at flush time is mirrored by the SAME path as a received one. Wiring the
+/// flusher over the settlement wallet is 1b (this increment does not touch boot).
+pub struct LightningSettlement {
+    wallet: Arc<cdk::Wallet>,
+}
+
+impl LightningSettlement {
+    pub fn new(wallet: Arc<cdk::Wallet>) -> Self {
+        Self { wallet }
+    }
+}
+
+/// The money-tooth gate: a bolt11 mint quote is only mintable once the mint reports it PAID.
+///
+/// cdk 0.17.1's [`cdk::nuts::MintQuoteState`] (= `nut23::QuoteState`) has exactly THREE
+/// variants — `Unpaid` (default), `Paid`, `Issued` — NOT the `{Pending, Unknown, Failed}`
+/// set an earlier design sketch assumed; there is no such thing here, so this gate is a
+/// total match over the real enum:
+/// - `Paid`   → `Ok`: the customer's Lightning payment reached the mint; we may mint.
+/// - `Unpaid` → `Err`: no payment yet → NO mint, NO credit (fail-closed).
+/// - `Issued` → `Err`: the ecash was ALREADY minted by a prior attempt. This gate is only
+///   ever consulted on the freshly-mintable path; the `Issued` RECOVERY is handled BEFORE
+///   the gate (see `verify_settlement`), so reaching the gate with `Issued` would mean a
+///   double-mint attempt — rejecting it is the correct fail-closed default.
+///
+/// This is the RED-on-revert target for the unpaid-gate tooth: relaxing it to `Ok(())` for
+/// every state lets an UNPAID quote mint (or attempt to) and credit — the money leak the
+/// tooth catches.
+fn ensure_quote_paid(state: cdk::nuts::MintQuoteState) -> anyhow::Result<()> {
+    use cdk::nuts::MintQuoteState;
+    match state {
+        MintQuoteState::Paid => Ok(()),
+        MintQuoteState::Unpaid => anyhow::bail!(
+            "bolt11 mint quote is UNPAID — the customer's Lightning payment has not reached \
+             the mint; refusing to mint or credit (fail-closed)"
+        ),
+        MintQuoteState::Issued => anyhow::bail!(
+            "bolt11 mint quote is already ISSUED — the freshly-mintable gate must not be \
+             reached on an already-minted quote (the Issued recovery branch handles it \
+             before this gate); refusing to mint again"
+        ),
+    }
+}
 
 #[async_trait::async_trait]
 impl SettlementProvider for LightningSettlement {
-    async fn issue(&self, _amount_sats: u64, _memo: &str) -> anyhow::Result<ChargeIssuedData> {
-        anyhow::bail!("lightning settlement not yet implemented")
+    async fn issue(&self, amount_sats: u64, memo: &str) -> anyhow::Result<ChargeIssuedData> {
+        // A NUT-04 BOLT11 mint quote: the mint returns a bolt11 invoice for `amount_sats` that
+        // any Lightning wallet can pay. The quote's `id` is the daemon-side handle we look the
+        // payment up by later, so it IS the charge_id (verify_settlement re-fetches by it).
+        let quote = self
+            .wallet
+            .mint_quote(
+                cdk::nuts::PaymentMethod::BOLT11,
+                Some(cdk::Amount::from(amount_sats)),
+                Some(memo.to_string()),
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("bolt11 mint quote: {e}"))?;
+        Ok(ChargeIssuedData {
+            charge_id: quote.id,
+            invoice_or_request: quote.request,
+            amount_sats,
+        })
     }
 
-    async fn verify_settlement(&self, _charge_id: &str, _evidence: &str) -> anyhow::Result<u64> {
-        anyhow::bail!("lightning settlement not yet implemented")
+    async fn verify_settlement(&self, charge_id: &str, _evidence: &str) -> anyhow::Result<u64> {
+        // `_evidence` is UNUSED for bolt11: the payer settled an invoice, they did not hand us a
+        // token. Payment is proven by asking the MINT about the quote (charge_id == quote id).
+        use cdk::nuts::MintQuoteState;
+
+        // Ask the mint the quote's current state (this also refreshes the local record).
+        let quote = self
+            .wallet
+            .check_mint_quote_status(charge_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("check bolt11 mint quote {charge_id}: {e}"))?;
+
+        // RECOVERY-AWARE mint (the orphaned-proofs tooth). A prior settle can crash AFTER
+        // `wallet.mint` (the proofs are minted into the wallet + the quote flips to ISSUED at
+        // the mint) but BEFORE the gateway's `credit_verified` durably records the credit. On
+        // the retry the quote is ISSUED, so `wallet.mint` would error (nothing left to mint) —
+        // instead we take the already-issued amount and let the gateway's charge_id-idempotent
+        // credit proceed. Net: a crash in that window recovers on the next settle with NO
+        // double-mint and NO lost sats. The proofs from the first (successful) mint are already
+        // in the wallet store, so they are NOT re-minted and NOT lost.
+        if quote.state == MintQuoteState::Issued {
+            let issued: u64 = quote.amount_issued.into();
+            tracing::info!(
+                charge_id,
+                issued_sats = issued,
+                "bolt11 settlement: quote already ISSUED (a prior mint succeeded before the \
+                 credit landed) — returning the already-issued amount for the idempotent credit \
+                 WITHOUT re-minting (orphaned-proofs recovery)"
+            );
+            return Ok(issued);
+        }
+
+        // FRESHLY-MINTABLE path. Gate first (money-tooth): only a PAID quote may mint. An UNPAID
+        // (or any non-PAID) quote is rejected here → no mint, no credit.
+        ensure_quote_paid(quote.state)?;
+
+        // PAID: mint the ecash into the daemon's wallet. The proofs' total is the MINT-VERIFIED
+        // amount — the ONLY sanctioned source for the credit (money-MUST), NEVER `amount_sats`.
+        use cdk::nuts::nut00::ProofsMethods as _;
+        let proofs = self
+            .wallet
+            .mint(charge_id, cdk::amount::SplitTarget::default(), None)
+            .await
+            .map_err(|e| anyhow::anyhow!("mint bolt11-settled ecash for {charge_id}: {e}"))?;
+        let minted: u64 = proofs
+            .total_amount()
+            .map_err(|e| anyhow::anyhow!("total the minted proofs for {charge_id}: {e}"))?
+            .into();
+        tracing::info!(
+            charge_id,
+            minted_sats = minted,
+            "bolt11 settlement: quote PAID → minted ecash into the wallet; returning the \
+             mint-verified amount for the credit"
+        );
+        Ok(minted)
+    }
+}
+
+#[cfg(test)]
+mod lightning_settlement_gate_tests {
+    //! The DETERMINISTIC money-tooth for bolt11 settlement (tooth 2): the `ensure_quote_paid`
+    //! gate that decides whether a mint quote may mint. It is a pure function over the real
+    //! cdk 0.17.1 `MintQuoteState`, so it is exercised with NO mint and NO network — the
+    //! gate carries the tooth even where the fakewallet cannot be pinned in a given state.
+    //!
+    //! RED-on-revert: relax `ensure_quote_paid` to `Ok(())` for every state (e.g. replace the
+    //! body with `let _ = state; Ok(())`) and `unpaid_quote_is_rejected_by_the_gate` fails —
+    //! the `is_err()` assertion goes false, proving the gate is what blocks an UNPAID quote
+    //! from minting + crediting.
+
+    use super::ensure_quote_paid;
+    use cdk::nuts::MintQuoteState;
+
+    #[test]
+    fn paid_quote_passes_the_gate() {
+        assert!(
+            ensure_quote_paid(MintQuoteState::Paid).is_ok(),
+            "a PAID mint quote must pass the gate so the wallet can mint the settled ecash"
+        );
+    }
+
+    #[test]
+    fn unpaid_quote_is_rejected_by_the_gate() {
+        // The money-tooth: an UNPAID quote must NOT be mintable — no mint, no credit.
+        assert!(
+            ensure_quote_paid(MintQuoteState::Unpaid).is_err(),
+            "an UNPAID bolt11 mint quote must be REJECTED (no payment reached the mint) — \
+             reverting the gate to accept-all makes this fail (RED-on-revert)"
+        );
+    }
+
+    #[test]
+    fn issued_quote_is_rejected_by_the_freshly_mintable_gate() {
+        // `Issued` never reaches this gate in `verify_settlement` (the recovery branch handles
+        // it first), so the gate treating a stray `Issued` as an error is the correct
+        // fail-closed default against a double-mint attempt.
+        assert!(
+            ensure_quote_paid(MintQuoteState::Issued).is_err(),
+            "the freshly-mintable gate must reject an already-ISSUED quote (double-mint guard)"
+        );
     }
 }
