@@ -657,6 +657,29 @@ pub fn agent_state_dir_for(instance_id: &str) -> PathBuf {
     state_root().join(format!("agent-{instance_id}"))
 }
 
+/// R2 read-quorum gate: determines whether the boot-time reconcile was authoritative
+/// (served >= read_k distinct relays) and controls the solvency check posture.
+///
+/// - `Assert`: the read was authoritative → run `assert_wallet_backs_counter` UNCHANGED
+///   (fail-closed if wallet < counter, as before R2).
+/// - `ProceedNonAuthoritative`: the read was below-quorum → the thin wallet balance is a
+///   LOWER BOUND, not proven insolvency → proceed with a loud warning. The rollover gate
+///   (§4, `read_established`) blocks any backup publish until >=k re-establishes authority.
+pub enum SolvencyGate {
+    Assert,
+    ProceedNonAuthoritative,
+}
+
+/// Decide the solvency posture from the read's authoritativeness. Pure and testable.
+/// (G4 zero-skip extended to money-reads: a below-quorum shortfall must not brick a funded agent.)
+pub fn solvency_gate(authoritative: bool) -> SolvencyGate {
+    if authoritative {
+        SolvencyGate::Assert
+    } else {
+        SolvencyGate::ProceedNonAuthoritative
+    }
+}
+
 /// The §7.2 wallet<->counter reconcile decision (brain-routstr R2-3/R2-5): the wallet
 /// must back every sat the metabolism counter believes it has, so the gateway never
 /// authorizes a think the wallet can't fund. The invariant is `>=`, NEVER `==` (R2-3:
@@ -761,7 +784,7 @@ async fn build_routstr_brain(
         None
     } else {
         let event_key = crate::nip60_key::derive_nip60_event_key(&seed);
-        let (relays, write_k, durability) = nip60.resolve(fleet_relay);
+        let (relays, write_k, read_k, durability) = nip60.resolve(fleet_relay);
         if let Some(warning) = durability.warning() {
             tracing::warn!(nip60_durability = %warning, "NIP-60 wallet backup: sub-quorum durability");
         }
@@ -775,6 +798,7 @@ async fn build_routstr_brain(
             relays = ?relays,
             n = relays.len(),
             k = write_k,
+            read_k,
             tier = ?durability,
             "NIP-60 wallet backup relay posture"
         );
@@ -785,6 +809,7 @@ async fn build_routstr_brain(
                 &event_key,
                 &relays,
                 Some(write_k),
+                Some(read_k),
                 brain.effective_mint_allowlist(),
             )
             .await?,
@@ -837,25 +862,60 @@ async fn build_routstr_brain(
     // Empty with no store; the reconcile error path degrades to empty (a fresh backup then simply
     // supersedes nothing).
     let mut nip60_initial_live_ids: Vec<String> = Vec::new();
+    // R2 condition (a): track whether the load-time reconcile was authoritative (served >=
+    // read_k distinct relays). A below-quorum read is a LOWER BOUND — we proceed but flag it
+    // so the rollover gate (condition b) blocks a potentially-shrunken backup publish until a
+    // >=k read re-establishes authority. Default true when NIP-60 is not configured (no relay
+    // reads → local wallet is authoritative by definition).
+    let nip60_read_authoritative;
+    let nip60_read_info;
     if let Some(store) = &nip60_store {
         let reconciled = store.reconcile_on_load_with_ids().await;
         let candidates = match reconciled {
-            Ok((candidates, ids)) => {
-                nip60_initial_live_ids = ids;
-                Ok(candidates)
+            Ok(read) => {
+                nip60_initial_live_ids = read.fetched_ids.clone();
+                nip60_read_authoritative = read.authoritative;
+                nip60_read_info = Some((read.served, read.total, read.read_k));
+                Ok(read.candidates)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                nip60_read_authoritative = false;
+                nip60_read_info = None;
+                Err(e)
+            }
         };
         let _restored =
             crate::nip60_reconcile::restore_from_relay_backup(candidates, wallet.as_ref()).await;
+    } else {
+        nip60_read_authoritative = true;
+        nip60_read_info = None;
     }
 
     // 4) Solvency check: the wallet must back every sat the counter believes it has. REFUSE
     //    TO BOOT on a shortfall (R2-5) — loud and safe — rather than letting the genome
     //    see repeated UPSTREAM_FAILED when the counter authorizes a think the wallet
     //    can't fund.
+    //    R2 condition (a): a below-quorum read is a LOWER BOUND; do not treat a thin wallet
+    //    balance as proven insolvency — proceed non-authoritatively (the rollover gate holds
+    //    until >=k re-establishes; die-when-broke fires on a real spend shortfall).
     let wallet_balance = wallet.total_balance().await.map(u64::from).unwrap_or(0);
-    assert_wallet_backs_counter(wallet_balance, treasury_remaining)?;
+    match solvency_gate(nip60_read_authoritative) {
+        SolvencyGate::Assert => assert_wallet_backs_counter(wallet_balance, treasury_remaining)?,
+        SolvencyGate::ProceedNonAuthoritative => {
+            let (served, total, read_k) = nip60_read_info.unwrap_or((0, 0, 0));
+            tracing::warn!(
+                served,
+                total,
+                read_k,
+                wallet_balance,
+                treasury_remaining,
+                "boot: restore below read-quorum ({served}/{total}, need {read_k}); \
+                 wallet {wallet_balance} vs counter {treasury_remaining} is a LOWER BOUND, \
+                 NOT treating as insolvent — proceeding non-authoritative, scheduling read-retry",
+            );
+            // boot PROCEEDS; read_established stays false => rollover gate (§4) holds.
+        }
+    }
 
     // 5) Publish the NIP-60 wallet-config (mints + the NUT-13 counters). ORDERED AFTER the
     //    with_counters seed at open (step 1) AND the restore-import (step 3), so the published

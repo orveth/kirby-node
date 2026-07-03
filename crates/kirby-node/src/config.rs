@@ -1040,6 +1040,12 @@ pub struct Nip60Config {
     /// non-empty (NIP-60 is opt-in).
     #[serde(default)]
     pub backup_flush_secs: Option<u64>,
+    /// The K-of-N READ threshold: a reconcile is AUTHORITATIVE only when this many DISTINCT
+    /// relays SERVED events. `None` => strict majority `floor(N/2)+1`, clamped `[1, N]`
+    /// (mirrors `write_k`). A below-quorum read is a LOWER-BOUND — never authoritative for a
+    /// death-relevant decision (solvency gate, rollover publish). Absent field = backcompat OK.
+    #[serde(default)]
+    pub read_k: Option<usize>,
 }
 
 /// The default NIP-60 backup flush cadence (seconds): how often the background flusher republishes
@@ -1102,12 +1108,16 @@ impl Nip60Durability {
 }
 
 impl Nip60Config {
-    /// Resolve the effective relay set + K-of-N threshold + durability verdict for a NON-EMPTY relay
-    /// set. NOTE: at BOOT an empty `[nip60].relays` means NIP-60 is OFF (opt-in — the wallet is
-    /// local-only), and boot never calls `resolve` in that case (see `build_routstr_brain`). The
-    /// empty→`fleet_relay` fallback below is a lower-level dev convenience ONLY, not the boot posture.
-    /// PURE (the caller emits [`Nip60Durability::warning`]), so it is unit-testable.
-    pub fn resolve(&self, fleet_relay: &str) -> (Vec<String>, usize, Nip60Durability) {
+    /// Resolve the effective relay set + write K-of-N + read K-of-N + durability verdict for a
+    /// NON-EMPTY relay set. NOTE: at BOOT an empty `[nip60].relays` means NIP-60 is OFF (opt-in —
+    /// the wallet is local-only), and boot never calls `resolve` in that case (see
+    /// `build_routstr_brain`). The empty→`fleet_relay` fallback below is a lower-level dev
+    /// convenience ONLY, not the boot posture. PURE (the caller emits
+    /// [`Nip60Durability::warning`]), so it is unit-testable.
+    ///
+    /// Returns `(relays, write_k, read_k, durability)`. `read_k` defaults to majority `n/2+1`
+    /// (mirrors `write_k`); N≤1 → read_k=1 (no dev/default behavior change); N=3 → read_k=2.
+    pub fn resolve(&self, fleet_relay: &str) -> (Vec<String>, usize, usize, Nip60Durability) {
         let relays = if self.relays.is_empty() {
             vec![fleet_relay.to_string()]
         } else {
@@ -1115,12 +1125,13 @@ impl Nip60Config {
         };
         let n = relays.len();
         let k = self.write_k.unwrap_or(n / 2 + 1).clamp(1, n);
+        let read_k = self.read_k.unwrap_or(n / 2 + 1).clamp(1, n);
         let durability = match n {
             0 | 1 => Nip60Durability::SingleRelayDevOnly,
             2 => Nip60Durability::BelowQuorum,
             _ => Nip60Durability::Quorum,
         };
-        (relays, k, durability)
+        (relays, k, read_k, durability)
     }
 }
 
@@ -1130,9 +1141,10 @@ mod nip60_config_tests {
 
     #[test]
     fn empty_relays_falls_back_to_single_fleet_relay_dev_only() {
-        let (relays, k, durability) = Nip60Config::default().resolve("ws://fleet:7777");
+        let (relays, k, read_k, durability) = Nip60Config::default().resolve("ws://fleet:7777");
         assert_eq!(relays, vec!["ws://fleet:7777".to_string()]);
         assert_eq!(k, 1);
+        assert_eq!(read_k, 1);
         assert_eq!(durability, Nip60Durability::SingleRelayDevOnly);
         assert!(
             durability.warning().is_some(),
@@ -1147,9 +1159,10 @@ mod nip60_config_tests {
             write_k: None,
             ..Default::default()
         };
-        let (relays, k, durability) = cfg.resolve("ws://fleet:7777");
+        let (relays, k, read_k, durability) = cfg.resolve("ws://fleet:7777");
         assert_eq!(relays.len(), 3, "configured relays override the fleet fallback");
         assert_eq!(k, 2, "default K = strict majority floor(3/2)+1");
+        assert_eq!(read_k, 2, "default read_k = strict majority floor(3/2)+1");
         assert_eq!(durability, Nip60Durability::Quorum);
         assert!(durability.warning().is_none(), "a >=3 quorum is money-durable, no warning");
     }
@@ -1167,24 +1180,24 @@ mod nip60_config_tests {
             relays: vec!["a".into()],
             ..Default::default()
         };
-        let (r1, k1, t1) = one.resolve("ws://fleet:7777");
-        assert_eq!((r1.len(), k1, t1), (1, 1, Nip60Durability::SingleRelayDevOnly));
+        let (r1, k1, rk1, t1) = one.resolve("ws://fleet:7777");
+        assert_eq!((r1.len(), k1, rk1, t1), (1, 1, 1, Nip60Durability::SingleRelayDevOnly));
 
         // n = 2: two explicit relays — BelowQuorum, majority k = 2.
         let two = Nip60Config {
             relays: vec!["a".into(), "b".into()],
             ..Default::default()
         };
-        let (r2, k2, t2) = two.resolve("ws://fleet:7777");
-        assert_eq!((r2.len(), k2, t2), (2, 2, Nip60Durability::BelowQuorum));
+        let (r2, k2, rk2, t2) = two.resolve("ws://fleet:7777");
+        assert_eq!((r2.len(), k2, rk2, t2), (2, 2, 2, Nip60Durability::BelowQuorum));
 
         // n = 3: three explicit relays — Quorum, majority k = 2.
         let three = Nip60Config {
             relays: vec!["a".into(), "b".into(), "c".into()],
             ..Default::default()
         };
-        let (r3, k3, t3) = three.resolve("ws://fleet:7777");
-        assert_eq!((r3.len(), k3, t3), (3, 2, Nip60Durability::Quorum));
+        let (r3, k3, rk3, t3) = three.resolve("ws://fleet:7777");
+        assert_eq!((r3.len(), k3, rk3, t3), (3, 2, 2, Nip60Durability::Quorum));
     }
 
     #[test]
@@ -1194,7 +1207,7 @@ mod nip60_config_tests {
             write_k: None,
             ..Default::default()
         };
-        let (_relays, k, durability) = cfg.resolve("ws://fleet:7777");
+        let (_relays, k, _read_k, durability) = cfg.resolve("ws://fleet:7777");
         assert_eq!(k, 2);
         assert_eq!(durability, Nip60Durability::BelowQuorum);
         assert!(durability.warning().is_some());
@@ -1207,7 +1220,7 @@ mod nip60_config_tests {
             write_k: Some(99),
             ..Default::default()
         };
-        let (_relays, k, _d) = cfg.resolve("ws://fleet:7777");
+        let (_relays, k, _read_k, _d) = cfg.resolve("ws://fleet:7777");
         assert_eq!(k, 3, "an over-large write_k clamps to N");
     }
 
