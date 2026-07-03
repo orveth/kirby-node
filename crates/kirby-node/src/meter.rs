@@ -636,6 +636,14 @@ impl Meter {
     pub fn treasury_remaining_best_effort(&self) -> u64 {
         self.treasury.remaining().unwrap_or(0)
     }
+
+    /// Best-effort total capability-act spend (Σ the debit ledger), for the total-burn runway
+    /// estimate (F0-C): the meter's `burned_sats` is rent only, but inference/egress/publish costs
+    /// debit the treasury directly. Read-only; a treasury read fault yields 0 so it never blocks
+    /// the meter tick.
+    pub fn capability_spent_best_effort(&self) -> u64 {
+        self.treasury.spent_sats().unwrap_or(0)
+    }
 }
 
 impl MeterSampleSource {
