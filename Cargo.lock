@@ -2642,6 +2642,7 @@ dependencies = [
  "kirby-custody",
  "kirby-proto",
  "libc",
+ "lightning-invoice",
  "nostr-sdk",
  "prost 0.13.5",
  "rand 0.9.4",
