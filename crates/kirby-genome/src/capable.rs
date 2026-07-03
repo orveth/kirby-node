@@ -60,6 +60,7 @@ use kirby_proto::{
 use prost::Message as _;
 
 use std::collections::{HashMap, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{boot_log, idle_forever, redial};
 use crate::metabolism::{
@@ -2604,20 +2605,221 @@ fn build_oracle_plan_prompt(
     ]
 }
 
-/// Build the O1 answer: a CANNED-price attestation stub, the stand-in for the live egress fetch
-/// (O2 replaces it with the real medianized quote + the full A.4 attestation). Labeled loudly as
-/// a stub so it can never be mistaken for a real quote.
-fn build_oracle_answer_stub(request: &OracleRequest, charge_id: &str) -> String {
+/// One O2 price feed (design §A.1): serves BTC/USD spot over plain GET JSON, well under the
+/// daemon's response cap, no auth. `extract` str-parses the price out of THIS feed's JSON shape
+/// (the genome is JSON-decoder-free, F5). The daemon's `[egress] host_allowlist` MUST include
+/// these hosts for the fetch to be permitted (deployment config); the SSRF floor holds regardless.
+struct OracleFeed {
+    source: &'static str,
+    url: &'static str,
+    extract: fn(&str) -> Option<f64>,
+}
+
+/// The MVP feed set (design §A.1). Three independent sources so one down/laggy feed cannot move
+/// the median. Adding a feed = one row here + its allowlist host; no other change.
+const ORACLE_FEEDS: [OracleFeed; 3] = [
+    OracleFeed {
+        source: "coinbase",
+        url: "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+        extract: extract_coinbase,
+    },
+    OracleFeed {
+        source: "kraken",
+        url: "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
+        extract: extract_kraken,
+    },
+    OracleFeed {
+        source: "coingecko",
+        url: "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+        extract: extract_coingecko,
+    },
+];
+
+/// coinbase `{"data":{"amount":"108000.00",...}}` -> the quoted `amount`, anchored under `data`.
+fn extract_coinbase(body: &str) -> Option<f64> {
+    let scope = body.split_once("\"data\"")?.1;
+    extract_quoted_number(scope, "\"amount\":\"")
+}
+
+/// kraken `{...,"result":{"XXBTZUSD":{...,"c":["108000.0","0.001"],...}}}` -> the first quoted
+/// element of `c` (the last-trade close), anchored under `result`.`XXBTZUSD`.
+fn extract_kraken(body: &str) -> Option<f64> {
+    let scope = body.split_once("\"result\"")?.1;
+    let scope = scope.split_once("\"XXBTZUSD\"")?.1;
+    extract_quoted_number(scope, "\"c\":[\"")
+}
+
+/// coingecko `{"bitcoin":{"usd":108000.5}}` -> the UNQUOTED `usd` number, anchored under `bitcoin`.
+fn extract_coingecko(body: &str) -> Option<f64> {
+    let scope = body.split_once("\"bitcoin\"")?.1;
+    extract_bare_number(scope, "\"usd\":")
+}
+
+/// Find `key` in `body`, then parse the QUOTED value immediately after it as a positive price
+/// (str-only, F5). `None` if the key is absent or the value is not positive+finite -- a shape
+/// change or bad read drops the source, it is NEVER medianized in as a real quote.
+fn extract_quoted_number(body: &str, key: &str) -> Option<f64> {
+    let after = body.split_once(key)?.1;
+    // Require a genuine CLOSING quote: a body cut off mid-value (`"amount":"108`) has no closing
+    // quote -> None, never a truncated-mantissa price (codex-2).
+    let quoted = after.split_once('"')?.0;
+    parse_positive_price(quoted)
+}
+
+/// Find `key`, then parse the BARE (unquoted) number after it (leading whitespace tolerated;
+/// digits and a single decimal point). `None` on absence / non-positive / non-finite.
+fn extract_bare_number(body: &str, key: &str) -> Option<f64> {
+    let after = body.split_once(key)?.1.trim_start();
+    let mut end = 0usize;
+    let mut seen_dot = false;
+    for (i, c) in after.char_indices() {
+        if c.is_ascii_digit() {
+            end = i + c.len_utf8();
+        } else if c == '.' && !seen_dot {
+            seen_dot = true;
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    // The char after the number MUST be a JSON value terminator -- never an exponent / letter /
+    // sign / second dot, so `"usd":1.08e5` is REJECTED (not truncated to 1.08) (codex-2).
+    let terminated = matches!(
+        after[end..].chars().next(),
+        None | Some(',') | Some('}') | Some(']') | Some(' ') | Some('\n') | Some('\r') | Some('\t')
+    );
+    if !terminated {
+        return None;
+    }
+    parse_positive_price(&after[..end])
+}
+
+/// Accept only a positive finite price; a 0 / negative / NaN / unparseable read yields `None`.
+fn parse_positive_price(s: &str) -> Option<f64> {
+    let v: f64 = s.trim().parse().ok()?;
+    (v.is_finite() && v > 0.0).then_some(v)
+}
+
+/// The median of the prices that answered (design §A.4): a single laggy/compromised feed cannot
+/// move a 3-source median. Even count -> the mean of the two middle values. `None` if empty.
+fn median_price(prices: &[f64]) -> Option<f64> {
+    if prices.is_empty() {
+        return None;
+    }
+    let mut sorted = prices.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    Some(if n % 2 == 1 { sorted[n / 2] } else { (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 })
+}
+
+/// Fetch ONE feed via the c-egress `http.fetch` door and return the RAW body (unlike
+/// [`execute_fetch`], which surfaces only a preview for the brain). A per-source idempotency key
+/// (`oracle-fetch-{seq}-{source}`) keeps the same-tick fetches from colliding -- a shared key
+/// would dedupe all but one to an empty DUPLICATE. Any non-2xx / bodyless / broke / denied /
+/// errored outcome -> `None` (that source is unreachable this tick; a broke fetch is a soft-skip,
+/// never death). The daemon guards the destination (host allowlist + SSRF floor); the genome
+/// never makes the request.
+async fn oracle_fetch<G: Gateway>(
+    gw: &mut G,
+    idempotency_key: &str,
+    url: &str,
+    max_cost_sats: u64,
+) -> Option<String> {
+    let req = build_oracle_fetch_request(idempotency_key, url, max_cost_sats);
+    let receipt = gw.call(req).await.ok()?;
+    match kirby_proto::Outcome::try_from(receipt.outcome).unwrap_or(kirby_proto::Outcome::Unspecified)
+    {
+        kirby_proto::Outcome::AuthorizedAndPerformed => {
+            let resp = receipt.http_response?;
+            // A usable price body is a COMPLETE 2xx: a non-2xx (or a 3xx returned as-is) is not,
+            // and a TRUNCATED body (hit the cap) is dropped -- a cut-off JSON could mis-parse to a
+            // wrong price (codex-1).
+            if (200..300).contains(&resp.status) && !resp.truncated {
+                Some(String::from_utf8_lossy(&resp.body).into_owned())
+            } else {
+                None
+            }
+        }
+        // DUPLICATE (no body re-served), broke, not-allowlisted, guard refusal, transport error.
+        _ => None,
+    }
+}
+
+/// Build an `http.fetch` Actuate with an EXPLICIT idempotency key. The oracle needs a DISTINCT key
+/// per source per tick; [`build_fetch_request`] hardcodes `capable-fetch-{seq}`, which would
+/// collide the 3 same-tick fetches. MVP: GET, no headers, daemon default caps.
+fn build_oracle_fetch_request(
+    idempotency_key: &str,
+    url: &str,
+    max_cost_sats: u64,
+) -> CapabilityRequest {
+    let payload = HttpFetch {
+        method: "GET".to_string(),
+        url: url.to_string(),
+        headers: Vec::new(),
+        max_response_bytes: 0,
+        timeout_ms: 0,
+    }
+    .encode_to_vec();
+    CapabilityRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        idempotency_key: idempotency_key.to_string(),
+        act: Some(Act::Actuate(Actuate {
+            kind: ACTUATE_KIND_HTTP_FETCH.to_string(),
+            payload,
+            max_cost_sats,
+        })),
+        budget_sats: max_cost_sats,
+    }
+}
+
+/// Build the O2 answer (design §A.4): fetch every feed, medianize the sources that answered, and
+/// render the attestation text. It NEVER fabricates a price -- an unreachable/unparseable source
+/// is dropped and the count stated honestly ("median of N of 3 sources"); zero sources yields an
+/// honest "unavailable" quote (the O3 late-retry/refund posture refines the zero case). The DM is
+/// signed daemon-side by the agent's social key (bound to the sovereign Q beacon, §A.4); this text
+/// is the payload.
+async fn build_oracle_answer<G: Gateway>(
+    gw: &mut G,
+    seq: u64,
+    request: &OracleRequest,
+    charge_id: &str,
+    params: &DiaristParams,
+) -> String {
     let pair = match request {
         OracleRequest::Price { pair, .. } => pair.as_str(),
         _ => "BTC/USD",
     };
+    let mut answered: Vec<(&'static str, f64)> = Vec::new();
+    for feed in ORACLE_FEEDS.iter() {
+        let key = format!("oracle-fetch-{seq}-{}", feed.source);
+        if let Some(body) = oracle_fetch(gw, &key, feed.url, params.memory_max_cost).await {
+            if let Some(price) = (feed.extract)(&body) {
+                answered.push((feed.source, price));
+            }
+        }
+    }
+    let fetched_unix =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let total = ORACLE_FEEDS.len();
+    let prices: Vec<f64> = answered.iter().map(|(_, p)| *p).collect();
+    let sources_line = if answered.is_empty() {
+        "(none reachable)".to_string()
+    } else {
+        answered.iter().map(|(s, p)| format!("{s}={p:.2}")).collect::<Vec<_>>().join(" ")
+    };
+    let answer_line = match median_price(&prices) {
+        Some(m) => format!("{m:.2} USD  (median of {} of {total} sources)", answered.len()),
+        None => format!("unavailable ({total} sources unreachable this tick)"),
+    };
     format!(
-        "KIRBY ORACLE ATTESTATION (O1 stub)\n\
-         query:  PRICE {pair}\n\
-         answer: 108000.00 USD  (CANNED STUB -- live egress fetch lands in O2)\n\
-         charge: {charge_id}\n\
-         note:   development stub, not a real quote."
+        "KIRBY ORACLE ATTESTATION\n\
+         query:   PRICE {pair}\n\
+         answer:  {answer_line}\n\
+         sources: {sources_line}\n\
+         fetched: {fetched_unix} (unix seconds, agent clock)\n\
+         charge:  {charge_id}\n\
+         note:    trusted-oracle attestation -- the agent fetched these values and vouches for them; NOT a trustless proof."
     )
 }
 
@@ -2632,6 +2834,11 @@ pub(super) struct PendingCharge {
     /// The QUOTED charge (sats). The answer is gated on the mint-verified settlement clearing
     /// this amount, so an underpayment never buys a full answer.
     amount_sats: u64,
+    /// The built attestation, cached once the fetch+medianize runs (codex-4). A DM-transport
+    /// Transient retries the SAME settlement; caching means the retry re-sends the IDENTICAL answer
+    /// instead of re-fetching (which would dedupe to empty bodies -> a degraded/inconsistent
+    /// answer). `None` until first built.
+    answer: Option<String>,
 }
 
 /// Poll the inbox for the OLDEST waiting DM or PAYMENT_SETTLED past `ack_seq` (non-blocking).
@@ -2739,9 +2946,9 @@ pub(super) async fn oracle_tick<G: Gateway>(
         }
         // Match the settlement to a charge WE issued and are still waiting on. Clone the fields so
         // the `pending` borrow ends before the mutable remove below.
-        let Some((sender, request, quoted)) = pending
+        let Some((sender, request, quoted, cached_answer)) = pending
             .get(&settled.charge_id)
-            .map(|pc| (pc.sender.clone(), pc.request.clone(), pc.amount_sats))
+            .map(|pc| (pc.sender.clone(), pc.request.clone(), pc.amount_sats, pc.answer.clone()))
         else {
             // Unmatched settlement (codex #2): already-answered / TTL-aged / reboot-lost (pending
             // is RAM-only, A.6). We cannot answer (we don't hold the job) and MVP does not
@@ -2786,8 +2993,19 @@ pub(super) async fn oracle_tick<G: Gateway>(
                 ),
             };
         }
-        // Paid in full: build the answer (O1 canned stub) and DM it to the seal-verified sender.
-        let answer = build_oracle_answer_stub(&request, &settled.charge_id);
+        // Paid in full: build the §A.4 attestation ONCE (fetch + medianize), cache it in the
+        // pending charge, and DM it. A later DM-transport retry reuses the cache -- no re-fetch
+        // (which would dedupe to empty bodies), and the customer gets the IDENTICAL answer (codex-4).
+        let answer = match cached_answer {
+            Some(a) => a,
+            None => {
+                let built = build_oracle_answer(gw, seq, &request, &settled.charge_id, params).await;
+                if let Some(pc) = pending.get_mut(&settled.charge_id) {
+                    pc.answer = Some(built.clone());
+                }
+                built
+            }
+        };
         match execute_dm_reply(gw, seq, &sender, &answer, params).await {
             // Transport error (the call never reached the daemon): do NOT consume, do NOT remove
             // -> retry the SAME settlement next tick (seq reused on Transient -> at-most-once dedupe).
@@ -2930,6 +3148,7 @@ pub(super) async fn oracle_tick<G: Gateway>(
                                 request: request.clone(),
                                 issued_seq: seq,
                                 amount_sats: amount,
+                                answer: None,
                             },
                         );
                         *inbox_ack_seq = ev.inbox_seq;
@@ -3674,6 +3893,153 @@ mod tests {
         // Tick 3: B's DM (seq 3) is now the oldest unconsumed -> charge B.
         oracle_tick(&mut gw, 3, &mut ack, &mut pending, &params, 1_000, 5).await;
         assert_eq!(gw.issue_charge_requests(), 2, "B's job is charged after A is answered");
+    }
+
+    /// TOOTH (O2): each feed extractor pulls the price from ITS JSON shape (str-only, F5); a
+    /// shape-changed / missing-key / non-positive body yields None (source dropped, never mis-read).
+    #[test]
+    fn oracle_o2_extractors_parse_each_feed_shape() {
+        assert_eq!(extract_coinbase(r#"{"data":{"amount":"108000.50","currency":"USD"}}"#), Some(108000.50));
+        assert_eq!(
+            extract_kraken(r#"{"error":[],"result":{"XXBTZUSD":{"a":["1"],"c":["108001.00","0.001"]}}}"#),
+            Some(108001.00)
+        );
+        assert_eq!(extract_coingecko(r#"{"bitcoin":{"usd":108002}}"#), Some(108002.0));
+        assert_eq!(extract_coinbase(r#"{"data":{"price":"1"}}"#), None, "missing key -> None");
+        assert_eq!(extract_kraken("not json at all"), None);
+        assert_eq!(extract_coingecko(r#"{"bitcoin":{"usd":0}}"#), None, "0 is not a valid price");
+        // codex-hardening: never turn a malformed/hostile body into a price.
+        assert_eq!(
+            extract_coingecko(r#"{"bitcoin":{"usd":1.08e5}}"#),
+            None,
+            "exponent notation is rejected, not truncated to 1.08 (codex-2)"
+        );
+        assert_eq!(
+            extract_coinbase(r#"{"data":{"amount":"108"#),
+            None,
+            "no closing quote (cut-off body) -> None, not a truncated-mantissa price (codex-2)"
+        );
+        assert_eq!(
+            extract_coinbase(r#"{"amount":"999.00"}"#),
+            None,
+            "a stray `amount` NOT under `data` is rejected (path-anchored, no injection) (codex-3)"
+        );
+        assert_eq!(
+            extract_coingecko(r#"{"usd":999}"#),
+            None,
+            "a stray `usd` NOT under `bitcoin` is rejected (path-anchored) (codex-3)"
+        );
+    }
+
+    /// TOOTH (O2, codex-1): a TRUNCATED feed body (hit the daemon cap) is DROPPED, never parsed --
+    /// a cut-off JSON could mis-parse to a wrong price. All sources truncated -> honest "unavailable".
+    #[tokio::test]
+    async fn oracle_o2_truncated_body_is_dropped_not_priced() {
+        let sender = dm_sender_hex(10);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &sender, "PRICE BTC/USD")
+            .with_payment_settled(2, &oracle_charge_id(1), 10);
+        // A WELL-FORMED body but flagged truncated: a valid extractor could read a price, yet O2
+        // must drop it (the cut-off is untrustworthy).
+        gw.fetch_response = Some(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: br#"{"data":{"amount":"100.00"},"result":{"XXBTZUSD":{"c":["101.00","0.1"]}},"bitcoin":{"usd":110}}"#.to_vec(),
+            truncated: true,
+            final_url: "https://api.coinbase.com/v2/prices/BTC-USD/spot".to_string(),
+        });
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        let out = oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(matches!(out, TickOutcome::Lived { action: Action::DmReply { .. }, .. }));
+        let answer = &gw.dm_replies[1].text;
+        assert!(answer.contains("unavailable"), "truncated bodies dropped -> unavailable: {answer}");
+        assert!(!answer.contains("median of"), "no median from truncated bodies: {answer}");
+    }
+
+    /// TOOTH (O2): the median is the MIDDLE of the answered prices (mean of the two middle for an
+    /// even count), order-independent. RED on returning the mean or the first instead.
+    #[test]
+    fn oracle_o2_median_of_answered_sources() {
+        assert_eq!(median_price(&[100.0, 101.0, 110.0]), Some(101.0), "middle, not the mean (103.67)");
+        assert_eq!(median_price(&[100.0, 104.0]), Some(102.0), "even: mean of the two middle");
+        assert_eq!(median_price(&[99.0]), Some(99.0));
+        assert_eq!(median_price(&[]), None);
+        assert_eq!(median_price(&[110.0, 100.0, 101.0]), Some(101.0), "order-independent");
+    }
+
+    /// TOOTH (O2, the wiring): a paid job fetches every feed, medianizes what answered, and DMs a
+    /// §A.4 attestation carrying the median + per-source prices + the charge_id. Also proves the 3
+    /// same-tick fetches use DISTINCT per-source idempotency keys — a shared key would dedupe all
+    /// but one to an empty body (a silent single-source "median"). RED on a broken median (the mean
+    /// of 100/101/110 = 103.67 ≠ 101) or a collided fetch key.
+    #[tokio::test]
+    async fn oracle_o2_fetch_medianize_attest_with_distinct_keys() {
+        let sender = dm_sender_hex(8);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &sender, "PRICE BTC/USD")
+            .with_payment_settled(2, &oracle_charge_id(1), 10);
+        // The mock serves ONE body for every http.fetch; make it carry all 3 feed shapes so each
+        // extractor parses its own field (coinbase=100, kraken=101, coingecko=110 -> median 101).
+        gw.fetch_response = Some(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: br#"{"data":{"amount":"100.00"},"result":{"XXBTZUSD":{"c":["101.00","0.1"]}},"bitcoin":{"usd":110}}"#.to_vec(),
+            truncated: false,
+            final_url: "https://api.coinbase.com/v2/prices/BTC-USD/spot".to_string(),
+        });
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await; // charge + invoice
+        let out = oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await; // settle -> fetch -> answer
+        assert!(matches!(out, TickOutcome::Lived { action: Action::DmReply { .. }, .. }), "answered, got {out:?}");
+
+        let answer = &gw.dm_replies[1].text;
+        assert!(answer.contains("KIRBY ORACLE ATTESTATION"), "attestation: {answer}");
+        assert!(answer.contains("median of 3 of 3 sources"), "all 3 parsed: {answer}");
+        assert!(answer.contains("101.00 USD"), "median of 100/101/110 = 101 (NOT the mean 103.67): {answer}");
+        assert!(
+            answer.contains("coinbase=100.00") && answer.contains("kraken=101.00") && answer.contains("coingecko=110.00"),
+            "per-source prices shown: {answer}"
+        );
+        assert!(answer.contains(&oracle_charge_id(1)), "attestation carries the charge_id: {answer}");
+
+        let fetch_keys: Vec<String> = gw
+            .requests
+            .iter()
+            .filter(|r| matches!(&r.act, Some(Act::Actuate(a)) if a.kind == ACTUATE_KIND_HTTP_FETCH))
+            .map(|r| r.idempotency_key.clone())
+            .collect();
+        assert_eq!(fetch_keys.len(), 3, "one fetch per feed: {fetch_keys:?}");
+        let distinct: std::collections::HashSet<&String> = fetch_keys.iter().collect();
+        assert_eq!(distinct.len(), 3, "DISTINCT per-source keys (no dedup collision): {fetch_keys:?}");
+    }
+
+    /// TOOTH (O2): with NO source reachable (every fetch bodyless), the answer is an honest
+    /// "unavailable" — never a fabricated price and never a median claim. RED on emitting a price
+    /// or a "median of" claim when zero sources answered.
+    #[tokio::test]
+    async fn oracle_o2_zero_sources_never_fabricates_a_price() {
+        let sender = dm_sender_hex(9);
+        let params = test_params();
+        // fetch_response defaults to None -> every http.fetch is performed-but-bodyless -> 0 sources.
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &sender, "PRICE BTC/USD")
+            .with_payment_settled(2, &oracle_charge_id(1), 10);
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        let out = oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(matches!(out, TickOutcome::Lived { action: Action::DmReply { .. }, .. }));
+        let answer = &gw.dm_replies[1].text;
+        assert!(answer.contains("KIRBY ORACLE ATTESTATION"), "still a signed attestation: {answer}");
+        assert!(answer.contains("unavailable"), "0 sources -> honest unavailable: {answer}");
+        assert!(!answer.contains("median of"), "NO median claim with 0 sources: {answer}");
     }
 
     // ---- NIP-17 DM arm (task #12): busy-flag one-at-a-time + reply-to-the-seal-verified-sender ----
