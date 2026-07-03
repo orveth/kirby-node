@@ -282,8 +282,9 @@ async fn paid_quote_settle_mints_and_credits_the_verified_amount() {
 //       it would have failed, not credited);
 //   (c) no proof loss — the wallet balance equals the minted amount throughout.
 //
-// RECOVERY MECHANISM PINNED: this is the ISSUED-branch credit (return amount_issued for the
-// idempotent credit), NOT reconcile_to_observed / NIP-60 restore. NIP-60 is portability-only
+// RECOVERY MECHANISM PINNED: this is the ISSUED-branch credit — sum the still-Unspent proofs the
+// wallet holds for the quote (via its durable Incoming Transaction) and credit THAT, NEVER the
+// mint-claimed amount_issued — NOT reconcile_to_observed / NIP-60 restore. NIP-60 is portability-only
 // and downstream (a background snapshot of the wallet's unspent set); it plays no part in this
 // same-process crash-window recovery, and this increment does not wire it. The proof is below:
 // reverting ONLY the ISSUED branch breaks recovery even with everything else intact.
@@ -341,8 +342,9 @@ async fn issued_quote_recovers_the_orphaned_mint() {
     let wallet_after_mint: u64 = wallet.total_balance().await.expect("balance").into();
     assert_eq!(wallet_after_mint, 300, "the minted proofs are in the wallet pre-retry");
 
-    // THE RETRY: settle the charge. verify_settlement sees ISSUED → returns amount_issued (no
-    // re-mint) → the treasury is credited idempotently.
+    // THE RETRY: settle the charge. verify_settlement sees ISSUED → sums the still-Unspent proofs
+    // held for the quote and returns THAT (here == the minted 300; none were spent — never
+    // amount_issued), no re-mint → the treasury is credited idempotently.
     let (svc, _queue) = lightning_gateway(0, wallet.clone());
     assert_eq!(svc.treasury_remaining().unwrap(), 0, "treasury empty before the retry");
 
