@@ -363,6 +363,66 @@ impl Nip60Transport for ClientTransport {
             .map_err(|e| anyhow::anyhow!("fetch NIP-60 events: {e}"))?;
         Ok(events.into_iter().collect())
     }
+
+    /// Per-relay read against the PRODUCTION relay pool.
+    ///
+    /// Fan-out across every READ-capable relay concurrently.  Down / half-open
+    /// relays are caught in two layers:
+    ///   1. Cheap status precheck (one atomic load) — skips obviously-dead relays
+    ///      at ~0ns without touching the socket.
+    ///   2. Outer `tokio::time::timeout(guard, …)` — ensures a deaf socket can
+    ///      never stall the whole tally beyond `timeout + 500ms`.
+    ///
+    /// Served classification: `Ok(events)` (including an EOSE'd empty set) counts
+    /// as served; `Err` or elapsed counts as not-served.  Dedup is by event id so
+    /// the union returned to the caller contains no duplicates.
+    async fn fetch_events_per_relay(
+        &self,
+        filter: Filter,
+        timeout: Duration,
+    ) -> anyhow::Result<PerRelayRead> {
+        // READ-capable relays = the quorum denominator.
+        let relays = self
+            .client
+            .pool()
+            .relays_with_flag(RelayServiceFlags::READ, FlagCheck::All)
+            .await; // HashMap<RelayUrl, Relay>
+        let total = relays.len();
+        // Down/half-open relays do NOT err fast — they ride the full timeout
+        // (the #103 deaf-socket problem).  Defences: cheap status precheck (1
+        // atomic load) + defensive outer timeout + full concurrency (join_all).
+        let guard = timeout + std::time::Duration::from_millis(500);
+        let reads = relays.into_values().map(|relay| {
+            let filter = filter.clone();
+            async move {
+                if !relay.is_connected() {
+                    return None; // down → not-served, ~0ns
+                }
+                match tokio::time::timeout(
+                    guard,
+                    relay.fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE),
+                )
+                .await
+                {
+                    Ok(Ok(events)) => Some(events.into_iter().collect::<Vec<Event>>()), // served
+                    _ => None, // Err / elapsed → not-served
+                }
+            }
+        });
+        let results = futures::future::join_all(reads).await;
+        let mut served = 0usize;
+        let mut seen = std::collections::HashSet::new();
+        let mut events = Vec::new();
+        for evs in results.into_iter().flatten() {
+            served += 1;
+            for e in evs {
+                if seen.insert(e.id) {
+                    events.push(e);
+                }
+            }
+        }
+        Ok(PerRelayRead { served, total, events })
+    }
 }
 
 /// The result of a load-time reconcile (returned by [`Nip60Store::reconcile_on_load_with_ids`]).
