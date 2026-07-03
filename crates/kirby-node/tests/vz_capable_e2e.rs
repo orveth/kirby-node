@@ -129,6 +129,7 @@ async fn chunk_e_vz_boots_gateways_meters_capable_run_and_halts_when_broke() {
         snapshot_capable: false,
         restore_checkpoint: None,
         lease_fence: None,
+        egress: None,
     };
 
     let config = MeteredRunConfig {

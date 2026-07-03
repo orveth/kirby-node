@@ -93,8 +93,9 @@ pub fn destination(act: &Act) -> String {
 
 /// Extract the host from a URL for allowlist matching. Best-effort: takes the
 /// authority between "scheme://" and the next "/" (or "?"), dropping any
-/// userinfo and port. A URL with no scheme is treated as host-only.
-fn host_of(url: &str) -> String {
+/// userinfo and port. A URL with no scheme is treated as host-only. `pub(crate)` so
+/// `run_agent` can derive the C-EGRESS refused-host set (relay/mint/node) from the same parse.
+pub(crate) fn host_of(url: &str) -> String {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let authority = after_scheme
         .split(['/', '?', '#'])
@@ -162,6 +163,12 @@ pub enum RailOutcome {
         actual_cost: u64,
         proof: Vec<u8>,
         completion: Vec<u8>,
+        /// C-EGRESS: the typed HTTP response for an `http.fetch` act, plumbed into
+        /// `CapabilityReceipt.http_response` (the brain needs the body back to keep thinking, the
+        /// same reason `completion` rides back). `None` for every other act. NOT persisted in the
+        /// ledger (a safe/idempotent GET re-fetches on a replay), so it never rides a
+        /// DUPLICATE_IGNORED receipt.
+        http_response: Option<kirby_proto::HttpResponse>,
     },
     /// The upstream rail failed; nothing was spent (the gateway debits 0 and
     /// returns UPSTREAM_FAILED).
@@ -184,6 +191,15 @@ pub trait Rail: Send + Sync {
     /// capped actual cost and the rail receipt. MUST NOT spend more than
     /// `cap_sats` regardless of the rail's natural cost.
     async fn perform(&self, act: &Act, cap_sats: u64) -> RailOutcome;
+
+    /// Whether an `Act::Actuate`'s cost is EXACT (`true` => reserve-before-perform) or a worst-case
+    /// UPPER BOUND (`false` => perform-then-debit-actual). `CompositeRail` delegates to the
+    /// actuator's `cost_is_exact`; the default `true` keeps every other rail on the existing
+    /// reserve-before-perform path. See `Gateway::authorize_actuate` for why a variable-cost kind
+    /// (HTTP egress) cannot reserve the worst case on a debit-only (no-refund) ledger.
+    fn actuate_cost_is_exact(&self, _act: &Act) -> bool {
+        true
+    }
 
     /// Pre-perform validation for an OUTWARD act (the actuator path), run BEFORE the gateway
     /// RESERVES/debits the idempotency key, so a malformed outward payload is a FREE denial (never
@@ -284,7 +300,7 @@ impl Rail for MockRail {
         // The mock is not a brain; a Completion on it carries no reply text (a
         // brain-mode run uses CompositeRail, which routes Completion to the
         // BrainBackend, never to this mock base).
-        RailOutcome::Performed { actual_cost, proof, completion: Vec::new() }
+        RailOutcome::Performed { actual_cost, proof, completion: Vec::new(), http_response: None }
     }
 }
 
@@ -487,7 +503,7 @@ impl Rail for CdkEcashRail {
                     spent = actual_cost,
                     "brokered act PERFORMED: settled ecash on the local mint over host networking (receipt = mint preimage)"
                 );
-                RailOutcome::Performed { actual_cost, proof: preimage, completion: Vec::new() }
+                RailOutcome::Performed { actual_cost, proof: preimage, completion: Vec::new(), http_response: None }
             }
             Err(e) => {
                 tracing::error!(error = %e, "brokered ecash settle failed upstream; debiting nothing");
@@ -656,7 +672,7 @@ impl Rail for CompositeRail {
                         completion.len()
                     )
                     .into_bytes();
-                    RailOutcome::Performed { actual_cost, proof, completion }
+                    RailOutcome::Performed { actual_cost, proof, completion, http_response: None }
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "brain backend failed to complete; debiting nothing");
@@ -701,6 +717,20 @@ impl Rail for CompositeRail {
                 None => Err("CompositeRail has no actuator configured for an Actuate".to_string()),
             },
             _ => Ok(()),
+        }
+    }
+
+    /// Delegate the reserve-vs-debit-actual decision to the actuator serving this kind: a fixed-cost
+    /// Nostr publish is exact (reserve-before-perform); a variable-cost HTTP fetch is not (perform-
+    /// then-debit-actual). No actuator / non-Actuate => the safe default (exact).
+    fn actuate_cost_is_exact(&self, act: &Act) -> bool {
+        match act {
+            Act::Actuate(a) => self
+                .actuator
+                .as_ref()
+                .map(|actuator| actuator.cost_is_exact(&a.kind))
+                .unwrap_or(true),
+            _ => true,
         }
     }
 }
@@ -773,6 +803,16 @@ pub trait Actuator: Send + Sync {
     /// write) so the agent cannot spam the world for free. A kind this actuator does not serve
     /// returns `u64::MAX`, so the gateway budget gate refuses it OVER_BUDGET (fail-closed).
     fn cost(&self, kind: &str) -> u64;
+    /// Whether `cost(kind)` is the EXACT host cost (`true`) or a worst-case UPPER BOUND (`false`).
+    /// Default `true`: a fixed-cost, non-idempotent actuator (a Nostr publish) is RESERVED
+    /// (recorded + debited) BEFORE performing, giving at-most-once on the outward effect. A
+    /// variable-cost, idempotent actuator (HTTP `http.fetch`, whose true cost is unknown until the
+    /// response body is read) returns `false`, so the gateway gates on the worst case then debits
+    /// the ACTUAL after performing — a debit-only ledger cannot refund a worst-case reservation
+    /// down to the actual. See `Gateway::authorize_actuate`.
+    fn cost_is_exact(&self, _kind: &str) -> bool {
+        true
+    }
     /// Validate the payload for `kind` WITHOUT performing the side effect (decode + kind-restrict +
     /// re-sanitize). The gateway calls this BEFORE it reserves/debits the idempotency key, so a
     /// malformed outward payload is a FREE denial (never charged). `Err(reason)` refuses; `Ok(())`
@@ -783,6 +823,68 @@ pub trait Actuator: Send + Sync {
     /// (D-20). A bad payload / disallowed kind / publish failure returns `UpstreamFailed` (the act
     /// did not happen, debit 0).
     async fn actuate(&self, kind: &str, payload: &[u8], cap_sats: u64) -> RailOutcome;
+}
+
+/// A kind-router that composes several [`Actuator`]s into ONE, dispatching each `kind` to the
+/// sub-actuator that serves it. This is how the daemon attaches BOTH the Nostr actuator (the
+/// `nostr.*` kinds, holding the DM/publish key material) AND the HTTP egress actuator (the
+/// `http.fetch` kind, holding a reqwest client) on the ONE `CompositeRail` actuator slot WITHOUT
+/// co-habiting their state in a single struct — each sub-actuator keeps its own guards + any
+/// credentials ("a new entry point needs its own guards"; the egress client and the DM/publish
+/// keys must never share a struct). A kind no sub-actuator serves is refused (fail-closed), exactly
+/// as a lone actuator refuses an unknown kind.
+pub struct CompositeActuator {
+    nostr: Option<Arc<dyn Actuator>>,
+    egress: Option<Arc<dyn Actuator>>,
+}
+
+impl CompositeActuator {
+    pub fn new(nostr: Option<Arc<dyn Actuator>>, egress: Option<Arc<dyn Actuator>>) -> Self {
+        CompositeActuator { nostr, egress }
+    }
+
+    /// Route a kind to the sub-actuator that serves it: `nostr.*` -> the Nostr actuator, `http.fetch`
+    /// -> the egress actuator. `None` for an unserved kind (or a sub-actuator not configured).
+    fn route(&self, kind: &str) -> Option<&Arc<dyn Actuator>> {
+        match kind {
+            kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH | kirby_proto::ACTUATE_KIND_NOSTR_DM_REPLY => {
+                self.nostr.as_ref()
+            }
+            kirby_proto::ACTUATE_KIND_HTTP_FETCH => self.egress.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Actuator for CompositeActuator {
+    fn cost(&self, kind: &str) -> u64 {
+        // An unserved kind is u64::MAX (fail-closed OVER_BUDGET), same as a lone actuator.
+        self.route(kind).map(|a| a.cost(kind)).unwrap_or(u64::MAX)
+    }
+
+    fn cost_is_exact(&self, kind: &str) -> bool {
+        // Route to the serving sub-actuator; an unserved kind uses the safe default (exact =
+        // reserve-before-perform). This never gates a real spend (cost() already refused the kind).
+        self.route(kind).map(|a| a.cost_is_exact(kind)).unwrap_or(true)
+    }
+
+    fn validate(&self, kind: &str, payload: &[u8]) -> Result<(), String> {
+        match self.route(kind) {
+            Some(a) => a.validate(kind, payload),
+            None => Err(format!("no actuator serves the kind {kind:?}")),
+        }
+    }
+
+    async fn actuate(&self, kind: &str, payload: &[u8], cap_sats: u64) -> RailOutcome {
+        match self.route(kind) {
+            Some(a) => a.actuate(kind, payload, cap_sats).await,
+            None => {
+                tracing::warn!(kind, "CompositeActuator: no sub-actuator serves this kind; refusing (fail-closed)");
+                RailOutcome::UpstreamFailed
+            }
+        }
+    }
 }
 
 /// How the actuator signs the note it publishes (the S3c fork):
@@ -1159,7 +1261,7 @@ impl Actuator for NostrActuator {
                     Ok(event_id) => {
                         tracing::info!(event_id = %event_id, "published a kind:1 note (the agent's outward voice)");
                         let actual_cost = self.cost_sats.min(cap_sats);
-                        RailOutcome::Performed { actual_cost, proof: event_id.into_bytes(), completion: Vec::new() }
+                        RailOutcome::Performed { actual_cost, proof: event_id.into_bytes(), completion: Vec::new(), http_response: None }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "nostr.publish failed to reach the relay; debiting nothing");
@@ -1182,7 +1284,7 @@ impl Actuator for NostrActuator {
                     Ok(event_id) => {
                         tracing::info!(event_id = %event_id, recipient = %to.to_hex(), "published a NIP-17 DM reply (the agent's private voice)");
                         let actual_cost = self.cost_sats.min(cap_sats);
-                        RailOutcome::Performed { actual_cost, proof: event_id.into_bytes(), completion: Vec::new() }
+                        RailOutcome::Performed { actual_cost, proof: event_id.into_bytes(), completion: Vec::new(), http_response: None }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "nostr.dm_reply failed to reach the relay; debiting nothing");

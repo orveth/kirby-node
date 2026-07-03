@@ -386,6 +386,7 @@ fn assert_no_credential_on_the_wire() {
         // request STRING the genome hands a customer -- an invoice to be paid, never a
         // credential to spend. The wallet that settles it lives only host-side.
         charge: None,
+        http_response: None,
     };
     let CapabilityReceipt {
         schema_version: _,
@@ -396,6 +397,7 @@ fn assert_no_credential_on_the_wire() {
         completion: _,
         memory: _,
         charge: _,
+        ..
     } = &receipt;
 }
 

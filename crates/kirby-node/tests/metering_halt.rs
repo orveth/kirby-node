@@ -77,6 +77,7 @@ async fn g2_meters_and_halts_on_budget() {
         snapshot_capable: false,
         restore_checkpoint: None,
         lease_fence: None,
+        egress: None,
     };
 
     let config = MeteredRunConfig {

@@ -640,6 +640,9 @@ impl GatewayService {
                 actual_cost,
                 proof,
                 completion,
+                // The generic path performs no Actuate (an Actuate forks to `authorize_actuate`
+                // before STEP3), so `http_response` is always absent here.
+                ..
             } => (actual_cost, proof, completion),
             RailOutcome::UpstreamFailed => {
                 // The act did not happen; debit nothing.
@@ -897,7 +900,10 @@ impl GatewayService {
             );
             return Ok(denied(Outcome::UpstreamFailed, remaining));
         }
-        // 2. FIXED host cost + ceiling gate (MED: deny over EITHER ceiling, NEVER clamp down).
+        // 2. WORST-CASE cost + ceiling gate (MED: deny over EITHER ceiling, NEVER clamp down, so a
+        //    hostile `max_cost_sats` cannot free/under-charge a variable-cost kind). For a fixed-
+        //    cost actuator `estimate` IS the exact cost; for a variable-cost actuator (HTTP egress)
+        //    it is the worst case — finite + pre-authorizable BECAUSE the response is capped (D-20).
         let estimate = self.rail.estimate(act);
         if estimate > a.max_cost_sats || estimate > req.budget_sats {
             return Ok(denied(Outcome::DeniedOverBudget, remaining));
@@ -905,50 +911,102 @@ impl GatewayService {
         if estimate > remaining {
             return Ok(denied(Outcome::DeniedInsufficientTreasury, remaining));
         }
-        // 3. RESERVE (record + debit) BEFORE the publish (HIGH: record-then-publish). A concurrent
-        //    or same-session-retry same-key sees this reservation at STEP1/in-txn and dedupes ->
-        //    at-most-once publish. The reserved record carries an EMPTY proof (the event id is not
-        //    known until the publish below); a resume replay returns the note as already-published.
-        let (cost_sats, post_remaining) = match self.treasury.debit_and_record(
-            &req.idempotency_key,
-            estimate,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )? {
-            DebitOutcome::Debited { cost_sats, remaining } => (cost_sats, remaining),
-            // Already reserved/performed (concurrent or replay): return the stored receipt and
-            // publish NOTHING. This is the dedupe that makes the retry at-most-once.
-            DebitOutcome::Duplicate(prior) => {
-                return Ok(receipt(
+
+        // 3. BRANCH on the actuator's cost semantics (the generalized fork):
+        if self.rail.actuate_cost_is_exact(act) {
+            // FIXED-cost + NON-idempotent (a Nostr publish): RESERVE (record + debit) BEFORE the
+            // publish (record-then-publish). A concurrent or same-session-retry same-key sees this
+            // reservation at STEP1/in-txn and dedupes -> AT-MOST-ONCE on the outward publish. The
+            // reserved record carries an EMPTY proof (the event id is not known until the publish);
+            // a resume replay returns the note as already-published.
+            let (cost_sats, post_remaining) = match self.treasury.debit_and_record(
+                &req.idempotency_key,
+                estimate,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )? {
+                DebitOutcome::Debited { cost_sats, remaining } => (cost_sats, remaining),
+                DebitOutcome::Duplicate(prior) => {
+                    return Ok(receipt(
+                        Outcome::DuplicateIgnored,
+                        prior.cost_sats,
+                        prior.treasury_remaining_after,
+                        prior.proof,
+                        prior.completion,
+                        None,
+                    ));
+                }
+                DebitOutcome::Insufficient { remaining } => {
+                    return Ok(denied(Outcome::DeniedInsufficientTreasury, remaining));
+                }
+            };
+            // PUBLISH. The actual spend is capped at the estimate (D-20); for a fixed-cost actuator
+            // it equals `cost_sats` (the reserved amount).
+            match self.rail.perform(act, estimate).await {
+                RailOutcome::Performed { proof, .. } => Ok(receipt(
+                    Outcome::AuthorizedAndPerformed,
+                    cost_sats,
+                    post_remaining,
+                    proof,
+                    Vec::new(),
+                    None,
+                )),
+                RailOutcome::UpstreamFailed => {
+                    // Publish failed AFTER the reserve+debit: the key STAYS recorded (a retry
+                    // dedupes -> never republishes) and the fixed cost STAYS debited (no refund).
+                    Ok(receipt(Outcome::UpstreamFailed, cost_sats, post_remaining, Vec::new(), Vec::new(), None))
+                }
+            }
+        } else {
+            // VARIABLE-cost + IDEMPOTENT (HTTP `http.fetch`, GET/HEAD): PERFORM first, then debit
+            // the ACTUAL (<= the worst-case estimate). A debit-only ledger has NO refund, so a
+            // worst-case reservation could not be settled DOWN to the actual — hence we do NOT
+            // pre-reserve; we gated on the worst case above, perform, then debit the actual
+            // atomically-with-recording (the brain's proven variable-cost pattern). Never-overspend
+            // holds: actual <= estimate <= budget <= treasury (D-9/D-20). A GET/HEAD is safe, so the
+            // bounded, documented at-most-once-minus window (a lost response after perform, before
+            // the record commits) is a harmless re-fetch — identical to the brain's completion
+            // window, NOT a double-publish.
+            let (actual_cost, proof, http_response) = match self.rail.perform(act, estimate).await {
+                RailOutcome::Performed { actual_cost, proof, http_response, .. } => {
+                    (actual_cost, proof, http_response)
+                }
+                RailOutcome::UpstreamFailed => {
+                    // The fetch did not happen (guard refusal / SSRF floor / rate limit / transport
+                    // failure); debit nothing.
+                    return Ok(denied(Outcome::UpstreamFailed, remaining));
+                }
+            };
+            match self.treasury.debit_and_record(
+                &req.idempotency_key,
+                actual_cost,
+                proof.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )? {
+                DebitOutcome::Debited { cost_sats, remaining } => Ok(CapabilityReceipt {
+                    http_response,
+                    ..receipt(Outcome::AuthorizedAndPerformed, cost_sats, remaining, proof, Vec::new(), None)
+                }),
+                // A concurrent same-key request performed this key first: return its stored receipt.
+                // The response body is NOT persisted in the ledger, so it is absent on the replay (a
+                // safe/idempotent GET re-fetches under a fresh key to see the body again).
+                DebitOutcome::Duplicate(prior) => Ok(receipt(
                     Outcome::DuplicateIgnored,
                     prior.cost_sats,
                     prior.treasury_remaining_after,
                     prior.proof,
                     prior.completion,
                     None,
-                ));
-            }
-            // Defense-in-depth: the treasury gate above already refused, so this is unreachable
-            // unless an invariant broke. Debit nothing.
-            DebitOutcome::Insufficient { remaining } => {
-                return Ok(denied(Outcome::DeniedInsufficientTreasury, remaining));
-            }
-        };
-        // 4. PUBLISH (the network side effect). The actual spend is capped at the estimate (D-20);
-        //    for a fixed-cost actuator it equals `cost_sats` (the reserved amount).
-        match self.rail.perform(act, estimate).await {
-            RailOutcome::Performed { proof, .. } => {
-                // Published. The reserved record holds an empty proof; the LIVE receipt carries the
-                // real event id (a future finalize() could persist it for replay fidelity).
-                Ok(receipt(Outcome::AuthorizedAndPerformed, cost_sats, post_remaining, proof, Vec::new(), None))
-            }
-            RailOutcome::UpstreamFailed => {
-                // The publish failed AFTER the reserve+debit (residual (a)): the key STAYS recorded
-                // (a retry of THIS key dedupes -> never republishes) and the fixed cost STAYS
-                // debited (the debit-only ledger has no refund). The genome advances to a new key.
-                Ok(receipt(Outcome::UpstreamFailed, cost_sats, post_remaining, Vec::new(), Vec::new(), None))
+                )),
+                // Defense-in-depth: the worst-case gate already refused over-treasury spends, and
+                // the actual is <= that worst case, so this is unreachable unless an invariant broke.
+                DebitOutcome::Insufficient { remaining } => {
+                    Ok(denied(Outcome::DeniedInsufficientTreasury, remaining))
+                }
             }
         }
     }
@@ -1016,6 +1074,7 @@ impl GatewayService {
                 completion: Vec::new(),
                 memory: None,
                 charge: Some(charge),
+                http_response: None,
             }),
             // Concurrent same-key: the stored ChargeIssued is in proof.
             DebitOutcome::Duplicate(prior) => Ok(CapabilityReceipt {
@@ -1027,6 +1086,7 @@ impl GatewayService {
                 completion: Vec::new(),
                 memory: None,
                 charge: ChargeIssued::decode(prior.proof.as_slice()).ok(),
+                http_response: None,
             }),
             // Unreachable (cost=0 can't go insufficient), but surfaced cleanly.
             DebitOutcome::Insufficient { remaining } => {
@@ -1459,6 +1519,9 @@ fn receipt(
         completion,
         memory,
         charge: None,
+        // Set explicitly (via `CapabilityReceipt { http_response, ..receipt(...) }`) only on the
+        // C-EGRESS variable-cost path; None everywhere else.
+        http_response: None,
     }
 }
 

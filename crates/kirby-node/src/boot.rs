@@ -112,6 +112,12 @@ pub struct BootConfig {
     /// attaches it to the `CompositeRail` (`with_actuator`), so an `Act::Actuate` is signed +
     /// published daemon-side. `None` for every other workload, so the rail performs ZERO publishes.
     pub social: Option<crate::config::SocialConfig>,
+    /// The C-EGRESS policy (the `http.fetch` actuator). `Some` ONLY when `[egress] enabled` for the
+    /// capable workload: `boot_and_observe` builds an `HttpEgressActuator` from it and composes it
+    /// ALONGSIDE the `NostrActuator` (a kind-router), so an `Act::Actuate{http.fetch}` is guarded +
+    /// performed daemon-side behind the SSRF floor. `None` (the default, deny-by-default) => the
+    /// `http.fetch` token is not granted and the rail performs ZERO fetches.
+    pub egress: Option<crate::egress::EgressPolicy>,
     /// The `[nip60]` wallet-backup config (relays + write quorum). NIP-60 is OPT-IN: with an empty
     /// relay set, `build_routstr_brain` wires NO Nip60Store and the wallet opens exactly as before;
     /// when relays are configured it connects a store, seeds the NUT-13 counter floor from the
@@ -365,12 +371,30 @@ async fn open_treasury_retrying(
 pub async fn boot_and_observe(
     config: BootConfig,
 ) -> anyhow::Result<(Box<dyn SandboxInstance>, BootOutcome, Treasury, EventStream, ServeGuard)> {
-    // The outward actuator (the agent's voice): built once if the workload configured it (the
-    // capable workload, `config.social = Some`), then attached to the CompositeRail below. None
-    // for every other workload, so the rail performs ZERO publishes.
-    let actuator: Option<Arc<dyn Actuator>> = match &config.social {
+    // The outward actuators (the agent's voice + its reach). Built once if the workload configured
+    // them (the capable workload), then attached to the CompositeRail below. None for every other
+    // workload, so the rail performs ZERO outward acts.
+    //
+    // The Nostr actuator (the `nostr.*` kinds) holds the DM/publish key material; the HTTP egress
+    // actuator (the `http.fetch` kind) holds a reqwest client + the SSRF policy and NO key material.
+    // They are SEPARATE structs — composed by a kind-router when both are present — so the egress
+    // client and the DM/publish keys never co-habit ("a new entry point needs its own guards").
+    let nostr_actuator: Option<Arc<dyn Actuator>> = match &config.social {
         Some(social) => Some(build_nostr_actuator(social).await?),
         None => None,
+    };
+    // Deny-by-default: `config.egress` is `Some` ONLY when `[egress] enabled` (set in run_agent).
+    let egress_actuator: Option<Arc<dyn Actuator>> = config.egress.as_ref().map(|policy| {
+        Arc::new(crate::egress::HttpEgressActuator::new(policy.clone())) as Arc<dyn Actuator>
+    });
+    let actuator: Option<Arc<dyn Actuator>> = match egress_actuator {
+        // No egress door: the Nostr actuator alone (or None) — byte-identical to pre-egress.
+        None => nostr_actuator,
+        // Egress enabled: a kind-router routes `http.fetch` -> egress and `nostr.*` -> nostr.
+        Some(egress) => Some(Arc::new(crate::rail::CompositeActuator::new(
+            nostr_actuator,
+            Some(egress),
+        ))),
     };
     let rail: Arc<dyn Rail> = match &config.brain {
         // The REAL brain (brain-routstr): a CompositeRail whose brain is a RoutstrBrain

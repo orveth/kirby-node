@@ -87,6 +87,7 @@ fn bootstrap_config(test: &str, image_dir: PathBuf, funding_sats: u64) -> KirbyC
         // would otherwise write the treasury under the durable default; tests stay sandboxed).
         state_root: Some(state),
         max_run_secs: None,
+        egress: kirby_node::config::EgressConfig::default(),
     }
 }
 

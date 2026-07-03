@@ -67,6 +67,13 @@ pub struct KirbyConfig {
     /// Used only when `workload = "capable"`; defaults so a bare `[memory]` (or none) runs.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// The `[egress]` knobs for the capable agent's OUTWARD HTTP fetch (C-EGRESS, the `http.fetch`
+    /// Actuate kind). DEFAULT-OFF (`enabled=false` + empty `host_allowlist`): the highest-blast-
+    /// radius door on the roadmap ships deny-by-default, and the `http.fetch` allowlist token is
+    /// granted ONLY when `enabled`. The non-relaxable SSRF floor holds even when a host IS
+    /// allowlisted (it is enforced structurally in the actuator, not by any config knob).
+    #[serde(default)]
+    pub egress: EgressConfig,
     /// The `[nip60]` knobs for the agent's PORTABLE Cashu wallet (proofs as NIP-44-encrypted
     /// events on relays, for cross-machine money-continuity). DEDICATED + independent of
     /// `[memory]`: money durability must not be coupled to the mind-state relay set. Defaults so
@@ -929,6 +936,87 @@ impl Default for MemoryConfig {
     }
 }
 
+/// The `[egress]` config: the policy for the capable agent's OUTWARD HTTP fetch (C-EGRESS, the
+/// `http.fetch` Actuate kind). This gates the DESTINATION (host allowlist + caps + rate); the
+/// per-kind allowlist token gates the DOOR (granted only when `enabled`). The NON-RELAXABLE SSRF
+/// floor (loopback / RFC1918 / link-local + metadata / ULA / CGNAT) lives in the actuator, NOT
+/// here: no knob in this block can widen past it. Deny-by-default: `enabled=false` + empty
+/// `host_allowlist` as shipped, so a bare config issues ZERO egress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressConfig {
+    /// The master switch. Default OFF. While `false`, the `http.fetch` token is NOT granted, so a
+    /// fetch is `DENIED_NOT_ALLOWLISTED` at the gateway before any handler runs (deny-by-default).
+    #[serde(default)]
+    pub enabled: bool,
+    /// The explicit hostnames the agent may reach (exact, case-insensitive host match). EMPTY (the
+    /// default) = deny ALL, even when `enabled` — a valid "on but locked down" state. A host on
+    /// this list is STILL subject to the non-relaxable SSRF floor (an allowlisted host that
+    /// resolves to a private/loopback/metadata IP is refused).
+    #[serde(default)]
+    pub host_allowlist: Vec<String>,
+    /// The host cap (bytes) on a response body: the caller's `max_response_bytes` is CLAMPED to
+    /// this, never widened. This is what makes the worst-case cost reservation finite and
+    /// pre-authorizable (`sats_per_request + ceil(cap/1024)*sats_per_kib`). Default 256 KiB.
+    #[serde(default = "default_egress_max_response_bytes")]
+    pub max_response_bytes: u32,
+    /// The host request timeout (ms): the caller's `timeout_ms` is CLAMPED to this. Default 10s.
+    #[serde(default = "default_egress_timeout_ms")]
+    pub timeout_ms: u32,
+    /// The HTTP methods the agent may use. Increment 1 is GET/HEAD only (safe, idempotent reads):
+    /// validation REJECTS any method outside {GET, HEAD}. Default `["GET", "HEAD"]`. POST/PUT are a
+    /// separately-reviewed fast-follow.
+    #[serde(default = "default_egress_methods")]
+    pub methods: Vec<String>,
+    /// The fixed floor cost (sats) charged per fetch, like a publish — a fetch is never free, so a
+    /// fetch loop is self-limiting (the agent dies broke). Must be >= 1 when enabled. Default 1.
+    #[serde(default = "default_egress_sats_per_request")]
+    pub sats_per_request: u64,
+    /// The per-KiB cost (sats) metered on the response body actually read (daemon-side, NOT the
+    /// eBPF VM-TAP meter, which never sees a C-EGRESS byte). Default 1.
+    #[serde(default = "default_egress_sats_per_kib")]
+    pub sats_per_kib: u64,
+    /// The token-bucket cap on fetches per minute (the DoS-by-volume / cost-bomb guard). Must be
+    /// >= 1 when enabled. Default 30.
+    #[serde(default = "default_egress_rate_per_min")]
+    pub rate_per_min: u32,
+}
+
+fn default_egress_max_response_bytes() -> u32 {
+    262_144
+}
+fn default_egress_timeout_ms() -> u32 {
+    10_000
+}
+fn default_egress_methods() -> Vec<String> {
+    vec!["GET".to_string(), "HEAD".to_string()]
+}
+fn default_egress_sats_per_request() -> u64 {
+    1
+}
+fn default_egress_sats_per_kib() -> u64 {
+    1
+}
+fn default_egress_rate_per_min() -> u32 {
+    30
+}
+
+impl Default for EgressConfig {
+    fn default() -> Self {
+        EgressConfig {
+            // DENY-BY-DEFAULT: off, and an empty allowlist even if flipped on. The whole-internet
+            // door does not open by omission.
+            enabled: false,
+            host_allowlist: Vec::new(),
+            max_response_bytes: default_egress_max_response_bytes(),
+            timeout_ms: default_egress_timeout_ms(),
+            methods: default_egress_methods(),
+            sats_per_request: default_egress_sats_per_request(),
+            sats_per_kib: default_egress_sats_per_kib(),
+            rate_per_min: default_egress_rate_per_min(),
+        }
+    }
+}
+
 /// The `[nip60]` config: the agent's portable Cashu wallet (NIP-60 — Cashu proofs as
 /// NIP-44-encrypted nostr events on relays, for cross-machine money-continuity). DEDICATED +
 /// independent of `[memory]` (the design's "independent operators" point): money durability must
@@ -1461,6 +1549,8 @@ impl Default for KirbyConfig {
                 ..BrainConfig::default()
             },
             memory: MemoryConfig::default(),
+            // Deny-by-default: the zero-config template does NOT open the egress door.
+            egress: EgressConfig::default(),
             agent: AgentConfig::default(),
             // M6: mem rent = 0 (die only from real inference spend); cpu/egress stay at the
             // live-config defaults (1/1000, 1/1) — only memory is zeroed.
@@ -1678,6 +1768,66 @@ impl KirbyConfig {
                 failover_window_floor,
             );
         }
+        // EGRESS POLICY SANITY (C-EGRESS), validated IFF the door is enabled — a `[egress]` block
+        // with `enabled=false` (the default) is inert and unchecked. Role-agnostic like the other
+        // infra checks: a FleetHost's `[egress]` is the TEMPLATE its tenants inherit, so its policy
+        // must be sane too. The NON-RELAXABLE SSRF floor is NOT validated here (it is structural in
+        // the actuator, unreachable by config); this only rejects a self-defeating or unsafe POLICY.
+        if self.egress.enabled {
+            // Increment 1 is GET/HEAD only: reject any other method at load rather than silently
+            // dropping it at runtime. POST/PUT (the exfil/write surface) are a separate review.
+            if self.egress.methods.is_empty() {
+                anyhow::bail!(
+                    "egress.methods must be non-empty when egress.enabled (Increment 1 allows GET and/or HEAD)"
+                );
+            }
+            for m in &self.egress.methods {
+                let up = m.to_ascii_uppercase();
+                if up != "GET" && up != "HEAD" {
+                    anyhow::bail!(
+                        "egress.methods contains {:?}, but Increment 1 permits only GET and HEAD (POST/PUT are a separately-reviewed fast-follow)",
+                        m
+                    );
+                }
+            }
+            // A zero response cap makes every fetch truncate to nothing; a zero timeout aborts every
+            // fetch; a zero rate denies every fetch. Each is a config that enables the door but can
+            // never use it — reject the footgun at load.
+            if self.egress.max_response_bytes == 0 {
+                anyhow::bail!("egress.max_response_bytes must be > 0 when egress.enabled");
+            }
+            if self.egress.timeout_ms == 0 {
+                anyhow::bail!("egress.timeout_ms must be > 0 when egress.enabled");
+            }
+            if self.egress.rate_per_min == 0 {
+                anyhow::bail!("egress.rate_per_min must be > 0 when egress.enabled");
+            }
+            // A fetch must never be FREE, or a fetch loop escapes the die-when-broke pressure that
+            // makes a flood self-limiting. The floor cost is charged per fetch like a publish.
+            if self.egress.sats_per_request == 0 {
+                anyhow::bail!(
+                    "egress.sats_per_request must be >= 1 when egress.enabled (a fetch is never free, so a flood is self-limiting)"
+                );
+            }
+            // Each allowlist entry is matched against a parsed URL host, so it must be a bare
+            // hostname: no scheme, path, port, or whitespace (a new entry point — guard the input
+            // rather than let a malformed entry silently never match). An empty allowlist is
+            // permitted (the valid "enabled but locked down" deny-all state).
+            for h in &self.egress.host_allowlist {
+                if h.is_empty()
+                    || h.contains("://")
+                    || h.contains('/')
+                    || h.contains(':')
+                    || h.chars().any(|c| c.is_whitespace())
+                {
+                    anyhow::bail!(
+                        "egress.host_allowlist entry {:?} must be a bare hostname (no scheme, path, port, or whitespace)",
+                        h
+                    );
+                }
+            }
+        }
+
         // M5 SEAM — everything below validates the AGENT this config would RUN: its funding, its
         // brain (affordability + the per-backend money paths), and its memory budget. A
         // `ConfigRole::FleetHost` runs NO agent from its own top-level config (that config is the

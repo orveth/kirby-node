@@ -59,6 +59,7 @@ async fn vz_lockdown_egress_boots_and_exposes_no_nic_egress_control() {
         snapshot_capable: false,
         restore_checkpoint: None,
         lease_fence: None,
+        egress: None,
     };
 
     let (vm, outcome, _treasury, _events, _serve_guard) = match boot::boot_and_observe(config).await {
