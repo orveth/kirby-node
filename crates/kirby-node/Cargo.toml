@@ -216,3 +216,9 @@ cdk-mintd = { workspace = true }
 # Pinned to the version ALREADY in the lock (transitive via cdk/nostr-sdk) so this adds
 # NO new resolution and no lock churn. TEST-ONLY: prod code never parses the invoice.
 lightning-invoice = "=0.34.0"
+# nostr-relay-builder boots an in-process nostr relay (rust-nostr's LocalRelay) for the
+# cross-machine FROST transport teeth: NostrRelayConn is exercised over a REAL websocket
+# relay in-harness (hermetic, no external binary, CI-safe). Pinned to the 0.44 line so it
+# shares the SAME `nostr` 0.44 crate as nostr-sdk (Event types unify across the seam).
+# TEST-ONLY: the relay never enters the daemon.
+nostr-relay-builder = "0.44"
