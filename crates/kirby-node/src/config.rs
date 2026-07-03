@@ -3209,6 +3209,81 @@ mod tests {
         assert!(err.contains("api_key_path"), "expected an api_key_path error, got: {err}");
     }
 
+    // ---- C-EGRESS [egress] policy validation (validated IFF enabled, role-agnostic) ----
+
+    /// Base: the zero-config default validates as a fleet host; we tweak only `[egress]`.
+    fn cfg_with_egress(egress: EgressConfig) -> KirbyConfig {
+        KirbyConfig { egress, ..KirbyConfig::default() }
+    }
+
+    #[test]
+    fn egress_disabled_is_not_validated() {
+        // enabled=false => the block is inert, so even self-defeating values do NOT fail load.
+        let cfg = cfg_with_egress(EgressConfig {
+            enabled: false,
+            methods: vec!["POST".into()],
+            max_response_bytes: 0,
+            rate_per_min: 0,
+            sats_per_request: 0,
+            ..EgressConfig::default()
+        });
+        assert!(cfg.validate_for(ConfigRole::FleetHost).is_ok(), "disabled egress is not validated");
+    }
+
+    #[test]
+    fn egress_enabled_with_defaults_is_valid() {
+        // enabled + shipped defaults (GET/HEAD, sane caps, EMPTY allowlist = deny-all) is a VALID
+        // "on but locked down" config.
+        let cfg = cfg_with_egress(EgressConfig { enabled: true, ..EgressConfig::default() });
+        assert!(
+            cfg.validate_for(ConfigRole::FleetHost).is_ok(),
+            "enabled egress with the defaults (empty allowlist) is valid"
+        );
+    }
+
+    #[test]
+    fn egress_enabled_rejects_non_get_head_method() {
+        let cfg = cfg_with_egress(EgressConfig {
+            enabled: true,
+            methods: vec!["GET".into(), "POST".into()],
+            ..EgressConfig::default()
+        });
+        let err = cfg.validate_for(ConfigRole::FleetHost).expect_err("POST must be rejected").to_string();
+        assert!(err.contains("GET and HEAD"), "expected a GET/HEAD-only error, got: {err}");
+    }
+
+    #[test]
+    fn egress_enabled_rejects_empty_methods_and_zero_caps() {
+        for bad in [
+            EgressConfig { enabled: true, methods: vec![], ..EgressConfig::default() },
+            EgressConfig { enabled: true, max_response_bytes: 0, ..EgressConfig::default() },
+            EgressConfig { enabled: true, timeout_ms: 0, ..EgressConfig::default() },
+            EgressConfig { enabled: true, rate_per_min: 0, ..EgressConfig::default() },
+            EgressConfig { enabled: true, sats_per_request: 0, ..EgressConfig::default() },
+        ] {
+            assert!(
+                cfg_with_egress(bad).validate_for(ConfigRole::FleetHost).is_err(),
+                "a self-defeating enabled egress config must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn egress_enabled_rejects_malformed_allowlist_host() {
+        for bad_host in ["https://api.example.com/", "api.example.com/path", "api.example.com:443", "has space"] {
+            let cfg = cfg_with_egress(EgressConfig {
+                enabled: true,
+                host_allowlist: vec![bad_host.to_string()],
+                ..EgressConfig::default()
+            });
+            let err = cfg
+                .validate_for(ConfigRole::FleetHost)
+                .expect_err("a non-bare-hostname allowlist entry must be rejected")
+                .to_string();
+            assert!(err.contains("bare hostname"), "expected a bare-hostname error for {bad_host:?}, got: {err}");
+        }
+    }
+
     /// TOOTH (backcompat guard): the zero-config values live ONLY in `KirbyConfig::default()`.
     /// A partial `kirby.toml` still parses with the HISTORICAL per-field serde defaults, so
     /// existing configs are byte-identical. RED-on-revert: leak any M5/M6/M7 value into a

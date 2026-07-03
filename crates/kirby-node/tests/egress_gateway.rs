@@ -77,6 +77,12 @@ impl Actuator for VariableEgressActuator {
     }
 
     async fn actuate(&self, kind: &str, _payload: &[u8], cap_sats: u64) -> RailOutcome {
+        // Yield at the perform point so a real `perform().await` is modeled: two joined fetches then
+        // genuinely INTERLEAVE (both reach here, past the gateway gate, before either debits). This
+        // is what makes `concurrent_fetches_never_perform_then_unpaid` a REAL tooth — without the
+        // `egress_debit_gate` lock both would perform (dispatch 2); a non-awaiting stub would instead
+        // serialize by construction under `join!` and pass regardless of the lock (a false tooth).
+        tokio::task::yield_now().await;
         *self.dispatched.lock().unwrap() += 1;
         if kind != ACTUATE_KIND_HTTP_FETCH {
             return RailOutcome::UpstreamFailed;
