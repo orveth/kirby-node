@@ -293,6 +293,33 @@ pub trait Nip60Transport: Send + Sync {
 
     /// Fetch every event matching `filter`, waiting up to `timeout`.
     async fn fetch_events(&self, filter: Filter, timeout: Duration) -> anyhow::Result<Vec<Event>>;
+
+    /// Per-relay read: how many DISTINCT relays SERVED events + the deduped union.
+    /// Consumed by the read-quorum tally (Cut A) and the ≥k-served check.
+    ///
+    /// Default impl delegates to `fetch_events` as ONE served relay (total=1, served=1)
+    /// so existing single-relay impls (MockTransport, InMemoryRelay) inherit served=1 ≥
+    /// read_k=1 → authoritative under any single-relay config — zero behavior change.
+    async fn fetch_events_per_relay(
+        &self,
+        filter: Filter,
+        timeout: Duration,
+    ) -> anyhow::Result<PerRelayRead> {
+        let events = self.fetch_events(filter, timeout).await?;
+        Ok(PerRelayRead { served: 1, total: 1, events })
+    }
+}
+
+/// The per-relay read result: how many DISTINCT relays SERVED events + the deduped union.
+/// Produced by [`Nip60Transport::fetch_events_per_relay`] and consumed by the read-quorum tally
+/// (Cut A) — `served >= read_k` is the authoritativeness gate.
+pub struct PerRelayRead {
+    /// DISTINCT relays that responded (served at least one event, or confirmed empty within timeout).
+    pub served: usize,
+    /// READ-capable relays in the pool (denominator for the quorum tally).
+    pub total: usize,
+    /// Deduped union of events across all served relays.
+    pub events: Vec<Event>,
 }
 
 /// The outcome of a [`Nip60Transport::send_event`]: the published event id + how many relays acked.
@@ -338,6 +365,25 @@ impl Nip60Transport for ClientTransport {
     }
 }
 
+/// The result of a load-time reconcile (returned by [`Nip60Store::reconcile_on_load_with_ids`]).
+/// Carries the per-relay quorum metadata alongside the candidate proofs so the boot solvency
+/// gate can use the same read's authority verdict (R2 condition a).
+pub struct ReconcileRead {
+    /// The aggregated candidate proofs (to be NUT-07-gated before import).
+    pub candidates: Vec<Proof>,
+    /// Hex ids of EVERY kind:7375 token event seen (decryptable or not) — seeds the flusher's
+    /// live-id set so the first flush del-chains ALL prior events into one clean snapshot.
+    pub fetched_ids: Vec<String>,
+    /// DISTINCT relays that served events (or confirmed empty) within the read timeout.
+    pub served: usize,
+    /// READ-capable relays in the pool (denominator).
+    pub total: usize,
+    /// The read_k threshold this store was configured with.
+    pub read_k: usize,
+    /// `served >= read_k` — the boot solvency gate uses this to decide Assert vs Proceed.
+    pub authoritative: bool,
+}
+
 /// The NIP-60 wallet relay store: publishes the agent's Cashu proofs as NIP-44-encrypted
 /// kind:7375 token events to the [`crate::config::Nip60Config`] relay set (signed by + encrypted
 /// to the event key) and reconciles them back on load. Mirrors [`crate::rail::EngramStore`]'s
@@ -355,11 +401,17 @@ pub struct Nip60Store {
     n: usize,
     /// The K-of-N ack threshold a publish must reach to count as durable.
     k: usize,
+    /// The K-of-N READ threshold: served >= read_k ⇒ authoritative. Default = majority.
+    read_k: usize,
     read_timeout: Duration,
     /// The mints whose relay-stored proofs this wallet will adopt on reconcile (N7 theft-guard;
     /// [`crate::config::BrainConfig::effective_mint_allowlist`]). Always includes the agent's own
     /// mint. Proofs drawn on any other mint are dropped by [`reconcile_token_set`].
     mint_allowlist: Vec<String>,
+    /// R2: set to `true` when a reconcile_on_load_with_ids returned served >= read_k.
+    /// `false` at construction; flipped by the reconcile. Accessed via SeqCst atomics so
+    /// the rollover gate (which holds `&self`) can read it without `&mut self`.
+    read_established: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Nip60Store {
@@ -372,6 +424,7 @@ impl Nip60Store {
         event_key: &[u8; 32],
         relays: &[String],
         write_k: Option<usize>,
+        read_k_opt: Option<usize>,
         mint_allowlist: Vec<String>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
@@ -389,19 +442,25 @@ impl Nip60Store {
         client.connect().await;
         let n = relays.len();
         let k = write_k.unwrap_or(n / 2 + 1).clamp(1, n);
-        tracing::info!(npub = %crypto.public_key().to_hex(), n, k, "NIP-60 wallet store connected");
+        let read_k = read_k_opt.unwrap_or(n / 2 + 1).clamp(1, n);
+        tracing::info!(npub = %crypto.public_key().to_hex(), n, k, read_k, "NIP-60 wallet store connected");
         Ok(Nip60Store {
             crypto,
             transport: Arc::new(ClientTransport { client }),
             n,
             k,
+            read_k,
             read_timeout: Duration::from_secs(NIP60_READ_TIMEOUT_SECS),
             mint_allowlist,
+            read_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
     /// Build a store over an arbitrary [`Nip60Transport`] — the seam the unit tests inject a mock
     /// through to exercise the ≥k gate + confirm-before-delete ordering without a live relay.
+    /// `read_k` defaults to `k` (write quorum); `read_established` starts TRUE so existing tests
+    /// that don't exercise the R2 read-quorum gate (e.g. the R1 rollover tests that call `rollover`
+    /// directly without a prior reconcile) keep working unchanged.
     #[cfg(test)]
     fn with_transport(
         crypto: Nip60Crypto,
@@ -415,8 +474,37 @@ impl Nip60Store {
             transport,
             n,
             k,
+            read_k: k, // default: same as write_k
             read_timeout: Duration::from_secs(NIP60_READ_TIMEOUT_SECS),
             mint_allowlist,
+            // TRUE: existing tests that go straight to `rollover` without a prior reconcile don't
+            // hit the R2 gate. R2 drill tests use `with_transport_and_read_k` + explicit reconcile.
+            read_established: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    /// `with_transport` variant with an explicit `read_k` and `read_established = false` — used by
+    /// R2 drill tests that model a below-quorum boot (the D_b tooth, etc.). The test drives the
+    /// reconcile explicitly to flip `read_established` when it wants to simulate quorum recovery.
+    #[cfg(test)]
+    fn with_transport_and_read_k(
+        crypto: Nip60Crypto,
+        transport: Arc<dyn Nip60Transport>,
+        n: usize,
+        k: usize,
+        read_k: usize,
+        mint_allowlist: Vec<String>,
+    ) -> Self {
+        Nip60Store {
+            crypto,
+            transport,
+            n,
+            k,
+            read_k,
+            read_timeout: Duration::from_secs(NIP60_READ_TIMEOUT_SECS),
+            mint_allowlist,
+            // FALSE: the R2 drill tests start with a below-quorum boot and drive reconcile to flip.
+            read_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -450,33 +538,45 @@ impl Nip60Store {
     /// event (a foreign event under our author) is SKIPPED, not fatal. The returned set is the
     /// CANDIDATE proofs; NUT-07 check-state (N2) filters it to UNSPENT before any spend (NIP-60
     /// is portability, not safety — the mint is the source of truth).
+    ///
+    /// ⚠️ This convenience wrapper drops the quorum metadata; prefer
+    /// [`Self::reconcile_on_load_with_ids`] when the boot solvency gate needs `authoritative`.
     pub async fn reconcile_on_load(&self) -> anyhow::Result<Vec<Proof>> {
-        // Reuse the id-carrying reconcile and drop the ids (the restore path only needs the
-        // candidate proofs). Kept as one implementation so the two never drift.
-        let (proofs, _ids) = self.reconcile_on_load_with_ids().await?;
-        Ok(proofs)
+        Ok(self.reconcile_on_load_with_ids().await?.candidates)
     }
 
     /// As [`Self::reconcile_on_load`], but ALSO returns the hex ids of EVERY kind:7375 token event
-    /// fetched under the event key (decryptable or not). The Cut A (#115) backup flusher seeds its
-    /// live-id set with these so the FIRST flush's rollover del-chains ALL prior token events into
-    /// ONE clean new snapshot — superseding an already-dead / undecryptable-foreign event is a
-    /// harmless no-op (the del-chain is advisory + the mint is truth), and it prevents the relay set
-    /// accreting stale events across restarts.
-    pub async fn reconcile_on_load_with_ids(&self) -> anyhow::Result<(Vec<Proof>, Vec<String>)> {
+    /// fetched under the event key (decryptable or not), and the per-relay quorum metadata. The
+    /// Cut A (#115) backup flusher seeds its live-id set with `fetched_ids` so the FIRST flush's
+    /// rollover del-chains ALL prior token events into ONE clean new snapshot. The `authoritative`
+    /// flag is `served >= read_k`; when false the R2 solvency gate proceeds non-authoritatively
+    /// and the rollover gate holds until a >=k read re-establishes.
+    pub async fn reconcile_on_load_with_ids(&self) -> anyhow::Result<ReconcileRead> {
         let filter = Filter::new()
             .kind(Kind::from(KIND_NIP60_TOKEN))
             .author(self.crypto.public_key());
-        let events = self
+        // R2: use per-relay read so we can count how many DISTINCT relays served events.
+        let per = self
             .transport
-            .fetch_events(filter, self.read_timeout)
+            .fetch_events_per_relay(filter, self.read_timeout)
             .await
-            .context("fetch NIP-60 token events for reconcile")?;
-        let mut all_ids: Vec<String> = Vec::with_capacity(events.len());
+            .context("fetch NIP-60 token events for reconcile (per-relay)")?;
+        let authoritative = per.served >= self.read_k;
+        // Store the verdict so the rollover gate can read it without a new relay fetch.
+        self.read_established
+            .store(authoritative, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(
+            served = per.served,
+            total = per.total,
+            read_k = self.read_k,
+            authoritative,
+            "NIP-60 reconcile: per-relay read quorum"
+        );
+        let mut fetched_ids: Vec<String> = Vec::with_capacity(per.events.len());
         let mut decoded: Vec<(String, TokenEventContent)> = Vec::new();
-        for ev in events.into_iter() {
+        for ev in per.events.into_iter() {
             let id_hex = ev.id.to_hex();
-            all_ids.push(id_hex.clone());
+            fetched_ids.push(id_hex.clone());
             match self.crypto.decrypt(&ev.content) {
                 Ok(content) => decoded.push((id_hex, content)),
                 Err(e) => tracing::warn!(
@@ -486,7 +586,15 @@ impl Nip60Store {
                 ),
             }
         }
-        Ok((reconcile_token_set(&decoded, &self.mint_allowlist), all_ids))
+        let candidates = reconcile_token_set(&decoded, &self.mint_allowlist);
+        Ok(ReconcileRead {
+            candidates,
+            fetched_ids,
+            served: per.served,
+            total: per.total,
+            read_k: self.read_k,
+            authoritative,
+        })
     }
 
     /// Publish the kind:17375 wallet-config (mints + per-keyset NUT-13 counters, NIP-44
@@ -570,8 +678,12 @@ impl Nip60Store {
     /// Roll over token events: replace the `superseded` events (their proofs consolidated into
     /// `new_proofs`) with ONE new kind:7375 event, CONFIRM-BEFORE-DELETE.
     ///
-    /// ⚠️ MONEY-SAFETY ORDERING (design doc point 6, + R1 read-after-write): (1) the new event
-    /// carries `del = superseded` — the del-chain, the AUTHORITATIVE supersede honored by
+    /// ⚠️ MONEY-SAFETY ORDERING (design doc point 6, + R1 read-after-write + R2 read-quorum gate):
+    /// (0, R2) ABORT if the boot-time reconcile was NOT authoritative (below read-quorum): the
+    /// restored proof set may be INCOMPLETE, so publishing a rollover here would del-chain/prune
+    /// events that were merely un-fetched — turning a thin READ into a backup WRITE-LOSS. Publish
+    /// and prune NOTHING; keep the prior backup; re-arm dirty (flusher retries next tick); (1) the
+    /// new event carries `del = superseded` — the del-chain, the AUTHORITATIVE supersede honored by
     /// [`reconcile_token_set`] even if the NIP-09 delete is ignored; (2) it is published and MUST
     /// reach >=k relays ([`Self::publish_token`] ERRORS otherwise) BEFORE anything is deleted, so a
     /// non-durable new event leaves the OLD events LIVE (never delete an input until its replacement
@@ -588,6 +700,21 @@ impl Nip60Store {
         new_proofs: Vec<Proof>,
         superseded: Vec<String>,
     ) -> anyhow::Result<EventId> {
+        // R2 condition (b): a below-read-quorum boot is NON-AUTHORITATIVE — its restored proof set
+        // may be INCOMPLETE. Publishing a rollover here would del-chain/prune events that were
+        // merely un-fetched (not truly superseded), turning a thin READ into a backup WRITE-LOSS.
+        // Publish/prune NOTHING; keep the prior backup; the flusher's `?` + RearmOnDrop re-arms
+        // dirty, so the snapshot is retried next tick (after a >=k read re-establishes authority).
+        if !self.read_established.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::warn!(
+                "rollover: read not established (below read-quorum boot) — kept prior backup, \
+                 published/pruned nothing; will retry once a >=k read lands"
+            );
+            anyhow::bail!(
+                "rollover skipped: read not established (non-authoritative boot)"
+            );
+        }
+
         let content = TokenEventContent {
             mint: mint.to_string(),
             unit: unit.to_string(),
@@ -1332,6 +1459,21 @@ mod tests {
                 .collect();
             Ok(events)
         }
+
+        /// R2: model `InMemoryRelay` as serving `acks` distinct relays so that tests that
+        /// configure it with `InMemoryRelay::new(2, ...)` + `read_k=2` remain authoritative
+        /// (served=2 >= read_k=2 → `read_established=true`). A 0-ack relay → served=0 → not
+        /// authoritative (models a doomed relay). The union is from `fetch_events` above.
+        async fn fetch_events_per_relay(
+            &self,
+            filter: Filter,
+            timeout: Duration,
+        ) -> anyhow::Result<PerRelayRead> {
+            let events = self.fetch_events(filter, timeout).await?;
+            // served = acks models "this many relay confirmations" — deduplication is already
+            // handled (only one store, one signing) so total=served=acks.
+            Ok(PerRelayRead { served: self.acks, total: self.acks.max(1), events })
+        }
     }
 
     fn test_crypto(seed_byte: u8) -> Nip60Crypto {
@@ -2033,6 +2175,44 @@ mod tests {
             }
             Ok(events)
         }
+
+        /// R2: per-relay read — counts DISTINCT served relays (UP flag) and unions their events.
+        /// An UP relay counts as served even if its log is empty (it answered within timeout).
+        /// A DOWN relay is not served (mirrors the prod precheck on a half-open socket).
+        async fn fetch_events_per_relay(
+            &self,
+            filter: Filter,
+            timeout: Duration,
+        ) -> anyhow::Result<PerRelayRead> {
+            let total = self.relays.len();
+            let mut served = 0usize;
+            let mut seen: std::collections::HashSet<EventId> = std::collections::HashSet::new();
+            let mut events = Vec::new();
+            for (log, up) in self.relays.iter().zip(self.up.iter()) {
+                if !up.load(AtomicOrdering::SeqCst) {
+                    continue; // down = not served
+                }
+                served += 1; // an UP relay counts as served (even if its log is empty)
+                for ev in log.lock().unwrap().iter() {
+                    // Apply the SAME kind + author filters as `fetch_events`.
+                    if let Some(kinds) = &filter.kinds {
+                        if !kinds.contains(&ev.kind) {
+                            continue;
+                        }
+                    }
+                    if let Some(authors) = &filter.authors {
+                        if !authors.contains(&ev.pubkey) {
+                            continue;
+                        }
+                    }
+                    if seen.insert(ev.id) {
+                        events.push(ev.clone());
+                    }
+                }
+            }
+            let _ = timeout; // no actual I/O in the double; the UP flag models reachability
+            Ok(PerRelayRead { served, total, events })
+        }
     }
 
     // ---- Tooth (c): READ-AFTER-WRITE in rollover — an acked-but-not-served new event is caught. --
@@ -2311,5 +2491,313 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.path);
             }
         }
+    }
+
+    // ============================================================================================
+    // R2 (#131 reliability leg): read-quorum safety — solvency gate, rollover gate, per-relay
+    // union, split-brain dedup.
+    //
+    // These teeth use `MultiRelayTransport` (N=3, k=2, read_k=2) or `with_transport_and_read_k`.
+    // ============================================================================================
+
+    // ---- D1 (condition a): solvency_gate(false) = ProceedNonAuthoritative ---------
+    //
+    // A below-quorum reconcile must NOT be treated as insolvent — wallet is a lower bound only.
+    // RED-on-revert: change `solvency_gate` to always return `Assert`; the test below calls
+    // `assert_wallet_backs_counter` which would bail on wallet < counter.
+    #[test]
+    fn r2_d1_solvency_gate_below_quorum_proceeds_non_authoritative() {
+        use crate::boot::{SolvencyGate, solvency_gate};
+        // Authoritative read → Assert (unchanged path).
+        assert!(matches!(solvency_gate(true), SolvencyGate::Assert));
+        // Below-quorum read → ProceedNonAuthoritative (never brick a funded agent).
+        assert!(matches!(solvency_gate(false), SolvencyGate::ProceedNonAuthoritative));
+        // ProceedNonAuthoritative means we DO NOT call assert_wallet_backs_counter.
+        // Verify: a below-quorum read with wallet < counter does NOT bail.
+        match solvency_gate(false) {
+            SolvencyGate::Assert => {
+                // We'd call assert_wallet_backs_counter here — but this branch should not be reached.
+                crate::boot::assert_wallet_backs_counter(0, 100)
+                    .expect_err("a zero wallet should fail the assert");
+                panic!("D1 FAILED: a below-quorum read chose Assert, it should be Proceed");
+            }
+            SolvencyGate::ProceedNonAuthoritative => {
+                // Correct: we proceed even though wallet(0) < counter(100).
+            }
+        }
+    }
+
+    // ---- D_b (condition b): below-quorum boot → rollover sends NO delete AND no publish --------
+    //
+    // A below-quorum boot leaves `read_established=false`. `rollover` must bail BEFORE
+    // `publish_token` (so no NIP-09 delete attempt and no kind:7375 publish).
+    // RED-on-revert: remove the §4 gate → the rollover proceeds → `any_delete_sent()` is true.
+    // Recovery: set_up all relays → reconcile_on_load_with_ids → read_established=true → next
+    // rollover DOES publish+prune.
+    #[tokio::test]
+    async fn r2_db_below_quorum_boot_rollover_sends_nothing_and_is_retried_on_recovery() {
+        let crypto = test_crypto(0x62);
+        // n=3, k=2, read_k=2 — a quorum relay set.
+        // Seed a REAL prior snapshot while all 3 relays are UP (authoritative read).
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let store_setup = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+        let first_id = store_setup
+            .rollover("https://m", "sat", vec![dummy_proof("init")], Vec::new())
+            .await
+            .expect("seed a real prior snapshot (all relays UP)");
+        assert_eq!(transport.distinct_token_ids().len(), 1);
+        assert!(!transport.any_delete_sent(), "no delete on the initial snapshot");
+
+        // Now simulate a BELOW-QUORUM boot: bring 2 relays DOWN so only 1 UP.
+        // The new store uses `with_transport_and_read_k` (read_established=false).
+        transport.set_up(1, false);
+        transport.set_up(2, false);
+        assert_eq!(transport.up_count(), 1);
+        let store_low = Nip60Store::with_transport_and_read_k(
+            crypto.clone(),
+            transport.clone(),
+            3,
+            2,
+            2, // read_k=2; served will be 1 (only relay 0 UP) → NOT authoritative
+            allow_m(),
+        );
+        // Reconcile under the below-quorum boot → served=1 < read_k=2 → NOT authoritative.
+        let read = store_low
+            .reconcile_on_load_with_ids()
+            .await
+            .expect("reconcile ok even below-quorum");
+        assert_eq!(read.served, 1, "only 1 relay is UP");
+        assert_eq!(read.total, 3);
+        assert!(!read.authoritative, "below-quorum → NOT authoritative");
+        // read_established should be false now.
+        assert!(
+            !store_low.read_established.load(std::sync::atomic::Ordering::SeqCst),
+            "read_established is false after a below-quorum reconcile"
+        );
+
+        // Attempt a rollover — must bail WITHOUT publishing or deleting.
+        let attempt_attempts_before = transport.attempts.lock().unwrap().len();
+        let result = store_low
+            .rollover("https://m", "sat", vec![dummy_proof("new")], vec![first_id.to_hex()])
+            .await;
+        assert!(result.is_err(), "rollover must bail when read not established");
+        assert!(
+            result.unwrap_err().to_string().contains("read not established"),
+            "error message mentions 'read not established'"
+        );
+        // No new sends — not even a publish attempt (gate fires before publish_token).
+        let attempt_count_after = transport.attempts.lock().unwrap().len();
+        assert_eq!(
+            attempt_count_after,
+            attempt_attempts_before,
+            "D_b: zero sends attempted (gate fires before publish_token)"
+        );
+        assert!(!transport.any_delete_sent(), "D_b: no NIP-09 delete attempted");
+        // The old backup is still on the relays (not corrupted).
+        assert!(
+            transport.distinct_token_ids().contains(&first_id),
+            "D_b: the prior snapshot is still intact after the gated rollover"
+        );
+
+        // RECOVERY: bring the downed relays back UP.
+        transport.set_up(1, true);
+        transport.set_up(2, true);
+        assert_eq!(transport.up_count(), 3);
+        // Re-reconcile → served=3 >= read_k=2 → authoritative → read_established=true.
+        let read2 = store_low
+            .reconcile_on_load_with_ids()
+            .await
+            .expect("reconcile ok after recovery");
+        assert!(read2.authoritative, "recovery: served=3 >= read_k=2 → authoritative");
+        assert!(
+            store_low.read_established.load(std::sync::atomic::Ordering::SeqCst),
+            "read_established is now true after a quorum reconcile"
+        );
+        // Now the rollover DOES publish+prune.
+        store_low
+            .rollover("https://m", "sat", vec![dummy_proof("new")], vec![first_id.to_hex()])
+            .await
+            .expect("rollover succeeds after read_established=true");
+        assert!(
+            transport.any_delete_sent(),
+            "D_b recovery: after read_established=true, rollover deletes the superseded event"
+        );
+    }
+
+    // ---- D2 (partial-set union): the per-relay union includes events from all UP relays ----------
+    //
+    // relay 0 has the LATEST token event (two proofs), relays 1+2 only have the older event (one
+    // proof). `fetch_events_per_relay` with all UP must return a union containing the latest event's
+    // proofs. Pulling only the first relay's events and ignoring 1+2 when relay 0 is DOWN would
+    // miss the latest → wrong candidate count.
+    //
+    // RED-on-revert: override `fetch_events_per_relay` to always return only the first relay's
+    // events → when relay 0 is the only one with the new event and 0+1+2 are all UP, a single-relay
+    // read would miss the relay-0-only new event → candidates under-count.
+    // (The positive assertion below captures this: the 3-relay union must include the proof only
+    // on relay 0 by counting total candidates > relays-1+2-only candidates.)
+    #[tokio::test]
+    async fn r2_d2_per_relay_union_includes_events_from_all_up_relays() {
+        let crypto = test_crypto(0x63);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        // n=3, k=2, read_k=2. Start with all relays UP + read_established=true.
+        let store = Nip60Store::with_transport_and_read_k(
+            crypto.clone(),
+            transport.clone(),
+            3,
+            2,
+            2,
+            allow_m(),
+        );
+        store.read_established.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Phase 1: publish OLD snapshot (one proof) → lands on all 3 relays.
+        let old_id = store
+            .rollover("https://m", "sat", vec![dummy_proof("old")], Vec::new())
+            .await
+            .expect("old snapshot to all 3 relays");
+        assert_eq!(transport.up_count(), 3);
+
+        // Phase 2: publish NEW snapshot (two proofs) to relay 0 ONLY.
+        // Bring 1+2 DOWN so only relay 0 stores the new event.
+        transport.set_up(1, false);
+        transport.set_up(2, false);
+        let new_content = TokenEventContent {
+            mint: "https://m".to_string(),
+            unit: "sat".to_string(),
+            proofs: vec![dummy_proof("new1"), dummy_proof("new2")],
+            del: vec![old_id.to_hex()],
+        };
+        // `publish_token` may fail the >=k gate (acks=1 < k=2) but still stores on relay 0.
+        let _ = store.publish_token(&new_content).await;
+        // Relay 0 now has: old + new (2 token events). Relays 1+2 have: old only.
+        let relay0_token_count = transport.relays[0]
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|ev| ev.kind == Kind::from(KIND_NIP60_TOKEN))
+            .count();
+        assert_eq!(relay0_token_count, 2, "relay 0 has old+new token events");
+
+        // Bring all relays UP → 3-relay union must include the relay-0-only new event.
+        transport.set_up(1, true);
+        transport.set_up(2, true);
+        let read_all = store
+            .reconcile_on_load_with_ids()
+            .await
+            .expect("reconcile with all 3 UP");
+        assert_eq!(read_all.served, 3, "all 3 UP → served=3");
+        // The per-relay union fetches relay 0's new event (del-chains the old → new proofs win).
+        // Candidates should include the new proofs (new1, new2) since the del-chain supersedes old.
+        // We verify by event-id coverage: the new event's id should be in fetched_ids.
+        assert!(
+            read_all.fetched_ids.len() >= 2,
+            "D2: the 3-relay union includes events from relay 0 (new) AND relays 1+2 (old): \
+             at least 2 distinct event ids; got {}",
+            read_all.fetched_ids.len()
+        );
+
+        // Now bring relay 0 DOWN and read only from 1+2.
+        transport.set_up(0, false);
+        let read_12 = store
+            .reconcile_on_load_with_ids()
+            .await
+            .expect("reconcile with relays 1+2 only");
+        assert_eq!(read_12.served, 2, "relays 1+2 UP → served=2");
+        // fetched_ids should only include events on relays 1+2 (the old event, not the new one).
+        assert!(
+            read_12.fetched_ids.len() < read_all.fetched_ids.len(),
+            "D2: the partial-set (1+2) union has FEWER events than the full-set (0+1+2) union — \
+             the relay-0-only new event is absent; got {partial} vs {full}",
+            partial = read_12.fetched_ids.len(),
+            full = read_all.fetched_ids.len()
+        );
+        // Restore relay 0.
+        transport.set_up(0, true);
+    }
+
+    // ---- D4 (split-brain): keep_unspent drops a proof the mint calls spent; no double-count ----
+    //
+    // This exercises the `nip60_reconcile::keep_unspent` / `check_states` path via the existing
+    // `reconcile_import` machinery (unit-tested in nip60_reconcile). We test the integration:
+    // two reconcile runs restore the same candidate set; a mint mock that marks one spent →
+    // only the unspent one imports; second run is novel-only no-op (no double-count).
+    //
+    // RED-on-revert: change `keep_unspent` to accept all proofs regardless of state → both
+    // proofs would be imported → double-count.
+    #[tokio::test]
+    async fn r2_d4_split_brain_keep_unspent_prevents_double_count() {
+        use crate::nip60_reconcile::{ReconcileWallet, reconcile_import};
+        use cdk::nuts::{Proof, ProofState, PublicKey, State};
+        use std::sync::Mutex;
+
+        fn dummy_proof_r2(secret: &str) -> Proof {
+            let json = format!(
+                r#"{{"amount":1,"id":"00ad268c4d1f5826","secret":"{secret}","C":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"}}"#
+            );
+            serde_json::from_str(&json).expect("dummy proof")
+        }
+
+        fn y_of_r2(p: &Proof) -> PublicKey { p.y().expect("proof Y") }
+
+        struct SplitBrainWallet {
+            known: Mutex<Vec<PublicKey>>,
+            states: Vec<ProofState>,
+            imported: Mutex<Vec<Proof>>,
+        }
+
+        #[async_trait]
+        impl ReconcileWallet for SplitBrainWallet {
+            async fn known_ys(&self) -> anyhow::Result<Vec<PublicKey>> {
+                Ok(self.known.lock().unwrap().clone())
+            }
+            async fn check_states(&self, _proofs: Vec<Proof>) -> anyhow::Result<Vec<ProofState>> {
+                Ok(self.states.clone())
+            }
+            async fn import_proofs(&self, proofs: Vec<Proof>) -> anyhow::Result<u64> {
+                let n = proofs.len() as u64;
+                // Track imported Ys as "known" for the second run (novel-only gate).
+                for p in &proofs {
+                    if let Ok(y) = p.y() {
+                        self.known.lock().unwrap().push(y);
+                    }
+                }
+                self.imported.lock().unwrap().extend(proofs);
+                Ok(n)
+            }
+        }
+
+        let p_unspent = dummy_proof_r2("unspent");
+        let p_spent = dummy_proof_r2("spent");
+        let y_unspent = y_of_r2(&p_unspent);
+        let y_spent = y_of_r2(&p_spent);
+
+        let wallet = SplitBrainWallet {
+            known: Mutex::new(vec![]),
+            states: vec![
+                ProofState::from((y_unspent, State::Unspent)),
+                ProofState::from((y_spent, State::Spent)),
+            ],
+            imported: Mutex::new(vec![]),
+        };
+
+        // First restore: both proofs are candidates; mint marks one spent.
+        let candidates = vec![p_unspent.clone(), p_spent.clone()];
+        let imported1 = reconcile_import(candidates.clone(), &wallet)
+            .await
+            .expect("first restore ok");
+        assert_eq!(imported1, 1, "D4: only the UNSPENT proof imports (not the spent one)");
+        let got1 = wallet.imported.lock().unwrap().clone();
+        assert_eq!(got1.len(), 1);
+        assert_eq!(y_of_r2(&got1[0]), y_unspent, "D4: the imported proof is the unspent one");
+
+        // Second restore (split-brain scenario: same candidates offered again).
+        // Novel-only gate: the unspent proof is now KNOWN → neither candidate is novel → no import.
+        let imported2 = reconcile_import(candidates, &wallet)
+            .await
+            .expect("second restore ok");
+        assert_eq!(imported2, 0, "D4: the second restore is a no-op (novel-only gate prevents double-count)");
+        let got2 = wallet.imported.lock().unwrap().clone();
+        assert_eq!(got2.len(), 1, "D4: still only one proof imported total (no double-count)");
     }
 }
