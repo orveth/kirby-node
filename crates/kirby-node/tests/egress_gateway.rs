@@ -261,6 +261,43 @@ async fn duplicate_fetch_is_single_debit_and_serves_no_body() {
     assert!(replay.http_response.is_none(), "the body is not re-served on a replay (not persisted)");
 }
 
+#[tokio::test]
+async fn concurrent_fetches_never_perform_then_unpaid() {
+    // codex-1 / no-concurrent-debit: two CONCURRENT distinct-key fetches on a treasury sized for
+    // exactly ONE (worst_case 100, treasury 100, actual 60 => 2*60 > 100). The egress_debit_gate
+    // serializes the [re-read balance -> gate -> perform -> debit] sequence, so EXACTLY ONE performs
+    // + debits its actual and the other is DENIED_INSUFFICIENT_TREASURY *before* performing (debit 0).
+    // WITHOUT the lock both would pass the stale gate, both perform, and the loser would be a
+    // performed-but-UNPAID fetch — i.e. dispatch_count would be 2. This tooth is RED without the
+    // serialization.
+    let (svc, actuator) = egress_gateway(/* treasury */ 100, true, /* worst_case */ 100, /* actual */ 60);
+    let (fa, fb) = (fetch_req("c-a", 500), fetch_req("c-b", 500));
+    let (ra, rb) = tokio::join!(
+        svc.authorize_capability(&fa),
+        svc.authorize_capability(&fb),
+    );
+    let (ra, rb) = (ra.unwrap(), rb.unwrap());
+    assert_eq!(
+        actuator.dispatch_count(),
+        1,
+        "only ONE fetch reached the actuator — the other was denied BEFORE performing (no performed-but-unpaid)"
+    );
+    let (perf_r, deny_r) = if ra.outcome == Outcome::AuthorizedAndPerformed as i32 {
+        (&ra, &rb)
+    } else {
+        (&rb, &ra)
+    };
+    assert_eq!(perf_r.outcome, Outcome::AuthorizedAndPerformed as i32, "one fetch performed");
+    assert_eq!(perf_r.cost_sats, 60, "the performed fetch debited its actual");
+    assert_eq!(
+        deny_r.outcome,
+        Outcome::DeniedInsufficientTreasury as i32,
+        "the other was denied (before performing) — the treasury couldn't cover a second worst case"
+    );
+    assert_eq!(deny_r.cost_sats, 0, "the denied fetch debited nothing");
+    assert_eq!(perf_r.treasury_remaining, 40, "treasury dropped by EXACTLY the one actual debit (100-60)");
+}
+
 // ---- RUNTIME SMOKE (network-gated, #[ignore]): the REAL HttpEgressActuator end-to-end ----
 //
 // Run with: cargo test -p kirby-node --test egress_gateway -- --ignored

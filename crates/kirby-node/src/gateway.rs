@@ -134,6 +134,20 @@ pub struct GatewayService {
     /// await. Entries are removed when the last holder drops the guard (bounded memory);
     /// see `settle_charge`. `Arc`-shared so the service stays cheap to clone.
     settle_locks: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Variable-cost egress debit serialization (C-EGRESS, codex-1). The `http.fetch` fork gates on
+    /// the balance, PERFORMS the network fetch, THEN debits the ACTUAL — a check-then-act with the
+    /// network in the middle (it must debit the actual, not a pre-reserved worst case, on a
+    /// no-refund ledger). Two CONCURRENT variable-cost fetches could both pass the worst-case gate
+    /// against the same balance, both perform, and the loser's debit then fail `Insufficient` AFTER
+    /// its GET already ran — a performed-but-UNPAID fetch (an economic leak; never-overspend still
+    /// holds via the atomic `checked_sub` debit). This single-flight guard — the SAME idiom as
+    /// `settle_locks`, tokio's Mutex held across the `perform().await` — serializes the variable-cost
+    /// `[re-read balance -> gate -> perform -> debit]` sequence, re-reading the balance INSIDE the
+    /// lock, so a fetch the treasury cannot cover is DENIED *before* performing (debit 0, no wasted
+    /// GET), never performed-then-unpaid. `Arc`-shared so the service stays cheap to clone (all
+    /// clones serialize on the ONE agent treasury). The fixed-cost actuate path (Nostr publish) does
+    /// NOT take this lock — it reserves-then-performs, so its debit is already atomic-before-network.
+    egress_debit_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The type of the per-charge single-flight map inside [`GatewayService::settle_locks`].
@@ -227,6 +241,7 @@ impl GatewayService {
             allowlisted_inbound_kinds,
             settlement: None,
             settle_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            egress_debit_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -963,12 +978,26 @@ impl GatewayService {
             // VARIABLE-cost + IDEMPOTENT (HTTP `http.fetch`, GET/HEAD): PERFORM first, then debit
             // the ACTUAL (<= the worst-case estimate). A debit-only ledger has NO refund, so a
             // worst-case reservation could not be settled DOWN to the actual — hence we do NOT
-            // pre-reserve; we gated on the worst case above, perform, then debit the actual
-            // atomically-with-recording (the brain's proven variable-cost pattern). Never-overspend
-            // holds: actual <= estimate <= budget <= treasury (D-9/D-20). A GET/HEAD is safe, so the
-            // bounded, documented at-most-once-minus window (a lost response after perform, before
-            // the record commits) is a harmless re-fetch — identical to the brain's completion
-            // window, NOT a double-publish.
+            // pre-reserve; we perform then debit the actual atomically-with-recording (the brain's
+            // proven variable-cost pattern). Never-overspend holds: actual <= estimate <= budget <=
+            // treasury (D-9/D-20). A GET/HEAD is safe, so the bounded at-most-once-minus window (a
+            // lost response after perform, before the record commits) is a harmless re-fetch, NOT a
+            // double-publish.
+            //
+            // SERIALIZE the [re-read balance -> gate -> perform -> debit] sequence (codex-1). Without
+            // it, two CONCURRENT variable-cost fetches could both pass the (stale) worst-case gate
+            // against the same balance, both perform, and the loser's debit then fail `Insufficient`
+            // AFTER its GET already ran — a performed-but-UNPAID fetch. Holding `egress_debit_gate`
+            // across the `perform().await` (tokio's Mutex, the `settle_locks` idiom) makes the
+            // balance RE-READ below AUTHORITATIVE: no other variable-cost debit can interleave, so a
+            // fetch the treasury cannot cover is DENIED here, BEFORE performing (debit 0, no wasted
+            // GET). Never-overspend held regardless (the atomic debit's `checked_sub`); this closes
+            // the economic performed-but-unpaid leak.
+            let _egress_debit_guard = self.egress_debit_gate.lock().await;
+            let remaining = self.balance()?;
+            if estimate > remaining {
+                return Ok(denied(Outcome::DeniedInsufficientTreasury, remaining));
+            }
             let (actual_cost, proof, http_response) = match self.rail.perform(act, estimate).await {
                 RailOutcome::Performed { actual_cost, proof, http_response, .. } => {
                     (actual_cost, proof, http_response)
@@ -1002,8 +1031,9 @@ impl GatewayService {
                     prior.completion,
                     None,
                 )),
-                // Defense-in-depth: the worst-case gate already refused over-treasury spends, and
-                // the actual is <= that worst case, so this is unreachable unless an invariant broke.
+                // Defense-in-depth: the under-lock balance re-read gated `estimate <= remaining` and
+                // the actual is <= that estimate, and the `egress_debit_gate` blocks any concurrent
+                // variable-cost debit — so this is unreachable unless an invariant broke.
                 DebitOutcome::Insufficient { remaining } => {
                     Ok(denied(Outcome::DeniedInsufficientTreasury, remaining))
                 }
