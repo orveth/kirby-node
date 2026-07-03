@@ -2718,62 +2718,80 @@ mod tests {
             .expect("old snapshot to all 3 relays");
         assert_eq!(transport.up_count(), 3);
 
-        // Phase 2: publish NEW snapshot (two proofs) to relay 0 ONLY.
-        // Bring 1+2 DOWN so only relay 0 stores the new event.
+        // Phase 2: publish a DIVERGENT new event to a NON-FIRST relay (relay 2) ONLY.
+        // Bring relays 0+1 DOWN so only relay 2 stores it — this proves the union reads
+        // BEYOND relay[0]: a first-relay-only impl would miss this event by id.
+        transport.set_up(0, false);
         transport.set_up(1, false);
-        transport.set_up(2, false);
         let new_content = TokenEventContent {
             mint: "https://m".to_string(),
             unit: "sat".to_string(),
             proofs: vec![dummy_proof("new1"), dummy_proof("new2")],
             del: vec![old_id.to_hex()],
         };
-        // `publish_token` may fail the >=k gate (acks=1 < k=2) but still stores on relay 0.
+        // acks=1 < k=2 → publish_token errors on the >=k gate but STILL stores on the one UP relay (2).
         let _ = store.publish_token(&new_content).await;
-        // Relay 0 now has: old + new (2 token events). Relays 1+2 have: old only.
-        let relay0_token_count = transport.relays[0]
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|ev| ev.kind == Kind::from(KIND_NIP60_TOKEN))
-            .count();
-        assert_eq!(relay0_token_count, 2, "relay 0 has old+new token events");
+        // Capture the divergent event's id from relay 2's log (the token event that is NOT the old one).
+        let new_id = {
+            let log = transport.relays[2].lock().unwrap();
+            log.iter()
+                .find(|ev| ev.kind == Kind::from(KIND_NIP60_TOKEN) && ev.id != old_id)
+                .expect("relay 2 stored the divergent new token event")
+                .id
+        };
+        assert_ne!(new_id, old_id, "the divergent event is distinct from the old snapshot");
+        // The divergent event lives ONLY on relay 2 (absent from the first relays).
+        assert!(
+            !transport.relays[0]
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|ev| ev.id == new_id),
+            "divergent event must be absent from relay 0"
+        );
+        assert!(
+            !transport.relays[1]
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|ev| ev.id == new_id),
+            "divergent event must be absent from relay 1"
+        );
 
-        // Bring all relays UP → 3-relay union must include the relay-0-only new event.
+        // Phase 3: bring all relays UP → the 3-relay union MUST include the relay-2-only event
+        // BY ID MEMBERSHIP (not a count). This is what proves the per-relay read genuinely unions
+        // across a NON-FIRST relay, and it stays RED if the impl drops non-first relays' events.
+        transport.set_up(0, true);
         transport.set_up(1, true);
-        transport.set_up(2, true);
         let read_all = store
             .reconcile_on_load_with_ids()
             .await
             .expect("reconcile with all 3 UP");
         assert_eq!(read_all.served, 3, "all 3 UP → served=3");
-        // The per-relay union fetches relay 0's new event (del-chains the old → new proofs win).
-        // Candidates should include the new proofs (new1, new2) since the del-chain supersedes old.
-        // We verify by event-id coverage: the new event's id should be in fetched_ids.
         assert!(
-            read_all.fetched_ids.len() >= 2,
-            "D2: the 3-relay union includes events from relay 0 (new) AND relays 1+2 (old): \
-             at least 2 distinct event ids; got {}",
-            read_all.fetched_ids.len()
+            read_all.fetched_ids.contains(&new_id.to_hex()),
+            "D2: the 3-relay union MUST include the relay-2-only divergent event by id; \
+             fetched_ids={:?} missing {}",
+            read_all.fetched_ids,
+            new_id.to_hex()
         );
 
-        // Now bring relay 0 DOWN and read only from 1+2.
-        transport.set_up(0, false);
-        let read_12 = store
+        // Partial-set: with relay 2 DOWN, the union must NOT contain the divergent event by id
+        // (it lived only there) — the id-membership negative complements the positive above.
+        transport.set_up(2, false);
+        let read_01 = store
             .reconcile_on_load_with_ids()
             .await
-            .expect("reconcile with relays 1+2 only");
-        assert_eq!(read_12.served, 2, "relays 1+2 UP → served=2");
-        // fetched_ids should only include events on relays 1+2 (the old event, not the new one).
+            .expect("reconcile with relays 0+1 only");
+        assert_eq!(read_01.served, 2, "relays 0+1 UP → served=2");
         assert!(
-            read_12.fetched_ids.len() < read_all.fetched_ids.len(),
-            "D2: the partial-set (1+2) union has FEWER events than the full-set (0+1+2) union — \
-             the relay-0-only new event is absent; got {partial} vs {full}",
-            partial = read_12.fetched_ids.len(),
-            full = read_all.fetched_ids.len()
+            !read_01.fetched_ids.contains(&new_id.to_hex()),
+            "D2: the partial-set (0+1) union must NOT contain the relay-2-only event by id; \
+             fetched_ids={:?} unexpectedly has {}",
+            read_01.fetched_ids,
+            new_id.to_hex()
         );
-        // Restore relay 0.
-        transport.set_up(0, true);
+        transport.set_up(2, true);
     }
 
     // ---- D4 (split-brain): keep_unspent drops a proof the mint calls spent; no double-count ----
