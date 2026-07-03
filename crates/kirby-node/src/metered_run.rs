@@ -438,6 +438,9 @@ async fn tick_until_exhausted(
     // fires on the first tick (right after the meter has a reading) so the live face
     // appears quickly; thereafter on the emitter's interval.
     let mut next_emit = start;
+    // Snapshot lifetime capability spend at run start; the runway estimate uses the DELTA this run
+    // (codex #5), so a resume's prior-run ledger spend does not inflate the current burn rate.
+    let start_capability_spent = meter.capability_spent_best_effort();
 
     loop {
         tokio::time::sleep(tick).await;
@@ -495,7 +498,13 @@ async fn tick_until_exhausted(
         if let Some(emitter) = agent_state {
             let now = tokio::time::Instant::now();
             if now >= next_emit {
-                let runway_secs = estimate_runway_secs(remaining, meter.burned_sats(), start, now);
+                let runway_secs = estimate_runway_secs(
+                    remaining,
+                    meter.burned_sats(),
+                    meter.capability_spent_best_effort().saturating_sub(start_capability_spent),
+                    start,
+                    now,
+                );
                 emitter.emit(remaining, runway_secs).await;
                 next_emit = now + emitter.interval;
             }
@@ -519,21 +528,26 @@ async fn tick_until_exhausted(
     }
 }
 
-/// Estimate seconds-to-broke at the current burn rate: `remaining / (burned /
-/// elapsed_secs)`. Returns `None` (the contract's `null` runway) until a burn rate
-/// is established (no elapsed time or nothing burned yet), so the UI never shows a
-/// divide-by-zero or a bogus infinite runway on the first tick.
+/// Estimate seconds-to-broke at the current TOTAL burn rate: `remaining / (total_burn /
+/// elapsed_secs)`, where `total_burn = burned_sats + capability_debits` (F0-C). The meter's
+/// `burned_sats` is only the synthetic VM-RENT; inference/egress/publish costs debit the treasury
+/// directly (the debit ledger) and are NOT in `burned_sats`. Counting BOTH makes the runway
+/// honest -- rent-only overstates it, so a busily-thinking agent would die surprised. Returns
+/// `None` (the contract's `null` runway) until a rate is established (no elapsed time, or nothing
+/// burned at all), so the UI never shows a divide-by-zero or a bogus infinite runway.
 fn estimate_runway_secs(
     remaining_sats: u64,
     burned_sats: u64,
+    capability_debits: u64,
     start: tokio::time::Instant,
     now: tokio::time::Instant,
 ) -> Option<u64> {
+    let total_burned = burned_sats.saturating_add(capability_debits);
     let elapsed_secs = now.duration_since(start).as_secs_f64();
-    if elapsed_secs <= 0.0 || burned_sats == 0 {
+    if elapsed_secs <= 0.0 || total_burned == 0 {
         return None; // no established burn rate yet -> null runway
     }
-    let burn_rate_per_sec = burned_sats as f64 / elapsed_secs;
+    let burn_rate_per_sec = total_burned as f64 / elapsed_secs;
     if burn_rate_per_sec <= 0.0 {
         return None;
     }
@@ -614,10 +628,10 @@ mod tests {
     fn runway_is_null_until_a_burn_rate_is_established() {
         let t0 = tokio::time::Instant::now();
         // No elapsed time yet -> null (no rate).
-        assert_eq!(estimate_runway_secs(1_000, 0, t0, t0), None);
-        // Elapsed but nothing burned yet -> null.
+        assert_eq!(estimate_runway_secs(1_000, 0, 0, t0, t0), None);
+        // Elapsed but nothing burned yet (no rent, no capability debits) -> null.
         let later = t0 + Duration::from_secs(1);
-        assert_eq!(estimate_runway_secs(1_000, 0, t0, later), None);
+        assert_eq!(estimate_runway_secs(1_000, 0, 0, t0, later), None);
     }
 
     #[test]
@@ -625,9 +639,24 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         let later = t0 + Duration::from_secs(2);
         // Burned 1000 sats over 2s = 500 sats/s; 1000 remaining -> 2s of runway.
-        assert_eq!(estimate_runway_secs(1_000, 1_000, t0, later), Some(2));
+        assert_eq!(estimate_runway_secs(1_000, 1_000, 0, t0, later), Some(2));
         // 5000 remaining at the same 500 sats/s -> 10s.
-        assert_eq!(estimate_runway_secs(5_000, 1_000, t0, later), Some(10));
+        assert_eq!(estimate_runway_secs(5_000, 1_000, 0, t0, later), Some(10));
+    }
+
+    /// F0-C: runway must count TOTAL burn (rent + capability debits), not rent alone -- else a
+    /// busily-thinking agent overstates its runway and dies surprised.
+    #[test]
+    fn runway_counts_capability_debits_not_just_rent() {
+        let t0 = tokio::time::Instant::now();
+        let later = t0 + Duration::from_secs(2);
+        // Rent alone: 1000 over 2s = 500/s; 2000 remaining -> 4s.
+        assert_eq!(estimate_runway_secs(2_000, 1_000, 0, t0, later), Some(4));
+        // Same rent + 1000 sats of capability debits: total 2000 over 2s = 1000/s -> only 2s.
+        assert_eq!(estimate_runway_secs(2_000, 1_000, 1_000, t0, later), Some(2));
+        // Capability debits ALONE (zero rent) still establish a rate (the old rent-only guard
+        // wrongly returned null here, hiding real burn).
+        assert_eq!(estimate_runway_secs(1_000, 0, 1_000, t0, later), Some(2));
     }
 
     #[test]
