@@ -109,6 +109,7 @@ impl Actuator for RecordingActuator {
                     actual_cost: self.cost.min(cap_sats),
                     proof: b"recorded-event-id-hex".to_vec(),
                     completion: Vec::new(),
+                    http_response: None,
                 }
             }
             Err(_) => RailOutcome::UpstreamFailed,

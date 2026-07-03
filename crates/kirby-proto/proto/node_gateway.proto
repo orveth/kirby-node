@@ -100,6 +100,13 @@ message SettleEcash {
   string recipient_or_quote = 3;
 }
 
+// SUPERSEDED by the "http.fetch" actuator kind (C-EGRESS; see HttpFetch below). This is inert
+// scaffolding for the original L402/paid-service idea: it has the wrong shape for a security-
+// critical egress door (a bare method/url/body with a money cap, no response bounding, no header
+// policy, no SSRF story) and no rail performs it (the mock returns a canned receipt). Real egress
+// is an Actuate{kind="http.fetch"} with the daemon-side SSRF guard + host allowlist. Left in place
+// (not removed) so field 5 of the `act` oneof stays retired and the wire stays compatible; do NOT
+// build on it.
 message PaidHttp {
   string method = 1;
   string url = 2;
@@ -221,6 +228,44 @@ message NostrTag {
 message NostrDmReply {
   string to_pubkey = 1;   // recipient hex x-only pubkey (the inbound DM's seal-verified sender)
   string text      = 2;   // the reply text (re-sanitized + re-capped daemon-side)
+}
+
+// The payload for the "http.fetch" actuator kind (C-EGRESS), prost-encoded into Actuate.payload so
+// the genome carries NO JSON and stays egress-locked: the VM never makes the request. The DAEMON
+// decodes this and RE-VALIDATES it against the [egress] policy -- scheme MUST be https, method MUST
+// be in the host method set (Increment 1: GET/HEAD only), host MUST be in the [egress] host_allowlist
+// -- then RESOLVES the host and REJECTS it if ANY resolved IP is in the non-relaxable SSRF-denied
+// floor (loopback / RFC1918 / link-local + cloud metadata / ULA / CGNAT / unspecified / multicast),
+// PINS the vetted IP for the connect (closing the DNS-rebinding / TOCTOU window), performs the
+// request host-side with redirects DISABLED, BOUNDS the response body to the host cap, and meters
+// the cost daemon-side (the eBPF VM-TAP meter never sees a C-EGRESS byte). A new entry point: the
+// daemon never trusts these fields, it re-checks all of them.
+message HttpFetch {
+  string method               = 1;  // "GET" | "HEAD"; the daemon restricts to the [egress] method set
+  string url                  = 2;  // absolute https:// URL; re-parsed + re-resolved + IP-vetted daemon-side
+  repeated HttpHeader headers = 3;  // request headers; only an allowlisted set is forwarded, the rest dropped
+  uint32 max_response_bytes   = 4;  // caller's response cap; the daemon CLAMPS to the host max, never widens
+  uint32 timeout_ms           = 5;  // caller hint; the daemon CLAMPS to the host max
+}
+
+// One HTTP header name/value pair (request or response). A nested message so headers stay typed on
+// the wire without the genome building JSON.
+message HttpHeader {
+  string name  = 1;
+  string value = 2;
+}
+
+// The typed result of an "http.fetch", returned in CapabilityReceipt.http_response (a NEW additive
+// field), NOT in `proof`: the brain needs the body BACK to keep thinking (the same reason a
+// Completion's reply text is its own field), while `proof` stays the small opaque audit token
+// (status + sha256 of the body) that the debit ledger records. Only an allowlisted set of response
+// headers is surfaced.
+message HttpResponse {
+  uint32 status               = 1;  // HTTP status code
+  repeated HttpHeader headers = 2;  // ALLOWLISTED response headers only (content-type, content-length, ...)
+  bytes  body                 = 3;  // response body, TRUNCATED to the effective cap
+  bool   truncated            = 4;  // true if the body hit the cap (an honest partial read)
+  string final_url            = 5;  // the URL actually fetched; redirects are NOT followed (a 3xx returns as-is)
 }
 
 // Daemon-produced payload for a PAYMENT_SETTLED inbound event (Component 2).
@@ -368,4 +413,9 @@ message CapabilityReceipt {
                                  // result, not just the proof. Reads carry it too (found/value/slugs) but are free.
   ChargeIssued charge = 8;       // earn-loop: the payment request the daemon issued for an IssueCharge act.
                                  // Absent for every other act.
+  HttpResponse http_response = 9;// C-EGRESS: the typed result of an "http.fetch" Actuate act, absent for
+                                 // every other act. Rides its own field (not `proof`) because the brain
+                                 // needs the body back to keep thinking; `proof` stays the small audit
+                                 // token (status + sha256(body)). NOT persisted in the ledger, so it is
+                                 // absent on a DUPLICATE_IGNORED replay (a safe/idempotent GET re-fetches).
 }

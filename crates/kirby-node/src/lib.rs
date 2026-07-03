@@ -251,6 +251,10 @@ pub mod fleet_reconcile;
 pub mod failover_detect;
 #[cfg(target_os = "linux")]
 pub mod full_loop_run;
+// C-EGRESS: the HTTP egress actuator (the `http.fetch` Actuate kind) and its non-relaxable SSRF
+// guard. Isolated so the security-critical logic (the whole-internet door) is one auditable surface
+// with direct unit teeth. Holds no key material (money-confinement).
+pub mod egress;
 pub mod gateway;
 // Hibernation thin-slice shared types (H0): StateBundle/Share/Lease/WatcherRecord/
 // WakeRequest + the agent-scoped path helper. Platform-agnostic host-side serde

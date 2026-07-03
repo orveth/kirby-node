@@ -25,6 +25,16 @@ pub const ACTUATE_KIND_NOSTR_PUBLISH: &str = "nostr.publish";
 /// the private voice is gated independently of the public one (per-kind allowlist).
 pub const ACTUATE_KIND_NOSTR_DM_REPLY: &str = "nostr.dm_reply";
 
+/// The actuator kind (and per-kind allowlist token) for an HTTP egress fetch (C-EGRESS): the
+/// agent's first voice to the WHOLE internet, and the highest-blast-radius door on the roadmap.
+/// The genome sets `Actuate.kind` to this with a prost-encoded [`HttpFetch`] payload; the daemon's
+/// `destination` returns it, so a workload whose allowlist LACKS this token issues ZERO fetches at
+/// the gateway allowlist step (the token gates the DOOR). The daemon's `HttpEgressActuator` then
+/// gates the DESTINATION: scheme + method + host allowlist + the non-relaxable resolve-then-pin
+/// SSRF floor. Granted ONLY when `[egress] enabled` (default off). Lives here, the shared contract,
+/// so the genome and daemon agree on ONE value.
+pub const ACTUATE_KIND_HTTP_FETCH: &str = "http.fetch";
+
 /// The only Nostr event kind the `nostr.publish` actuator may emit in the MVP: 1, a public
 /// text note (NIP-01). The daemon RESTRICTS the publishable kind to this (defense in depth,
 /// the handler is a new entry point); a payload naming any other kind is refused. A `u16`

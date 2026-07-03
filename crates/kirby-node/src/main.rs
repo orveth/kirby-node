@@ -2380,6 +2380,8 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
         memory: None,
         agent: None,
         social: None,
+        // No outward acts in the G1 demo: no voice, no egress door.
+        egress: None,
         // No brain/wallet in the G1 demo → NIP-60 is inactive (empty relays, no store).
         nip60: Default::default(),
         fleet_relay: String::new(),
@@ -2476,6 +2478,8 @@ async fn run_app_checkpoint(args: AppCheckpointArgs) -> anyhow::Result<()> {
         memory: None,
         agent: None,
         social: None,
+        // No outward acts in the app-checkpoint demo: no voice, no egress door.
+        egress: None,
         // No brain/wallet in the app-checkpoint demo → NIP-60 inactive.
         nip60: Default::default(),
         fleet_relay: String::new(),

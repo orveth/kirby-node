@@ -427,7 +427,7 @@ fn agent_boot_config(
     // and all three cmdline blocks travel. This is the only config-wiring the capable agent
     // needs (no new daemon act/rail/metering/nerve code — the two acts compose on orthogonal
     // seams).
-    let (allow, brain, memory, agent) = match cfg.workload {
+    let (mut allow, brain, memory, agent) = match cfg.workload {
         Workload::Capable => (
             // The capable loop is the both-acts workload PLUS the outward voice: the brain +
             // memory sentinels AND the nostr.publish actuator token in the allowlist, so
@@ -486,6 +486,26 @@ fn agent_boot_config(
         }),
         _ => None,
     };
+    // C-EGRESS (deny-by-default): grant the `http.fetch` token AND build the egress policy ONLY
+    // when `[egress] enabled` on the capable workload. Without the token a fetch is
+    // DENIED_NOT_ALLOWLISTED at the gateway (the door stays shut); without the policy no
+    // HttpEgressActuator is built (nothing to perform it). The refused-host set adds the node's own
+    // infra endpoints (the fleet relay, the mint, the Routstr node) so egress can never reach them
+    // even if a deploy allowlisted the host — belt-and-suspenders atop the SSRF floor (which already
+    // blocks them by loopback/private IP when co-located).
+    let egress = if matches!(cfg.workload, Workload::Capable) && cfg.egress.enabled {
+        allow.push(kirby_proto::ACTUATE_KIND_HTTP_FETCH.to_string());
+        let mut refused = vec![crate::rail::host_of(&cfg.relay.url)];
+        if !cfg.brain.mint_url.trim().is_empty() {
+            refused.push(crate::rail::host_of(&cfg.brain.mint_url));
+        }
+        if !cfg.brain.node_url.trim().is_empty() {
+            refused.push(crate::rail::host_of(&cfg.brain.node_url));
+        }
+        Some(crate::egress::EgressPolicy::from_config(&cfg.egress, refused))
+    } else {
+        None
+    };
     Ok(BootConfig {
         image,
         node_id: cfg.node_id.clone(),
@@ -503,6 +523,7 @@ fn agent_boot_config(
         memory,
         agent,
         social,
+        egress,
         nip60: cfg.nip60.clone(),
         fleet_relay: cfg.relay.url.clone(),
         // Sovereign single-agent v0 is vsock-only (no TAP egress lockdown; that is
@@ -989,6 +1010,7 @@ mod tests {
             fleet: Default::default(),
             state_root: None,
             max_run_secs: None,
+            egress: Default::default(),
         }
     }
 

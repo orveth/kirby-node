@@ -85,6 +85,7 @@ fn vz_boot(
         snapshot_capable: false,
         restore_checkpoint: None,
         lease_fence: None,
+        egress: None,
     }
 }
 
