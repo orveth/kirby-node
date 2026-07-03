@@ -13,9 +13,16 @@
 //!   - TOOTH 2 (unpaid-gate, integration arm): a quote that is NOT yet paid does not mint or
 //!     credit through the settle path .. `unpaid_quote_settle_credits_nothing`
 //!     (the DETERMINISTIC gate tooth lives in rail.rs `lightning_settlement_gate_tests`)
-//!   - TOOTH 3 (orphaned-proofs recovery): a crash between `mint()` and the credit recovers on
-//!     the settle RETRY via the ISSUED branch — treasury credited exactly the minted amount,
-//!     mint() ran exactly once, no proof loss .. `issued_quote_recovers_the_orphaned_mint`
+//!   - TOOTH 3 (orphaned-proofs recovery + IDEMPOTENT): a crash between `mint()` and the credit
+//!     recovers on the settle RETRY via the ISSUED branch — treasury credited exactly the summed
+//!     HELD-UNSPENT amount (NOT the mint-claimed amount_issued), mint() ran exactly once, no proof
+//!     loss, AND a second settle credits nothing more .. `issued_quote_recovers_the_orphaned_mint`
+//!   - TOOTH (ii) (★PHANTOM-GUARD): an ISSUED quote whose mint-claimed `amount_issued` diverges
+//!     from the ZERO sats actually held FAILS CLEAN (credits nothing, records a stranded quote),
+//!     never crediting the phantom `amount_issued`
+//!     .. `issued_quote_with_no_held_proofs_fails_clean_and_records_stranded`
+//!   - MINT-DOWN-CLEAN: an unreachable mint during settle errors, credits nothing, no panic
+//!     .. `mint_unreachable_during_settle_errs_and_credits_nothing`
 //!
 //! The fakewallet mint (a real cdk-mintd with the cdk-fake-wallet backend) auto-marks a mint
 //! quote PAID after a short random delay (mintd default min..=max = 1..=3s), so "the stranger
@@ -25,24 +32,54 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cdk::amount::SplitTarget;
 use cdk::nuts::nut00::ProofsMethods as _;
-use cdk::nuts::MintQuoteState;
+use cdk::nuts::{MintQuoteState, State};
 
 use kirby_node::gateway::{GatewayService, Session};
 use kirby_node::mint_rig::build_wallet;
 use kirby_node::nerve::InboundQueue;
 use kirby_node::rail::{
-    ChargeIssuedData, LightningSettlement, MockRail, SettlementProvider, ISSUE_CHARGE_DESTINATION,
+    ChargeIssuedData, LightningSettlement, MockRail, SettlementProvider, StrandedQuoteSink,
+    ISSUE_CHARGE_DESTINATION,
 };
 use kirby_node::treasury::{CreditOutcome, Treasury};
 
 use kirby_proto::InboundKind;
 
 use common::mint_fixture::FakeMint;
+
+/// A capturing [`StrandedQuoteSink`] for the phantom-guard tooth: records every
+/// `record_stranded` call so the test can assert the TRUE lost-response path (mint ISSUED,
+/// wallet empty) recorded the stranded quote instead of crediting.
+#[derive(Default)]
+struct CapturingStrandedSink {
+    calls: Mutex<Vec<(String, u64, String)>>,
+    count: AtomicU64,
+}
+
+impl StrandedQuoteSink for CapturingStrandedSink {
+    fn record_stranded(&self, quote_id: &str, amount_issued: u64, reason: &str) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.calls
+            .lock()
+            .unwrap()
+            .push((quote_id.to_string(), amount_issued, reason.to_string()));
+    }
+}
+
+impl CapturingStrandedSink {
+    fn count(&self) -> u64 {
+        self.count.load(Ordering::SeqCst)
+    }
+    fn last(&self) -> Option<(String, u64, String)> {
+        self.calls.lock().unwrap().last().cloned()
+    }
+}
 
 /// A settlement-mode gateway wired with a `LightningSettlement` over the daemon's host-held
 /// wallet (mirrors E6's `settlement_gateway`, swapping the provider). Returns the service +
@@ -337,5 +374,171 @@ async fn issued_quote_recovers_the_orphaned_mint() {
     // (c) no proof loss: the minted proofs are all still there.
     assert_eq!(wallet_after_retry, 300, "no proof loss — the minted 300 sat remain in the wallet");
 
+    // (d) IDEMPOTENT: a SECOND settle of the SAME charge credits nothing more. The gateway's
+    //     credit_lookup hits the now-recorded credit and short-circuits (never re-verifying), so
+    //     the treasury stays at exactly 300 and the credit is Duplicate. verify_settlement is
+    //     safe-to-call-more-than-once by construction (its ISSUED re-sum of Unspent proofs is
+    //     deterministic), and the gateway is the double-credit wall.
+    let second = svc
+        .settle_charge(&charge.charge_id, "")
+        .await
+        .expect("a second settle of the same charge must not error");
+    assert!(
+        matches!(second, CreditOutcome::Duplicate(_)),
+        "a second settle of an already-credited charge must be Duplicate (credited nothing more)"
+    );
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        minted,
+        "IDEMPOTENT: the treasury is still exactly the once-credited amount (300) after a re-settle"
+    );
+
     mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// TOOTH (ii) — ★PHANTOM-GUARD: an ISSUED quote whose mint-claimed `amount_issued` DIVERGES from
+// the sats actually HELD in the wallet must NEVER credit `amount_issued`.
+//
+// CONSTRUCTING THE DIVERGENCE (amount_issued=300, held=0): mint the proofs (quote flips to
+// ISSUED at the mint, so `amount_issued`=300), then mark those proofs SPENT in the wallet's
+// localstore (models a daemon that already spent/melted them, or a lost mint-response that left
+// the mint's book ISSUED while the wallet holds nothing Unspent for the quote). Now the mint
+// CLAIMS 300 issued, but the wallet holds ZERO Unspent for the quote. The tx still names the
+// proofs (found_transaction=true), so this is the "tx exists but every proof is gone" arm.
+//
+// Correct code: `held_unspent_for_quote` sums the Unspent proofs = 0 → verify_settlement
+// FAILS CLEAN (Err), credits nothing, and records the stranded quote via the injected sink.
+//
+// RED-on-revert: replace the ISSUED branch body with `return Ok(quote.amount_issued.into());`
+// (the old phantom bug). verify_settlement then credits the mint-claimed 300 the wallet does
+// NOT hold → settle_charge returns Credited{300} → the "treasury stays 0 / settle errs"
+// assertions fail. Observed RED = the treasury is credited 300 phantom sats. This is what
+// proves "never amount_issued".
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn issued_quote_with_no_held_proofs_fails_clean_and_records_stranded() {
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    let wallet = build_wallet(&mint.url()).await.expect("build daemon wallet");
+    let probe = LightningSettlement::new(wallet.clone());
+    let charge = probe.issue(300, "phantom-guard").await.expect("issue");
+
+    // The stranger pays; mint the proofs (this flips the quote to ISSUED and sets amount_issued).
+    await_quote_state(&wallet, &charge.charge_id, MintQuoteState::Paid).await;
+    let minted_proofs = wallet
+        .mint(&charge.charge_id, SplitTarget::default(), None)
+        .await
+        .expect("mint the settled ecash");
+    let minted_ys = minted_proofs.ys().expect("minted proof ys");
+    let minted: u64 = minted_proofs.total_amount().expect("total").into();
+    assert_eq!(minted, 300, "the mint produced the full amount");
+
+    // Precondition: the quote is ISSUED and the mint claims amount_issued == 300.
+    let issued_quote = wallet
+        .check_mint_quote_status(&charge.charge_id)
+        .await
+        .expect("check quote");
+    assert_eq!(issued_quote.state, MintQuoteState::Issued, "quote is ISSUED at the mint");
+    assert_eq!(
+        u64::from(issued_quote.amount_issued),
+        300,
+        "the mint CLAIMS 300 issued — this is the phantom amount the buggy branch would credit"
+    );
+
+    // MAKE THEM DIVERGE: mark the minted proofs SPENT so the wallet holds ZERO Unspent for the
+    // quote while the mint's book still says amount_issued=300.
+    wallet
+        .localstore
+        .update_proofs_state(minted_ys, State::Spent)
+        .await
+        .expect("mark the minted proofs spent (the wallet no longer holds them)");
+    let held_unspent: u64 = wallet
+        .localstore
+        .get_proofs(None, None, Some(vec![State::Unspent]), None)
+        .await
+        .expect("read unspent proofs")
+        .iter()
+        .map(|p| u64::from(p.proof.amount))
+        .sum();
+    assert_eq!(held_unspent, 0, "precondition: the wallet holds ZERO Unspent — divergence is real");
+
+    // Wire settlement with a CAPTURING stranded sink so we can assert the fail-clean record.
+    let sink = Arc::new(CapturingStrandedSink::default());
+    let treasury = Treasury::open_temporary(0).expect("treasury");
+    let session = Session {
+        task_descriptor: "phantom-guard".into(),
+        budget_sats: 0,
+        allowlisted_destinations: vec![ISSUE_CHARGE_DESTINATION.to_string()],
+        allowlisted_inbound_kinds: vec![InboundKind::PaymentSettled],
+    };
+    let svc = GatewayService::new(treasury, Arc::new(MockRail::new()), session)
+        .with_settlement_provider(
+            LightningSettlement::new(wallet.clone()).with_stranded_sink(sink.clone()),
+        );
+    assert_eq!(svc.treasury_remaining().unwrap(), 0, "treasury starts empty");
+
+    // THE TOOTH: settling the ISSUED-but-not-held quote FAILS CLEAN — no credit, no phantom sats.
+    let settled = svc.settle_charge(&charge.charge_id, "").await;
+    assert!(
+        settled.is_err(),
+        "settling an ISSUED quote with NO held proofs must FAIL CLEAN (never credit amount_issued)"
+    );
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        0,
+        "MONEY-MUST: a phantom amount_issued (300) with an empty wallet credits NOTHING — \
+         reverting the ISSUED branch to `Ok(amount_issued)` credits 300 here (RED-on-revert)"
+    );
+
+    // The stranded quote was recorded for out-of-band (saga/NUT-09) recovery.
+    assert_eq!(sink.count(), 1, "the lost-response path recorded exactly one stranded quote");
+    let (rec_id, rec_amt, rec_reason) = sink.last().expect("a stranded record");
+    assert_eq!(rec_id, charge.charge_id, "the stranded record carries the quote id");
+    assert_eq!(rec_amt, 300, "the stranded record carries the mint-claimed amount_issued");
+    assert!(
+        rec_reason.contains("issued-but-proofs-not-held"),
+        "the stranded record reason names the lost-response (got {rec_reason:?})"
+    );
+
+    mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// MINT-DOWN-CLEAN: the mint is unreachable during settlement → verify Errs, nothing is
+// credited, no panic, no partial/committed state a retry would double-count.
+//
+// Construct: issue a charge against a LIVE mint (so we hold a real quote id), then SHUT THE
+// MINT DOWN and settle. `verify_settlement`'s `check_mint_quote_status` hits a dead URL → Err →
+// `settle_charge` returns Err → the treasury is untouched. Because the FIRST wall (credit_lookup)
+// found nothing and verify_settlement never reached the wallet, a later retry (against a live
+// mint) would still credit exactly once — no committed state was written on the failed attempt.
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn mint_unreachable_during_settle_errs_and_credits_nothing() {
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    let wallet = build_wallet(&mint.url()).await.expect("build daemon wallet");
+    let probe = LightningSettlement::new(wallet.clone());
+    let charge = probe.issue(150, "mint-down").await.expect("issue while the mint is up");
+
+    // The mint goes DOWN before settlement.
+    mint.shutdown().await;
+
+    let (svc, _queue) = lightning_gateway(0, wallet.clone());
+    assert_eq!(svc.treasury_remaining().unwrap(), 0, "treasury starts empty");
+
+    // Settling now must ERROR (the mint status check cannot reach a dead mint) — not panic.
+    let settled = svc.settle_charge(&charge.charge_id, "").await;
+    assert!(
+        settled.is_err(),
+        "settling against an unreachable mint must return Err (no credit)"
+    );
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        0,
+        "MONEY-MUST: a mint-down settle credits NOTHING and leaves no state a retry would double-count"
+    );
 }

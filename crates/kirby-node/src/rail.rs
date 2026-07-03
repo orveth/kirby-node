@@ -3454,8 +3454,9 @@ impl SettlementProvider for CashuSettlement {
 ///   the payer supplies).
 ///
 /// MONEY-MUST: `verify_settlement` returns the MINT-VERIFIED amount (the total of the proofs
-/// the mint actually minted, or the already-issued amount on the recovery path), NEVER the
-/// requested `amount_sats`. The gateway wires that value straight into `credit_verified`.
+/// the mint actually minted, or — on the ISSUED recovery path — the sats ACTUALLY HELD in the
+/// wallet for this quote), NEVER the requested `amount_sats` and NEVER the mint's CLAIMED
+/// `amount_issued`. The gateway wires that value straight into `credit_verified`.
 ///
 /// NIP-60 PERSISTENCE: the minted proofs land in the wallet's cdk store (the truth) exactly
 /// like `CashuSettlement`'s received proofs. The relay MIRROR is NOT inline here: the
@@ -3465,11 +3466,125 @@ impl SettlementProvider for CashuSettlement {
 /// flusher over the settlement wallet is 1b (this increment does not touch boot).
 pub struct LightningSettlement {
     wallet: Arc<cdk::Wallet>,
+    /// Where a TRUE lost-response (mint ISSUED but the proofs never landed in the wallet) is
+    /// durably recorded for later operator recovery via CDK's saga (NUT-09). Defaults to a
+    /// loud-`tracing::error!` sink ([`LoudErrorStrandedSink`]); a durable sled-backed sink is
+    /// injected via [`Self::with_stranded_sink`] (tests capture it; the real durable impl +
+    /// its boot wiring is Inc 1b — see `record_stranded`). Safety does NOT depend on this
+    /// marker's durability: the lost-response path FAILS CLEAN (no credit) regardless.
+    stranded_sink: Arc<dyn StrandedQuoteSink + Send + Sync>,
 }
 
 impl LightningSettlement {
+    /// Build a settlement over the host-held wallet with the DEFAULT loud-error stranded sink.
+    /// Existing callers are unchanged: a durable sink is opt-in via [`Self::with_stranded_sink`].
     pub fn new(wallet: Arc<cdk::Wallet>) -> Self {
-        Self { wallet }
+        Self { wallet, stranded_sink: Arc::new(LoudErrorStrandedSink) }
+    }
+
+    /// Inject a [`StrandedQuoteSink`] (builder form): tests inject a capturing sink to assert the
+    /// lost-response path records the stranded quote; Inc 1b injects the durable sled-backed sink.
+    pub fn with_stranded_sink(mut self, sink: Arc<dyn StrandedQuoteSink + Send + Sync>) -> Self {
+        self.stranded_sink = sink;
+        self
+    }
+
+    /// Sum the sats ACTUALLY HELD (unspent) in the wallet for `charge_id`'s mint quote, and
+    /// whether any wallet [`Transaction`](cdk::wallet::types::Transaction) records that quote.
+    ///
+    /// This is the counter-FREE recovery read the ISSUED branch uses (NO `wallet.restore`, NO
+    /// NUT-13 counter writes). The wallet writes a durable Incoming `Transaction{quote_id, ys}`
+    /// ONLY after the minted proofs persist, so the record's PRESENCE ⇒ proofs were stored; its
+    /// `ys` name those proofs. We then read them back by y and sum only the `State::Unspent`
+    /// ones — the deterministic (idempotent) "what is really here for this quote right now".
+    ///
+    /// Returns `(held_sats, found_transaction)`:
+    ///   - `held_sats` = summed amount of the still-Unspent proofs named by the quote's tx(s);
+    ///   - `found_transaction` = true iff at least one Incoming tx quotes this `charge_id`.
+    ///
+    /// A `(0, true)` result (tx exists but every proof was spent/removed) and a `(0, false)`
+    /// (no tx at all — the true lost-response) both mean "credit nothing" to the caller.
+    async fn held_unspent_for_quote(&self, charge_id: &str) -> anyhow::Result<(u64, bool)> {
+        use cdk::nuts::State;
+        use cdk::wallet::types::TransactionDirection;
+
+        // The wallet writes an Incoming (mint) Transaction only after the proofs persist. List
+        // Incoming Sat txs and select the one(s) whose quote_id == charge_id. `get_transaction`
+        // takes a TransactionId (a hash of the ys), NOT a quote_id, so we list+filter by quote_id.
+        let txs = self
+            .wallet
+            .localstore
+            .list_transactions(
+                Some(self.wallet.mint_url.clone()),
+                Some(TransactionDirection::Incoming),
+                Some(self.wallet.unit.clone()),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("list wallet transactions for quote {charge_id}: {e}"))?;
+
+        // Collect the ys of every Incoming tx that names this quote (normally exactly one).
+        let ys: Vec<cdk::nuts::PublicKey> = txs
+            .iter()
+            .filter(|t| t.quote_id.as_deref() == Some(charge_id))
+            .flat_map(|t| t.ys.iter().copied())
+            .collect();
+        let found_transaction = !ys.is_empty();
+        if !found_transaction {
+            // No durable record that proofs for this quote ever persisted ⇒ the TRUE lost-response.
+            return Ok((0, false));
+        }
+
+        // Read those proofs back and sum ONLY the still-Unspent ones. Summing Unspent (not the
+        // claimed amount) makes the recovery DETERMINISTIC + idempotent: a second settle re-sums
+        // the same live set → the same number, and a proof later spent drops out of the sum.
+        let proofs = self
+            .wallet
+            .localstore
+            .get_proofs_by_ys(ys)
+            .await
+            .map_err(|e| anyhow::anyhow!("read proofs for quote {charge_id}: {e}"))?;
+        let held: u64 = proofs
+            .iter()
+            .filter(|p| p.state == State::Unspent)
+            .map(|p| u64::from(p.proof.amount))
+            .sum();
+        Ok((held, found_transaction))
+    }
+}
+
+/// A durable-record seam for a TRUE lost-response: the mint reports a quote ISSUED but the
+/// minted proofs are NOT held in the wallet (no Incoming tx names the quote, or every named
+/// proof is gone). The daemon credits NOTHING (fail-clean); this records the fact so an
+/// operator can recover the stranded value out of band (CDK persists `counter_start/end` +
+/// the blinded messages for exactly this case; recovery is `recover_incomplete_sagas` /
+/// NUT-09). Held behind a trait so tests inject a capturing impl and Inc 1b can inject a
+/// durable (sled-backed) impl WITHOUT changing this call site.
+pub trait StrandedQuoteSink {
+    /// Record that `quote_id` is ISSUED-but-not-held: the mint claims `amount_issued` sats were
+    /// issued, but the wallet does not hold them. `reason` is a short human note. MUST NOT credit.
+    fn record_stranded(&self, quote_id: &str, amount_issued: u64, reason: &str);
+}
+
+/// The DEFAULT [`StrandedQuoteSink`]: emit a loud `tracing::error!` carrying the quote id, the
+/// mint-claimed amount, and the reason. Non-durable by itself — the durable sled-backed sink +
+/// its boot wiring is Inc 1b. Chosen for 1a because (a) `LightningSettlement` is not yet wired
+/// into boot (adding a durable store would require boot changes this increment must not make),
+/// and (b) money-safety does NOT rest on the marker: the lost-response path already FAILS CLEAN
+/// (returns Err, credits nothing) whether or not the marker persists. The loud error guarantees
+/// the event is never silent while the durable store is deferred.
+pub struct LoudErrorStrandedSink;
+
+impl StrandedQuoteSink for LoudErrorStrandedSink {
+    fn record_stranded(&self, quote_id: &str, amount_issued: u64, reason: &str) {
+        tracing::error!(
+            quote_id,
+            amount_issued,
+            reason,
+            "STRANDED bolt11 mint quote: the mint reports it ISSUED but the wallet holds NO \
+             proofs for it — crediting NOTHING (fail-clean). Recover via CDK's saga \
+             (recover_incomplete_sagas / NUT-09). [Inc 1b: replace this loud-error sink with a \
+             durable sled-backed StrandedQuoteSink wired at boot.]"
+        );
     }
 }
 
@@ -3482,9 +3597,10 @@ impl LightningSettlement {
 /// - `Paid`   → `Ok`: the customer's Lightning payment reached the mint; we may mint.
 /// - `Unpaid` → `Err`: no payment yet → NO mint, NO credit (fail-closed).
 /// - `Issued` → `Err`: the ecash was ALREADY minted by a prior attempt. This gate is only
-///   ever consulted on the freshly-mintable path; the `Issued` RECOVERY is handled BEFORE
-///   the gate (see `verify_settlement`), so reaching the gate with `Issued` would mean a
-///   double-mint attempt — rejecting it is the correct fail-closed default.
+///   ever consulted on the freshly-mintable path; the `Issued` RECOVERY (credit the held
+///   Unspent proofs, or fail-clean when none are held) is handled BEFORE the gate (see
+///   `verify_settlement`), so reaching the gate with `Issued` would mean a double-mint
+///   attempt — rejecting it is the correct fail-closed default.
 ///
 /// This is the RED-on-revert target for the unpaid-gate tooth: relaxing it to `Ok(())` for
 /// every state lets an UNPAID quote mint (or attempt to) and credit — the money leak the
@@ -3543,21 +3659,50 @@ impl SettlementProvider for LightningSettlement {
         // RECOVERY-AWARE mint (the orphaned-proofs tooth). A prior settle can crash AFTER
         // `wallet.mint` (the proofs are minted into the wallet + the quote flips to ISSUED at
         // the mint) but BEFORE the gateway's `credit_verified` durably records the credit. On
-        // the retry the quote is ISSUED, so `wallet.mint` would error (nothing left to mint) —
-        // instead we take the already-issued amount and let the gateway's charge_id-idempotent
-        // credit proceed. Net: a crash in that window recovers on the next settle with NO
-        // double-mint and NO lost sats. The proofs from the first (successful) mint are already
-        // in the wallet store, so they are NOT re-minted and NOT lost.
+        // the retry the quote is ISSUED, so `wallet.mint` would error (nothing left to mint).
+        //
+        // MONEY-CORRECT recovery (counter-FREE): we credit the sats ACTUALLY HELD in the wallet
+        // for this quote — the summed still-Unspent proofs the wallet's durable Incoming
+        // Transaction names — NEVER the mint's CLAIMED `amount_issued`. `amount_issued` is the
+        // mint's book, not ours: a lost mint-response can leave the mint ISSUED with our wallet
+        // EMPTY, and crediting `amount_issued` there would be PHANTOM sats. Summing our own
+        // Unspent proofs is also deterministic, so a double-settle re-sums the SAME amount (the
+        // idempotency the gateway's charge_id credit relies on).
         if quote.state == MintQuoteState::Issued {
-            let issued: u64 = quote.amount_issued.into();
-            tracing::info!(
-                charge_id,
-                issued_sats = issued,
-                "bolt11 settlement: quote already ISSUED (a prior mint succeeded before the \
-                 credit landed) — returning the already-issued amount for the idempotent credit \
-                 WITHOUT re-minting (orphaned-proofs recovery)"
+            let (held, found_transaction) = self.held_unspent_for_quote(charge_id).await?;
+            if held > 0 {
+                // The ORPHANED (common) crash: the proofs really are in the wallet. Credit
+                // EXACTLY the held sum (mint-verified sats we actually hold), no re-mint.
+                tracing::info!(
+                    charge_id,
+                    held_sats = held,
+                    amount_issued = u64::from(quote.amount_issued),
+                    "bolt11 settlement: quote already ISSUED and its minted proofs are HELD in \
+                     the wallet (a prior mint succeeded before the credit landed) — crediting the \
+                     summed UNSPENT proofs (NOT the mint-claimed amount_issued), no re-mint \
+                     (orphaned-proofs recovery)"
+                );
+                return Ok(held);
+            }
+            // The TRUE lost-response: the mint says ISSUED, but we hold NOTHING for this quote
+            // (no Incoming tx names it, or every named proof is spent/removed). FAIL CLEAN —
+            // credit nothing, record the stranded quote for out-of-band recovery. Do NOT touch
+            // NUT-13 counters: CDK's saga already persists counter_start/end + the blinded
+            // messages for this quote, so recovery goes through the saga (NUT-09), not here.
+            let amount_issued: u64 = quote.amount_issued.into();
+            let reason = if found_transaction {
+                "issued-but-proofs-not-held (a transaction names the quote but every proof is \
+                 spent/removed); restore key is in CDK's saga (recover_incomplete_sagas / NUT-09)"
+            } else {
+                "issued-but-proofs-not-held (no wallet transaction records this quote's proofs); \
+                 restore key is in CDK's saga (recover_incomplete_sagas / NUT-09)"
+            };
+            self.stranded_sink.record_stranded(charge_id, amount_issued, reason);
+            anyhow::bail!(
+                "bolt11 settlement: quote {charge_id} is ISSUED at the mint but the wallet holds \
+                 NO proofs for it (mint-claimed amount_issued={amount_issued}) — refusing to \
+                 credit phantom sats (fail-clean); recorded as a stranded quote for saga recovery"
             );
-            return Ok(issued);
         }
 
         // FRESHLY-MINTABLE path. Gate first (money-tooth): only a PAID quote may mint. An UNPAID
