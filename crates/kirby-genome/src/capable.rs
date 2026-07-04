@@ -2528,6 +2528,13 @@ pub(super) async fn earn_loop(
 /// `oracle_min_charge_sats` floor lands in O3).
 const ORACLE_DEFAULT_CHARGE_SATS: u64 = 10;
 
+/// The FLOOR on a quoted oracle charge (design O3-2). The brain quotes `CHARGE:<n>`; a quote below
+/// this floor is clamped UP so the oracle never sells an answer below its own cost (one think + up
+/// to `ORACLE_FETCH_ATTEMPTS` fetches per feed under the O3-1 retry). This is a MIN, not a fixed
+/// price -- a quote at or above the floor passes through unchanged. A named, config-tunable const
+/// (a future wire to `DiaristParams` is out of scope).
+const ORACLE_MIN_CHARGE_SATS: u64 = 10;
+
 /// How many ticks an issued-but-unpaid charge stays in the in-memory waiting-set before it is
 /// aged out (design A.6: the customer-never-pays path costs the agent one think + one invoice
 /// DM, already spent, never an unbounded memory leak). Seq advances ~once per tick, so this is a
@@ -3144,8 +3151,16 @@ pub(super) async fn oracle_tick<G: Gateway>(
                     },
                 };
                 // The charge amount rides the plan (CHARGE:<n>, positive allowlist), falling back
-                // to the MVP default so a malformed plan still quotes a sensible price.
-                let amount_sats = parse_inbound_job_request(&reply, ORACLE_DEFAULT_CHARGE_SATS);
+                // to the MVP default so a malformed plan still quotes a sensible price. O3-2: clamp
+                // UP to the min-charge floor so an under-quote can't sell an answer below cost (a
+                // MIN, not a fixed price -- a quote >= the floor passes through unchanged).
+                let quoted_sats = parse_inbound_job_request(&reply, ORACLE_DEFAULT_CHARGE_SATS);
+                let amount_sats = quoted_sats.max(ORACLE_MIN_CHARGE_SATS);
+                if amount_sats > quoted_sats {
+                    boot_log(&format!(
+                        "oracle seq={seq}: quote {quoted_sats} below floor {ORACLE_MIN_CHARGE_SATS}; charging the floor"
+                    ));
+                }
 
                 // ISSUE CHARGE: daemon-side, zero cost to the genome; keyed per seq (idempotent on
                 // a Transient replay -> the SAME charge_id, never a second charge).
@@ -4301,6 +4316,58 @@ mod tests {
             coinbase_keys.contains(&"oracle-fetch-2-coinbase-0".to_string())
                 && coinbase_keys.contains(&"oracle-fetch-2-coinbase-1".to_string()),
             "the two attempt keys carry the -0 / -1 suffixes: {coinbase_keys:?}"
+        );
+    }
+
+    /// The `amount_sats` of the single IssueCharge that reached the gateway (the oracle quote).
+    fn issued_charge_amount(gw: &MockGateway) -> u64 {
+        gw.requests
+            .iter()
+            .find_map(|r| match &r.act {
+                Some(Act::IssueCharge(c)) => Some(c.amount_sats),
+                _ => None,
+            })
+            .expect("an IssueCharge reached the gateway")
+    }
+
+    /// TOOTH (O3-2): a brain quote BELOW the min-charge floor is clamped UP to the floor, so the
+    /// oracle never sells an answer below its own cost. RED on removing `.max(ORACLE_MIN_CHARGE_SATS)`
+    /// -> the below-floor quote (2) is issued verbatim.
+    #[tokio::test]
+    async fn oracle_min_charge_floor_clamps_below_floor_quote() {
+        let sender = dm_sender_hex(15);
+        let params = test_params();
+        // The brain under-quotes: CHARGE:2, below the 10-sat floor.
+        let mut gw = MockGateway::thinking("CHARGE:2").with_dm(1, &sender, "PRICE BTC/USD");
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        assert_eq!(gw.issue_charge_requests(), 1, "the DM is charged");
+        assert_eq!(
+            issued_charge_amount(&gw),
+            ORACLE_MIN_CHARGE_SATS,
+            "a below-floor quote (2) is clamped UP to the floor (10), not sold below cost"
+        );
+    }
+
+    /// TOOTH (O3-2, anti-over-clamp): a brain quote ABOVE the floor passes through UNCHANGED -- the
+    /// floor is a MIN, not a fixed price. Guards against clamping every quote down to the floor.
+    #[tokio::test]
+    async fn oracle_min_charge_floor_passes_above_floor_quote() {
+        let sender = dm_sender_hex(16);
+        let params = test_params();
+        // The brain quotes CHARGE:50, comfortably above the floor.
+        let mut gw = MockGateway::thinking("CHARGE:50").with_dm(1, &sender, "PRICE BTC/USD");
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        assert_eq!(gw.issue_charge_requests(), 1, "the DM is charged");
+        assert_eq!(
+            issued_charge_amount(&gw),
+            50,
+            "an above-floor quote passes through unchanged (the floor is a MIN, not a fixed price)"
         );
     }
 
