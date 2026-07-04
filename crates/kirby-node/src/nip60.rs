@@ -2926,4 +2926,234 @@ mod tests {
         let got2 = wallet.imported.lock().unwrap().clone();
         assert_eq!(got2.len(), 1, "D4: still only one proof imported total (no double-count)");
     }
+
+    // ============================================================================================
+    // Config-plane cut (#45) heavy teeth — real cdk-fakewallet mint + wallet over the choke-point
+    // decorator. T5 (recovery-mint blocked at the choke point) and T3 (retry converges the FULL
+    // path: ≥k → establish → restore pulls funds → solvency PASSES).
+    // ============================================================================================
+
+    // ---- T5 (config-plane §2.2, kirby weight-hardest): mint_unissued_quotes() on a below-quorum
+    // fresh box is BLOCKED at the choke point — recovery-mint physically cannot derive (it routes
+    // through `increment_keyset_counter`), so no reused NUT-13 index. Establishing then lets the
+    // SAME quote mint.
+    //
+    // A Paid-but-unissued mint quote is the durable recovery anchor (CDK's get_unissued_mint_quotes).
+    // With the establishment latch FALSE, `mint_unissued_quotes` attempts the mint → the choke point
+    // errs → CDK logs+continues → NOTHING minted (balance stays 0). After `establish()` the same
+    // quote mints and the balance rises.
+    //
+    // RED-on-revert: remove the `!counter_established` guard in
+    // `Nip60CounterDb::increment_keyset_counter` → the deferred `mint_unissued_quotes` mints from the
+    // thin state → the "balance stays 0 while deferred" assert fails.
+    #[tokio::test]
+    async fn t5_recovery_mint_is_blocked_at_the_choke_point_when_deferred() {
+        use cdk::amount::Amount;
+        use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod};
+        use cdk::wallet::Wallet;
+
+        let mint = mint_fixture::FakeMint::start(18863)
+            .await
+            .expect("boot the local fakewallet mint");
+        let mint_url = mint.url();
+
+        // A wallet whose localstore IS a DEFERRED choke-point decorator (fresh-box below-quorum).
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
+        let counter_db = Arc::new(crate::nip60_counter::Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            std::collections::HashMap::new(),
+            false, // DEFERRED: derivations blocked at the choke point
+        ));
+        assert!(!counter_db.is_established(), "precondition: counter deferred");
+        let wallet = Wallet::new(&mint_url, CurrencyUnit::Sat, counter_db.clone(), [9u8; 64], None)
+            .expect("build wallet over the deferred choke-point decorator");
+
+        // Create a mint quote and drive it to PAID (the fakewallet auto-pays); poll the mint until
+        // the quote is mintable, so the block below is genuinely the CHOKE POINT, not an unpaid quote.
+        let quote = wallet
+            .mint_quote(PaymentMethod::BOLT11, Some(Amount::from(128)), None, None)
+            .await
+            .expect("request a mint quote");
+        let mut paid = false;
+        for _ in 0..40 {
+            if let Ok(q) = wallet.check_mint_quote_status(&quote.id).await {
+                if q.state == MintQuoteState::Paid && q.amount_mintable() > Amount::ZERO {
+                    paid = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        assert!(paid, "the fakewallet must mark the quote PAID so the deferred block is the choke point");
+
+        // DEFERRED: recovery-mint attempts to derive → choke point errs → CDK skips → nothing minted.
+        // THE MONEY-SAFETY PROOF: a Paid, mintable quote yields ZERO proofs because the derivation
+        // is blocked at the choke point (no reused NUT-13 index derived from thin state).
+        let minted_deferred = wallet
+            .mint_unissued_quotes()
+            .await
+            .expect("mint_unissued_quotes returns cleanly (skips the un-mintable-because-gated quote)");
+        let bal_deferred = wallet.total_balance().await.map(u64::from).unwrap_or(0);
+        assert_eq!(
+            u64::from(minted_deferred), 0,
+            "recovery-mint is BLOCKED at the choke point while deferred — nothing minted"
+        );
+        assert_eq!(
+            bal_deferred, 0,
+            "MONEY-SAFETY: no proofs derived from thin state (revert the gate → this mints 128 → RED)"
+        );
+        // Belt-and-suspenders: a DIRECT counter-reserve is refused too (the exact op recovery-mint
+        // routes through), and it mutated nothing while deferred.
+        {
+            use cdk::cdk_database::WalletDatabase as _;
+            let kid: Id = "009a1f293253e41e".parse().unwrap();
+            assert!(
+                counter_db.increment_keyset_counter(&kid, 1).await.is_err(),
+                "the choke point refuses a direct derivation while deferred"
+            );
+        }
+
+        // ESTABLISH: the choke point opens. A fresh Paid quote now mints, proving the ONLY thing
+        // that blocked recovery-mint was the establishment latch (not the mint / not the quote). A
+        // fresh quote is used because the deferred attempt above left the first quote's cdk mint-saga
+        // partially advanced (recovery of a poisoned in-flight saga is cdk's boot-step-2 concern, not
+        // this tooth's).
+        counter_db.establish();
+        let quote2 = wallet
+            .mint_quote(PaymentMethod::BOLT11, Some(Amount::from(128)), None, None)
+            .await
+            .expect("request a second mint quote");
+        let mut paid2 = false;
+        for _ in 0..40 {
+            if let Ok(q) = wallet.check_mint_quote_status(&quote2.id).await {
+                if q.state == MintQuoteState::Paid && q.amount_mintable() > Amount::ZERO {
+                    paid2 = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        assert!(paid2, "the second quote is PAID");
+        let minted_ok = wallet
+            .mint_unissued_quotes()
+            .await
+            .expect("mint_unissued_quotes succeeds once the counter is established");
+        assert!(
+            u64::from(minted_ok) >= 128,
+            "after establish, a Paid quote mints (recovery-mint converges once the choke point opens): minted={minted_ok}"
+        );
+        let bal_ok = wallet.total_balance().await.map(u64::from).unwrap_or(0);
+        assert!(bal_ok >= 128, "the wallet balance rose after establishing: {bal_ok}");
+
+        mint.shutdown().await;
+    }
+
+    // ---- T3 (config-plane §2.4, RUNTIME FULL PATH): the bounded retry genuinely converges. After a
+    // ≥k config read lands, `try_establish_counter` flips the latch, fast-forwards the floor,
+    // re-reconciles, RESTORES the relay-backed proofs into a fresh wallet (PULLS FUNDS), and the
+    // wallet then BACKS the counter → solvency PASSES → the agent is LIVE. Not a compile check: it
+    // drives the real establishment function against a real mint + a real per-relay store that goes
+    // from below-quorum to ≥k.
+    //
+    // RED-on-revert: change `try_establish_counter` to always `return Ok(false)` (never establish) →
+    // the counter stays deferred forever → the restore imports nothing → the balance stays 0 →
+    // solvency never passes → the asserts fail.
+    #[tokio::test]
+    async fn t3_bounded_retry_converges_full_path_establish_restore_solvent() {
+        use cdk::nuts::State;
+        use cdk::wallet::Wallet;
+
+        let mint = mint_fixture::FakeMint::start(18864)
+            .await
+            .expect("boot the local fakewallet mint");
+        let mint_url = mint.url();
+
+        // SOURCE wallet: fund it, then publish its unspent proofs to the relay backup (the funds a
+        // failover box will restore).
+        let source = crate::mint_rig::build_wallet(&mint_url).await.expect("build source wallet");
+        crate::mint_rig::fund_wallet(source.clone(), 256).await.expect("fund the source wallet");
+        let source_proofs: Vec<Proof> = source
+            .get_proofs_with(Some(vec![State::Unspent]), None)
+            .await
+            .expect("read the source wallet's unspent proofs");
+        assert!(!source_proofs.is_empty(), "the source wallet holds unspent proofs to back up");
+
+        // A per-relay store (n=3, read_k=2), read_established starts FALSE. Publish the proofs while
+        // all relays are UP (durable, acks=3 >= k=2).
+        let crypto = test_crypto(0x73);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let store = Arc::new(Nip60Store::with_transport_and_read_k(
+            crypto.clone(),
+            transport.clone(),
+            3,
+            2,
+            2,
+            vec![mint_url.clone()],
+        ));
+        store
+            .publish_token(&TokenEventContent {
+                mint: mint_url.clone(),
+                unit: "sat".to_string(),
+                proofs: source_proofs.clone(),
+                del: Vec::new(),
+            })
+            .await
+            .expect("publish the source proofs as a durable token backup");
+
+        // TARGET: a FRESH failover wallet over a DEFERRED choke-point decorator (empty local store).
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("target wallet store");
+        let counter_db = Arc::new(crate::nip60_counter::Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            std::collections::HashMap::new(),
+            false, // fresh-box below-quorum → deferred
+        ));
+        let target = Wallet::new(&mint_url, cdk::nuts::CurrencyUnit::Sat, counter_db.clone(), [3u8; 64], None)
+            .expect("build the fresh target wallet over the deferred decorator");
+
+        // BELOW-QUORUM: 2 of 3 relays down → a config read serves 1 < read_k=2.
+        transport.set_up(1, false);
+        transport.set_up(2, false);
+        let attempt_below = crate::boot::try_establish_counter(&store, &counter_db, &target)
+            .await
+            .expect("a below-quorum establish attempt returns cleanly");
+        assert!(!attempt_below, "below-quorum → the retry does NOT establish");
+        assert!(!counter_db.is_established(), "counter still deferred below quorum");
+        // A derivation is genuinely blocked in this window.
+        {
+            use cdk::cdk_database::WalletDatabase as _;
+            let kid: Id = "009a1f293253e41e".parse().unwrap();
+            assert!(
+                counter_db.increment_keyset_counter(&kid, 1).await.is_err(),
+                "derivations are BLOCKED at the choke point while deferred (alive-but-frozen)"
+            );
+        }
+        assert_eq!(target.total_balance().await.map(u64::from).unwrap_or(0), 0, "target unfunded while deferred");
+
+        // RECOVERY: relays back UP → a ≥k config read lands → the retry establishes + restores.
+        transport.set_up(1, true);
+        transport.set_up(2, true);
+        let attempt_ok = crate::boot::try_establish_counter(&store, &counter_db, &target)
+            .await
+            .expect("the ≥k establish attempt runs the full path");
+        assert!(attempt_ok, "≥k → the retry ESTABLISHES the counter");
+        assert!(counter_db.is_established(), "counter established after the ≥k read");
+
+        // FULL PATH: restore PULLED FUNDS into the target wallet.
+        let target_balance = target.total_balance().await.map(u64::from).unwrap_or(0);
+        assert!(
+            target_balance >= 256,
+            "restore pulled the relay-backed funds into the fresh wallet (got {target_balance})"
+        );
+
+        // SOLVENCY PASSES → the agent is LIVE: token read ≥k AND counter established → authoritative,
+        // and the restored wallet backs the counter (treasury <= restored balance).
+        assert!(
+            crate::boot::boot_solvency_authoritative(true, counter_db.is_established()),
+            "the full path makes the solvency read authoritative"
+        );
+        crate::boot::assert_wallet_backs_counter(target_balance, 256)
+            .expect("solvency PASSES — the restored wallet backs the counter (agent LIVE)");
+
+        mint.shutdown().await;
+    }
 }

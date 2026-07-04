@@ -601,6 +601,81 @@ mod tests {
         );
     }
 
+    // ---- T4 (config-plane §2.2, resume unaffected): a RESUME (local counter present) + a
+    // BELOW-quorum config read must NOT be deferred — the latch establishes immediately (resume is
+    // safe: fast-forward is lift-up-only) and derivations flow. A false-defer on resume would freeze
+    // a healthy reboot (regression).
+    //
+    // RED-on-revert: change the four-state logic in `open_persistent_wallet` to key on
+    // `config_authoritative` ALONE (drop the `resume ||`) → resume + below-quorum → established=false
+    // → `is_established()` is false / the derivation below is blocked → RED.
+    #[tokio::test]
+    async fn t4_resume_with_below_quorum_config_is_not_deferred() {
+        use cdk::cdk_database::WalletDatabase as _;
+        let tmp = TempDir::new("t4cp");
+        let db_path = tmp.db_path();
+        let k = kid("009a1f293253e41e");
+        // A prior instance already derived here → local counter table is NON-empty (RESUME).
+        seed_local_store(&db_path, &[(k, 100)]).await;
+        let floor: HashMap<Id, u32> = HashMap::new();
+
+        // config_authoritative = FALSE (a below-quorum config read).
+        let (_wallet, counter_db) =
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, false)
+                .await
+                .expect("open persistent wallet (resume)");
+
+        assert!(
+            counter_db.is_established(),
+            "RESUME must establish immediately even below config-quorum (no false-defer, §2.2 state 1)"
+        );
+        // Derivations flow (the choke point does not bite on resume).
+        let v = counter_db
+            .increment_keyset_counter(&k, 1)
+            .await
+            .expect("a resume wallet derives freely (not deferred)");
+        assert!(v >= 100, "the resume inner counter is at least its local value");
+    }
+
+    // ---- T8 (config-plane §2.2 state 4, create-fund guard): a fresh box + a ≥k config read + NO
+    // prior head → the counter establishes at 0 and derivations FLOW (a genuinely-new agent must NOT
+    // be false-blocked — this is create-fund / new-agent creation). Sound ONLY under the
+    // quorum-intersection invariant (§2.8b, T9): ≥k-with-no-head ⟹ no head was ever written.
+    //
+    // RED-on-revert: change the four-state logic to establish ONLY on `resume` (defer even at ≥k) →
+    // a fresh-box ≥k boot is deferred → the derivation below is blocked → a new agent can't operate
+    // → RED.
+    #[tokio::test]
+    async fn t8_fresh_box_quorum_no_head_establishes_at_zero_and_derives() {
+        use cdk::cdk_database::WalletDatabase as _;
+        let tmp = TempDir::new("t8cp");
+        let db_path = tmp.db_path();
+        let k = kid("009a1f293253e41e");
+        // Genuinely new: NO local store seeding, empty floor. config_authoritative = TRUE (≥k read).
+        let floor: HashMap<Id, u32> = HashMap::new();
+
+        let (_wallet, counter_db) =
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true)
+                .await
+                .expect("open persistent wallet (fresh box, ≥k, no head)");
+
+        assert!(
+            counter_db.is_established(),
+            "fresh-box + ≥k + no-head → establish at 0 (state 4); a new agent must NOT be false-blocked"
+        );
+        // The counter starts at 0 (nothing to fast-forward) and derivations flow from index 0.
+        let first = counter_db
+            .increment_keyset_counter(&k, 0)
+            .await
+            .expect("read the fresh inner counter");
+        assert_eq!(first, 0, "a genuinely-new counter establishes at 0 (no phantom floor)");
+        let after = counter_db
+            .increment_keyset_counter(&k, 5)
+            .await
+            .expect("a new agent derives freely from 0 (create-fund flows)");
+        assert!(after >= 5, "derivations flow for a genuinely-new agent");
+    }
+
     // ---- union_max_counters unit coverage (the pure merge under T1/T2). --------------------------
     #[test]
     fn union_max_takes_the_higher_over_the_union_of_keys() {

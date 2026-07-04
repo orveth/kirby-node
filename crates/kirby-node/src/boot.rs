@@ -688,6 +688,27 @@ pub fn solvency_gate(authoritative: bool) -> SolvencyGate {
     }
 }
 
+/// The §2.8 boot solvency authority: authoritative ONLY when BOTH the token read reached quorum
+/// AND the NUT-13 counter was established. Pure so the T10 false-broke tooth exercises it directly.
+///
+/// ⚠️ The composition is the FIX: keying solvency on the TOKEN read ALONE (the pre-config-plane
+/// behavior) false-brokes a fresh box whose token read hit quorum but whose config read was
+/// below-quorum (counter deferred → restore-receive no-op'd → wallet transiently 0 → Assert →
+/// `assert_wallet_backs_counter(0, initial_sats)` bails, self-heal unreachable). ANDing in
+/// `counter_established` routes that reachable seam to ProceedNonAuthoritative instead. This does
+/// NOT blur die-when-broke — the runtime meter (meter.rs), not this boot-only check, owns genuine
+/// death (§2.8).
+pub fn boot_solvency_authoritative(nip60_read_authoritative: bool, counter_established: bool) -> bool {
+    nip60_read_authoritative && counter_established
+}
+
+/// The §2.3 write-back gate: publish the 17375 counter head ONLY when the config read reached
+/// read-quorum. Below-quorum → skip (never republish a potentially-thin head that would regress the
+/// true head — finding-2, propagating). Pure so the T1 tooth exercises it directly.
+pub fn should_publish_config(config_authoritative: bool) -> bool {
+    config_authoritative
+}
+
 /// The §7.2 wallet<->counter reconcile decision (brain-routstr R2-3/R2-5): the wallet
 /// must back every sat the metabolism counter believes it has, so the gateway never
 /// authorizes a think the wallet can't fund. The invariant is `>=`, NEVER `==` (R2-3:
@@ -996,7 +1017,8 @@ async fn build_routstr_brain(
     // does NOT blur die-when-broke: that lives in the runtime METER (meter.rs), not this boot-only
     // refuse-to-start check; a genuinely-broke agent still dies at runtime when the treasury hits 0.
     let counter_established = counter_db.is_established();
-    let solvency_authoritative = nip60_read_authoritative && counter_established;
+    let solvency_authoritative =
+        boot_solvency_authoritative(nip60_read_authoritative, counter_established);
     match solvency_gate(solvency_authoritative) {
         SolvencyGate::Assert => assert_wallet_backs_counter(wallet_balance, treasury_remaining)?,
         SolvencyGate::ProceedNonAuthoritative => {
@@ -1029,7 +1051,7 @@ async fn build_routstr_brain(
     //    every future boot (finding-2, propagating). Below-quorum → skip the publish, keep the
     //    existing head, warn; the bounded retry re-publishes once a ≥k read re-establishes.
     if let Some(store) = &nip60_store {
-        if config_authoritative {
+        if should_publish_config(config_authoritative) {
             if let Err(e) = store
                 .publish_wallet_config(counter_db.keyset_counters(), vec![brain.mint_url.clone()])
                 .await
@@ -1791,5 +1813,106 @@ mod boot_saga_recovery_tests {
         let ok = async { Ok::<(), anyhow::Error>(()) };
         let out = recover_sagas_within(ok, Duration::from_secs(30)).await;
         assert!(out.is_ok(), "a clean recovery passes through unchanged");
+    }
+}
+
+#[cfg(test)]
+mod config_plane_tests {
+    use super::*;
+
+    // ---- T1 (config-plane §2.3): the write-back gate skips the config publish below read-quorum. -
+    //
+    // A below-quorum config read may have loaded a THIN 17375 floor; republishing it as a NEW head
+    // would REGRESS the true head on the reached relays (finding-2, propagating). The gate is wired
+    // through `should_publish_config`, so boot only calls `publish_wallet_config` when it returns
+    // true.
+    //
+    // RED-on-revert: change `should_publish_config` to always return `true` → boot publishes the
+    // thin head below quorum → this `assert!(!...)` fails.
+    #[test]
+    fn t1_write_back_gate_skips_publish_below_config_quorum() {
+        assert!(
+            !should_publish_config(false),
+            "below config read-quorum → the 17375 counter head is NOT republished (never regress \
+             the true head, §2.3)"
+        );
+        assert!(
+            should_publish_config(true),
+            "an authoritative (≥k) config read → the head IS republished as before"
+        );
+    }
+
+    // ---- T6 (config-plane §2.4): the retry BACKS OFF, never SPINS. -------------------------------
+    //
+    // The runtime meter debits the treasury every tick independent of the wallet, so a hot retry
+    // loop would raise measured CPU burn and hasten REAL death. `config_retry_backoff` must return a
+    // NON-ZERO, BOUNDED, MONOTONICALLY-NON-DECREASING delay — the mechanism that keeps a defer
+    // window from debiting faster than baseline idle.
+    //
+    // RED-on-revert: change `config_retry_backoff` to return `Duration::ZERO` (a spin) → the
+    // `>= base` / `> 0` assertions fail.
+    #[test]
+    fn t6_config_retry_backs_off_never_spins() {
+        let base = Duration::from_secs(2);
+        let max = Duration::from_secs(60);
+        let mut prev = Duration::ZERO;
+        for attempt in 0..14u32 {
+            let d = config_retry_backoff(attempt, base, max);
+            // NEVER a spin: strictly positive and at least the base interval.
+            assert!(d >= base, "attempt {attempt}: backoff {d:?} must be >= base {base:?} (never a spin)");
+            assert!(d > Duration::ZERO, "attempt {attempt}: backoff must be non-zero (never a spin)");
+            // BOUNDED: capped at max.
+            assert!(d <= max, "attempt {attempt}: backoff {d:?} must be <= max {max:?} (bounded)");
+            // MONOTONIC non-decreasing (exponential ramp), so it is not a fixed hot interval.
+            assert!(d >= prev, "attempt {attempt}: backoff must not decrease");
+            prev = d;
+        }
+        // The ramp actually grows before the cap (attempt 0 base=2s, attempt 2 = 8s), then caps.
+        assert_eq!(config_retry_backoff(0, base, max), Duration::from_secs(2));
+        assert_eq!(config_retry_backoff(2, base, max), Duration::from_secs(8));
+        assert_eq!(config_retry_backoff(30, base, max), max, "far-out attempts cap at max");
+    }
+
+    // ---- T10 (config-plane §2.8): the solvency false-broke FIX — restore-deferred proceeds. ------
+    //
+    // The reachable seam: fresh-box + config-below-quorum (counter DEFERRED, `counter_established` =
+    // false, restore-receive no-op'd, wallet transiently 0) + token-read ≥k (`nip60_read_authoritative`
+    // = true). Keying solvency on the TOKEN read ALONE takes the Assert branch →
+    // `assert_wallet_backs_counter(0, initial_sats)` bails → boot aborts, self-heal unreachable
+    // (FALSE-BROKE). ANDing in `counter_established` routes it to ProceedNonAuthoritative instead.
+    //
+    // RED-on-revert: change `boot_solvency_authoritative` to return `nip60_read_authoritative` (the
+    // token-only pre-fix behavior) → the seam takes Assert → the bail below fires → this test's
+    // "boot proceeds" expectation fails (it goes RED at the `matches!(... ProceedNonAuthoritative)`
+    // assertion, and the demonstrated Assert-path bail proves the abort).
+    #[test]
+    fn t10_solvency_false_broke_fix_restore_deferred_proceeds() {
+        // Established path (resume / ≥k restore ran / new-at-0): Assert as before, die-when-broke
+        // intact at boot for a genuinely-broke agent.
+        assert!(
+            boot_solvency_authoritative(true, true),
+            "token ≥k AND counter established → authoritative (Assert, unchanged)"
+        );
+        assert!(matches!(solvency_gate(boot_solvency_authoritative(true, true)), SolvencyGate::Assert));
+
+        // THE SEAM: token ≥k but counter DEFERRED → NOT authoritative → ProceedNonAuthoritative.
+        assert!(
+            !boot_solvency_authoritative(true, false),
+            "token ≥k but counter DEFERRED → NOT authoritative (the false-broke seam)"
+        );
+        assert!(
+            matches!(
+                solvency_gate(boot_solvency_authoritative(true, false)),
+                SolvencyGate::ProceedNonAuthoritative
+            ),
+            "restore-deferred fresh box must PROCEED (no false-broke bail), self-healing on ≥k"
+        );
+
+        // Prove the counterfactual bite: had we taken Assert on this seam, a transiently-0 wallet vs
+        // a nonzero seeded treasury WOULD bail (this is exactly what the fix routes around).
+        assert!(
+            assert_wallet_backs_counter(0, 50_000).is_err(),
+            "the Assert path on a transiently-0 wallet bails — the false-broke the fix prevents"
+        );
     }
 }
