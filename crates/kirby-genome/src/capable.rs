@@ -2775,8 +2775,10 @@ fn build_oracle_fetch_request(
 
 /// Build the O2 answer (design §A.4): fetch every feed, medianize the sources that answered, and
 /// render the attestation text. It NEVER fabricates a price -- an unreachable/unparseable source
-/// is dropped and the count stated honestly ("median of N of 3 sources"); zero sources yields an
-/// honest "unavailable" quote (the O3 late-retry/refund posture refines the zero case). The DM is
+/// is dropped and the count stated honestly ("median of N of 3 sources"). A SIGNED price requires a
+/// two-of-three QUORUM: fewer than two sources yields an honest "unavailable" quote (0 sources become
+/// "unreachable this tick"; exactly 1 becomes "need 2 for quorum"), never a 1-of-N attestation (the
+/// O3 late-retry/refund posture refines the sub-quorum case). The DM is
 /// signed daemon-side by the agent's social key (bound to the sovereign Q beacon, §A.4); this text
 /// is the payload.
 async fn build_oracle_answer<G: Gateway>(
@@ -2808,9 +2810,14 @@ async fn build_oracle_answer<G: Gateway>(
     } else {
         answered.iter().map(|(s, p)| format!("{s}={p:.2}")).collect::<Vec<_>>().join(" ")
     };
-    let answer_line = match median_price(&prices) {
-        Some(m) => format!("{m:.2} USD  (median of {} of {total} sources)", answered.len()),
-        None => format!("unavailable ({total} sources unreachable this tick)"),
+    // QUORUM FLOOR (§A.4): a SIGNED price requires a >=2-of-3 quorum. `median_price` returns Some for
+    // ANY non-empty slice, so a lone source would otherwise attest a "median of 1" -- a 1-of-N
+    // posture that is FORBIDDEN (one unverified feed can move it). The floor lives HERE, at
+    // answer-assembly; `median_price` stays pure. The count is stated honestly in every branch.
+    let answer_line = match (answered.len(), median_price(&prices)) {
+        (n, Some(m)) if n >= 2 => format!("{m:.2} USD  (median of {n} of {total} sources)"),
+        (0, _) => format!("unavailable ({total} sources unreachable this tick)"),
+        (n, _) => format!("unavailable (only {n} of {total} sources; need >=2 for quorum)"),
     };
     format!(
         "KIRBY ORACLE ATTESTATION\n\
@@ -4040,6 +4047,50 @@ mod tests {
         assert!(answer.contains("KIRBY ORACLE ATTESTATION"), "still a signed attestation: {answer}");
         assert!(answer.contains("unavailable"), "0 sources -> honest unavailable: {answer}");
         assert!(!answer.contains("median of"), "NO median claim with 0 sources: {answer}");
+    }
+
+    /// TOOTH (O2, codex #5 -> quorum floor): with EXACTLY ONE source reachable, the oracle must NOT
+    /// attest a "median of 1" price -- a lone unverified feed cannot move a real median, so a signed
+    /// 1-of-N price is FORBIDDEN. The answer is an honest "unavailable" that states the count and the
+    /// >=2 quorum requirement, with NO price claim. RED on reverting the quorum floor (letting a
+    /// single source emit a price again). The body carries ONLY the coinbase shape, so only that one
+    /// extractor parses it (kraken needs `result`.`XXBTZUSD`, coingecko needs `bitcoin` -- both
+    /// absent) -> answered.len() == 1.
+    #[tokio::test]
+    async fn oracle_o2_single_source_below_quorum_never_prices() {
+        let sender = dm_sender_hex(11);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &sender, "PRICE BTC/USD")
+            .with_payment_settled(2, &oracle_charge_id(1), 10);
+        // Only coinbase's field is present -> exactly 1 of the 3 feeds extracts a price.
+        gw.fetch_response = Some(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: br#"{"data":{"amount":"100.00"}}"#.to_vec(),
+            truncated: false,
+            final_url: "https://api.coinbase.com/v2/prices/BTC-USD/spot".to_string(),
+        });
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        let out = oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(matches!(out, TickOutcome::Lived { action: Action::DmReply { .. }, .. }));
+        let answer = &gw.dm_replies[1].text;
+        assert!(answer.contains("KIRBY ORACLE ATTESTATION"), "still a signed attestation: {answer}");
+        assert!(
+            answer.contains("unavailable"),
+            "1 source is below the >=2 quorum -> honest unavailable: {answer}"
+        );
+        assert!(
+            !answer.contains("median of"),
+            "NO median claim from a single source (1-of-N is forbidden): {answer}"
+        );
+        assert!(
+            !answer.contains(" USD"),
+            "NO price claim below quorum: {answer}"
+        );
     }
 
     // ---- NIP-17 DM arm (task #12): busy-flag one-at-a-time + reply-to-the-seal-verified-sender ----
