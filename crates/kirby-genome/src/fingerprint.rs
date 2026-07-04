@@ -30,8 +30,9 @@ pub fn derive(nonce: &[u8], vm_generation: u64) -> String {
     to_hex(&sha256(&input))
 }
 
-/// Lowercase-hex encode a byte slice (no external crate).
-fn to_hex(bytes: &[u8]) -> String {
+/// Lowercase-hex encode a byte slice (no external crate). `pub(crate)` so other genome modules
+/// (e.g. the oracle's content-addressed charge key) reuse the SAME dependency-free hex encoder.
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -44,7 +45,9 @@ fn to_hex(bytes: &[u8]) -> String {
 /// SHA-256 (FIPS 180-4), self-contained, no dependency. Returns the 32-byte digest.
 /// This is the spike's `H`: a deterministic hash with strong avalanche so the
 /// fingerprint reliably differs whenever the input `(nonce, generation)` differs.
-fn sha256(message: &[u8]) -> [u8; 32] {
+/// `pub(crate)` so the oracle's content-addressed charge key hashes request identity with the
+/// SAME vetted hasher (no new crypto dependency, F5).
+pub(crate) fn sha256(message: &[u8]) -> [u8; 32] {
     // Initial hash values: the fractional parts of the square roots of the first
     // eight primes (FIPS 180-4 5.3.3).
     let mut h: [u32; 8] = [

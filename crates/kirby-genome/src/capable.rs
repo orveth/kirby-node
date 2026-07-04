@@ -2889,6 +2889,52 @@ pub(super) struct PendingCharge {
     answer: Option<String>,
 }
 
+/// The content-addressed identity of an oracle charge: `sha256` of the inbound request's
+/// INTRINSIC, reboot-stable fields (the source event id `correlation_id`, the sender pubkey, the
+/// event's `created_at`, and the DM payload bytes). This replaces the old `seq`-based charge key,
+/// which recycled across reboots (oracle_loop reset seq to 0 each boot) so a fresh post-reboot DM
+/// reused a key whose PERSISTENT prior-boot `ChargeIssued` the daemon re-served -- a wrong-customer
+/// correlation ([HIGH]) and a wedge on the Transient path ([MED]). Keying on the request itself
+/// gives: reboot-independent (no seq/checkpoint); distinct request -> distinct key even at equal
+/// amounts (no wrong-customer); same event replayed -> same key -> correct dedupe (no
+/// double-charge); fresh request -> fresh key (no wedge).
+///
+/// Each variable-length field is LENGTH-PREFIXED (its byte length as 8 LE bytes, then the bytes) so
+/// the encoding is UNAMBIGUOUS -- domain separation: (pubkey="ab", payload="c") can never hash-equal
+/// (pubkey="a", payload="bc"). `created_at` is a fixed 8 LE bytes (self-delimiting). The FULL
+/// 64-hex SHA-256 digest is used (no truncation -- a truncated digest that collided two requests
+/// would re-introduce the wrong-customer [HIGH]).
+///
+/// `correlation_id` is the SOURCE nostr event id (`nerve.rs` sets it to `event.id` on every inbound
+/// typed event) -- a globally-unique, reboot-stable per-event id. Including it means two DISTINCT
+/// DMs never share a key even if the sender + payload + `created_at` second all match (so a second
+/// identical-looking question with a different `CHARGE:n` plan can't collapse onto the first and
+/// wedge). A true REPLAY of the SAME event (same id) still maps to the SAME key -> correct dedupe,
+/// no double-charge. The sender/created_at/payload are folded in too (defense-in-depth, and to stay
+/// well-defined if a future path ever enqueues an empty `correlation_id`).
+fn oracle_charge_identity(
+    correlation_id: &str,
+    source_pubkey: &str,
+    created_at: u64,
+    payload: &[u8],
+) -> [u8; 32] {
+    let cid = correlation_id.as_bytes();
+    let pk = source_pubkey.as_bytes();
+    let mut buf = Vec::with_capacity(8 + cid.len() + 8 + pk.len() + 8 + 8 + payload.len());
+    // Every VARIABLE-length field is length-prefixed (its byte length as 8 LE bytes, then the
+    // bytes) so no two distinct tuples share an encoding -- domain separation: (pubkey="ab",
+    // payload="c") can never encode-equal (pubkey="a",payload="bc"). created_at is a fixed 8 LE
+    // bytes (self-delimiting).
+    buf.extend_from_slice(&(cid.len() as u64).to_le_bytes());
+    buf.extend_from_slice(cid);
+    buf.extend_from_slice(&(pk.len() as u64).to_le_bytes());
+    buf.extend_from_slice(pk);
+    buf.extend_from_slice(&created_at.to_le_bytes());
+    buf.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    buf.extend_from_slice(payload);
+    crate::fingerprint::sha256(&buf)
+}
+
 /// Poll the inbox for the OLDEST waiting DM or PAYMENT_SETTLED past `ack_seq` (non-blocking).
 /// ONE cursor spans BOTH kinds by design: the daemon queue prunes by seq (kind-agnostic -- see
 /// [`crate`]'s `InboundQueue::drain_after`), so two independent per-kind cursors would let
@@ -3162,9 +3208,21 @@ pub(super) async fn oracle_tick<G: Gateway>(
                     ));
                 }
 
-                // ISSUE CHARGE: daemon-side, zero cost to the genome; keyed per seq (idempotent on
-                // a Transient replay -> the SAME charge_id, never a second charge).
-                let charge_key = format!("oracle-charge-{seq}");
+                // ISSUE CHARGE: daemon-side, zero cost to the genome. The key is CONTENT-ADDRESSED
+                // to the request's intrinsic identity (sender + source `created_at` + payload), NOT
+                // the per-boot `seq` -- so it is reboot-independent and never recycles to a stale
+                // prior-boot charge (wrong-customer). Idempotent on a Transient replay of the SAME
+                // request -> the SAME charge_id, never a second charge. `ev.source_pubkey` was moved
+                // into `sender`; `ev.created_at`/`ev.payload` are still the source event's fields.
+                let charge_key = format!(
+                    "oracle-charge-v3-{}",
+                    crate::fingerprint::to_hex(&oracle_charge_identity(
+                        &ev.correlation_id,
+                        &sender,
+                        ev.created_at,
+                        &ev.payload
+                    ))
+                );
                 let charge_receipt = match gw
                     .issue_charge(amount_sats, &format!("oracle: {text}"), &charge_key)
                     .await
@@ -3183,6 +3241,33 @@ pub(super) async fn oracle_tick<G: Gateway>(
                     ));
                     return TickOutcome::Transient;
                 };
+                // BELT (defense-in-depth): the content-addressed key can never dedupe to a stale
+                // charge, so the returned amount must equal the clamped intent. A divergence means
+                // the daemon re-served a stale/divergent ChargeIssued under this key -- refuse to
+                // invoice (never quote/serve at a stale, possibly below-floor amount). CONSUME the
+                // event (advance the inbox cursor) rather than Transient: a persistent divergence
+                // under a fixed key would otherwise reuse the same key forever and WEDGE the single
+                // inbox cursor, starving every later DM (codex). An amount divergence under a content
+                // key is a hard daemon anomaly, not a transient hiccup; the customer has paid nothing
+                // (the charge was never invoiced), so dropping this one job loud-logged loses no
+                // money and unblocks the queue.
+                if charge.amount_sats != amount_sats {
+                    boot_log(&format!(
+                        "oracle seq={seq}: issue_charge returned amount {} != intended {} under key {charge_key} (stale/divergent dedupe); NOT invoicing, consuming the event",
+                        charge.amount_sats, amount_sats
+                    ));
+                    *inbox_ack_seq = ev.inbox_seq;
+                    return TickOutcome::Lived {
+                        think_cost,
+                        treasury_remaining: treasury_after_think,
+                        recorded_write: false,
+                        action: Action::Note,
+                        verify: None,
+                        feedback: format!(
+                            "oracle: charge amount divergence under {charge_key}; consumed, not invoiced"
+                        ),
+                    };
+                }
 
                 // INVOICE the customer (a metered dm_reply; a broke send is a soft-skip, a
                 // transport error retries). ARM the pending charge + consume the DM only once the
@@ -3331,6 +3416,15 @@ mod tests {
         /// WITHOUT touching the same-tick fetches. An empty/exhausted queue => the call proceeds
         /// normally. Mirrors `fetch_script`'s per-attempt sequencing, DM-side.
         dm_call_errors: std::collections::VecDeque<bool>,
+        /// Override the `amount_sats` returned in the `ChargeIssued` (P3 belt tooth): models a
+        /// daemon that re-serves a STALE/divergent charge under a recycled key -- the returned amount
+        /// differs from the intent the request recorded. `None` => echo the requested amount (normal).
+        issue_charge_amount_override: Option<u64>,
+        /// Per-idempotency-key stale amounts (T-MED wedge tooth): if `issue_charge` is called with a
+        /// key present here, it re-serves that STALE amount (as a daemon holding a stale charge under
+        /// a RECYCLED key would). A key absent here mints the requested amount. Lets a test place a
+        /// stale charge under only the seq-recycled key and show content-addressed keys dodge it.
+        stale_charge_by_key: HashMap<String, u64>,
         /// Every Actuate request's decoded payload (the NostrPublish), so a test can assert the
         /// EXACT content + kind that reached the gateway (P2: one publish, sanitized content).
         published: Vec<NostrPublish>,
@@ -3603,7 +3697,14 @@ mod tests {
                 budget_sats: 0,
             });
             // The daemon mints a charge_id + payment request; mirror the ChargeIssued shape
-            // (echo the amount). The genome treats it opaquely.
+            // (echo the amount, unless a test overrides it to model a stale/divergent dedupe). The
+            // genome treats it opaquely.
+            let returned_amount = self
+                .stale_charge_by_key
+                .get(idempotency_key)
+                .copied()
+                .or(self.issue_charge_amount_override)
+                .unwrap_or(amount_sats);
             Ok(CapabilityReceipt {
                 schema_version: kirby_proto::SCHEMA_VERSION,
                 outcome: Outcome::AuthorizedAndPerformed as i32,
@@ -3611,8 +3712,8 @@ mod tests {
                 treasury_remaining: self.think_treasury,
                 charge: Some(kirby_proto::ChargeIssued {
                     charge_id: format!("mock-charge-{idempotency_key}"),
-                    invoice_or_request: format!("cashu:charge:{idempotency_key}:{amount_sats}"),
-                    amount_sats,
+                    invoice_or_request: format!("cashu:charge:{idempotency_key}:{returned_amount}"),
+                    amount_sats: returned_amount,
                     method: ChargeMethod::Cashu as i32,
                 }),
                 ..Default::default()
@@ -3731,11 +3832,20 @@ mod tests {
 
     // ---- ORACLE workload (Milestone 2, product 1): the charge -> settle -> answer money spine ----
 
-    /// The deterministic charge_id the MockGateway's `issue_charge` returns for a given oracle
-    /// tick seq (`mock-charge-<idempotency_key>`, key = `oracle-charge-<seq>`), so a test can
-    /// inject a settlement that matches the charge the tick issued.
-    fn oracle_charge_id(seq: u64) -> String {
-        format!("mock-charge-oracle-charge-{seq}")
+    /// The deterministic charge_id the MockGateway's `issue_charge` returns for the oracle charge
+    /// of a DM from `sender` carrying `message` (created_at 0, correlation_id "", as `with_dm`
+    /// scripts it). The key is now CONTENT-ADDRESSED (`oracle-charge-v3-<sha256(request identity)>`),
+    /// so a settlement must be injected with the charge_id matching the SAME (sender, message) DM.
+    fn oracle_charge_id_for(sender: &str, message: &str) -> String {
+        let key = format!(
+            "oracle-charge-v3-{}",
+            crate::fingerprint::to_hex(&oracle_charge_identity("", sender, 0, message.as_bytes()))
+        );
+        format!("mock-charge-{key}")
+    }
+    /// Convenience for the common `PRICE BTC/USD` DM the oracle tests script.
+    fn oracle_charge_id(sender: &str) -> String {
+        oracle_charge_id_for(sender, "PRICE BTC/USD")
     }
 
     /// TOOTH (O1, THE money spine): CHARGE-BEFORE-ANSWER. The oracle emits NO answer DM until a
@@ -3775,7 +3885,7 @@ mod tests {
         assert_eq!(gw.dm_reply_requests(), 1, "still only the invoice; no answer without payment");
 
         // Now the customer pays: enqueue the matching PAYMENT_SETTLED.
-        gw = gw.with_payment_settled(2, &oracle_charge_id(1), 10);
+        gw = gw.with_payment_settled(2, &oracle_charge_id(&sender), 10);
 
         // Tick 3: the settlement matches the pending charge -> the answer DM goes out.
         let out = oracle_tick(&mut gw, 3, &mut ack, &mut pending, &params, 1_000, 5).await;
@@ -3802,8 +3912,8 @@ mod tests {
         let params = test_params();
         let mut gw = MockGateway::thinking("CHARGE:10")
             .with_dm(1, &sender, "PRICE BTC/USD")
-            .with_payment_settled(2, &oracle_charge_id(1), 10)
-            .with_payment_settled(3, &oracle_charge_id(1), 10); // a duplicate (fresh queue entry)
+            .with_payment_settled(2, &oracle_charge_id(&sender), 10)
+            .with_payment_settled(3, &oracle_charge_id(&sender), 10); // a duplicate (fresh queue entry)
         let mut ack: u64 = 0;
         let mut pending: HashMap<String, PendingCharge> = HashMap::new();
 
@@ -3894,7 +4004,7 @@ mod tests {
         // Quote 10 sats (the plan says CHARGE:10) but the customer settles only 3.
         let mut gw = MockGateway::thinking("CHARGE:10")
             .with_dm(1, &sender, "PRICE BTC/USD")
-            .with_payment_settled(2, &oracle_charge_id(1), 3);
+            .with_payment_settled(2, &oracle_charge_id(&sender), 3);
         let mut ack: u64 = 0;
         let mut pending: HashMap<String, PendingCharge> = HashMap::new();
 
@@ -3920,7 +4030,7 @@ mod tests {
         let params = test_params();
         let mut gw = MockGateway::thinking("CHARGE:10")
             .with_dm(1, &sender, "PRICE BTC/USD")
-            .with_payment_settled(2, &oracle_charge_id(1), 10);
+            .with_payment_settled(2, &oracle_charge_id(&sender), 10);
         // Force every actuate (invoice + answer) to a NOT-DELIVERED daemon outcome.
         gw.actuate_outcome = Outcome::DeniedInsufficientTreasury as i32;
         let mut ack: u64 = 0;
@@ -3958,7 +4068,7 @@ mod tests {
 
         // Interleave: A's settlement (seq 2) AND a fresh DM from B (seq 3) are BOTH waiting.
         gw = gw
-            .with_payment_settled(2, &oracle_charge_id(1), 10)
+            .with_payment_settled(2, &oracle_charge_id(&a), 10)
             .with_dm(3, &b, "PRICE BTC/USD");
 
         // Tick 2: oldest-first MUST take A's settlement (seq 2), not B's newer DM (seq 3).
@@ -4021,7 +4131,7 @@ mod tests {
         let params = test_params();
         let mut gw = MockGateway::thinking("CHARGE:10")
             .with_dm(1, &sender, "PRICE BTC/USD")
-            .with_payment_settled(2, &oracle_charge_id(1), 10);
+            .with_payment_settled(2, &oracle_charge_id(&sender), 10);
         // A WELL-FORMED body but flagged truncated: a valid extractor could read a price, yet O2
         // must drop it (the cut-off is untrustworthy).
         gw.fetch_response = Some(HttpResponse {
@@ -4063,7 +4173,7 @@ mod tests {
         let params = test_params();
         let mut gw = MockGateway::thinking("CHARGE:10")
             .with_dm(1, &sender, "PRICE BTC/USD")
-            .with_payment_settled(2, &oracle_charge_id(1), 10);
+            .with_payment_settled(2, &oracle_charge_id(&sender), 10);
         // The mock serves ONE body for every http.fetch; make it carry all 3 feed shapes so each
         // extractor parses its own field (coinbase=100, kraken=101, coingecko=110 -> median 101).
         gw.fetch_response = Some(HttpResponse {
@@ -4092,7 +4202,7 @@ mod tests {
             answer.to_ascii_lowercase().contains("vouch"),
             "at quorum the note vouches for the values (transparency of a real attestation): {answer}"
         );
-        assert!(answer.contains(&oracle_charge_id(1)), "attestation carries the charge_id: {answer}");
+        assert!(answer.contains(&oracle_charge_id(&sender)), "attestation carries the charge_id: {answer}");
 
         let fetch_keys: Vec<String> = gw
             .requests
@@ -4123,7 +4233,7 @@ mod tests {
         // fetch_response defaults to None -> every http.fetch is performed-but-bodyless -> 0 sources.
         let mut gw = MockGateway::thinking("CHARGE:10")
             .with_dm(1, &sender, "PRICE BTC/USD")
-            .with_payment_settled(2, &oracle_charge_id(1), 10);
+            .with_payment_settled(2, &oracle_charge_id(&sender), 10);
         let mut ack: u64 = 0;
         let mut pending: HashMap<String, PendingCharge> = HashMap::new();
 
@@ -4149,7 +4259,7 @@ mod tests {
         let params = test_params();
         let mut gw = MockGateway::thinking("CHARGE:10")
             .with_dm(1, &sender, "PRICE BTC/USD")
-            .with_payment_settled(2, &oracle_charge_id(1), 10);
+            .with_payment_settled(2, &oracle_charge_id(&sender), 10);
         // Only coinbase's field is present -> exactly 1 of the 3 feeds extracts a price.
         gw.fetch_response = Some(HttpResponse {
             status: 200,
@@ -4193,7 +4303,7 @@ mod tests {
         let params = test_params();
         let mut gw = MockGateway::thinking("CHARGE:10")
             .with_dm(1, &sender, "PRICE BTC/USD")
-            .with_payment_settled(2, &oracle_charge_id(1), 10);
+            .with_payment_settled(2, &oracle_charge_id(&sender), 10);
         // Only coinbase's field is present -> exactly 1 of 3 feeds extracts (value 100.00).
         gw.fetch_response = Some(HttpResponse {
             status: 200,
@@ -4247,7 +4357,7 @@ mod tests {
         let params = test_params();
         let mut gw = MockGateway::thinking("CHARGE:10")
             .with_dm(1, &sender, "PRICE BTC/USD")
-            .with_payment_settled(2, &oracle_charge_id(1), 10);
+            .with_payment_settled(2, &oracle_charge_id(&sender), 10);
         // coinbase: transient (None -> success). kraken: steady (answers attempt 0). coingecko:
         // persistent fail. So the retry on coinbase is load-bearing for reaching the >=2 quorum.
         gw.fetch_script.insert(
@@ -4288,7 +4398,7 @@ mod tests {
         let params = test_params();
         let mut gw = MockGateway::thinking("CHARGE:10")
             .with_dm(1, &sender, "PRICE BTC/USD")
-            .with_payment_settled(2, &oracle_charge_id(1), 10);
+            .with_payment_settled(2, &oracle_charge_id(&sender), 10);
         // coinbase ALWAYS fails (both attempts None). kraken + coingecko fall back to the default
         // combined body and answer, so quorum is met (irrelevant here -- we assert coinbase's fetch
         // behavior). The default body carries all 3 shapes.
@@ -4396,7 +4506,7 @@ mod tests {
         let params = test_params();
         let mut gw = MockGateway::thinking("CHARGE:10")
             .with_dm(1, &sender, "PRICE BTC/USD")
-            .with_payment_settled(2, &oracle_charge_id(1), 10);
+            .with_payment_settled(2, &oracle_charge_id(&sender), 10);
         // coinbase=100.00 and kraken=102.00 answer; coingecko persistently fails -> exactly 2 of 3.
         // Single-shape bodies so each extractor reads only its own field.
         gw.fetch_script.insert(
@@ -4446,7 +4556,7 @@ mod tests {
         let params = test_params();
         let mut gw = MockGateway::thinking("CHARGE:10")
             .with_dm(1, &sender, "PRICE BTC/USD")
-            .with_payment_settled(2, &oracle_charge_id(1), 10);
+            .with_payment_settled(2, &oracle_charge_id(&sender), 10);
         // All 3 sources answer via the default combined body (the first build reaches quorum).
         gw.fetch_response = ok_body(
             br#"{"data":{"amount":"100.00"},"result":{"XXBTZUSD":{"c":["101.00","0.1"]}},"bitcoin":{"usd":110}}"#,
@@ -4458,7 +4568,7 @@ mod tests {
 
         // Tick 1: DM -> charge + invoice.
         oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
-        let charge_id = oracle_charge_id(1);
+        let charge_id = oracle_charge_id(&sender);
 
         let fetch_keys = |gw: &MockGateway| -> std::collections::HashSet<String> {
             gw.requests
@@ -4501,6 +4611,169 @@ mod tests {
             "the delivered answer is byte-identical to the first build (cache, not a re-fetch)"
         );
         assert!(pending.is_empty(), "the delivered charge is cleared from the waiting-set");
+    }
+
+    /// Read the single IssueCharge idempotency key that reached the gateway (the charge key).
+    fn issued_charge_key(gw: &MockGateway) -> String {
+        gw.requests
+            .iter()
+            .find_map(|r| match &r.act {
+                Some(Act::IssueCharge(_)) => Some(r.idempotency_key.clone()),
+                _ => None,
+            })
+            .expect("an IssueCharge reached the gateway")
+    }
+
+    /// TOOTH (T-HIGH, wrong-customer): two DISTINCT requests with EQUAL amounts (both 10) but a
+    /// different sender produce DISTINCT charge keys, so the daemon can never dedupe one to the
+    /// other's charge_id -- no wrong-customer correlation. Both ticks run at the SAME seq (1), the
+    /// post-reboot collision case. RED on reverting to a seq-based key: equal seq -> equal key ->
+    /// collision.
+    #[tokio::test]
+    async fn oracle_charge_key_distinct_per_request_no_wrong_customer() {
+        let params = test_params();
+        // Request 1: sender X. Request 2: sender Y. Both CHARGE:10, both processed at seq 1.
+        let mut gw1 =
+            MockGateway::thinking("CHARGE:10").with_dm(1, &dm_sender_hex(21), "PRICE BTC/USD");
+        let mut gw2 =
+            MockGateway::thinking("CHARGE:10").with_dm(1, &dm_sender_hex(22), "PRICE BTC/USD");
+        let (mut a1, mut a2): (u64, u64) = (0, 0);
+        let mut p1: HashMap<String, PendingCharge> = HashMap::new();
+        let mut p2: HashMap<String, PendingCharge> = HashMap::new();
+        oracle_tick(&mut gw1, 1, &mut a1, &mut p1, &params, 1_000, 0).await;
+        oracle_tick(&mut gw2, 1, &mut a2, &mut p2, &params, 1_000, 0).await;
+        let k1 = issued_charge_key(&gw1);
+        let k2 = issued_charge_key(&gw2);
+        assert!(k1.starts_with("oracle-charge-v3-"), "content-addressed key: {k1}");
+        assert_ne!(
+            k1, k2,
+            "distinct requests (different sender) at equal amount + equal seq must get DISTINCT keys (no wrong-customer): {k1} vs {k2}"
+        );
+    }
+
+    /// TOOTH (T-MED, no-wedge): a STALE charge sitting under the key a SEQ-based scheme would recycle
+    /// to (`oracle-charge-1`) does NOT block requests -- content-addressed keys never use that key,
+    /// so each fresh request mints a correct charge and is armed. Two distinct DMs both get armed.
+    /// RED on reverting to a seq-based key: request A (seq 1) hits the stale `oracle-charge-1` ->
+    /// amount mismatch -> P3 Transient -> A never arms (and in the live loop, its reused seq re-serves
+    /// the stale charge forever, blocking B).
+    #[tokio::test]
+    async fn oracle_charge_mismatch_does_not_wedge_inbox() {
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &dm_sender_hex(23), "PRICE BTC/USD")
+            .with_dm(2, &dm_sender_hex(24), "PRICE BTC/USD");
+        // A stale below-floor charge is parked under the recycled seq-1 key (a prior boot's leftover).
+        gw.stale_charge_by_key.insert("oracle-charge-1".to_string(), 5);
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        // Tick 1 (seq 1): A. Content key != oracle-charge-1 -> fresh correct charge -> armed.
+        let out = oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        assert!(matches!(out, TickOutcome::Lived { .. }), "A is not wedged by the stale seq-key: {out:?}");
+        // Tick 2 (seq 2): B (a DIFFERENT event). Also armed -> the stale charge blocked nobody.
+        oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 0).await;
+        assert_eq!(
+            pending.len(),
+            2,
+            "both distinct requests are armed; the stale seq-key charge wedged neither"
+        );
+    }
+
+    /// TOOTH (T-domain): the charge identity is DOMAIN-SEPARATED (length-prefixed), so two distinct
+    /// field tuples can never share a hash input. RED on reverting to naive concat: ("ab","c") and
+    /// ("a","bc") (and ("a"+"b", ...) splits) would collide.
+    #[test]
+    fn oracle_charge_identity_is_domain_separated() {
+        let t = 1_700_000_000u64;
+        let e = "event-id"; // a fixed correlation_id; the pubkey/payload boundary is what we probe.
+        assert_ne!(
+            oracle_charge_identity(e, "ab", t, b"c"),
+            oracle_charge_identity(e, "a", t, b"bc"),
+            "a pubkey/payload boundary shift must NOT collide"
+        );
+        assert_ne!(
+            oracle_charge_identity(e, "", t, b"abc"),
+            oracle_charge_identity(e, "abc", t, b""),
+            "moving all bytes across the boundary must NOT collide"
+        );
+        assert_ne!(
+            oracle_charge_identity(e, "x", t, b"yz"),
+            oracle_charge_identity(e, "xy", t, b"z"),
+            "another boundary split must NOT collide"
+        );
+        // created_at participates too: same sender+payload, different second -> different identity.
+        assert_ne!(
+            oracle_charge_identity(e, "x", t, b"q"),
+            oracle_charge_identity(e, "x", t + 1, b"q"),
+            "a different created_at is a different request"
+        );
+        // The event id (correlation_id) disambiguates: same sender + payload + created_at second but
+        // a DIFFERENT source event id -> a DISTINCT key (two genuine same-second DMs never collide).
+        assert_ne!(
+            oracle_charge_identity("evt-1", "x", t, b"q"),
+            oracle_charge_identity("evt-2", "x", t, b"q"),
+            "a different source event id is a different request"
+        );
+        // A correlation_id/pubkey boundary shift must not collide either (both length-prefixed).
+        assert_ne!(
+            oracle_charge_identity("ab", "c", t, b"q"),
+            oracle_charge_identity("a", "bc", t, b"q"),
+            "a correlation_id/pubkey boundary shift must NOT collide"
+        );
+    }
+
+    /// TOOTH (T-a, P3 belt): if `issue_charge` returns a ChargeIssued whose amount DIVERGES from the
+    /// clamped intent (a stale below-floor replay), the oracle must NOT invoice it and must NOT arm a
+    /// pending charge below floor -- it CONSUMES the event (advancing the inbox cursor, so it cannot
+    /// wedge the queue) and reports a Note, not a DmReply. RED on removing the P3 mismatch guard: the
+    /// below-floor charge gets invoiced + armed.
+    #[tokio::test]
+    async fn oracle_charge_stale_below_floor_replay_never_served() {
+        let sender = dm_sender_hex(25);
+        let params = test_params();
+        // Intent CHARGE:50 (above floor), but the daemon re-serves a stale 5-sat (below-floor) charge.
+        let mut gw = MockGateway::thinking("CHARGE:50").with_dm(1, &sender, "PRICE BTC/USD");
+        gw.issue_charge_amount_override = Some(5);
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        let out = oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        assert!(
+            matches!(out, TickOutcome::Lived { action: Action::Note, .. }),
+            "a returned-amount mismatch must NOT invoice; it consumes the event as a Note, got {out:?}"
+        );
+        assert!(gw.dm_replies.is_empty(), "the stale below-floor charge is NEVER invoiced: {:?}", gw.dm_replies);
+        assert!(pending.is_empty(), "no pending charge is armed at the stale below-floor amount");
+        assert_eq!(ack, 1, "the anomalous event is CONSUMED (cursor advanced), never wedging the inbox");
+    }
+
+    /// TOOTH (T-b): the SAME request (identical sender + created_at + payload) yields the SAME charge
+    /// key (idempotent dedupe -> no double-charge on a replay), and a DIFFERENT request yields a
+    /// DIFFERENT key.
+    #[tokio::test]
+    async fn oracle_charge_key_stable_for_same_request() {
+        let params = test_params();
+        let sender = dm_sender_hex(26);
+        // Two independent boots processing the byte-identical DM at DIFFERENT seqs -> SAME key.
+        let mut gw_a = MockGateway::thinking("CHARGE:10").with_dm(1, &sender, "PRICE BTC/USD");
+        let mut gw_b = MockGateway::thinking("CHARGE:10").with_dm(9, &sender, "PRICE BTC/USD");
+        let (mut aa, mut ab): (u64, u64) = (0, 0);
+        let mut pa: HashMap<String, PendingCharge> = HashMap::new();
+        let mut pb: HashMap<String, PendingCharge> = HashMap::new();
+        oracle_tick(&mut gw_a, 1, &mut aa, &mut pa, &params, 1_000, 0).await;
+        oracle_tick(&mut gw_b, 7, &mut ab, &mut pb, &params, 1_000, 0).await;
+        assert_eq!(
+            issued_charge_key(&gw_a),
+            issued_charge_key(&gw_b),
+            "the same request at different seqs -> the SAME content-addressed key (correct dedupe)"
+        );
+        // The same (sender, payload) processed once more -> the same key (idempotent dedupe).
+        let mut gw_c = MockGateway::thinking("CHARGE:10").with_dm(1, &sender, "PRICE BTC/USD");
+        let mut ac: u64 = 0;
+        let mut pc: HashMap<String, PendingCharge> = HashMap::new();
+        oracle_tick(&mut gw_c, 1, &mut ac, &mut pc, &params, 1_000, 0).await;
+        assert_eq!(issued_charge_key(&gw_c), issued_charge_key(&gw_a), "same (sender,payload) -> same key");
     }
 
     // ---- NIP-17 DM arm (task #12): busy-flag one-at-a-time + reply-to-the-seal-verified-sender ----
