@@ -2805,19 +2805,34 @@ async fn build_oracle_answer<G: Gateway>(
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let total = ORACLE_FEEDS.len();
     let prices: Vec<f64> = answered.iter().map(|(_, p)| *p).collect();
-    let sources_line = if answered.is_empty() {
-        "(none reachable)".to_string()
-    } else {
-        answered.iter().map(|(s, p)| format!("{s}={p:.2}")).collect::<Vec<_>>().join(" ")
-    };
     // QUORUM FLOOR (§A.4): a SIGNED price requires a >=2-of-3 quorum. `median_price` returns Some for
     // ANY non-empty slice, so a lone source would otherwise attest a "median of 1" -- a 1-of-N
     // posture that is FORBIDDEN (one unverified feed can move it). The floor lives HERE, at
-    // answer-assembly; `median_price` stays pure. The count is stated honestly in every branch.
+    // answer-assembly; `median_price` stays pure. Below quorum, NO usable price VALUE ships ANYWHERE
+    // in the SIGNED doc (not `answer:`, not `sources:`) AND the note does NOT vouch -- a lone feed's
+    // number in the provenance line would be the same forbidden 1-of-N posture one layer down.
+    let has_quorum = answered.len() >= 2;
+    let sources_line = if answered.is_empty() {
+        "(none reachable)".to_string()
+    } else if has_quorum {
+        // Transparency of a real attestation: the per-source values that composed the median.
+        answered.iter().map(|(s, p)| format!("{s}={p:.2}")).collect::<Vec<_>>().join(" ")
+    } else {
+        // Reachability WITHOUT values: the source NAMES answered, but below quorum NO digit ships.
+        let names = answered.iter().map(|(s, _)| *s).collect::<Vec<_>>().join(", ");
+        format!("{names} reachable; below quorum -- values withheld")
+    };
     let answer_line = match (answered.len(), median_price(&prices)) {
         (n, Some(m)) if n >= 2 => format!("{m:.2} USD  (median of {n} of {total} sources)"),
         (0, _) => format!("unavailable ({total} sources unreachable this tick)"),
         (n, _) => format!("unavailable (only {n} of {total} sources; need >=2 for quorum)"),
+    };
+    // The vouch appears ONLY at quorum; below it the note is neutral (no vouch), keeping the honest
+    // "NOT a trustless proof" boundary in both.
+    let note_line = if has_quorum {
+        "trusted-oracle attestation -- the agent fetched these values and vouches for them; NOT a trustless proof."
+    } else {
+        "below quorum (need >=2 sources); no price attested; NOT a trustless proof."
     };
     format!(
         "KIRBY ORACLE ATTESTATION\n\
@@ -2826,7 +2841,7 @@ async fn build_oracle_answer<G: Gateway>(
          sources: {sources_line}\n\
          fetched: {fetched_unix} (unix seconds, agent clock)\n\
          charge:  {charge_id}\n\
-         note:    trusted-oracle attestation -- the agent fetched these values and vouches for them; NOT a trustless proof."
+         note:    {note_line}"
     )
 }
 
@@ -4013,6 +4028,10 @@ mod tests {
             answer.contains("coinbase=100.00") && answer.contains("kraken=101.00") && answer.contains("coingecko=110.00"),
             "per-source prices shown: {answer}"
         );
+        assert!(
+            answer.to_ascii_lowercase().contains("vouch"),
+            "at quorum the note vouches for the values (transparency of a real attestation): {answer}"
+        );
         assert!(answer.contains(&oracle_charge_id(1)), "attestation carries the charge_id: {answer}");
 
         let fetch_keys: Vec<String> = gw
@@ -4091,6 +4110,51 @@ mod tests {
             !answer.contains(" USD"),
             "NO price claim below quorum: {answer}"
         );
+    }
+
+    /// TOOTH (O2, keeper:kirby verify): the quorum floor reaches the WHOLE signed doc, not just the
+    /// `answer:` line. Below quorum (exactly 1 answered) NO usable price VALUE ships ANYWHERE -- not
+    /// in `answer:`, not in the `sources:` provenance line -- AND the `note:` does NOT vouch (a
+    /// vouch for a single-source number is the same forbidden 1-of-N posture one layer down).
+    /// Provenance is kept as reachability WITHOUT the digit (the source NAME still appears). RED on
+    /// EITHER half independently: revert the sources-line withholding -> the value string leaks;
+    /// revert the note gating -> the vouch leaks.
+    #[tokio::test]
+    async fn oracle_o2_below_quorum_doc_emits_no_value_and_no_vouch() {
+        let sender = dm_sender_hex(12);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &sender, "PRICE BTC/USD")
+            .with_payment_settled(2, &oracle_charge_id(1), 10);
+        // Only coinbase's field is present -> exactly 1 of 3 feeds extracts (value 100.00).
+        gw.fetch_response = Some(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: br#"{"data":{"amount":"100.00"}}"#.to_vec(),
+            truncated: false,
+            final_url: "https://api.coinbase.com/v2/prices/BTC-USD/spot".to_string(),
+        });
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        let out = oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(matches!(out, TickOutcome::Lived { action: Action::DmReply { .. }, .. }));
+        let doc = &gw.dm_replies[1].text;
+        // (a) NO usable price value anywhere in the doc (answer OR sources), and no price framing.
+        assert!(
+            !doc.contains("100.00"),
+            "the single-source VALUE must not leak into the signed doc (answer or sources): {doc}"
+        );
+        assert!(!doc.contains(" USD"), "no price unit below quorum: {doc}");
+        assert!(!doc.contains("median of"), "no median claim below quorum: {doc}");
+        // (b) the note does NOT vouch (case-insensitive).
+        assert!(
+            !doc.to_ascii_lowercase().contains("vouch"),
+            "the note must NOT vouch below quorum: {doc}"
+        );
+        // Positive-transparency: provenance keeps the reachable source NAME (reachability, no digit).
+        assert!(doc.contains("coinbase"), "the reachable source name is still shown: {doc}");
     }
 
     // ---- NIP-17 DM arm (task #12): busy-flag one-at-a-time + reply-to-the-seal-verified-sender ----
