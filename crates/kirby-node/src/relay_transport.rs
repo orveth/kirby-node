@@ -1377,6 +1377,252 @@ impl ReplayGuard {
     }
 }
 
+// ================================================================================================
+// THE PRODUCTION `RelayConn`: `NostrRelayConn` -- the wire the cross-machine ceremony rides.
+//
+// Everything above is generic over `<C: RelayConn>` and, until now, only the in-memory
+// `InMemoryConn` (tests) satisfied it. `NostrRelayConn` is the real transport: a `nostr_sdk`
+// `Client` subscribed to `#p = me` + the kirby transport kinds, reaching one or more real relays.
+// It is the ONE keystone that turns the whole (already-proven) ceremony into a cross-machine one.
+// ================================================================================================
+
+/// How many recently-seen event ids [`NostrRelayConn`] remembers to suppress the SAME frame
+/// arriving from multiple relays (multi-relay dedup). Bounded so a long-lived ceremony
+/// subscription never grows without limit; a ceremony's frame rate is low, so this spans far
+/// more than any in-flight window.
+const SEEN_EVENT_CAP: usize = 4096;
+
+/// A bounded recently-seen-event-id set with FIFO eviction, for cross-relay dedup: the SAME
+/// signed frame is delivered once per relay it reaches, but the transport must yield it ONCE.
+#[derive(Default)]
+struct SeenEvents {
+    set: std::collections::HashSet<EventId>,
+    order: std::collections::VecDeque<EventId>,
+}
+
+impl SeenEvents {
+    /// Record `id`; return `true` the FIRST time it is seen, `false` on a duplicate.
+    fn first_sight(&mut self, id: EventId) -> bool {
+        if self.set.contains(&id) {
+            return false;
+        }
+        self.set.insert(id);
+        self.order.push_back(id);
+        if self.order.len() > SEEN_EVENT_CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
+}
+
+/// The production [`RelayConn`]: a `nostr_sdk::Client` subscribed to `#p = me` + the kirby
+/// transport kinds ([`kirby_proto::KIND_KIRBY_COSIGN`] + [`kirby_proto::KIND_KIRBY_SHARE`]),
+/// reaching one or more real relays. Drops into the SAME `RelayConn` seam the in-memory double
+/// fills, so the [`CoordinatorRelayHub`] / [`run_holder_server`] / framing are all unchanged.
+///
+/// OPACITY (the whole reason a relay drops in): a DUMB carrier. It moves whole signed [`Event`]s
+/// and NEVER deserializes the ceremony `payload`; routing is the relay's `#p` + kind index alone,
+/// exactly as the in-memory double. So the `nonce_never_crosses` invariant holds over the wire.
+///
+/// FAIL-CLOSED: `publish`/`next_event` surface every failure as `Err` (the any-available-2-of-3
+/// fallback + the per-wire timeout turn that into "abandon this subset / defer"); a frame is never
+/// silently dropped or fabricated. In particular `publish` treats "reached zero relays" as `Err`
+/// even though nostr-sdk's `send_event` returns `Ok` with an empty success set in that case.
+///
+/// RECONNECT (the #103 lesson, load-bearing): the persistent subscription is NON-auto-closing and
+/// the relays keep nostr-relay-pool's DEFAULT options -- `reconnect = true` AND the keepalive PING
+/// ON. This is the deliberate OPPOSITE of the nerve presence lane (which disables ping because it
+/// re-beacons every <=15s): here the keepalive is what surfaces a half-open socket so the pool's
+/// reconnect loop fires, and on every (re)connect the pool AUTO-RE-SENDS the active REQ
+/// (nostr-relay-pool `InnerRelay::resubscribe`, verified in-source). So a dropped / half-open relay
+/// self-heals for the next ceremony with NO manual re-subscribe; a ceremony in flight during the
+/// outage just times out per wire and the fallback abandons that subset. Multi-relay reach is the
+/// other half: a frame fans out to every relay, so one relay dying still lands it via another.
+///
+/// LAZY CONNECT (runtime affinity): nostr-relay-pool spawns each relay's connection task on the
+/// runtime that drives `connect().await` (`async_utility::task::spawn` -> `Handle::current`). The
+/// hub / holder-server move a `RelayConn` into a background thread with ITS OWN runtime and drive
+/// it there, so connect+subscribe is DEFERRED to the first `publish` / `next_event` (guarded by a
+/// once-cell) -- that runs on the long-lived actor runtime, so the relay tasks live exactly as
+/// long as the actor that owns them. Connecting eagerly on a throwaway runtime would strand them.
+/// A caller that wants the subscription live up front (e.g. so a holder is subscribed BEFORE any
+/// ephemeral solicit is published) calls [`Self::ensure_connected`] on its own long-lived runtime.
+pub struct NostrRelayConn {
+    /// This connection's own transport pubkey; the subscription is `#p = me`.
+    me: PublicKey,
+    /// The relays this connection publishes to (all of them) and reads from (deduped).
+    relays: Vec<String>,
+    /// The nostr-sdk client, built signer-LESS: frames are pre-signed before `publish`, so the
+    /// client only carries bytes (it never signs, preserving opacity + the sender-auth model).
+    client: Client,
+    /// The pool notification stream, taken at construction (before connect) so nothing is missed
+    /// once the relays come up. A `tokio::sync::Mutex` (matching the in-memory double) gives
+    /// `next_event` `&self` access; it is driven by ONE actor loop, so the lock is uncontended.
+    notifications: tokio::sync::Mutex<tokio::sync::broadcast::Receiver<RelayPoolNotification>>,
+    /// Connect + subscribe exactly once, on the runtime of the first `publish` / `next_event`
+    /// (or [`Self::ensure_connected`]). Cancel-safe: a cancelled init just retries next call.
+    ready: tokio::sync::OnceCell<()>,
+    /// Recently-seen event ids for cross-relay dedup.
+    seen: Mutex<SeenEvents>,
+}
+
+impl NostrRelayConn {
+    /// Bind a connection to `me` over `relays` WITHOUT connecting yet (connect is deferred to the
+    /// first use; see the type doc's runtime-affinity note). Errs on an empty relay set
+    /// (fail-closed: a carrier with nowhere to go is a configuration error, not a silent no-op).
+    pub fn new(me: PublicKey, relays: Vec<String>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !relays.is_empty(),
+            "NostrRelayConn requires at least one relay URL (got none)"
+        );
+        let client = Client::builder().build();
+        let notifications = client.notifications();
+        Ok(Self {
+            me,
+            relays,
+            client,
+            notifications: tokio::sync::Mutex::new(notifications),
+            ready: tokio::sync::OnceCell::new(),
+            seen: Mutex::new(SeenEvents::default()),
+        })
+    }
+
+    /// Bind a connection from a holder-address token (`<pubkey_hex>@<relay_csv>`): subscribe
+    /// `#p = <pubkey>` over `<relay_csv>`. Symmetric -- the coordinator and each holder each stand
+    /// up their own `NostrRelayConn` from their own address (the SAME token `placement.json` holds).
+    pub fn from_address(address: &str) -> anyhow::Result<Self> {
+        let (me, relays) = parse_holder_address(address)?;
+        Self::new(me, relays)
+    }
+
+    /// Force connect + subscribe now (idempotent). Production connects lazily on first use; this
+    /// lets a caller warm the persistent subscription up front on its OWN long-lived runtime --
+    /// e.g. so a holder's `#p = me` subscription is live BEFORE any (ephemeral, un-stored)
+    /// KIND_KIRBY_COSIGN solicit is published at it.
+    pub async fn ensure_connected(&self) -> anyhow::Result<()> {
+        self.ensure_ready().await
+    }
+
+    /// Connect every relay (DEFAULT options: reconnect + keepalive ping ON) and subscribe the
+    /// persistent `#p = me` + transport-kinds filter, exactly once. Uses `connect()` -- which spawns
+    /// each relay's reconnect-looping task, so a relay down at init keeps retrying -- plus
+    /// `wait_for_connection` (bounded, so the first publish rides a live socket where one is
+    /// reachable); `verify_subscriptions(true)` per relay so a hostile relay cannot inject
+    /// off-`#p` / wrong-kind frames; and a STABLE subscription id so a cancelled-retry or a reconnect
+    /// re-REQs the SAME id rather than stacking a second subscription. A relay still down here is NOT
+    /// fatal (reconnect keeps trying); the per-publish empty-success check is the real fail-closed gate.
+    async fn ensure_ready(&self) -> anyhow::Result<()> {
+        self.ready
+            .get_or_try_init(|| async {
+                for url in &self.relays {
+                    // verify_subscriptions(true): the pool LOCALLY drops any relay-pushed event that
+                    // does not match our active subscription, so a buggy / hostile relay cannot inject
+                    // an off-`#p` or wrong-kind frame into next_event. Defense-in-depth for the routing
+                    // + opacity contract -- WITHOUT this carrier ever parsing a tag itself.
+                    self.client
+                        .pool()
+                        .add_relay(url, RelayOptions::new().verify_subscriptions(true))
+                        .await
+                        .with_context(|| format!("NostrRelayConn: add relay {url}"))?;
+                }
+                // connect() -- NOT try_connect -- spawns each relay's PERSISTENT connection task, so a
+                // relay that is DOWN at init keeps retrying via the reconnect loop instead of being
+                // abandoned (try_connect schedules NO retry after an initial-connection failure:
+                // pool/mod.rs "without spawning the connection task if it fails"). wait_for_connection
+                // then bounds the wait so the first publish rides a live socket where one is reachable.
+                self.client.connect().await;
+                self.client.wait_for_connection(Duration::from_secs(10)).await;
+                let filter = Filter::new()
+                    .kinds([
+                        Kind::from(kirby_proto::KIND_KIRBY_COSIGN),
+                        Kind::from(kirby_proto::KIND_KIRBY_SHARE),
+                    ])
+                    .pubkey(self.me);
+                // A STABLE subscription id (derived from `me`): re-subscribing -- whether from a
+                // cancelled-then-retried init or the pool's auto-resubscribe on reconnect -- reuses the
+                // SAME id (an idempotent re-REQ), so it never stacks a second long-lived subscription.
+                let sub_id = SubscriptionId::new(format!("kirby-frost-cosign-{}", self.me.to_hex()));
+                self.client
+                    .subscribe_with_id(sub_id, filter, None)
+                    .await
+                    .context("NostrRelayConn: subscribe #p=me + transport kinds")?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map(|_| ())
+    }
+}
+
+impl RelayConn for NostrRelayConn {
+    async fn publish(&self, event: Event) -> anyhow::Result<()> {
+        self.ensure_ready().await?;
+        // send_event returns Ok even when EVERY relay rejected (the per-relay results live in the
+        // Output); it Errs only on a structural miss (no relays configured). Fail-closed: an empty
+        // success set means the frame reached NO relay -- surface it as Err so the wire times out
+        // cleanly instead of pretending the frame was delivered.
+        let output = self
+            .client
+            .send_event(&event)
+            .await
+            .map_err(|e| anyhow::anyhow!("NostrRelayConn publish: {e}"))?;
+        if output.success.is_empty() {
+            anyhow::bail!(
+                "NostrRelayConn publish: reached zero relays ({} failed)",
+                output.failed.len()
+            );
+        }
+        Ok(())
+    }
+
+    async fn next_event(&self) -> anyhow::Result<Event> {
+        self.ensure_ready().await?;
+        let mut rx = self.notifications.lock().await;
+        loop {
+            match rx.recv().await {
+                Ok(RelayPoolNotification::Event { event, .. }) => {
+                    // Cross-relay dedup by id (the SAME frame arrives once per relay). NEVER
+                    // inspect the payload -- the carrier stays opaque. There is NO await between
+                    // matching and returning, so a `select!` cancellation cannot drop a frame
+                    // already taken off the stream.
+                    let id = event.id;
+                    if self
+                        .seen
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("NostrRelayConn seen-set poisoned"))?
+                        .first_sight(id)
+                    {
+                        return Ok(*event);
+                    }
+                }
+                Ok(RelayPoolNotification::Shutdown) => {
+                    anyhow::bail!("NostrRelayConn: relay pool shut down");
+                }
+                // EOSE / OK / other relay messages are not a delivery -- keep waiting.
+                Ok(RelayPoolNotification::Message { .. }) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // The stream overflowed and dropped `n` notifications for THIS receiver. We do NOT
+                    // surface this as Err: an Err from next_event makes the actor loop `break`, which
+                    // would tear down the whole long-lived hub / holder-server on a transient overflow.
+                    // Fail-closed is preserved at the CEREMONY boundary instead -- a dropped frame means
+                    // a reply the peer awaits never arrives, so that wire hits its timeout and the
+                    // any-available-2-of-3 fallback abandons the subset. An incomplete aggregate can
+                    // never verify under Q, so a lag can only cost a clean retry, never a partial /
+                    // wrong signature. Logged loudly so overload stays visible.
+                    tracing::warn!(
+                        skipped = n,
+                        "NostrRelayConn: notification stream lagged (dropped frames surface as a per-wire timeout + fallback)"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    anyhow::bail!("NostrRelayConn: notification stream closed");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1906,5 +2152,221 @@ mod tests {
             "a different coordinator is a distinct frame"
         );
         println!("REPLAY-GUARD PASS: fresh admitted; duplicate (coord,session,round) refused; stale created_at refused");
+    }
+
+    // ---- NostrRelayConn: the production transport, proven over a REAL (hermetic, in-process) ----
+    // ---- nostr relay. These are ADDITIVE: the InMemoryConn tests above stay the fast golden.  ----
+
+    use nostr_relay_builder::MockRelay;
+
+    /// FRAME ROUND-TRIP over a REAL relay: a `#p`-addressed CoSignEvent frame published by the
+    /// coordinator's [`NostrRelayConn`] arrives at the holder's [`NostrRelayConn`] over a hermetic
+    /// in-process nostr relay, decodes to the SAME CoSignEvent (opaque payload byte-identical),
+    /// and a tampered copy is rejected at verify (integrity is the frame's; the carrier only moved
+    /// bytes). Mirrors [`codec_round_trips_and_rejects_tampering`] but over the real wire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn relayconn_frame_round_trips_over_real_relay() {
+        let relay = MockRelay::run().await.expect("boot the in-process relay");
+        let url = relay.url().await.to_string();
+
+        let coordinator = Keys::generate();
+        let holder = Keys::generate();
+
+        let coord_conn =
+            NostrRelayConn::new(coordinator.public_key(), vec![url.clone()]).expect("coord conn");
+        let holder_conn =
+            NostrRelayConn::new(holder.public_key(), vec![url.clone()]).expect("holder conn");
+        // Warm BOTH persistent subscriptions before publishing: KIND_KIRBY_COSIGN is ephemeral,
+        // so a subscriber must be live at publish time (a real relay does not store it).
+        coord_conn.ensure_connected().await.expect("coordinator subscribes");
+        holder_conn.ensure_connected().await.expect("holder subscribes");
+
+        let cse = CoSignEvent {
+            session_id: 42,
+            from: GuardianId::try_from(2u16).unwrap(),
+            round: kirby_custody::seam::ROUND_SHARE,
+            payload: vec![0xCA, 0xFE, 0xBA, 0xBE],
+        };
+        let frame =
+            encode_cosign_frame(AGENT, &cse, holder.public_key(), &coordinator).expect("encode");
+        coord_conn.publish(frame).await.expect("publish the frame over the real relay");
+
+        // The holder receives it over the wire (bounded so a routing bug fails fast, not hangs).
+        let got = tokio::time::timeout(Duration::from_secs(10), holder_conn.next_event())
+            .await
+            .expect("the frame must arrive at the #p-addressed holder within the timeout")
+            .expect("next_event ok");
+
+        let (agent, decoded, sender) =
+            decode_cosign_frame(&got).expect("decode the delivered frame");
+        assert_eq!(agent, AGENT);
+        assert_eq!(sender, coordinator.public_key(), "sender is the publisher's transport key");
+        assert_eq!(decoded.session_id, cse.session_id);
+        assert_eq!(decoded.from, cse.from);
+        assert_eq!(decoded.round, cse.round);
+        assert_eq!(
+            decoded.payload, cse.payload,
+            "opaque payload round-trips byte-for-byte over the wire"
+        );
+
+        // Tamper the DELIVERED frame -> verify must fail (the id no longer matches the content).
+        let json = serde_json::to_string(&got).expect("serialize the delivered frame to json");
+        let tampered = json.replace("cafebabe", "deadbeef");
+        assert_ne!(json, tampered, "the tamper must actually change the frame json");
+        let bad = Event::from_json(&tampered).expect("parse the tampered json back to an Event");
+        assert!(
+            decode_cosign_frame(&bad).is_err(),
+            "a tampered frame must be rejected at verify (id/content mismatch)"
+        );
+        println!("RELAYCONN-ROUNDTRIP PASS: #p-addressed CoSignEvent frame round-trips over a real relay; opaque payload byte-identical; tamper rejected");
+    }
+
+    /// ★ TRANSPARENCY TOOTH: the SAME 2-of-3 ceremony the in-memory keystone proves
+    /// ([`remote_relay_holder_in_a_2of3_quorum_produces_a_q_valid_signature`]), but with the one
+    /// remote holder reached over `NostrRelayConn` + a REAL (in-process) nostr relay, produces a
+    /// signature that verifies under Q -- byte-identical-VERIFYING to the in-process golden. Proves
+    /// the production wire carries the ceremony faithfully: nostr-sdk really moves our opaque
+    /// frames over a real relay, sync bridge + actor + holder-server included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn relay_remote_holder_2of3_over_real_relay_is_q_valid() {
+        let ks = keyset();
+        let kps = three_kps(&ks);
+
+        let relay = MockRelay::run().await.expect("boot the in-process relay");
+        let url = relay.url().await.to_string();
+
+        let coordinator_keys = Keys::generate();
+        let holder_keys = Keys::generate();
+
+        // Warm both persistent subscriptions on THIS long-lived runtime BEFORE the ceremony
+        // solicits (ephemeral cosign frames need a live subscriber at publish time). The relay-pool
+        // tasks then live on this runtime, which outlives the whole ceremony.
+        let holder_conn =
+            NostrRelayConn::new(holder_keys.public_key(), vec![url.clone()]).expect("holder conn");
+        holder_conn.ensure_connected().await.expect("holder subscribes");
+        let coord_conn = NostrRelayConn::new(coordinator_keys.public_key(), vec![url.clone()])
+            .expect("coord conn");
+        coord_conn.ensure_connected().await.expect("coordinator subscribes");
+
+        // Holder 2 "on another machine": its server loop on its own thread + runtime, driving the
+        // (already-connected) holder_conn.
+        let server2 = Arc::new(RemoteHolderServer::new(kps[1].clone(), ks.pubkeys.clone()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let holder_keys_thread = holder_keys.clone();
+        let server2_thread = Arc::clone(&server2);
+        let holder_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("holder rt");
+            rt.block_on(async {
+                let _ = run_holder_server(
+                    &holder_keys_thread,
+                    AGENT,
+                    server2_thread,
+                    holder_conn,
+                    allow_all_coordinators(),
+                    shutdown_rx,
+                )
+                .await;
+            });
+        });
+
+        // The coordinator hub over its (already-connected) relay endpoint.
+        let hub = CoordinatorRelayHub::start(
+            coord_conn,
+            coordinator_keys.clone(),
+            AGENT,
+            DEFAULT_WIRE_TIMEOUT,
+        )
+        .expect("start hub");
+
+        // Holder 1 co-located; holder 2 remote over the REAL relay transport.
+        let local = LocalHolder::new(kps[0].clone(), ks.pubkeys.clone());
+        let remote_addr = format!("{}@{}", holder_keys.public_key().to_hex(), url);
+        let remote_transport = hub.connect(&remote_addr).expect("connect remote holder");
+        let remote = RemoteHolder::new(
+            crate::quorum_signer::identifier_to_u16(kps[1].identifier()),
+            remote_transport,
+        );
+
+        let holders: Vec<Box<dyn Holder>> = vec![Box::new(local), Box::new(remote)];
+        let qs = QuorumSigner::new(holders, ks.pubkeys.clone()).expect("build mixed signer");
+        let q_bytes = qs.q_bytes().to_vec();
+
+        // The ceremony is SYNC (RemoteHolder.recv blocks on the wire); drive it off the async
+        // workers so the relay-pool tasks keep progressing on this runtime.
+        let event =
+            tokio::task::spawn_blocking(move || qs.sign_nostr_event(1, CREATED_AT, CONTENT))
+                .await
+                .expect("join the ceremony task")
+                .expect("2-of-3 with a relay RemoteHolder over a real relay signs");
+
+        let expect_id = nip01_event_id(&hex::encode(&q_bytes), CREATED_AT, 1, CONTENT);
+        assert_eq!(event.id, hex::encode(expect_id), "id is the NIP-01 id under Q");
+        assert_eq!(event.pubkey, hex::encode(&q_bytes));
+        assert!(
+            verifies_under_q(&event.sig, &expect_id, &ks.pubkeys),
+            "the mixed local + relay-remote 2-of-3 aggregate must verify under Q (== in-process golden)"
+        );
+
+        let _ = shutdown_tx.send(());
+        drop(hub);
+        let _ = holder_thread.join();
+        println!("RELAY-TRANSPARENCY PASS: a 2-of-3 with one RemoteHolder over NostrRelayConn + a real relay produced a Q-valid signature (== in-process golden)");
+    }
+
+    /// MULTI-RELAY FAILOVER: both sides reach TWO relays; kill one mid-run, and a `#p`-addressed
+    /// frame still lands via the other. Proves the publish fan-out + inbound dedup give real
+    /// redundancy -- the resilience half of the #103 lesson: a dead / half-open relay does not
+    /// strand a frame when another relay carries it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn relayconn_multi_relay_survives_one_relay_dying() {
+        let relay1 = MockRelay::run().await.expect("relay 1");
+        let relay2 = MockRelay::run().await.expect("relay 2");
+        let url1 = relay1.url().await.to_string();
+        let url2 = relay2.url().await.to_string();
+
+        let coordinator = Keys::generate();
+        let holder = Keys::generate();
+
+        let coord_conn =
+            NostrRelayConn::new(coordinator.public_key(), vec![url1.clone(), url2.clone()])
+                .expect("coord conn");
+        let holder_conn =
+            NostrRelayConn::new(holder.public_key(), vec![url1.clone(), url2.clone()])
+                .expect("holder conn");
+        coord_conn.ensure_connected().await.expect("coordinator subscribes to both");
+        holder_conn.ensure_connected().await.expect("holder subscribes to both");
+
+        // Kill relay 1 mid-run. The connections stay reachable via relay 2 (fan-out publish +
+        // dedup inbound), so the frame must still land.
+        relay1.shutdown();
+
+        let cse = CoSignEvent {
+            session_id: 7,
+            from: GuardianId::try_from(1u16).unwrap(),
+            round: kirby_custody::seam::ROUND_SHARE,
+            payload: vec![0xF0, 0x0D],
+        };
+        let frame =
+            encode_cosign_frame(AGENT, &cse, holder.public_key(), &coordinator).expect("encode");
+        // Fan-out: relay 1 is dead, but relay 2 accepts -> publish succeeds (non-empty success).
+        coord_conn
+            .publish(frame)
+            .await
+            .expect("publish still reaches a live relay after one died");
+
+        let got = tokio::time::timeout(Duration::from_secs(15), holder_conn.next_event())
+            .await
+            .expect("the frame must arrive via the surviving relay")
+            .expect("next_event ok");
+        let (_agent, decoded, sender) = decode_cosign_frame(&got).expect("decode");
+        assert_eq!(sender, coordinator.public_key());
+        assert_eq!(
+            decoded.payload, cse.payload,
+            "the frame survived one relay dying, delivered via the other"
+        );
+        println!("RELAYCONN-FAILOVER PASS: with 2 relays and one killed mid-run, the #p-addressed frame still landed via the survivor");
     }
 }
