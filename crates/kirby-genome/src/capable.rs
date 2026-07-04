@@ -2535,6 +2535,17 @@ const ORACLE_DEFAULT_CHARGE_SATS: u64 = 10;
 /// forgets them, and an unpaid charge holds no sats the agent could reclaim anyway.
 const ORACLE_PENDING_TTL_TICKS: u64 = 240;
 
+/// How many times a single feed is fetched in ONE answer-build before it is given up as
+/// unreachable this tick (design O3-1). A transient blip in >=2 of 3 sources at the settlement
+/// instant would otherwise burn a PAID quote into a cached "unavailable" -- never re-fetched, never
+/// refunded. This bounded SAME-TICK retry (no backoff, no sleeps) gives each feed a second
+/// immediate try; a PERSISTENT outage still degrades to an honest "unavailable" after this many
+/// attempts, never an unbounded loop. `build_oracle_answer` runs only when the answer is not yet
+/// cached, so the retry is inherently first-build-only. Each attempt MUST use a DISTINCT
+/// idempotency key (the `-{attempt}` suffix): a reused key would dedupe the retry to an empty
+/// DUPLICATE body, so it could never help.
+const ORACLE_FETCH_ATTEMPTS: u32 = 2;
+
 /// A classified inbound oracle request. The parser is TOTAL (every input maps to one variant; an
 /// unrecognized query is [`OracleRequest::Unsupported`], never a panic), mirroring the
 /// capable-loop [`Action`] grammar's discipline.
@@ -2794,10 +2805,18 @@ async fn build_oracle_answer<G: Gateway>(
     };
     let mut answered: Vec<(&'static str, f64)> = Vec::new();
     for feed in ORACLE_FEEDS.iter() {
-        let key = format!("oracle-fetch-{seq}-{}", feed.source);
-        if let Some(body) = oracle_fetch(gw, &key, feed.url, params.memory_max_cost).await {
-            if let Some(price) = (feed.extract)(&body) {
-                answered.push((feed.source, price));
+        // BOUNDED SAME-TICK RETRY (O3-1): give each feed up to ORACLE_FETCH_ATTEMPTS immediate tries
+        // (no backoff), breaking on the first extractable price. The `-{attempt}` suffix keeps every
+        // attempt's idempotency key DISTINCT -- a reused key would dedupe the retry to an empty
+        // DUPLICATE body. A persistent outage exhausts the attempts and the feed stays unanswered
+        // (honest "unavailable"), never an unbounded loop.
+        for attempt in 0..ORACLE_FETCH_ATTEMPTS {
+            let key = format!("oracle-fetch-{seq}-{}-{attempt}", feed.source);
+            if let Some(body) = oracle_fetch(gw, &key, feed.url, params.memory_max_cost).await {
+                if let Some(price) = (feed.extract)(&body) {
+                    answered.push((feed.source, price));
+                    break;
+                }
             }
         }
     }
@@ -3287,6 +3306,11 @@ mod tests {
         /// FETCH test can assert the body reaches the genome. `None` (the default) => a bodyless
         /// performed fetch (models a DUPLICATE replay).
         fetch_response: Option<HttpResponse>,
+        /// Per-URL scripted fetch responses (O3-1 retry): each `http.fetch` to a URL present here
+        /// POPS the next response off its queue, so a test can make attempt 0 fail (None) and
+        /// attempt 1 succeed (Some) for the SAME source. An exhausted queue yields None (bodyless).
+        /// A URL absent here falls back to `fetch_response` (the single-body default).
+        fetch_script: HashMap<String, std::collections::VecDeque<Option<HttpResponse>>>,
         /// Every Actuate request's decoded payload (the NostrPublish), so a test can assert the
         /// EXACT content + kind that reached the gateway (P2: one publish, sanitized content).
         published: Vec<NostrPublish>,
@@ -3482,9 +3506,15 @@ mod tests {
                         Outcome::AuthorizedAndPerformed | Outcome::DuplicateIgnored
                     );
                     // C-EGRESS: an http.fetch receipt carries the typed response (when performed);
-                    // every other actuate kind leaves it absent.
+                    // every other actuate kind leaves it absent. O3-1: if this URL has a scripted
+                    // queue, POP the next attempt's response (so the same source can fail then
+                    // succeed across retries); otherwise the single-body default.
                     let http_response = if performed && a.kind == ACTUATE_KIND_HTTP_FETCH {
-                        self.fetch_response.clone()
+                        let url = HttpFetch::decode(a.payload.as_slice()).ok().map(|f| f.url);
+                        match url.as_ref().and_then(|u| self.fetch_script.get_mut(u)) {
+                            Some(queue) => queue.pop_front().flatten(),
+                            None => self.fetch_response.clone(),
+                        }
                     } else {
                         None
                     };
@@ -4040,9 +4070,17 @@ mod tests {
             .filter(|r| matches!(&r.act, Some(Act::Actuate(a)) if a.kind == ACTUATE_KIND_HTTP_FETCH))
             .map(|r| r.idempotency_key.clone())
             .collect();
+        // Each feed answers on attempt 0 -> one fetch per feed (the retry loop breaks on success).
         assert_eq!(fetch_keys.len(), 3, "one fetch per feed: {fetch_keys:?}");
         let distinct: std::collections::HashSet<&String> = fetch_keys.iter().collect();
         assert_eq!(distinct.len(), 3, "DISTINCT per-source keys (no dedup collision): {fetch_keys:?}");
+        // O3-1: the key format now carries the attempt suffix (`-{source}-{attempt}`); attempt 0.
+        for src in ["coinbase", "kraken", "coingecko"] {
+            assert!(
+                fetch_keys.iter().any(|k| k == &format!("oracle-fetch-2-{src}-0")),
+                "the attempt-0 key for {src} has the -source-attempt format: {fetch_keys:?}"
+            );
+        }
     }
 
     /// TOOTH (O2): with NO source reachable (every fetch bodyless), the answer is an honest
@@ -4155,6 +4193,115 @@ mod tests {
         );
         // Positive-transparency: provenance keeps the reachable source NAME (reachability, no digit).
         assert!(doc.contains("coinbase"), "the reachable source name is still shown: {doc}");
+    }
+
+    /// A scripted 2xx fetch body for the O3 retry tests (empty `final_url`; not asserted).
+    fn ok_body(body: &[u8]) -> Option<HttpResponse> {
+        Some(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: body.to_vec(),
+            truncated: false,
+            final_url: String::new(),
+        })
+    }
+
+    /// TOOTH (O3-1): a TRANSIENT blip is retried within the same tick and the source is then
+    /// priced. coinbase fails on attempt 0 and answers on attempt 1; exactly one OTHER source
+    /// answers steadily -> the retried source is what carries the fetch over the >=2 quorum, so the
+    /// attestation is PRICED (median), not "unavailable". RED on reverting the bound to 1 attempt:
+    /// coinbase never gets its second try -> only 1 source -> below quorum -> "unavailable".
+    #[tokio::test]
+    async fn oracle_o2_transient_fetch_retried_then_priced() {
+        let sender = dm_sender_hex(13);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &sender, "PRICE BTC/USD")
+            .with_payment_settled(2, &oracle_charge_id(1), 10);
+        // coinbase: transient (None -> success). kraken: steady (answers attempt 0). coingecko:
+        // persistent fail. So the retry on coinbase is load-bearing for reaching the >=2 quorum.
+        gw.fetch_script.insert(
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot".to_string(),
+            [None, ok_body(br#"{"data":{"amount":"100.00"}}"#)].into_iter().collect(),
+        );
+        gw.fetch_script.insert(
+            "https://api.kraken.com/0/public/Ticker?pair=XBTUSD".to_string(),
+            [ok_body(br#"{"result":{"XXBTZUSD":{"c":["102.00","0.1"]}}}"#)].into_iter().collect(),
+        );
+        gw.fetch_script.insert(
+            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd".to_string(),
+            [None, None].into_iter().collect(),
+        );
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        let out = oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(matches!(out, TickOutcome::Lived { action: Action::DmReply { .. }, .. }));
+        let doc = &gw.dm_replies[1].text;
+        assert!(
+            !doc.contains("unavailable"),
+            "the retried transient source reaches quorum -> PRICED, not unavailable: {doc}"
+        );
+        assert!(doc.contains("median of 2 of 3 sources"), "coinbase(retry)+kraken = 2 of 3: {doc}");
+        assert!(doc.contains("101.00 USD"), "median of 100.00/102.00 = 101.00: {doc}");
+    }
+
+    /// TOOTH (O3-1): a PERSISTENTLY failing source is fetched EXACTLY ORACLE_FETCH_ATTEMPTS times
+    /// (bounded -- never an unbounded loop), and the two attempt keys are DISTINCT (`-0` and `-1`).
+    /// RED on EITHER half independently: raise/remove the bound -> the fetch count != 2; drop the
+    /// `-{attempt}` suffix -> the two keys collide (not distinct), which in production would dedupe
+    /// the retry to an empty DUPLICATE body.
+    #[tokio::test]
+    async fn oracle_o2_persistent_failure_bounded_and_distinct_keys() {
+        let sender = dm_sender_hex(14);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &sender, "PRICE BTC/USD")
+            .with_payment_settled(2, &oracle_charge_id(1), 10);
+        // coinbase ALWAYS fails (both attempts None). kraken + coingecko fall back to the default
+        // combined body and answer, so quorum is met (irrelevant here -- we assert coinbase's fetch
+        // behavior). The default body carries all 3 shapes.
+        gw.fetch_response = ok_body(
+            br#"{"data":{"amount":"100.00"},"result":{"XXBTZUSD":{"c":["101.00","0.1"]}},"bitcoin":{"usd":110}}"#,
+        );
+        gw.fetch_script.insert(
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot".to_string(),
+            [None, None].into_iter().collect(),
+        );
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+
+        // Every http.fetch idempotency key aimed at coinbase this build.
+        let coinbase_keys: Vec<String> = gw
+            .requests
+            .iter()
+            .filter(|r| matches!(&r.act, Some(Act::Actuate(a)) if a.kind == ACTUATE_KIND_HTTP_FETCH))
+            .map(|r| r.idempotency_key.clone())
+            .filter(|k| k.contains("coinbase"))
+            .collect();
+        // BOUNDED: exactly 2 tries (the documented ORACLE_FETCH_ATTEMPTS bound) for a persistent
+        // failure -- never an unbounded loop. Literal 2 so raising/removing the bound goes RED.
+        assert_eq!(
+            coinbase_keys.len(),
+            2,
+            "a persistent failure is fetched exactly 2 times (the ORACLE_FETCH_ATTEMPTS bound): {coinbase_keys:?}"
+        );
+        // DISTINCT keys per attempt (`-0` and `-1`), else the retry would dedupe to an empty body.
+        let distinct: std::collections::HashSet<&String> = coinbase_keys.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            coinbase_keys.len(),
+            "each attempt uses a DISTINCT idempotency key (the -attempt suffix): {coinbase_keys:?}"
+        );
+        assert!(
+            coinbase_keys.contains(&"oracle-fetch-2-coinbase-0".to_string())
+                && coinbase_keys.contains(&"oracle-fetch-2-coinbase-1".to_string()),
+            "the two attempt keys carry the -0 / -1 suffixes: {coinbase_keys:?}"
+        );
     }
 
     // ---- NIP-17 DM arm (task #12): busy-flag one-at-a-time + reply-to-the-seal-verified-sender ----
