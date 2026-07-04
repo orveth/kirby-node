@@ -150,6 +150,13 @@ pub struct BootConfig {
     /// agent's lease. This is where the previously-zero-caller fence becomes wired into a
     /// real run (gate G-FENCE-LIVE): live money is fenced only because of this attach.
     pub lease_fence: Option<crate::gateway::LeaseFence>,
+    /// INC2a: the agent's shared co-sign COORDINATOR. For a DISTRIBUTED FROST keystore
+    /// (placement.json present) it holds the ONE [`crate::relay_transport::CoordinatorRelayHub`]
+    /// that both the voice actuator and the DM path load their `QuorumSigner` through -- the SAME
+    /// instance the beacon signer uses in `run_agent`, so every sign site shares one hub routes-map
+    /// and holder set (cross-talk-free by construction). For a co-located / non-FROST boot it holds
+    /// no hub ([`crate::relay_transport::AgentCosign::none`]); every load is byte-identical to before.
+    pub cosign: std::sync::Arc<crate::relay_transport::AgentCosign>,
 }
 
 /// The gateway event receiver the genome's `ReportEvent`s arrive on (diagnostic
@@ -380,7 +387,7 @@ pub async fn boot_and_observe(
     // They are SEPARATE structs — composed by a kind-router when both are present — so the egress
     // client and the DM/publish keys never co-habit ("a new entry point needs its own guards").
     let nostr_actuator: Option<Arc<dyn Actuator>> = match &config.social {
-        Some(social) => Some(build_nostr_actuator(social).await?),
+        Some(social) => Some(build_nostr_actuator(social, &config.cosign).await?),
         None => None,
     };
     // Deny-by-default: `config.egress` is `Some` ONLY when `[egress] enabled` (set in run_agent).
@@ -509,6 +516,7 @@ fn attach_actuator(rail: CompositeRail, actuator: Option<Arc<dyn Actuator>>) -> 
 /// Mirrors `build_routstr_brain`'s shape (a backend built before the VM boots).
 async fn build_nostr_actuator(
     social: &crate::config::SocialConfig,
+    cosign: &crate::relay_transport::AgentCosign,
 ) -> anyhow::Result<Arc<dyn Actuator>> {
     // S3d FROST-TENANT BRANCH: when a per-agent keystore dir is configured, the agent's voice is
     // its SOVEREIGN 2-of-3 quorum (Q SIGNS EVERYTHING), NOT a node-local key. Load the
@@ -520,14 +528,14 @@ async fn build_nostr_actuator(
     // Build the base actuator (its PUBLISH voice): a FROST quorum (Q signs) OR a single local key.
     // Keep the quorum `Arc` when FROST so the born-unified DM path below can REUSE it for the QSigner.
     let (mut actuator, frost_quorum) = if let Some(keystore_dir) = social.frost_keystore_dir.as_deref() {
-        let quorum = Arc::new(
-            crate::keyset_provisioning::load_quorum_signer_at(keystore_dir).with_context(|| {
-                format!(
-                    "load per-agent FROST quorum signer from keystore {} (S3d)",
-                    keystore_dir.display()
-                )
-            })?,
-        );
+        // INC2a: load through the shared `AgentCosign` seam (co-located = fresh signer, byte-identical;
+        // distributed = the ONE hub-backed signer the beacon signer also uses).
+        let quorum = cosign.load_signer().with_context(|| {
+            format!(
+                "load per-agent FROST quorum signer from keystore {} (S3d)",
+                keystore_dir.display()
+            )
+        })?;
         let actuator =
             NostrActuator::connect_frost(quorum.clone(), &social.relays, social.cost_sats).await?;
         (actuator, Some(quorum))
@@ -560,11 +568,11 @@ async fn build_nostr_actuator(
         let quorum = frost_quorum.ok_or_else(|| {
             anyhow::anyhow!("dm_under_q requires FROST publish mode (boot-wiring bug)")
         })?;
-        let ecdh = Arc::new(
-            crate::keyset_provisioning::load_quorum_ecdh_at(keystore_dir).with_context(|| {
-                format!("load QuorumEcdh from keystore {} (dm_under_q)", keystore_dir.display())
-            })?,
-        );
+        // INC2a co-gate: `load_ecdh` FAILS CLOSED LOUD on a DISTRIBUTED keystore (cross-machine ECDH
+        // is Inc3). A co-located keystore is unchanged.
+        let ecdh = Arc::new(cosign.load_ecdh().with_context(|| {
+            format!("load QuorumEcdh from keystore {} (dm_under_q)", keystore_dir.display())
+        })?);
         let qsigner: Arc<dyn nostr_sdk::NostrSigner> =
             Arc::new(crate::qsigner::QSigner::new(ecdh, quorum));
         actuator = actuator.with_dm_q_signer(qsigner);
@@ -1276,17 +1284,19 @@ pub async fn boot_and_observe_with_rail(
             // threshold ECDH. Else the dedicated plain dm_keys (pre-P1, byte-identical).
             let (dm_signer, dm_me): (std::sync::Arc<dyn nostr_sdk::NostrSigner>, nostr_sdk::PublicKey) =
                 if social.dm_under_q {
-                    let keystore_dir = social.frost_keystore_dir.as_deref().ok_or_else(|| {
+                    // Explicit fail-closed: dm_under_q requires a provisioned FROST keystore (the
+                    // shared `AgentCosign` also enforces this, but this names the dm_under_q intent).
+                    let _keystore_dir = social.frost_keystore_dir.as_deref().ok_or_else(|| {
                         anyhow::anyhow!(
                             "dm_under_q requires a provisioned FROST keystore for the DM identity Q"
                         )
                     })?;
-                    let ecdh = std::sync::Arc::new(
-                        crate::keyset_provisioning::load_quorum_ecdh_at(keystore_dir)?,
-                    );
-                    let quorum = std::sync::Arc::new(
-                        crate::keyset_provisioning::load_quorum_signer_at(keystore_dir)?,
-                    );
+                    // INC2a: through the shared `AgentCosign` seam. `load_ecdh` FAILS CLOSED LOUD on a
+                    // DISTRIBUTED keystore (cross-machine ECDH is Inc3, the co-gate); co-located is
+                    // unchanged. `load_signer` gives the ONE shared signer (distributed) or a fresh
+                    // one (co-located).
+                    let ecdh = std::sync::Arc::new(config.cosign.load_ecdh()?);
+                    let quorum = config.cosign.load_signer()?;
                     let q = ecdh.q_public_key()?;
                     tracing::info!(
                         "NIP-17 DM identity is the FROST key Q (born-unified, dm_under_q; DMs seal/unwrap under Q)"

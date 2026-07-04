@@ -82,6 +82,7 @@ fn boot_config(image: ImagePaths, node_id: &str, task: &str, cid: u32, port: u32
         snapshot_capable: true,
         restore_checkpoint: None,
         lease_fence: None,
+        cosign: std::sync::Arc::new(kirby_node::relay_transport::AgentCosign::none()),
         egress: None,
     }
 }

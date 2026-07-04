@@ -59,6 +59,7 @@ async fn vz_lockdown_egress_boots_and_exposes_no_nic_egress_control() {
         snapshot_capable: false,
         restore_checkpoint: None,
         lease_fence: None,
+        cosign: std::sync::Arc::new(kirby_node::relay_transport::AgentCosign::none()),
         egress: None,
     };
 

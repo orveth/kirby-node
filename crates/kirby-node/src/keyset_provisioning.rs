@@ -1212,7 +1212,11 @@ fn assert_shares_present_across_sinks(sinks: &[&dyn ShareSink]) -> anyhow::Resul
 /// [`load_quorum_signer_from_sinks`] (which unseals every share into a `LocalHolder` HERE -- the
 /// share comes home, and the cross-machine guarantee is gone). Sealed-sinks (at-rest storage) are
 /// NOT remote-holders (sign-time custody): keep the wall hard.
-pub fn load_quorum_signer_distributed(
+// pub(crate), NOT pub: the ONLY pub way to engage distributed signing is the flag-aware
+// [`load_agent_quorum_signer`]. Exposing this raw loader would be a flag-BLIND route to distributed
+// signing (a caller could load a distributed signer without consulting distributed_signing_enabled).
+// In-crate callers are the dispatcher + the tests; there is no downstream/integration-crate caller.
+pub(crate) fn load_quorum_signer_distributed(
     keystore_dir: &Path,
     factory: &dyn crate::remote_holder::HolderTransportFactory,
 ) -> anyhow::Result<QuorumSigner> {
@@ -1254,30 +1258,37 @@ pub fn load_quorum_signer_distributed(
     )
 }
 
-/// THE SELF-DESCRIBING SIGN-PATH DISPATCHER: build the agent's [`QuorumSigner`] from its keystore
-/// dir, choosing the co-located or distributed loader by the keystore's own shape. This is the
-/// single seam the live sign sites (the voice actuator, the beacon signer, the lease signer) call
-/// so the all-local vs distributed choice lives in ONE place, not three.
+/// THE SINGLE FLAG-AWARE SIGN-PATH DISPATCHER: build the agent's [`QuorumSigner`] from its keystore
+/// dir, choosing the co-located or distributed loader. This is the ONE place the all-local vs
+/// distributed choice lives, so there is NO flag-blind route to distributed signing (every caller
+/// passes `distributed_signing_enabled`, so mere `placement.json` presence can never engage
+/// distributed by itself).
 ///
-///   * `placement.json` present => DISTRIBUTED: build from `RemoteHolder`s via `factory`. A
-///     distributed keystore with NO factory supplied is a LOUD error (the sign path cannot reach
-///     the remote holders without a transport).
-///   * otherwise               => CO-LOCATED: the byte-identical [`load_quorum_signer_at`] path
-///     (unchanged; the single-box default needs no factory).
+/// Distributed is engaged IFF BOTH hold: `placement.json` present AND `distributed_signing_enabled`
+/// (the Inc2a ON-flip gate, `identity.distributed_signing_enabled`):
+///   * ENGAGED => DISTRIBUTED: build from `RemoteHolder`s via `factory`. Engaged with NO factory is
+///     a LOUD error (the sign path cannot reach the remote holders without a transport).
+///   * NOT ENGAGED => CO-LOCATED: the byte-identical [`load_quorum_signer_at`] path. This covers a
+///     plain co-located keystore AND a keystore whose `placement.json` is present but the flag is
+///     FALSE (INERT -- distributed provisioning may have written the manifest, but signing stays
+///     co-located until an operator flips the gate; see `AgentCosign`).
 pub fn load_agent_quorum_signer(
     keystore_dir: &Path,
     factory: Option<&dyn crate::remote_holder::HolderTransportFactory>,
+    distributed_signing_enabled: bool,
 ) -> anyhow::Result<QuorumSigner> {
-    if is_distributed_keystore(keystore_dir) {
+    if distributed_signing_enabled && is_distributed_keystore(keystore_dir) {
         let factory = factory.ok_or_else(|| {
             anyhow::anyhow!(
-                "keystore {} is DISTRIBUTED (placement.json present) but no HolderTransportFactory \
-                 was supplied -- the sign path needs a transport to reach the remote holders",
+                "keystore {} is DISTRIBUTED (placement.json present) and distributed signing is \
+                 ENABLED, but no HolderTransportFactory was supplied -- the sign path needs a \
+                 transport to reach the remote holders",
                 keystore_dir.display()
             )
         })?;
         load_quorum_signer_distributed(keystore_dir, factory)
     } else {
+        // CO-LOCATED, OR distributed-shaped-but-flag-off (INERT). Either way, no hub / no wire.
         load_quorum_signer_at(keystore_dir)
     }
 }
@@ -2231,8 +2242,9 @@ mod tests {
             assert!(share_path(&dir, idx).is_file(), "co-located share_{idx}.json must exist");
         }
 
-        // The dispatcher routes to the co-located loader WITHOUT a factory (None is fine here).
-        let signer = load_agent_quorum_signer(&dir, None)
+        // The dispatcher routes to the co-located loader WITHOUT a factory (None is fine here); the
+        // flag is irrelevant for a keystore that is not distributed-shaped.
+        let signer = load_agent_quorum_signer(&dir, None, false)
             .expect("dispatcher loads the co-located signer with no transport factory");
         assert_eq!(signer.q_bytes(), id.q_bytes(), "dispatcher signer Q matches the co-located identity");
         let event = signer
@@ -2241,15 +2253,18 @@ mod tests {
         assert_eq!(event.pubkey, hex::encode(id.q_bytes()));
         assert_event_verifies_under_q(&event, &dir);
 
-        // And a distributed keystore through the dispatcher with NO factory is a LOUD error (it
-        // cannot reach the remote holders) -- it must never silently fall back to co-located.
+        // And a distributed keystore through the dispatcher with distributed signing ENABLED but NO
+        // factory is a LOUD error (it cannot reach the remote holders) -- it must never silently
+        // fall back to co-located. (With the flag FALSE the manifest is INERT -- exercised by the
+        // AgentCosign inert tooth; here we prove the ENGAGED-without-transport failure.)
         let (anchor, dirs) = dist_dirs("flip-dispatch-nofactory");
         let dsinks = sealed_sinks(&dirs);
         provision_keyset_distributed(&anchor, &placement_for_sealed_sinks(), &as_dyn(&dsinks))
             .expect("distributed provision");
         assert!(
-            load_agent_quorum_signer(&anchor, None).is_err(),
-            "a distributed keystore with no transport factory must fail (never silently co-locate)"
+            load_agent_quorum_signer(&anchor, None, true).is_err(),
+            "a distributed keystore with distributed signing enabled but no transport factory must \
+             fail (never silently co-locate)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2331,5 +2346,338 @@ mod tests {
             return false;
         }
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // ============================================================================================
+    // INC2a BOOT-WIRING TEETH: the coordinator sign-path dispatch over a REAL relay via AgentCosign.
+    //
+    // Inc1's relay_transport teeth prove the TRANSPORT (a RemoteHolder over a real relay signs).
+    // These prove the BOOT WIRING: a DISTRIBUTED keystore (placement.json) drives 3 holder-servers +
+    // 1 coordinator ALL LOCAL over a loopback relay THROUGH the SAME `AgentCosign` seam the beacon
+    // signer (run_agent) + voice actuator (boot) load their QuorumSigner through, and produces a
+    // Q-valid nostr event == the in-process golden. Plus: co-located byte-identical (default-OFF),
+    // any-available fallback over the real wire, and the ECDH co-gate fail-closed IN CODE.
+    //
+    // SERIALIZATION NOTE (the carried ON-flip constraint): a shared distributed signer assumes
+    // ceremonies are serialized per agent (one reply channel per holder). Inc2a is default-OFF, so
+    // these single-ceremony teeth are the whole exercised surface; the distributed ON-flip (co-gated
+    // with cross-machine ECDH, Inc3) must add per-agent ceremony serialization before it flips ON.
+    // ============================================================================================
+
+    use crate::relay_transport::{
+        allow_all_coordinators, AgentCosign, NostrRelayConn, DEFAULT_WIRE_TIMEOUT,
+    };
+    use crate::remote_holder::RemoteHolderServer;
+    use nostr_relay_builder::MockRelay;
+    use nostr_sdk::Keys;
+
+    const INC2_AGENT: &str = "agent-inc2-boot-wiring";
+    const INC2_CREATED_AT: u64 = 1750000000;
+    const INC2_CONTENT: &str = "Kirby's beacon + voice sign under Q across machines, wired at boot.";
+
+    // Keep DEFAULT_WIRE_TIMEOUT referenced even if a future edit drops the any-available tooth, so
+    // the import never dangles under -D warnings.
+    const _: std::time::Duration = DEFAULT_WIRE_TIMEOUT;
+
+    /// A relay-addressed placement: holder `i+1` labeled `holder-{i+1}` (aligned with `sealed_sinks`),
+    /// address `<holder_transport_pubkey_hex>@<relay_url>` so the coordinator's NostrRelayConn factory
+    /// dials it over the real relay (and the SAME address named the sink share `i+1` was shipped to).
+    fn relay_placement(holder_keys: &[Keys], url: &str) -> PlacementManifest {
+        PlacementManifest {
+            holders: holder_keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| HolderPlacement {
+                    identifier: (i + 1) as u16,
+                    label: format!("holder-{}", i + 1),
+                    address: format!("{}@{}", k.public_key().to_hex(), url),
+                })
+                .collect(),
+        }
+    }
+
+    /// Stand up a holder-server "on its own machine": unseal share `idx` from `sink`, build a
+    /// `RemoteHolderServer`, and run it on its OWN thread + runtime driving a NostrRelayConn. The
+    /// connection is WARMED (`ensure_connected`) on the caller's (test) runtime BEFORE it moves into
+    /// the holder thread -- so its persistent subscription is live before the coordinator solicits
+    /// (mirrors Inc1's relay-transparency tooth). Returns the shutdown sender + the thread handle.
+    async fn spawn_relay_holder(
+        holder_keys: Keys,
+        idx: u16,
+        sink: &LocalSealedSink<FixedBinding>,
+        pubkeys: PublicKeyPackage,
+        url: String,
+    ) -> (tokio::sync::oneshot::Sender<()>, std::thread::JoinHandle<()>) {
+        let bytes = sink.get_share(idx).expect("unseal the holder's share for its server");
+        let kp: KeyPackage = serde_json::from_slice(&bytes).expect("share is a KeyPackage");
+        let server = std::sync::Arc::new(RemoteHolderServer::new(kp, pubkeys));
+        let conn = NostrRelayConn::new(holder_keys.public_key(), vec![url]).expect("holder conn");
+        conn.ensure_connected().await.expect("holder subscribes before the coordinator solicits");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("holder runtime");
+            rt.block_on(async {
+                let _ = crate::relay_transport::run_holder_server(
+                    &holder_keys,
+                    INC2_AGENT,
+                    server,
+                    conn,
+                    allow_all_coordinators(),
+                    shutdown_rx,
+                )
+                .await;
+            });
+        });
+        (shutdown_tx, handle)
+    }
+
+    /// ★ INC2a TRANSPARENCY TOOTH: a DISTRIBUTED-keystore agent, wired through `AgentCosign`, signs a
+    /// Q-valid nostr event end-to-end over a REAL loopback relay -- 3 holder-servers + 1 coordinator
+    /// all local. The aggregate verifies under the tweaked group Q == the in-process golden. Goes
+    /// through the SAME seam boot uses: `AgentCosign::load_signer` -> `load_agent_quorum_signer` ->
+    /// `load_quorum_signer_distributed`. RED-on-revert (manual): force the dispatch co-located (or
+    /// factory=None) and this FAILS -- a distributed keystore has no local shares to sign with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn distributed_agent_signs_q_valid_over_real_relay_via_agentcosign() {
+        let (anchor, dirs) = dist_dirs("inc2-e2e");
+        let sinks = sealed_sinks(&dirs);
+        let holder_keys: Vec<Keys> = (0..SHARE_COUNT).map(|_| Keys::generate()).collect();
+
+        let relay = MockRelay::run().await.expect("boot the in-process relay");
+        let url = relay.url().await.to_string();
+
+        // Provision the DISTRIBUTED keystore: ships share i to sink i, writes placement.json + anchor.
+        let placement = relay_placement(&holder_keys, &url);
+        provision_keyset_distributed(&anchor, &placement, &as_dyn(&sinks))
+            .expect("distributed provisioning");
+        assert!(is_distributed_keystore(&anchor), "placement.json marks the keystore distributed");
+
+        let pubkeys = FrostIdentity::load(&pubkeys_path(&anchor)).unwrap().pubkeys().clone();
+
+        // 3 holder-servers, each on its own machine-runtime, over the real relay.
+        let mut shutdowns = Vec::new();
+        let mut handles = Vec::new();
+        for i in 0..SHARE_COUNT as usize {
+            let (tx, h) = spawn_relay_holder(
+                holder_keys[i].clone(),
+                (i + 1) as u16,
+                &sinks[i],
+                pubkeys.clone(),
+                url.clone(),
+            )
+            .await;
+            shutdowns.push(tx);
+            handles.push(h);
+        }
+
+        // The COORDINATOR: the SAME AgentCosign seam boot uses. A distributed keystore => it starts
+        // the ONE shared hub, and load_signer builds RemoteHolders through it.
+        let coordinator_keys = Keys::generate();
+        let cosign = AgentCosign::build(
+            Some(anchor.clone()),
+            coordinator_keys,
+            INC2_AGENT,
+            std::slice::from_ref(&url),
+            true, // distributed_signing_enabled: engage the distributed path for this tooth
+        )
+        .await
+        .expect("build the distributed AgentCosign coordinator");
+        assert!(cosign.is_distributed(), "a placement.json keystore must build a shared hub");
+
+        let qs = cosign.load_signer().expect("distributed QuorumSigner via the shared hub");
+
+        // The ceremony blocks on the wire (RemoteHolder.recv); drive it off the async workers so the
+        // relay-pool tasks keep progressing on this runtime.
+        let event = tokio::task::spawn_blocking(move || {
+            qs.sign_nostr_event(1, INC2_CREATED_AT, INC2_CONTENT)
+        })
+        .await
+        .expect("join the ceremony task")
+        .expect("the distributed 2-of-3 over the real relay signs");
+
+        assert_event_verifies_under_q(&event, &anchor);
+
+        for tx in shutdowns {
+            let _ = tx.send(());
+        }
+        drop(cosign);
+        for h in handles {
+            let _ = h.join();
+        }
+        println!(
+            "INC2a E2E PASS: a distributed-keystore agent wired via AgentCosign signed a Q-valid event over a real relay (== in-process golden)"
+        );
+    }
+
+    /// ★ INC2a DEFAULT-OFF (byte-identical): a CO-LOCATED keystore (today's default, no placement.json)
+    /// through `AgentCosign` builds NO hub and signs Q-valid exactly as before -- the dispatch seam is
+    /// transparent when there is no placement.json. RED-on-revert (manual): make the dispatch treat a
+    /// co-located keystore as distributed and this FAILS (there is no hub / no remote holders).
+    #[tokio::test]
+    async fn colocated_keystore_builds_no_hub_and_signs_q_valid() {
+        let dir = temp_keystore("inc2-colocated");
+        provision_keyset_at(&dir).expect("co-located provision (today's default)");
+
+        // No relays needed: a co-located keystore builds no hub regardless.
+        let cosign = AgentCosign::build(Some(dir.clone()), Keys::generate(), INC2_AGENT, &[], false)
+            .await
+            .expect("build co-located AgentCosign");
+        assert!(
+            !cosign.is_distributed(),
+            "a co-located keystore (no placement.json) must build NO hub -- distributed is default-OFF"
+        );
+
+        // Co-located signing is fully in-process (LocalHolders); no wire, so a direct call is fine.
+        let qs = cosign.load_signer().expect("co-located QuorumSigner");
+        let event = qs
+            .sign_nostr_event(1, INC2_CREATED_AT, INC2_CONTENT)
+            .expect("co-located 2-of-3 signs (byte-identical to pre-Inc2)");
+        assert_event_verifies_under_q(&event, &dir);
+        println!("INC2a DEFAULT-OFF PASS: a co-located keystore builds no hub and signs Q-valid (byte-identical)");
+    }
+
+    /// ★ INC2a INERT ON-FLIP GATE: a keystore whose placement.json is PRESENT but the ON-flip gate
+    /// (distributed_signing_enabled) is FALSE builds NO hub and stays co-located -- placement.json
+    /// ALONE does NOT engage distributed signing. This is the safety property Inc2a rests on: a
+    /// future distributed-provision-at-spawn writes placement.json, and without the flag it must NOT
+    /// auto-engage the distributed path (and its concurrent-ceremony clobber surface) before #48+#49.
+    /// Proven by NON-ENGAGEMENT (no hub built) + the co-located sign path still producing a Q-valid
+    /// event. RED-on-revert (manual): drop `&& distributed_signing_enabled` from the build engagement
+    /// predicate and this FAILS -- the hub gets built on placement.json alone (is_distributed()==true).
+    #[tokio::test]
+    async fn placement_present_but_flag_off_is_inert_no_hub() {
+        // A keystore with LOCAL shares (co-located provision) AND a placement.json alongside -- the
+        // mixed shape a future provision-at-spawn could transiently present. `is_distributed_keystore`
+        // sees the manifest, but the flag is the master gate.
+        let dir = temp_keystore("inc2-inert");
+        let id = provision_keyset_at(&dir).expect("co-located provision (local shares present)");
+        std::fs::write(placement_path(&dir), b"{\"holders\":[]}").expect("write a placement.json");
+        assert!(is_distributed_keystore(&dir), "placement.json present => distributed-shaped");
+
+        // Flag FALSE => INERT: NO hub built, even though placement.json exists.
+        let cosign = AgentCosign::build(Some(dir.clone()), Keys::generate(), INC2_AGENT, &[], false)
+            .await
+            .expect("build inert AgentCosign (placement present, flag off)");
+        assert!(
+            !cosign.is_distributed(),
+            "placement.json present + flag OFF must build NO hub (INERT) -- the flag gates engagement, not file presence"
+        );
+
+        // The sign path stays co-located (uses the local shares) and produces a Q-valid event.
+        let qs = cosign.load_signer().expect("inert => co-located QuorumSigner");
+        assert_eq!(qs.q_bytes(), id.q_bytes(), "inert signer Q == the co-located identity");
+        let event = qs
+            .sign_nostr_event(1, INC2_CREATED_AT, INC2_CONTENT)
+            .expect("the inert (co-located) 2-of-3 signs");
+        assert_event_verifies_under_q(&event, &dir);
+
+        // ECDH stays co-located too (not engaged => no co-gate bail), consistent with the signer.
+        cosign
+            .load_ecdh()
+            .expect("inert => co-located ECDH loads (not engaged, no co-gate)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("INC2a INERT PASS: placement.json present + flag OFF => NO hub, co-located sign Q-valid (placement alone does NOT engage distributed)");
+    }
+
+    /// ★ INC2a ECDH CO-GATE (fail-closed IN CODE): a DISTRIBUTED keystore must refuse an in-process
+    /// ECDH load LOUDLY -- cross-machine threshold ECDH is Inc3, and a distributed box holds fewer
+    /// than the quorum of shares locally. This enforces the Inc2+3 co-gate in code, not merely by a
+    /// config default. RED-on-revert (manual): delete the `self.hub.is_some()` guard in
+    /// `AgentCosign::load_ecdh` and this FAILS -- the load falls through to `load_quorum_ecdh_at`,
+    /// which proceeds on the < quorum local shares instead of failing closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn distributed_keystore_ecdh_load_fails_closed_naming_the_inc3_co_gate() {
+        let (anchor, dirs) = dist_dirs("inc2-ecdh-cogate");
+        let sinks = sealed_sinks(&dirs);
+        let holder_keys: Vec<Keys> = (0..SHARE_COUNT).map(|_| Keys::generate()).collect();
+
+        let relay = MockRelay::run().await.expect("boot the in-process relay");
+        let url = relay.url().await.to_string();
+        let placement = relay_placement(&holder_keys, &url);
+        provision_keyset_distributed(&anchor, &placement, &as_dyn(&sinks)).expect("provision");
+
+        // The REAL production object: a distributed AgentCosign (hub started). ECDH never dials the
+        // hub -- the guard fires purely on the keystore shape.
+        let cosign = AgentCosign::build(
+            Some(anchor.clone()),
+            Keys::generate(),
+            INC2_AGENT,
+            std::slice::from_ref(&url),
+            true, // distributed_signing_enabled: engage the distributed path for this tooth
+        )
+        .await
+        .expect("build distributed AgentCosign");
+
+        // `QuorumEcdh` isn't `Debug`, so match rather than `expect_err`.
+        let err = match cosign.load_ecdh() {
+            Ok(_) => panic!(
+                "load_ecdh MUST fail closed on a distributed keystore (the Inc2+3 co-gate)"
+            ),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Inc3") && msg.contains("DISTRIBUTED"),
+            "the co-gate error must name Inc3 + the distributed keystore, got: {msg}"
+        );
+        println!("INC2a ECDH CO-GATE PASS (fail-closed in code): {msg}");
+    }
+
+    /// ★ INC2a ANY-AVAILABLE over the REAL wire: with one holder-server down, the coordinator's
+    /// any-available-2-of-3 selection falls to a DIFFERENT 2-subset and still produces a Q-valid sig.
+    /// Kills holder identifier 2, so the default first subset [1,2] is abandoned (its holder is
+    /// unreachable) and [1,3] carries the ceremony. (One per-wire timeout applies, so this is the
+    /// slower tooth.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn distributed_sign_survives_one_holder_down_via_any_available() {
+        let (anchor, dirs) = dist_dirs("inc2-anyavail");
+        let sinks = sealed_sinks(&dirs);
+        let holder_keys: Vec<Keys> = (0..SHARE_COUNT).map(|_| Keys::generate()).collect();
+
+        let relay = MockRelay::run().await.expect("boot the in-process relay");
+        let url = relay.url().await.to_string();
+        let placement = relay_placement(&holder_keys, &url);
+        provision_keyset_distributed(&anchor, &placement, &as_dyn(&sinks)).expect("provision");
+        let pubkeys = FrostIdentity::load(&pubkeys_path(&anchor)).unwrap().pubkeys().clone();
+
+        // Bring up holders 1 and 3; DELIBERATELY leave holder 2 down (never spawned) so the first
+        // subset [1,2] must be abandoned for [1,3].
+        let (tx1, h1) =
+            spawn_relay_holder(holder_keys[0].clone(), 1, &sinks[0], pubkeys.clone(), url.clone())
+                .await;
+        let (tx3, h3) =
+            spawn_relay_holder(holder_keys[2].clone(), 3, &sinks[2], pubkeys.clone(), url.clone())
+                .await;
+
+        let cosign = AgentCosign::build(
+            Some(anchor.clone()),
+            Keys::generate(),
+            INC2_AGENT,
+            std::slice::from_ref(&url),
+            true, // distributed_signing_enabled: engage the distributed path for this tooth
+        )
+        .await
+        .expect("build distributed AgentCosign");
+        let qs = cosign.load_signer().expect("distributed QuorumSigner");
+
+        let event = tokio::task::spawn_blocking(move || {
+            qs.sign_nostr_event(1, INC2_CREATED_AT, INC2_CONTENT)
+        })
+        .await
+        .expect("join the ceremony task")
+        .expect("a DIFFERENT 2-subset ([1,3]) still produces a Q-valid sig with holder 2 down");
+
+        assert_event_verifies_under_q(&event, &anchor);
+
+        let _ = tx1.send(());
+        let _ = tx3.send(());
+        drop(cosign);
+        let _ = h1.join();
+        let _ = h3.join();
+        println!("INC2a ANY-AVAILABLE PASS: holder 2 down -> subset [1,3] still signed a Q-valid event over the real relay");
     }
 }

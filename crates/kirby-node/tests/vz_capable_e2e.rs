@@ -129,6 +129,7 @@ async fn chunk_e_vz_boots_gateways_meters_capable_run_and_halts_when_broke() {
         snapshot_capable: false,
         restore_checkpoint: None,
         lease_fence: None,
+        cosign: std::sync::Arc::new(kirby_node::relay_transport::AgentCosign::none()),
         egress: None,
     };
 

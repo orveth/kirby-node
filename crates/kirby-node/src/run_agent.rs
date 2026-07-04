@@ -270,18 +270,21 @@ fn load_identity(config: &KirbyConfig) -> anyhow::Result<NodeIdentity> {
 fn beacon_signer(
     config: &KirbyConfig,
     identity: &NodeIdentity,
+    cosign: &crate::relay_transport::AgentCosign,
 ) -> anyhow::Result<crate::nerve::BeaconSigner> {
     match config.identity.frost_keystore_dir.as_deref() {
         Some(keystore_dir) => {
             use anyhow::Context as _;
-            let quorum = crate::keyset_provisioning::load_quorum_signer_at(keystore_dir)
-                .with_context(|| {
-                    format!(
-                        "load per-agent FROST quorum signer from keystore {} for the beacons (S3e)",
-                        keystore_dir.display()
-                    )
-                })?;
-            Ok(crate::nerve::BeaconSigner::Frost(std::sync::Arc::new(quorum)))
+            // INC2a: load through the shared `AgentCosign` seam -- co-located returns a fresh signer
+            // (byte-identical to before), distributed returns the ONE hub-backed signer the voice
+            // actuator also loads (so both share one hub routes-map + holder set, cross-talk-free).
+            let quorum = cosign.load_signer().with_context(|| {
+                format!(
+                    "load per-agent FROST quorum signer from keystore {} for the beacons (S3e)",
+                    keystore_dir.display()
+                )
+            })?;
+            Ok(crate::nerve::BeaconSigner::Frost(quorum))
         }
         None => Ok(crate::nerve::BeaconSigner::NodeKey(identity.clone())),
     }
@@ -406,6 +409,7 @@ fn pin_diarist_memory_key(
 fn agent_boot_config(
     run: &RunAgentConfig,
     restore_checkpoint: Option<CheckpointArtifact>,
+    cosign: &std::sync::Arc<crate::relay_transport::AgentCosign>,
 ) -> anyhow::Result<crate::boot::BootConfig> {
     use crate::boot::{BootConfig, ImagePaths};
     use crate::config::Workload;
@@ -532,6 +536,9 @@ fn agent_boot_config(
         snapshot_capable: false,
         restore_checkpoint,
         lease_fence: None,
+        // INC2a: the shared co-sign coordinator (the ONE hub for a distributed keystore) the boot
+        // path loads the voice + DM signers through -- the SAME instance the beacon signer uses.
+        cosign: std::sync::Arc::clone(cosign),
     })
 }
 
@@ -596,7 +603,23 @@ pub async fn run(mut run: RunAgentConfig) -> anyhow::Result<RunAgentOutcome> {
     // the actuator loads); otherwise the node key. Build it ONCE and thread it through
     // presence + lifecycle + agent-state, so every public event is signed under the
     // agent's identity Q ("Q signs everything").
-    let signer = beacon_signer(&run.config, &identity)?;
+    // INC2a: the agent's co-sign COORDINATOR, built ONCE and threaded to every sign site. For a
+    // DISTRIBUTED FROST keystore (placement.json present) this starts the ONE shared
+    // CoordinatorRelayHub -- coordinator transport key = the node identity, relays = the agent's
+    // relay set -- that both the beacon signer AND the voice actuator load their QuorumSigner
+    // through, so they share one hub routes-map + holder set (cross-talk-free BY CONSTRUCTION). For
+    // a co-located / no-frost agent it holds no hub and every load is byte-identical to before.
+    let cosign = std::sync::Arc::new(
+        crate::relay_transport::AgentCosign::build(
+            run.config.identity.frost_keystore_dir.clone(),
+            identity.keys().clone(),
+            &run.config.agent_id,
+            std::slice::from_ref(&run.config.relay.url),
+            run.config.identity.distributed_signing_enabled,
+        )
+        .await?,
+    );
+    let signer = beacon_signer(&run.config, &identity, &cosign)?;
     // The agent's PUBLIC identity npub: Q for a FROST tenant, the node key otherwise.
     let npub = signer.npub();
     tracing::info!(npub = %npub, frost = matches!(signer, crate::nerve::BeaconSigner::Frost(_)), "agent identity ready (beacons + voice sign under this key)");
@@ -619,9 +642,11 @@ pub async fn run(mut run: RunAgentConfig) -> anyhow::Result<RunAgentOutcome> {
     // lifecycle, both signed under `signer` (the agent's FROST quorum key Q for a tenant).
     match mode {
         RunMode::Bootstrap => {
-            run_bootstrap(&run, &signer, backend, npub.clone(), canonical_npub).await
+            run_bootstrap(&run, &signer, &cosign, backend, npub.clone(), canonical_npub).await
         }
-        RunMode::Resume => run_resume(&run, &signer, backend, npub.clone(), canonical_npub).await,
+        RunMode::Resume => {
+            run_resume(&run, &signer, &cosign, backend, npub.clone(), canonical_npub).await
+        }
     }
 }
 
@@ -669,6 +694,7 @@ fn resolve_canonical_social_hex(config: &KirbyConfig) -> anyhow::Result<Option<S
 async fn run_bootstrap(
     run: &RunAgentConfig,
     signer: &crate::nerve::BeaconSigner,
+    cosign: &std::sync::Arc<crate::relay_transport::AgentCosign>,
     backend: ResolvedBackend,
     npub: String,
     canonical_npub: Option<String>,
@@ -685,7 +711,7 @@ async fn run_bootstrap(
     // submits, and halt on exhaustion. The metered run boots the agent through the
     // selected backend, attaches the host meter, and pauses-then-kills the VM when
     // cumulative burn reaches the budget.
-    let boot = agent_boot_config(run, None)?;
+    let boot = agent_boot_config(run, None, cosign)?;
     let metered = MeteredRunConfig {
         boot,
         tick: run.meter_tick,
@@ -783,6 +809,7 @@ async fn run_bootstrap(
 async fn run_resume(
     run: &RunAgentConfig,
     signer: &crate::nerve::BeaconSigner,
+    cosign: &std::sync::Arc<crate::relay_transport::AgentCosign>,
     backend: ResolvedBackend,
     npub: String,
     canonical_npub: Option<String>,
@@ -801,7 +828,7 @@ async fn run_resume(
     // 5. Boot FRESH with the checkpoint in GetSessionContext (no born; the agent
     // already lived, it is continuing). The genome rehydrates the logical state and
     // reports a restore-seen event.
-    let boot = agent_boot_config(run, Some(checkpoint.clone()))?;
+    let boot = agent_boot_config(run, Some(checkpoint.clone()), cosign)?;
     let (vm, outcome, treasury, mut events, _serve_guard) = boot::boot_and_observe(boot).await?;
     if !outcome.reached_running {
         vm.halt().await;
@@ -986,6 +1013,7 @@ mod tests {
                 treasury_dir: Some(root.clone()),
                 frost_keystore_dir: None,
                 dm_under_q: false,
+                distributed_signing_enabled: false,
             },
             relay: RelayConfig {
                 url: "ws://127.0.0.1:7777".to_string(),
@@ -1025,6 +1053,7 @@ mod tests {
             treasury_dir: None,
             frost_keystore_dir: None,
             dm_under_q: false,
+            distributed_signing_enabled: false,
         };
 
         // Unset => pinned to the resolved identity key (the SAME resolution the run uses).

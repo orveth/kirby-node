@@ -58,6 +58,7 @@ async fn g1_genome_boots_and_completes_session_context_round_trip() {
         snapshot_capable: false,
         restore_checkpoint: None,
         lease_fence: None,
+        cosign: std::sync::Arc::new(kirby_node::relay_transport::AgentCosign::none()),
         egress: None,
     };
 

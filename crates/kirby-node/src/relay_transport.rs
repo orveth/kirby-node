@@ -243,7 +243,13 @@ pub struct CoordinatorRelayHub {
 impl CoordinatorRelayHub {
     /// Start a hub over `conn` (already connected + subscribed to `#p = coordinator pubkey` +
     /// the co-sign kind). Spawns the background actor thread (its own current-thread runtime).
-    pub fn start<C: RelayConn>(
+    ///
+    /// pub(crate), NOT pub: starting a coordinator hub is HALF of engaging distributed signing
+    /// (the other half is [`crate::keyset_provisioning::load_quorum_signer_distributed`]). The only
+    /// pub engager is [`AgentCosign::build`], which starts the hub IFF the ON-flip flag is set --
+    /// so there is no flag-blind route to distributed signing. In-crate callers are `AgentCosign` +
+    /// the tests; no downstream/integration-crate caller exists.
+    pub(crate) fn start<C: RelayConn>(
         conn: C,
         coordinator_keys: Keys,
         agent_id: impl Into<String>,
@@ -330,6 +336,203 @@ impl Drop for CoordinatorRelayHub {
         // join, since a transport may briefly outlive the hub: taking the handle and dropping it
         // detaches the thread.
         let _ = self.actor.take();
+    }
+}
+
+/// The agent's co-sign COORDINATOR: the ONE shared [`CoordinatorRelayHub`] for a DISTRIBUTED FROST
+/// keystore (`None` for a co-located or non-FROST agent), plus the memoized distributed
+/// [`QuorumSigner`]. Built ONCE at agent boot ([`crate::run_agent`]) and threaded to EVERY sign site
+/// (the beacon signer + the voice actuator), so all of them load their signer through this ONE seam.
+///
+/// WHY IT IS STRUCTURAL (not merely a tooth): the hub demuxes inbound replies by holder pubkey in a
+/// single routes map, and [`CoordinatorRelayHub::connect`] OVERWRITES a holder's route. Two
+/// INDEPENDENT distributed `QuorumSigner`s (a beacon one + a voice one) connecting the SAME holders
+/// over the SAME coordinator key would clobber each other's reply routes AND collide on the shared
+/// `#p = coordinator` inbound subscription. Memoizing ONE hub-backed signer here means both sign
+/// sites share ONE hub + ONE routes map + ONE holder set -- the cross-talk cannot happen BY
+/// CONSTRUCTION.
+///
+/// DISPATCH: distributed FROST signing is ENGAGED IFF BOTH hold -- `placement.json` present AND the
+/// explicit ON-flip gate `identity.distributed_signing_enabled == true`. The ONE flag-aware dispatch
+/// point is [`crate::keyset_provisioning::load_agent_quorum_signer`] (it takes the flag, so there is
+/// NO flag-blind route to distributed). `AgentCosign` decides engagement ONCE at
+/// [`Self::build`] -- it starts the shared hub IFF engaged -- and every [`Self::load_signer`] loads
+/// through that dispatcher, passing `distributed_signing_enabled = self.hub.is_some()` (hub present
+/// == engaged) and the hub as the factory:
+///   * ENGAGED (hub present) => the hub-backed signer ([`crate::keyset_provisioning::load_quorum_signer_distributed`]),
+///     MEMOIZED (sharing is mandatory, see above).
+///   * NOT ENGAGED (co-located, OR placement present but the flag is FALSE => INERT) => a FRESH
+///     per-call signer ([`crate::keyset_provisioning::load_quorum_signer_at`]), byte-identical to the
+///     pre-Inc2 path -- NO memoization, so no shared state is introduced where there was none.
+///
+/// WHY THE FLAG (the ON-flip gate, decoupled from file presence): a future distributed-provision-at-
+/// spawn WRITES `placement.json`, so presence-alone would silently auto-engage distributed signing --
+/// and with it the concurrent-ceremony clobber below -- before the serializer lands. The flag defaults
+/// FALSE, so `placement.json` alone is INERT until an operator flips it (only after #48 + #49 close).
+///
+/// CARRIED CONSTRAINT (why the flag must stay FALSE until #49): a shared distributed signer assumes
+/// ceremonies are SERIALIZED per agent -- [`RelayHolderTransport::recv`] is one-ceremony-at-a-time per
+/// transport (a single reply channel per holder). Enabling distributed signing without per-agent
+/// ceremony serialization lets concurrent beacon/voice/DM ceremonies clobber each other's reply
+/// routes -- a money-safety violation. Inc2a ships the wiring default-OFF; the ON-flip (co-gated with
+/// cross-machine ECDH, Inc3) MUST add serialization before flipping the flag on for real money.
+pub struct AgentCosign {
+    /// The agent's FROST keystore dir (`None` for a non-FROST / no-keystore boot).
+    keystore_dir: Option<PathBuf>,
+    /// The ONE shared coordinator hub for a DISTRIBUTED keystore; `None` when co-located / no-frost.
+    hub: Option<Arc<CoordinatorRelayHub>>,
+    /// The memoized distributed `QuorumSigner` (built on first [`Self::load_signer`], reused after).
+    /// Only populated on the distributed (hub) path; co-located loads are fresh per call.
+    signer: Mutex<Option<Arc<crate::quorum_signer::QuorumSigner>>>,
+}
+
+impl AgentCosign {
+    /// Build the agent's co-sign coordinator from its config-derived inputs. When `keystore_dir` is
+    /// a DISTRIBUTED keystore (placement.json present) start the ONE shared hub over a
+    /// [`NostrRelayConn`]: `coordinator_keys` is the coordinator's transport identity (the agent's
+    /// node key), `relays` the co-sign relay set, `agent_id` binds every frame. The subscription is
+    /// warmed up front ([`NostrRelayConn::ensure_connected`]) BEFORE the conn moves into the hub's
+    /// actor thread, so a solicit published right after boot has a live subscriber. Co-located /
+    /// absent / non-FROST => no hub (the byte-identical single-box path).
+    ///
+    /// RUNTIME REQUIREMENT: `ensure_connected` warms the relay-pool tasks on the CALLER's tokio
+    /// runtime (the one awaiting this fn), then the conn moves into the hub actor's own thread +
+    /// runtime; the pool tasks keep living on the caller runtime. So this MUST be awaited on a
+    /// LONG-LIVED runtime that outlives the agent (the `run_agent` agent runtime satisfies this) --
+    /// building it on a short-lived/setup runtime would strand the pool tasks and later ceremonies
+    /// would time out. (Hardening this into a self-contained connect-inside-the-actor-runtime is a
+    /// transport-layer follow-up; the single-agent boot path meets the requirement today.)
+    pub async fn build(
+        keystore_dir: Option<PathBuf>,
+        coordinator_keys: Keys,
+        agent_id: &str,
+        relays: &[String],
+        distributed_signing_enabled: bool,
+    ) -> anyhow::Result<Self> {
+        let hub = match keystore_dir.as_deref() {
+            // ENGAGE distributed IFF the ON-flip gate is set AND the keystore is distributed-shaped.
+            Some(dir) if distributed_signing_enabled && crate::keyset_provisioning::is_distributed_keystore(dir) => {
+                if relays.is_empty() {
+                    anyhow::bail!(
+                        "distributed FROST keystore {} needs at least one co-sign relay to reach \
+                         the remote holders, but the relay set is empty (fail closed)",
+                        dir.display()
+                    );
+                }
+                let conn = NostrRelayConn::new(coordinator_keys.public_key(), relays.to_vec())
+                    .context("build the coordinator NostrRelayConn for distributed co-signing")?;
+                conn.ensure_connected()
+                    .await
+                    .context("connect + subscribe the coordinator co-sign relay before signing")?;
+                let hub = CoordinatorRelayHub::start(
+                    conn,
+                    coordinator_keys,
+                    agent_id.to_string(),
+                    DEFAULT_WIRE_TIMEOUT,
+                )
+                .context("start the shared co-sign coordinator hub")?;
+                tracing::info!(
+                    keystore = %dir.display(),
+                    relays = relays.len(),
+                    "distributed FROST keystore + distributed_signing_enabled: started the ONE shared co-sign coordinator hub (Q signs across machines)"
+                );
+                Some(Arc::new(hub))
+            }
+            // INERT: a distributed-shaped keystore whose ON-flip gate is OFF -- build NO hub, stay
+            // co-located. (Loud, so an operator sees the manifest present but signing not engaged.)
+            Some(dir)
+                if !distributed_signing_enabled
+                    && crate::keyset_provisioning::is_distributed_keystore(dir) =>
+            {
+                tracing::warn!(
+                    keystore = %dir.display(),
+                    "FROST keystore has a placement.json but identity.distributed_signing_enabled=false: \
+                     distributed signing is INERT (co-located path, NO co-sign hub built). Enable only \
+                     after #48 (reconnect proof) + #49 (ceremony serialization) close."
+                );
+                None
+            }
+            _ => None,
+        };
+        Ok(Self { keystore_dir, hub, signer: Mutex::new(None) })
+    }
+
+    /// A coordinator for a NON-FROST / no-keystore boot (the boot demo, app-checkpoint, tests that
+    /// never sign under Q): no hub, no keystore. [`Self::load_signer`] / [`Self::load_ecdh`] error
+    /// if called (there is nothing to load) -- those paths only run when a FROST keystore is set.
+    pub fn none() -> Self {
+        Self { keystore_dir: None, hub: None, signer: Mutex::new(None) }
+    }
+
+    /// Whether this agent's keystore is DISTRIBUTED (a shared hub was started).
+    pub fn is_distributed(&self) -> bool {
+        self.hub.is_some()
+    }
+
+    /// The [`QuorumSigner`](crate::quorum_signer::QuorumSigner) for this agent's keystore, dispatched
+    /// by the keystore shape. DISTRIBUTED => the MEMOIZED one hub-backed signer (shared across all
+    /// sign sites: one routes map / one holder set). CO-LOCATED => a FRESH per-call signer
+    /// (byte-identical to the pre-Inc2 path; no shared state).
+    pub fn load_signer(&self) -> anyhow::Result<Arc<crate::quorum_signer::QuorumSigner>> {
+        let dir = self.keystore_dir.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("AgentCosign::load_signer called with no FROST keystore configured")
+        })?;
+        match &self.hub {
+            // DISTRIBUTED: memoize the ONE shared signer (sharing is mandatory -- one routes map).
+            Some(hub) => {
+                let mut cached = self
+                    .signer
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("AgentCosign signer cache mutex poisoned"))?;
+                if let Some(existing) = cached.as_ref() {
+                    return Ok(Arc::clone(existing));
+                }
+                // Engaged: dispatch with the flag TRUE + the hub as factory (the single flag-aware
+                // dispatch point). hub.is_some() == engaged, so this is consistent by construction.
+                let signer = crate::keyset_provisioning::load_agent_quorum_signer(
+                    dir,
+                    Some(hub.as_ref() as &dyn HolderTransportFactory),
+                    true,
+                )
+                .context("load the distributed QuorumSigner via the shared co-sign hub")?;
+                let arc = Arc::new(signer);
+                *cached = Some(Arc::clone(&arc));
+                Ok(arc)
+            }
+            // NOT ENGAGED (co-located, OR placement present but flag off => INERT): a fresh signer
+            // per call. The dispatcher, with the flag FALSE, takes the co-located loader even if a
+            // placement.json exists -- byte-identical to today's two-independent-signers path.
+            None => {
+                let signer = crate::keyset_provisioning::load_agent_quorum_signer(dir, None, false)
+                    .context("load the co-located QuorumSigner")?;
+                Ok(Arc::new(signer))
+            }
+        }
+    }
+
+    /// The [`QuorumEcdh`](crate::quorum_ecdh::QuorumEcdh) for the DM / wallet-read (NIP-44) path.
+    /// FAIL-CLOSED LOUD when distributed signing is ENGAGED (`self.hub.is_some()` -- placement
+    /// present AND the ON-flip gate set): cross-machine threshold ECDH lands in Inc3, and an engaged
+    /// distributed agent holds FEWER than the quorum of shares locally, so in-process ECDH cannot
+    /// reach quorum. This enforces the Inc2+3 co-gate IN CODE, keyed off the SAME engagement decision
+    /// as [`Self::load_signer`] (so a placement-present-but-INERT keystore, flag off, stays on the
+    /// co-located ECDH path -- consistent with its co-located signing). Not-engaged =>
+    /// [`crate::keyset_provisioning::load_quorum_ecdh_at`] (unchanged).
+    pub fn load_ecdh(&self) -> anyhow::Result<crate::quorum_ecdh::QuorumEcdh> {
+        let dir = self.keystore_dir.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("AgentCosign::load_ecdh called with no FROST keystore configured")
+        })?;
+        if self.hub.is_some() {
+            anyhow::bail!(
+                "FROST keystore {} has DISTRIBUTED signing ENGAGED, but cross-machine threshold ECDH \
+                 (the DM / wallet-read path) is not yet wired -- it lands in Inc3. This is the Inc2+3 \
+                 co-gate: an engaged distributed agent holds fewer than the quorum of shares locally, \
+                 so in-process ECDH cannot reach quorum. Refusing to load (fail closed).",
+                dir.display()
+            );
+        }
+        crate::keyset_provisioning::load_quorum_ecdh_at(dir)
+            .with_context(|| format!("load co-located QuorumEcdh from keystore {}", dir.display()))
     }
 }
 

@@ -2393,6 +2393,8 @@ async fn run_boot(args: BootArgs) -> anyhow::Result<()> {
         snapshot_capable: false,
         restore_checkpoint: None,
         lease_fence: None,
+        // No FROST co-signing on this demo boot path (no distributed keystore).
+        cosign: std::sync::Arc::new(kirby_node::relay_transport::AgentCosign::none()),
     };
 
     let (vm, outcome, _treasury, _events, _serve_guard) = boot::boot_and_observe(config).await?;
@@ -2487,6 +2489,8 @@ async fn run_app_checkpoint(args: AppCheckpointArgs) -> anyhow::Result<()> {
         snapshot_capable: false,
         restore_checkpoint: None,
         lease_fence: None,
+        // No FROST co-signing on this demo boot path (no distributed keystore).
+        cosign: std::sync::Arc::new(kirby_node::relay_transport::AgentCosign::none()),
     };
     let mut config = app_checkpoint_run::AppCheckpointRunConfig::new(boot_config);
     config.checkpoint_timeout = Duration::from_secs(args.checkpoint_secs);
