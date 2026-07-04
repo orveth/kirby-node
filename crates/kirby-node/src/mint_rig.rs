@@ -122,11 +122,21 @@ impl WalletKey {
 /// the returned handle exposes `keyset_counters()` for the publisher.
 /// Funding the live wallet is out-of-band (§11); this only OPENS an already-funded (or
 /// fresh) store.
+/// `config_authoritative`: whether the 17375 counter-floor config read that produced
+/// `initial_counters` reached read-quorum (config-plane §2.1). It drives the FOUR-STATE
+/// establishment latch (§2.2): on a fresh box (empty local counter table) a BELOW-quorum config
+/// read cannot be trusted to establish the floor (a real head may live on an unreached relay →
+/// index reuse), so the counter is DEFERRED (latch false, fast-forward NOT run, every derivation
+/// blocked at the choke point until the bounded retry lands a ≥k read). A RESUME (non-empty local
+/// counter) is always safe (fast-forward is lift-up-only) and establishes immediately; a fresh box
+/// with a ≥k read establishes at the true floor (or at 0 when genuinely new — sound only under the
+/// quorum-intersection invariant, §2.8b). Callers with no relays (NIP-60 off) pass `true`.
 pub async fn open_persistent_wallet(
     mint_url: &str,
     db_path: &Path,
     seed: [u8; 64],
     initial_counters: HashMap<Id, u32>,
+    config_authoritative: bool,
 ) -> anyhow::Result<(Arc<Wallet>, Arc<crate::nip60_counter::Nip60CounterDb>)> {
     // The store lives in db_path's directory; ensure it exists.
     if let Some(parent) = db_path.parent() {
@@ -162,26 +172,49 @@ pub async fn open_persistent_wallet(
     // harmless (the local counter wins).
     let merged = union_max_counters(&initial_counters, &local_map);
 
+    // FOUR-STATE establishment (config-plane §2.2), authority-first. The RESUME signal is the LOCAL
+    // counter table: a NON-empty local counter means a prior instance already derived here, so
+    // fast-forward (lift-up-only) is safe and the latch establishes immediately (state 1). A fresh
+    // box (empty local table) can only conclude the floor is safe to establish from an
+    // AUTHORITATIVE (≥k) config read (states 3+4); a below-quorum config read on a fresh box is
+    // DEFERRED (state 2) — we cannot distinguish genuinely-new from restore-pending-on-an-unreached
+    // relay, and fast-forwarding to a thin/stale floor would derive at reused NUT-13 indices.
+    let resume = !local_map.is_empty();
+    let established = resume || config_authoritative;
+
     // Mirror the NUT-13 keyset counter through the NIP-60 decorator so it can travel in the
     // 17375 wallet-config for a cross-machine reconstruct. The mirror is SEEDED with `merged` (floor
     // ∪ local, max per keyset) so a later publish can never regress the counter below what the relay
-    // OR the local store recorded (the no-regress + completeness MONEY-MUST). The returned handle
-    // exposes `keyset_counters()` for the publisher.
-    let counter_db = Arc::new(crate::nip60_counter::Nip60CounterDb::with_counters(
+    // OR the local store recorded (the no-regress + completeness MONEY-MUST). The establishment
+    // latch is seeded by the four-state discrimination above; when `false` the choke-point gate
+    // blocks every derivation until the bounded retry (§2.4) lands a ≥k read.
+    let counter_db = Arc::new(crate::nip60_counter::Nip60CounterDb::with_counters_established(
         Arc::new(localstore),
         merged,
+        established,
     ));
-    // Fast-forward the INNER NUT-13 derivation counter to the seeded floor BEFORE the wallet
-    // derives anything, so a fresh-store reconstruct never re-issues an already-used secret (the
-    // shadow seed alone fixes only the PUBLISH mirror, not what cdk derives from). It now lifts the
-    // inner counter for the COMPLETE merged set (floor ∪ local); for a local-only keyset the merged
-    // value equals the inner counter already, so that arm is a no-op (never a spurious burn) — its
-    // purpose is a complete + non-regressing SHADOW for the publish, not to advance local keysets.
-    // No-op on a fresh / non-reconstruct boot (empty floor + empty local table).
-    counter_db
-        .fast_forward_inner_to_floor()
-        .await
-        .map_err(|e| anyhow::anyhow!("fast-forward NUT-13 counter to the reconstruct floor: {e}"))?;
+    if established {
+        // Fast-forward the INNER NUT-13 derivation counter to the seeded floor BEFORE the wallet
+        // derives anything, so a fresh-store reconstruct never re-issues an already-used secret (the
+        // shadow seed alone fixes only the PUBLISH mirror, not what cdk derives from). It lifts the
+        // inner counter for the COMPLETE merged set (floor ∪ local); for a local-only keyset the
+        // merged value equals the inner counter already, so that arm is a no-op (never a spurious
+        // burn). No-op on a genuinely-new boot (empty floor + empty local table → establish at 0,
+        // state 4, sound under the §2.8b quorum-intersection invariant).
+        counter_db.fast_forward_inner_to_floor().await.map_err(|e| {
+            anyhow::anyhow!("fast-forward NUT-13 counter to the reconstruct floor: {e}")
+        })?;
+    } else {
+        // State 2 (fresh box + below-quorum config): DEFER. Do NOT fast-forward to a thin/stale
+        // floor; the latch stays false so the choke point blocks derivations until a ≥k config read
+        // establishes the true floor (the bounded retry re-drives this exact sequence).
+        tracing::warn!(
+            db = %db_path.display(),
+            "NIP-60 counter DEFERRED: fresh-box restore below config read-quorum — derivations \
+             blocked at the choke point (money-safe, no reused NUT-13 index) until a ≥k config read \
+             establishes the true floor (stalled: below-quorum config, awaiting k relays)"
+        );
+    }
 
     let wallet = Wallet::new(mint_url, CurrencyUnit::Sat, counter_db.clone(), seed, None)
         .map_err(|e| anyhow::anyhow!("build persistent cdk wallet against {mint_url}: {e}"))?;
@@ -445,7 +478,7 @@ mod tests {
         let floor: HashMap<Id, u32> = HashMap::new();
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true)
                 .await
                 .expect("open persistent wallet");
 
@@ -468,7 +501,7 @@ mod tests {
         let floor = HashMap::from([(k, 50u32)]);
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true)
                 .await
                 .expect("open persistent wallet");
 
@@ -494,7 +527,7 @@ mod tests {
         let floor: HashMap<Id, u32> = HashMap::new();
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true)
                 .await
                 .expect("open persistent wallet");
 

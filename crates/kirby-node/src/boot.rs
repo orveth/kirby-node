@@ -708,6 +708,70 @@ pub fn assert_wallet_backs_counter(wallet_balance: u64, treasury_remaining: u64)
     Ok(())
 }
 
+/// The config-plane bounded read-retry schedule (§2.4). The base interval (attempt 0), the cap on
+/// a single interval, and the bounded attempt count — a BOUNDED, OBSERVABLE window that self-heals
+/// on a ≥k read and never wedges silent-forever.
+const CONFIG_RETRY_BASE: Duration = Duration::from_secs(2);
+const CONFIG_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(60);
+const CONFIG_RETRY_MAX_ATTEMPTS: u32 = 12;
+
+/// The config-plane retry BACKOFF (§2.4, T6): a BOUNDED exponential — `base` doubled each attempt,
+/// capped at `max`, and NEVER below `base`. ★ HARD money-safety requirement: the retry must BACK
+/// OFF, never SPIN — the runtime meter (meter.rs:565) debits the treasury every tick independent of
+/// the wallet, so a hot retry loop would raise measured CPU burn and hasten REAL death. A non-zero
+/// floor (`>= base`) is exactly what keeps a defer window from debiting faster than baseline idle.
+/// Pure + total so the T6 tooth exercises it directly.
+pub fn config_retry_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
+    let factor = 1u64.checked_shl(attempt.min(32)).unwrap_or(u64::MAX);
+    let secs = base.as_secs().saturating_mul(factor);
+    Duration::from_secs(secs).clamp(base, max)
+}
+
+/// ONE config-plane establishment attempt (§2.4): re-read the 17375 counter-floor per-relay and, if
+/// it reached read-quorum (≥k), ESTABLISH the counter and re-drive the full recovery path. Returns
+/// `Ok(true)` when it establishes this call, `Ok(false)` when still below quorum (the retry loop
+/// backs off and tries again).
+///
+/// ORDERING (§2.6b — establishment PRECEDES the re-driven restore-receive so it derives at correct
+/// indices): (1) re-seed the NEWLY-learned TRUE floor into the mirror (the open-time seed was a
+/// THIN/empty below-quorum floor); (2) fast-forward the inner counter to it (gate-exempt via
+/// self.inner); (3) flip the establishment latch + re-flip the token read (`reconcile_on_load_with_ids`
+/// → `read_established`); (4) re-drive the restore-receive (now unblocked); (5) drain deferred
+/// Paid-but-unissued mint quotes via `mint_unissued_quotes` (recovery-mint, now that the choke point
+/// is open). Shared with the token plane: one attempt re-establishes BOTH the config floor and the
+/// token `read_established`.
+pub(crate) async fn try_establish_counter(
+    store: &crate::nip60::Nip60Store,
+    counter_db: &crate::nip60_counter::Nip60CounterDb,
+    wallet: &cdk::wallet::Wallet,
+) -> anyhow::Result<bool> {
+    let cr = store.load_config_quorum().await?;
+    if !cr.config_authoritative {
+        return Ok(false); // still below quorum — the loop backs off and retries
+    }
+    // ≥k: seed the true floor, fast-forward (gate-exempt), THEN establish (ordering §2.6b).
+    if let Some(config) = cr.config {
+        counter_db.seed_floor(config.counters_by_id());
+    }
+    counter_db
+        .fast_forward_inner_to_floor()
+        .await
+        .map_err(|e| anyhow::anyhow!("config-plane retry: fast-forward NUT-13 counter to the true floor: {e}"))?;
+    counter_db.establish();
+    // Re-reconcile the token plane → flips `read_established` (unblocks the rollover gate) + yields
+    // the restore candidates for the re-driven restore-receive.
+    let read = store.reconcile_on_load_with_ids().await?;
+    // Re-drive the restore-receive now that derivations are unblocked (§2.6b). Degrades internally.
+    let _restored = crate::nip60_reconcile::restore_from_relay_backup(Ok(read.candidates), wallet).await;
+    // Drain any deferred Paid-but-unissued mint quotes (recovery-mint through the now-open choke
+    // point; safe to call blindly — re-checks with the mint, self-skips amount_mintable()==0).
+    match wallet.mint_unissued_quotes().await {
+        Ok(amt) => tracing::info!(minted = %amt, "config-plane retry: drained deferred mint quotes"),
+        Err(e) => tracing::warn!(error = %e, "config-plane retry: mint_unissued_quotes failed (advisory; retries next attempt)"),
+    }
+    Ok(true)
+}
+
 /// Read the AUTHORITATIVE `treasury_remaining` before wiring the brain wallet to it, so
 /// the §7.2 reconcile compares the wallet against the real counter: bootstrap seeds
 /// `initial_sats`; resume keeps the persisted balance (the seed arg is honored only on
@@ -792,7 +856,11 @@ async fn build_routstr_brain(
         None
     } else {
         let event_key = crate::nip60_key::derive_nip60_event_key(&seed);
-        let (relays, write_k, read_k, durability) = nip60.resolve(fleet_relay);
+        // §2.8b: FAIL-CLOSED on a quorum-intersection violation (read_k + write_k > n) BEFORE
+        // connecting — a config that can't guarantee read/write overlap must never boot the
+        // establishment machinery into a state where fresh-box establish-at-0 (§2.2 state 4) is
+        // unsound (index reuse via a weak write quorum). Default majority both sides satisfies it.
+        let (relays, write_k, read_k, durability) = nip60.resolve_checked(fleet_relay)?;
         if let Some(warning) = durability.warning() {
             tracing::warn!(nip60_durability = %warning, "NIP-60 wallet backup: sub-quorum durability");
         }
@@ -824,22 +892,35 @@ async fn build_routstr_brain(
         ))
     };
 
-    // The counter floor loaded from the 17375 head (empty with no store / a fresh wallet).
-    let initial_counters = match &nip60_store {
-        Some(store) => store
-            .load_config()
-            .await?
-            .map(|config| config.counters_by_id())
-            .unwrap_or_default(),
-        None => std::collections::HashMap::new(),
+    // The counter floor loaded from the 17375 head (empty with no store / a fresh wallet), AND
+    // whether that config read reached read-quorum (§2.1). config_authoritative drives the
+    // four-state establishment latch (§2.2): a below-quorum config read on a fresh box DEFERS the
+    // counter (derivations blocked) rather than establishing from a possibly-thin floor. With no
+    // store (NIP-60 off) the local wallet is authoritative by definition.
+    let (initial_counters, config_authoritative) = match &nip60_store {
+        Some(store) => {
+            let cr = store.load_config_quorum().await?;
+            (
+                cr.config.map(|config| config.counters_by_id()).unwrap_or_default(),
+                cr.config_authoritative,
+            )
+        }
+        None => (std::collections::HashMap::new(), true),
     };
 
     // 1) Open the PERSISTENT wallet (file store + persisted seed, §7.1; funded out-of-band, §11),
     //    with the counter mirror SEEDED by the loaded floor — this seed PRECEDES the config publish
-    //    in step 4 (the no-regress ordering).
-    let (wallet, counter_db) =
-        crate::mint_rig::open_persistent_wallet(&brain.mint_url, db_path, seed, initial_counters)
-            .await?;
+    //    in step 4 (the no-regress ordering). `config_authoritative` gates the four-state
+    //    establishment (§2.2): on a fresh box a below-quorum read leaves the counter DEFERRED
+    //    (latch false → choke-point blocks derivations until the bounded retry lands a ≥k read).
+    let (wallet, counter_db) = crate::mint_rig::open_persistent_wallet(
+        &brain.mint_url,
+        db_path,
+        seed,
+        initial_counters,
+        config_authoritative,
+    )
+    .await?;
     let ecash = CdkEcash::new(wallet.clone());
 
     // 2) Recover incomplete cdk sagas FIRST (R2-4), BEFORE measuring the balance: a prior
@@ -907,7 +988,16 @@ async fn build_routstr_brain(
     //    balance as proven insolvency — proceed non-authoritatively (the rollover gate holds
     //    until >=k re-establishes; die-when-broke fires on a real spend shortfall).
     let wallet_balance = wallet.total_balance().await.map(u64::from).unwrap_or(0);
-    match solvency_gate(nip60_read_authoritative) {
+    // §2.8 solvency posture: authoritative ONLY when BOTH the token read reached quorum AND the
+    // NUT-13 counter was established (config-plane). A restore-deferred fresh box (counter NOT
+    // established) has a transiently-0 wallet (§2.6b: the restore-receive tripped the choke-point
+    // gate and no-op'd), so treating it as authoritative would false-broke bail even when the token
+    // read hit quorum — the reachable failover false-death seam (§2.8, T10). Deferring the assert
+    // does NOT blur die-when-broke: that lives in the runtime METER (meter.rs), not this boot-only
+    // refuse-to-start check; a genuinely-broke agent still dies at runtime when the treasury hits 0.
+    let counter_established = counter_db.is_established();
+    let solvency_authoritative = nip60_read_authoritative && counter_established;
+    match solvency_gate(solvency_authoritative) {
         SolvencyGate::Assert => assert_wallet_backs_counter(wallet_balance, treasury_remaining)?,
         SolvencyGate::ProceedNonAuthoritative => {
             let (served, total, read_k) = nip60_read_info.unwrap_or((0, 0, 0));
@@ -915,13 +1005,16 @@ async fn build_routstr_brain(
                 served,
                 total,
                 read_k,
+                counter_established,
                 wallet_balance,
                 treasury_remaining,
-                "boot: restore below read-quorum ({served}/{total}, need {read_k}); \
-                 wallet {wallet_balance} vs counter {treasury_remaining} is a LOWER BOUND, \
-                 NOT treating as insolvent — proceeding non-authoritative, scheduling read-retry",
+                "boot: restore below read-quorum ({served}/{total}, need {read_k}) OR counter \
+                 deferred (established={counter_established}); wallet {wallet_balance} vs counter \
+                 {treasury_remaining} is a LOWER BOUND, NOT treating as insolvent — proceeding \
+                 non-authoritative, scheduling read-retry (stalled: below-quorum config, awaiting k relays)",
             );
-            // boot PROCEEDS; read_established stays false => rollover gate (§4) holds.
+            // boot PROCEEDS; read_established / counter_established stay false => rollover gate (§4)
+            // + choke-point gate (§2.2) hold; the bounded retry re-establishes on a ≥k read.
         }
     }
 
@@ -930,15 +1023,79 @@ async fn build_routstr_brain(
     //    counter is >= the loaded floor AND reflects any proofs restored this boot (no regression).
     //    Best-effort: a failure is logged, NOT fatal (the mint remains truth; the next counter
     //    change re-publishes).
+    //    §2.3 WRITE-BACK GATE: publish the counter head ONLY when the config read was authoritative
+    //    (≥k). A below-quorum config read may have loaded a THIN floor; republishing it as a NEW
+    //    17375 head would REGRESS the true head (a lower head on the reached relays) — poisoning
+    //    every future boot (finding-2, propagating). Below-quorum → skip the publish, keep the
+    //    existing head, warn; the bounded retry re-publishes once a ≥k read re-establishes.
     if let Some(store) = &nip60_store {
-        if let Err(e) = store
-            .publish_wallet_config(counter_db.keyset_counters(), vec![brain.mint_url.clone()])
-            .await
-        {
+        if config_authoritative {
+            if let Err(e) = store
+                .publish_wallet_config(counter_db.keyset_counters(), vec![brain.mint_url.clone()])
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "NIP-60 boot config publish failed (advisory; the seeded floor re-publishes on the next change)"
+                );
+            }
+        } else {
             tracing::warn!(
-                error = %e,
-                "NIP-60 boot config publish failed (advisory; the seeded floor re-publishes on the next change)"
+                "NIP-60 boot config publish SKIPPED: below config read-quorum — refusing to \
+                 republish a potentially-thin counter head (never regress the true head, §2.3); \
+                 the bounded retry re-publishes once a ≥k read re-establishes authority"
             );
+        }
+    }
+
+    // §2.4 BOUNDED READ-RETRY: when the counter was DEFERRED (fresh-box below-quorum boot, latch
+    // false), spawn a bounded backoff task that re-reads the config per-relay and, on a ≥k read,
+    // establishes the floor + re-drives restore + drains deferred mints (`try_establish_counter`).
+    // Boot PROCEEDS (the agent survives on its existing balance; the runtime meter still owns
+    // die-when-broke) — in the window it is ALIVE-BUT-FROZEN (every NUT-13 derivation blocked at the
+    // choke point, §2.5) with a LOUD stall percept, self-healing on ≥k. On bound-expiry it proceeds
+    // on existing balance, minting stays blocked, the stall stays visible (never a silent wedge).
+    if let Some(store) = &nip60_store {
+        if !counter_db.is_established() {
+            tracing::warn!(
+                "stalled: below-quorum config, awaiting k relays — spawning the bounded config-plane \
+                 read-retry (§2.4); derivations remain blocked at the choke point until a ≥k read lands"
+            );
+            let store = store.clone();
+            let counter_db_retry = counter_db.clone();
+            let wallet_retry = wallet.clone();
+            tokio::spawn(async move {
+                for attempt in 0..CONFIG_RETRY_MAX_ATTEMPTS {
+                    let delay =
+                        config_retry_backoff(attempt, CONFIG_RETRY_BASE, CONFIG_RETRY_MAX_INTERVAL);
+                    tokio::time::sleep(delay).await;
+                    match try_establish_counter(&store, &counter_db_retry, &wallet_retry).await {
+                        Ok(true) => {
+                            tracing::info!(
+                                attempt,
+                                "config-plane retry: counter ESTABLISHED on a ≥k read — derivations \
+                                 unblocked, floor fast-forwarded, restore re-driven, deferred mints drained"
+                            );
+                            return;
+                        }
+                        Ok(false) => tracing::warn!(
+                            attempt,
+                            "stalled: below-quorum config, awaiting k relays (retry attempt {attempt} \
+                             still below quorum; backing off)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            attempt,
+                            error = %e,
+                            "config-plane retry attempt errored (will back off and retry)"
+                        ),
+                    }
+                }
+                tracing::warn!(
+                    "config-plane retry: bound expired still below quorum — proceeding on the \
+                     existing balance, minting/derivation stays BLOCKED (money-safe), the stall \
+                     stays visible; re-establishes on the next boot that reaches ≥k"
+                );
+            });
         }
     }
 

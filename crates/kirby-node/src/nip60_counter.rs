@@ -27,6 +27,7 @@
 //!     observation only, never read back into the wallet.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -53,10 +54,23 @@ pub struct Nip60CounterDb {
     /// Highest counter value observed per keyset this session, seeded optionally with a
     /// reconstruct floor. Snapshotted by [`Self::keyset_counters`] for the publisher.
     shadow: Mutex<HashMap<Id, u32>>,
+    /// The config-plane cut's ONE-SHOT BOOT-TIME establishment latch (§2.2). When `false`, the
+    /// choke-point gate on [`WalletDatabase::increment_keyset_counter`] REFUSES every NUT-13
+    /// derivation (a clean recoverable `Error::Database`), so a fresh-box below-quorum boot cannot
+    /// derive at reused indices. Flipped to `true` EXACTLY ONCE — the moment the floor is
+    /// legitimately established (RESUME, or a ≥k config read) — after which every derivation is a
+    /// single cheap atomic load (runtime-free; no per-op quorum check, no stall on a healthy node).
+    ///
+    /// ★ INVARIANT #2 — MONOTONIC (false→true only, NEVER back). cdk touches the counter multiple
+    /// times per op incl. a POST-network increment (receive/saga); a true→false mid-op flip would
+    /// strand already-minted proofs. [`Self::establish`] only ever stores `true`.
+    counter_established: AtomicBool,
 }
 
 impl Nip60CounterDb {
-    /// Wrap `inner` with an empty counter mirror.
+    /// Wrap `inner` with an empty counter mirror. The establishment latch defaults `true` (bare
+    /// wrappers — the plain rail wallet, unit tests — derive freely); the config-plane boot path
+    /// constructs via [`Self::with_counters_established`] and computes the four-state latch (§2.2).
     pub fn new(inner: InnerStore) -> Self {
         Self::with_counters(inner, HashMap::new())
     }
@@ -64,11 +78,50 @@ impl Nip60CounterDb {
     /// Wrap `inner`, seeding the mirror with `initial` counters (the values loaded from
     /// the 17375 wallet-config on a reconstruct). The mirror only ever rises above these
     /// floors, so a later publish cannot regress the counter below what the relay already
-    /// recorded.
+    /// recorded. Latch defaults `true` (see [`Self::new`]).
     pub fn with_counters(inner: InnerStore, initial: HashMap<Id, u32>) -> Self {
+        Self::with_counters_established(inner, initial, true)
+    }
+
+    /// Wrap `inner` with seeded `initial` floors AND an explicit establishment-latch value
+    /// (config-plane §2.2). The boot path passes `established` computed from the four-state
+    /// discrimination (RESUME → true; fresh-box + ≥k config → true; fresh-box + below-quorum →
+    /// FALSE = defer). A `false` latch gates every derivation at the choke point until
+    /// [`Self::establish`] flips it (the bounded retry, on a ≥k config read).
+    pub fn with_counters_established(
+        inner: InnerStore,
+        initial: HashMap<Id, u32>,
+        established: bool,
+    ) -> Self {
         Self {
             inner,
             shadow: Mutex::new(initial),
+            counter_established: AtomicBool::new(established),
+        }
+    }
+
+    /// Flip the establishment latch `true` (MONOTONIC — false→true only, idempotent). Called once
+    /// the floor is legitimately established: at construction for RESUME / ≥k-fresh-box, or by the
+    /// bounded retry (§2.4) after a ≥k config read fast-forwards the true floor. Never reverts
+    /// (invariant #2), so a post-network increment can never be stranded by a mid-op un-establish.
+    pub fn establish(&self) {
+        self.counter_established.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the establishment latch is set (a single cheap atomic load — the healthy-node hot
+    /// path). The boot solvency gate (§2.8) and the retry (§2.4) read it.
+    pub fn is_established(&self) -> bool {
+        self.counter_established.load(Ordering::SeqCst)
+    }
+
+    /// Fold fresh `floors` into the publish-mirror (monotonic max per keyset), so a subsequent
+    /// [`Self::fast_forward_inner_to_floor`] lifts the inner derivation counter to the NEWLY-learned
+    /// TRUE floor. Used by the bounded retry (§2.4): the mirror was seeded at open with a THIN /
+    /// empty below-quorum floor; on a ≥k config read the retry re-seeds the true floor HERE before
+    /// fast-forwarding + establishing, so the counter never establishes below the real head.
+    pub fn seed_floor(&self, floors: HashMap<Id, u32>) {
+        for (id, c) in floors {
+            self.observe(&id, c);
         }
     }
 
@@ -108,6 +161,12 @@ impl Nip60CounterDb {
             shadow.iter().map(|(id, c)| (*id, *c)).collect()
         };
         for (id, floor) in floors {
+            // ★ INVARIANT #1 (config-plane §2.2, LOAD-BEARING — do NOT route through the decorated
+            // `self.increment_keyset_counter`): fast-forward IS the establishment ACTION and must be
+            // GATE-EXEMPT. It calls `self.inner` (the concrete store) directly so it can lift the
+            // counter to the true floor BEFORE the establishment latch flips true. Rerouting it
+            // through the gated method would SELF-DEADLOCK — establishment blocked by the
+            // not-yet-established latch it is trying to establish. (Regression-guarded by T7.)
             let cur = self.inner.increment_keyset_counter(&id, 0).await?;
             if floor > cur {
                 self.inner.increment_keyset_counter(&id, floor - cur).await?;
@@ -224,9 +283,22 @@ impl WalletDatabase<Error> for Nip60CounterDb {
         self.inner.update_mint_url(old_mint_url, new_mint_url).await
     }
 
-    /// The one intercept: pass the increment straight through to the inner store (which
-    /// stays cdk's source of truth), then mirror the returned counter for later publish.
+    /// The one intercept + the config-plane CHOKE POINT (§2.2): this is the ONLY counter-mutating
+    /// method in the entire `WalletDatabase` trait, so EVERY NUT-13 derivation (swap / receive /
+    /// mint-issue / melt-change / send / restore, AND `mint_unissued_quotes`'s recovery-mint)
+    /// reserves its index range through here. When the establishment latch is NOT set, REFUSE with
+    /// a clean recoverable `Error::Database` — cdk reserves the counter range BEFORE its network
+    /// call, so this `Err` trips at the first reserve, `?`-propagates, and the op aborts with NO
+    /// half-minted proofs (no panic, no partial commit). This is the bypass-proof gate that keeps a
+    /// fresh-box below-quorum boot from deriving at a reused / thin-floor index (money loss). On a
+    /// healthy (established) node it is a single cheap atomic load — runtime-free.
     async fn increment_keyset_counter(&self, keyset_id: &Id, count: u32) -> Result<u32, Error> {
+        if !self.counter_established.load(Ordering::SeqCst) {
+            return Err(Error::Database(Box::from(
+                "NIP-60 NUT-13 counter not established (below-quorum fresh-box restore): derivation \
+                 deferred until a ≥k config read establishes the true floor (config-plane §2.2)",
+            )));
+        }
         let new_counter = self.inner.increment_keyset_counter(keyset_id, count).await?;
         self.observe(keyset_id, new_counter);
         Ok(new_counter)
@@ -498,6 +570,107 @@ mod tests {
             inner_now >= floor,
             "the INNER derivation counter must be fast-forwarded to >= the seeded floor \
              (got {inner_now}, floor {floor}) — else receive_proofs re-derives used secrets"
+        );
+    }
+
+    // ---- T2 (config-plane §2.2): the choke-point gate DEFERS every derivation when the latch is
+    // not established (a fresh-box below-quorum boot). Any NUT-13 derivation reserves its index
+    // range through `increment_keyset_counter` (swap/receive/mint/melt/send/restore + recovery-mint)
+    // — with the latch FALSE it must return a clean recoverable Err and mutate NOTHING (no
+    // reused-index derivation), so the wallet cannot derive from a thin floor.
+    //
+    // RED-on-revert: remove the `!counter_established` guard block in `increment_keyset_counter` →
+    // the increment succeeds from the thin state → the `expect_err` fails (derivation was NOT
+    // blocked).
+    #[tokio::test]
+    async fn t2_choke_point_defers_derivation_when_not_established() {
+        let mem = cdk_sqlite::wallet::memory::empty()
+            .await
+            .expect("in-memory wallet store");
+        let id = test_keyset_id();
+        // Fresh-box + below-quorum → latch starts FALSE (deferred).
+        let db = Nip60CounterDb::with_counters_established(Arc::new(mem), HashMap::new(), false);
+        assert!(!db.is_established(), "precondition: latch deferred");
+
+        let err = db
+            .increment_keyset_counter(&id, 1)
+            .await
+            .expect_err("a derivation MUST be blocked while the counter is not established");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not established"),
+            "the gate returns a clean recoverable 'counter not established' Error::Database (got: {msg})"
+        );
+
+        // The inner store was never mutated: after establishing, a no-op read is still 0.
+        db.establish();
+        let inner_now = db
+            .increment_keyset_counter(&id, 0)
+            .await
+            .expect("read inner counter after establish");
+        assert_eq!(inner_now, 0, "the blocked increment mutated NOTHING (no reserved index burned)");
+    }
+
+    // ---- establish() is MONOTONIC (invariant #2) and unblocks derivation. -------------------------
+    #[tokio::test]
+    async fn establish_is_monotonic_and_unblocks_derivation() {
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("store");
+        let id = test_keyset_id();
+        let db = Nip60CounterDb::with_counters_established(Arc::new(mem), HashMap::new(), false);
+        // Blocked before establish.
+        assert!(db.increment_keyset_counter(&id, 1).await.is_err());
+        db.establish();
+        assert!(db.is_established());
+        // Unblocked after establish.
+        let v = db.increment_keyset_counter(&id, 3).await.expect("derives after establish");
+        assert!(v >= 3, "the inner counter advanced once established");
+        // Monotonic: `establish` again stays true (never reverts); there is no un-establish path.
+        db.establish();
+        assert!(db.is_established(), "establish is idempotent and never reverts (invariant #2)");
+    }
+
+    // ---- T7 (config-plane §2.2 invariant #1): fast_forward_inner_to_floor is GATE-EXEMPT because
+    // it routes through `self.inner`, NOT the decorated `self.increment_keyset_counter`. This test
+    // pins the exemption: fast-forward must succeed AND lift the inner counter even while the latch
+    // is FALSE (establishment happens BEFORE the latch flips). If a refactor rerouted fast-forward
+    // through the decorated (gated) method, establishment would SELF-DEADLOCK (the gate blocks the
+    // very op trying to establish) — this test would then RED (fast-forward returns Err / does not
+    // lift).
+    //
+    // RED-on-revert: change `fast_forward_inner_to_floor` to call `self.increment_keyset_counter`
+    // instead of `self.inner.increment_keyset_counter` → with the latch false the calls Err →
+    // `expect("fast-forward")` panics / the inner counter is not lifted → RED (self-deadlock proven).
+    #[tokio::test]
+    async fn t7_fast_forward_is_gate_exempt_via_self_inner() {
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("store");
+        let id = test_keyset_id();
+        let floor: u32 = 5_000;
+        // Latch FALSE (deferred) — the choke point would block a decorated derivation.
+        let db = Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            HashMap::from([(id, floor)]),
+            false,
+        );
+        assert!(!db.is_established(), "precondition: latch is not established");
+
+        // fast_forward MUST still succeed and lift the inner counter (it is the establishment
+        // ACTION and is gate-exempt via self.inner). A reroute through the gated method would
+        // self-deadlock here.
+        db.fast_forward_inner_to_floor()
+            .await
+            .expect("fast-forward is gate-exempt and must succeed even while the latch is false");
+
+        // Now establish (as the boot path does after fast-forward) and confirm the inner counter was
+        // genuinely lifted to the floor — proving fast-forward reached the inner store.
+        db.establish();
+        let inner_now = db
+            .increment_keyset_counter(&id, 0)
+            .await
+            .expect("read inner counter after establish");
+        assert!(
+            inner_now >= floor,
+            "fast-forward (gate-exempt) lifted the inner counter to >= the floor even while the \
+             latch was false (got {inner_now}, floor {floor}) — invariant #1 holds"
         );
     }
 }

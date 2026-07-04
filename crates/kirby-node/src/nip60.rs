@@ -444,6 +444,23 @@ pub struct ReconcileRead {
     pub authoritative: bool,
 }
 
+/// The result of a quorum-aware config-floor read (returned by [`Nip60Store::load_config_quorum`],
+/// config-plane §2.1). Carries the per-relay quorum metadata alongside the decrypted config so the
+/// boot path can decide whether the NUT-13 counter floor is safe to ESTABLISH (a below-quorum read
+/// on a fresh box must DEFER — §2.2). The config-plane analog of [`ReconcileRead`] (token plane).
+pub struct ConfigRead {
+    /// The decrypted wallet-config lww-head, or `None` when the agent has never published one.
+    pub config: Option<WalletConfigContent>,
+    /// DISTINCT relays that served events (or confirmed empty) within the read timeout.
+    pub served: usize,
+    /// READ-capable relays in the pool (denominator).
+    pub total: usize,
+    /// The read_k threshold this store was configured with.
+    pub read_k: usize,
+    /// `served >= read_k` — the boot path uses this to decide establish vs defer (§2.2).
+    pub config_authoritative: bool,
+}
+
 /// The NIP-60 wallet relay store: publishes the agent's Cashu proofs as NIP-44-encrypted
 /// kind:7375 token events to the [`crate::config::Nip60Config`] relay set (signed by + encrypted
 /// to the event key) and reconciles them back on load. Mirrors [`crate::rail::EngramStore`]'s
@@ -708,15 +725,39 @@ impl Nip60Store {
     /// money-critical, so a decrypt failure is surfaced (fail-closed at the caller), NEVER silently
     /// treated as an empty floor — an empty floor would let a later publish regress the counter.
     pub async fn load_config(&self) -> anyhow::Result<Option<WalletConfigContent>> {
+        Ok(self.load_config_quorum().await?.config)
+    }
+
+    /// As [`Self::load_config`], but QUORUM-AWARE (config-plane §2.1): read the kind:17375
+    /// counter-floor per-relay (reusing the Cut A [`Nip60Transport::fetch_events_per_relay`]
+    /// primitive) so the boot path knows whether the floor read reached read-quorum BEFORE any
+    /// counter-consuming op. `config_authoritative = served >= read_k`. This is the config-plane
+    /// analog of [`Self::reconcile_on_load_with_ids`] (the token plane): a DISTINCT read of a
+    /// DISTINCT kind (17375 config head vs 7375 token proofs) with its own authority marker. A
+    /// below-quorum config read must NOT establish the NUT-13 counter floor on a fresh box (a real
+    /// head may live on an unreached relay → index reuse); the caller defers establishment (§2.2).
+    ///
+    /// ⚠️ Fail-closed like `load_config`: an undecryptable config HEAD is a HARD error (the counter
+    /// floor is money-critical), never silently an empty floor.
+    pub async fn load_config_quorum(&self) -> anyhow::Result<ConfigRead> {
         let filter = Filter::new()
             .kind(Kind::from(KIND_NIP60_WALLET_CONFIG))
             .author(self.crypto.public_key());
-        let events = self
+        // R2 config-plane: per-relay read so we can count DISTINCT relays that SERVED the config.
+        let per = self
             .transport
-            .fetch_events(filter, self.read_timeout)
+            .fetch_events_per_relay(filter, self.read_timeout)
             .await
-            .context("fetch NIP-60 wallet-config events")?;
-        match crate::engram::lww_head(&events) {
+            .context("fetch NIP-60 wallet-config events (per-relay)")?;
+        let config_authoritative = per.served >= self.read_k;
+        tracing::info!(
+            served = per.served,
+            total = per.total,
+            read_k = self.read_k,
+            config_authoritative,
+            "NIP-60 load_config: per-relay config read quorum"
+        );
+        let config = match crate::engram::lww_head(&per.events) {
             Some(head) => {
                 let mut config = self
                     .crypto
@@ -729,10 +770,17 @@ impl Nip60Store {
                 config
                     .mints
                     .retain(|m| self.mint_allowlist.iter().any(|a| a == m));
-                Ok(Some(config))
+                Some(config)
             }
-            None => Ok(None),
-        }
+            None => None,
+        };
+        Ok(ConfigRead {
+            config,
+            served: per.served,
+            total: per.total,
+            read_k: self.read_k,
+            config_authoritative,
+        })
     }
 
     /// Roll over token events: replace the `superseded` events (their proofs consolidated into

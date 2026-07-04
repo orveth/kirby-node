@@ -198,7 +198,7 @@ async fn persistent_wallet_reopen_after_drop_is_spendable() {
         .resolve_seed()
         .expect("create the fresh 0600 seed");
     let (w, _counter_db) =
-        open_persistent_wallet(&mint_url, &db_path, seed, std::collections::HashMap::new())
+        open_persistent_wallet(&mint_url, &db_path, seed, std::collections::HashMap::new(), true)
             .await
             .expect("open persistent wallet");
     fund_wallet(w.clone(), 300).await.expect("fund");
@@ -225,7 +225,7 @@ async fn persistent_wallet_reopen_after_drop_is_spendable() {
         .resolve_seed()
         .expect("load the persisted seed");
     let (w2, _counter_db) =
-        open_persistent_wallet(&mint_url, &db_path, seed2, std::collections::HashMap::new())
+        open_persistent_wallet(&mint_url, &db_path, seed2, std::collections::HashMap::new(), true)
             .await
             .expect("reopen persistent wallet");
     assert_eq!(balance(&w2).await, 300, "balance survived the reopen (store + seed)");
