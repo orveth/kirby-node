@@ -85,6 +85,7 @@ fn vz_boot(
         snapshot_capable: false,
         restore_checkpoint: None,
         lease_fence: None,
+        cosign: std::sync::Arc::new(kirby_node::relay_transport::AgentCosign::none()),
         egress: None,
     }
 }

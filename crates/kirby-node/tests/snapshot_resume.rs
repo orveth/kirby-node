@@ -74,6 +74,7 @@ async fn g6_snapshot_and_resume_on_node2() {
         snapshot_capable: true,
         restore_checkpoint: None,
         lease_fence: None,
+        cosign: std::sync::Arc::new(kirby_node::relay_transport::AgentCosign::none()),
         egress: None,
     };
 

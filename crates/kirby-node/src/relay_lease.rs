@@ -570,6 +570,28 @@ impl RelayLeaseGrantor {
             "a node can only claim a lease naming ITSELF as holder: requested holder {node_id} != this node {}",
             self.node_id
         );
+        // INC2a co-gate (fail-closed): the lease signer is a THIRD Q-sign site (alongside the beacon
+        // signer + the voice actuator). Distributed lease signing over remote holders lands with the
+        // ON-flip (Inc2b/Inc3); until then a DISTRIBUTED keystore must NOT sign a lease via the
+        // co-located loader -- that would either fail confusingly or, on a mixed keystore, silently
+        // sign with STALE local shares (masking distributed intent). Refuse LOUD. A co-located
+        // keystore (today's default -- no placement.json) is byte-identical below.
+        //
+        // Flag-AGNOSTIC by design: this keys off is_distributed_keystore ALONE, NOT
+        // identity.distributed_signing_enabled. It is finding-1 STALE-SHARE protection (never
+        // lease-sign from local shares on a distributed-shaped keystore), ORTHOGONAL to the flag's
+        // finding-2 concurrent-ceremony purpose -- the flag gates the shared co-sign HUB, which the
+        // lease never uses (it builds its own single_agent authority). Do NOT "reconcile" this with
+        // the flag: making it flag-aware would WEAKEN the stale-share guard.
+        if crate::keyset_provisioning::is_distributed_keystore(keystore_dir) {
+            anyhow::bail!(
+                "FROST keystore {} for agent {agent_id} is DISTRIBUTED, but distributed lease \
+                 signing (over remote holders) is not yet wired -- it lands with the Inc2+3 ON-flip. \
+                 Refusing to sign this lease from the co-located loader (fail closed; never sign a \
+                 lease with stale local shares).",
+                keystore_dir.display()
+            );
+        }
         // Load the tenant's OWN quorum Q from the keystore the supervisor provisioned, and
         // build a single-agent authority that signs THIS agent's lease under THAT Q.
         let signer = Arc::new(
@@ -1330,5 +1352,56 @@ mod fence_qverify_tests {
             "no lease signed under the expected Q => None => the caller fails closed"
         );
         assert!(!confirm_takeover_win(None, 7, 2), "None => stand down (no launch)");
+    }
+}
+
+/// INC2a lease-signer co-gate: the kind-31002 lease FROST-sign site (`claim_for`) is a THIRD
+/// Q-sign site (alongside the beacon signer + the voice actuator). It must FAIL CLOSED on a
+/// DISTRIBUTED keystore -- distributed lease signing over remote holders lands with the Inc2+3
+/// ON-flip. A co-located keystore (today's default) is unaffected. Closes the codex-flagged
+/// third sign-site bypass.
+#[cfg(test)]
+mod inc2_lease_cogate_tests {
+    use super::*;
+
+    /// A publisher that MUST NOT be reached: the co-gate bails BEFORE any signing or publish.
+    struct NeverPublisher;
+    #[async_trait::async_trait]
+    impl LeasePublisher for NeverPublisher {
+        async fn publish_lease(&self, _event: &NostrEvent) -> anyhow::Result<()> {
+            panic!("the distributed co-gate must fail closed BEFORE any lease is signed or published");
+        }
+    }
+
+    /// A DISTRIBUTED keystore (placement.json present) makes a lease claim fail closed with the
+    /// co-gate error -- never signing via the co-located loader. RED-on-revert: remove the guard in
+    /// `claim_for` and the error changes (load_quorum_signer_at fails "not provisioned" instead of
+    /// the co-gate message), so this assertion no longer holds -- the guard bites.
+    #[tokio::test]
+    async fn distributed_keystore_lease_claim_fails_closed() {
+        // The guard keys off placement.json presence BEFORE loading any signer, so a bare dir with
+        // a placement.json file suffices (no full distributed keystore needed).
+        let dir = std::env::temp_dir().join(format!(
+            "kirby-inc2-lease-cogate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("placement.json"), b"{\"holders\":[]}").unwrap();
+        assert!(crate::keyset_provisioning::is_distributed_keystore(&dir));
+
+        const NODE: LeaseNodeId = 7;
+        let grantor = RelayLeaseGrantor::new(NODE, std::sync::Arc::new(NeverPublisher));
+        let err = match grantor.claim_for("agent-x", NODE, 1, &dir).await {
+            Ok(_) => panic!("a DISTRIBUTED keystore lease claim MUST fail closed (Inc2+3 ON-flip)"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("DISTRIBUTED") && err.contains("ON-flip"),
+            "the lease co-gate error must name the distributed keystore + the ON-flip, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("INC2a LEASE CO-GATE PASS (fail-closed): {err}");
     }
 }

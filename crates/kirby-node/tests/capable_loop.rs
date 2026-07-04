@@ -480,6 +480,7 @@ async fn capable_vm_boots_plans_acts_verifies_and_dies_when_broke() {
         snapshot_capable: false,
         restore_checkpoint: None,
         lease_fence: None,
+        cosign: std::sync::Arc::new(kirby_node::relay_transport::AgentCosign::none()),
         egress: None,
     };
 

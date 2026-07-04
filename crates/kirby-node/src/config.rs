@@ -422,6 +422,20 @@ pub struct IdentityConfig {
     /// serialization into the child `kirby.toml`.
     #[serde(default)]
     pub dm_under_q: bool,
+    /// INC2a distributed-signing ON-flip gate. Distributed FROST signing (the sovereign Q signs
+    /// over REMOTE holders via the co-sign relay transport) engages IFF this is `true` AND the
+    /// keystore is distributed (a `placement.json` is present). Defaults FALSE, so `placement.json`
+    /// ALONE is INERT — the agent stays on the co-located path and builds NO co-sign hub, even if
+    /// the manifest exists. This decouples the ENABLE decision from mere file presence: a future
+    /// distributed-provision-at-spawn writes `placement.json`, and presence-alone would otherwise
+    /// silently auto-engage distributed signing.
+    ///
+    /// DO NOT enable until BOTH close: #48 (half-open reconnect RED-on-revert proof) and #49
+    /// (per-agent ceremony serialization). Enabling earlier is a MONEY-SAFETY VIOLATION — the shared
+    /// co-sign hub demuxes replies by a single per-holder channel, so concurrent beacon/voice/DM
+    /// ceremonies clobber each other's reply routes.
+    #[serde(default)]
+    pub distributed_signing_enabled: bool,
 }
 
 impl IdentityConfig {
