@@ -3326,6 +3326,11 @@ mod tests {
         /// attempt 1 succeed (Some) for the SAME source. An exhausted queue yields None (bodyless).
         /// A URL absent here falls back to `fetch_response` (the single-body default).
         fetch_script: HashMap<String, std::collections::VecDeque<Option<HttpResponse>>>,
+        /// Per-call `nostr.dm_reply` transport-error script (O3-3 cache-reuse tooth): each DM reply
+        /// call POPS the next flag; `true` => the call errors (transport Transient), like a lost RPC,
+        /// WITHOUT touching the same-tick fetches. An empty/exhausted queue => the call proceeds
+        /// normally. Mirrors `fetch_script`'s per-attempt sequencing, DM-side.
+        dm_call_errors: std::collections::VecDeque<bool>,
         /// Every Actuate request's decoded payload (the NostrPublish), so a test can assert the
         /// EXACT content + kind that reached the gateway (P2: one publish, sanitized content).
         published: Vec<NostrPublish>,
@@ -3449,6 +3454,16 @@ mod tests {
             // test can assert the idempotency key, but the genome sees a transport error).
             if self.actuate_errors && matches!(&req.act, Some(Act::Actuate(_))) {
                 return Err(tonic::Status::unavailable("simulated transient actuate failure"));
+            }
+            // O3-3: a per-call DM transport-error script -- error ONLY this `nostr.dm_reply` call
+            // (not the same-tick fetches) when the queue's next flag is `true`, so a test can drive
+            // a Transient DM delivery followed by a successful retry off the cached answer.
+            if let Some(Act::Actuate(a)) = &req.act {
+                if a.kind == ACTUATE_KIND_NOSTR_DM_REPLY
+                    && matches!(self.dm_call_errors.pop_front(), Some(true))
+                {
+                    return Err(tonic::Status::unavailable("simulated transient dm_reply failure"));
+                }
             }
             let receipt = match req.act {
                 Some(Act::Completion(_)) => CapabilityReceipt {
@@ -4369,6 +4384,123 @@ mod tests {
             50,
             "an above-floor quote passes through unchanged (the floor is a MIN, not a fixed price)"
         );
+    }
+
+    /// TOOTH (O3-3, n=2 boundary): EXACTLY 2 of the 3 sources answer (the 3rd persistently fails).
+    /// Two is the minimum quorum, so the paid job must deliver a FULL attestation -- the median of
+    /// the two, both source values shown, and a vouching note -- NOT "unavailable". This locks the
+    /// exactly-at-quorum boundary directly (the n=3 distinct-keys test only exercises it above).
+    #[tokio::test]
+    async fn oracle_o2_exactly_two_sources_at_quorum_delivers_median_vouch() {
+        let sender = dm_sender_hex(17);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &sender, "PRICE BTC/USD")
+            .with_payment_settled(2, &oracle_charge_id(1), 10);
+        // coinbase=100.00 and kraken=102.00 answer; coingecko persistently fails -> exactly 2 of 3.
+        // Single-shape bodies so each extractor reads only its own field.
+        gw.fetch_script.insert(
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot".to_string(),
+            [ok_body(br#"{"data":{"amount":"100.00"}}"#)].into_iter().collect(),
+        );
+        gw.fetch_script.insert(
+            "https://api.kraken.com/0/public/Ticker?pair=XBTUSD".to_string(),
+            [ok_body(br#"{"result":{"XXBTZUSD":{"c":["102.00","0.1"]}}}"#)].into_iter().collect(),
+        );
+        gw.fetch_script.insert(
+            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd".to_string(),
+            [None, None].into_iter().collect(),
+        );
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        let out = oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(matches!(out, TickOutcome::Lived { action: Action::DmReply { .. }, .. }));
+        let doc = &gw.dm_replies[1].text;
+        assert!(doc.contains("median of 2 of 3 sources"), "exactly-2 quorum is met: {doc}");
+        assert!(
+            doc.contains("101.00 USD"),
+            "median of 100.00 & 102.00 = 101.00 (mean of the two sorted): {doc}"
+        );
+        assert!(
+            doc.contains("coinbase=100.00") && doc.contains("kraken=102.00"),
+            "at quorum BOTH source values are shown: {doc}"
+        );
+        assert!(
+            doc.to_ascii_lowercase().contains("vouch"),
+            "at quorum the note vouches for the values: {doc}"
+        );
+    }
+
+    /// TOOTH (O3-3, cache-reuse): a paid quote's answer is built + fetched EXACTLY ONCE and reused
+    /// on a delivery retry -- never re-fetched per delivery (which would be unbounded egress on one
+    /// paid quote). We drive the first answer DM to a transport-Transient, then re-tick the SAME
+    /// (still-unacked) settlement: the cache short-circuit returns the cached answer BEFORE any
+    /// fetch. The tooth: the second tick records NO new `oracle-fetch-*` keys and delivers the
+    /// IDENTICAL text. A future refactor that moves the fetch ahead of the cache check would fetch
+    /// again on the re-tick (new keys at the new seq) -> RED.
+    #[tokio::test]
+    async fn oracle_cached_answer_reused_on_retick_without_refetch() {
+        let sender = dm_sender_hex(18);
+        let params = test_params();
+        let mut gw = MockGateway::thinking("CHARGE:10")
+            .with_dm(1, &sender, "PRICE BTC/USD")
+            .with_payment_settled(2, &oracle_charge_id(1), 10);
+        // All 3 sources answer via the default combined body (the first build reaches quorum).
+        gw.fetch_response = ok_body(
+            br#"{"data":{"amount":"100.00"},"result":{"XXBTZUSD":{"c":["101.00","0.1"]}},"bitcoin":{"usd":110}}"#,
+        );
+        // The invoice DM (tick 1) succeeds; the FIRST answer DM (tick 2) errors -> Transient.
+        gw.dm_call_errors = [false, true].into_iter().collect();
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        // Tick 1: DM -> charge + invoice.
+        oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        let charge_id = oracle_charge_id(1);
+
+        let fetch_keys = |gw: &MockGateway| -> std::collections::HashSet<String> {
+            gw.requests
+                .iter()
+                .filter_map(|r| match &r.act {
+                    Some(Act::Actuate(a)) if a.kind == ACTUATE_KIND_HTTP_FETCH => {
+                        Some(r.idempotency_key.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Tick 2 (seq 2): settlement -> build (fetch) -> answer DM errors -> Transient, not removed.
+        let out = oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(matches!(out, TickOutcome::Transient), "the errored answer DM -> Transient: {out:?}");
+        let keys_1 = fetch_keys(&gw);
+        assert!(!keys_1.is_empty(), "the first build fetched (recorded oracle-fetch keys)");
+        assert_eq!(gw.dm_replies.len(), 1, "only the invoice DELIVERED; the errored answer DM did not");
+        let cached = pending
+            .get(&charge_id)
+            .and_then(|pc| pc.answer.clone())
+            .expect("the answer is cached in the PendingCharge after the first build");
+
+        // Tick 3 (seq 3, a NEW seq): the SAME still-unacked settlement is re-read; cached_answer is
+        // Some -> the cache short-circuit returns it BEFORE any fetch, and the DM now delivers.
+        let out = oracle_tick(&mut gw, 3, &mut ack, &mut pending, &params, 1_000, 5).await;
+        assert!(
+            matches!(out, TickOutcome::Lived { action: Action::DmReply { .. }, .. }),
+            "the retick delivers the cached answer: {out:?}"
+        );
+        let keys_2 = fetch_keys(&gw);
+        assert_eq!(
+            keys_2, keys_1,
+            "the retick reused the cache -> NO new oracle-fetch keys (a re-fetch would add seq-3 keys): {keys_2:?} vs {keys_1:?}"
+        );
+        assert_eq!(gw.dm_replies.len(), 2, "now the answer DM DELIVERED (invoice + answer)");
+        assert_eq!(
+            gw.dm_replies[1].text, cached,
+            "the delivered answer is byte-identical to the first build (cache, not a re-fetch)"
+        );
+        assert!(pending.is_empty(), "the delivered charge is cleared from the waiting-set");
     }
 
     // ---- NIP-17 DM arm (task #12): busy-flag one-at-a-time + reply-to-the-seal-verified-sender ----
