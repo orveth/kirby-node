@@ -3553,6 +3553,25 @@ pub struct LightningSettlement {
     backup_notifier: Option<BackupDirtyNotifier>,
 }
 
+/// Mark the NIP-60 backup dirty (when a notifier is wired), THEN compute the fallible total of the
+/// freshly-minted proofs. The ORDER is money-safety load-bearing: the proofs are durable the
+/// instant `wallet.mint()` returns Ok, so the backup flag MUST flip BEFORE the fallible
+/// `total_amount()` — otherwise a totaling error (a u64 overflow of the summed proofs) would
+/// early-return with the just-minted, durable proofs never marked for backup, stranding them
+/// unmirrored on a failover restore (real sats-loss). Marking dirty is a cheap lock (no await, no
+/// network) that can never block or fail a settlement. Split out so the mark-BEFORE-total ordering
+/// is unit-testable — the live fresh-mint path cannot force a `total_amount` failure with a real
+/// wallet.
+fn mark_dirty_then_total(
+    notifier: &Option<BackupDirtyNotifier>,
+    total: impl FnOnce() -> anyhow::Result<u64>,
+) -> anyhow::Result<u64> {
+    if let Some(notifier) = notifier {
+        notifier.mark_dirty();
+    }
+    total()
+}
+
 impl LightningSettlement {
     /// Build a settlement over the host-held wallet with the DEFAULT loud-error stranded sink.
     /// Existing callers are unchanged: a durable sink is opt-in via [`Self::with_stranded_sink`].
@@ -3939,19 +3958,20 @@ impl SettlementProvider for LightningSettlement {
             .mint(charge_id, cdk::amount::SplitTarget::default(), None)
             .await
             .map_err(|e| anyhow::anyhow!("mint bolt11-settled ecash for {charge_id}: {e}"))?;
-        let minted: u64 = proofs
-            .total_amount()
-            .map_err(|e| anyhow::anyhow!("total the minted proofs for {charge_id}: {e}"))?
-            .into();
         // The mint materialized the proofs into the wallet's cdk store (the truth, already durable).
-        // Mark the NIP-60 backup dirty so the NEXT flush mirrors these freshly-minted proofs to the
-        // relay backup WITHOUT waiting for a later spend — the failover sats-loss guard. A settlement
-        // mint writes straight into the raw wallet (bypassing the Nip60BackedEcash decorator), so
-        // this notifier is the ONLY thing that flips dirty for a minted settlement proof. Cheap (no
-        // await/network under the lock); can never block or fail the settlement.
-        if let Some(notifier) = &self.backup_notifier {
-            notifier.mark_dirty();
-        }
+        // Mark the NIP-60 backup dirty IMMEDIATELY — BEFORE the fallible total below — so the NEXT
+        // flush mirrors these freshly-minted proofs to the relay backup WITHOUT waiting for a later
+        // spend (the failover sats-loss guard) AND a totaling error can never strand them unmarked.
+        // A settlement mint writes straight into the raw wallet (bypassing the Nip60BackedEcash
+        // decorator), so this notifier is the ONLY thing that flips dirty for a minted settlement
+        // proof. `mark_dirty_then_total` enforces the mark-BEFORE-total ordering (unit-tested); the
+        // mark is a cheap lock (no await/network) that can never block or fail the settlement.
+        let minted: u64 = mark_dirty_then_total(&self.backup_notifier, || {
+            Ok(proofs
+                .total_amount()
+                .map_err(|e| anyhow::anyhow!("total the minted proofs for {charge_id}: {e}"))?
+                .into())
+        })?;
         tracing::info!(
             charge_id,
             minted_sats = minted,
@@ -4008,5 +4028,55 @@ mod lightning_settlement_gate_tests {
             ensure_quote_paid(MintQuoteState::Issued).is_err(),
             "the freshly-mintable gate must reject an already-ISSUED quote (double-mint guard)"
         );
+    }
+}
+
+#[cfg(test)]
+mod settlement_backup_ordering_tests {
+    //! FIX 2 (bolt11 1b rev2): the fresh-mint path marks the NIP-60 backup dirty BEFORE the
+    //! FALLIBLE `total_amount()`. `mark_dirty_then_total` is the ordering seam the real path uses;
+    //! here we drive it with a `total` that ERRORS and assert the backup was STILL marked dirty.
+    //!
+    //! RED-on-revert: reorder `mark_dirty_then_total` to run `total()` first and mark dirty after
+    //! (the pre-fix ordering) — an erroring total early-returns before the flag flips, so `dirty`
+    //! stays false and `mark_dirty_fires_before_a_failing_total` fails. That is exactly the
+    //! failover sats-loss the fix closes: a totaling error would leave freshly-minted, durable
+    //! settlement proofs unmirrored on a restore-from-relay.
+    use super::{mark_dirty_then_total, BackupDirtyNotifier, BackupState};
+    use std::sync::{Arc, Mutex};
+
+    fn state_and_notifier() -> (Arc<Mutex<BackupState>>, BackupDirtyNotifier) {
+        let state = Arc::new(Mutex::new(BackupState { live_ids: Vec::new(), dirty: false }));
+        let notifier = BackupDirtyNotifier { state: state.clone() };
+        (state, notifier)
+    }
+
+    #[test]
+    fn mark_dirty_fires_before_a_failing_total() {
+        let (state, notifier) = state_and_notifier();
+        let out = mark_dirty_then_total(&Some(notifier), || {
+            Err(anyhow::anyhow!("total the minted proofs: amount overflow"))
+        });
+        assert!(out.is_err(), "a failing total still propagates its error (the credit is gated on it)");
+        assert!(
+            state.lock().unwrap().dirty,
+            "the backup was marked dirty BEFORE the fallible total — freshly-minted, durable proofs \
+             are never stranded unmirrored by a totaling error (RED if mark_dirty runs AFTER total)"
+        );
+    }
+
+    #[test]
+    fn total_passes_through_and_marks_dirty_on_success() {
+        let (state, notifier) = state_and_notifier();
+        let out = mark_dirty_then_total(&Some(notifier), || Ok(4242)).expect("ok total");
+        assert_eq!(out, 4242, "the mint-verified total threads through unchanged");
+        assert!(state.lock().unwrap().dirty, "a successful mint also marks the backup dirty");
+    }
+
+    #[test]
+    fn no_notifier_is_a_noop_and_still_totals() {
+        // NIP-60 not configured: no notifier, nothing to mirror to — the total still threads through.
+        let out = mark_dirty_then_total(&None, || Ok(7)).expect("ok total");
+        assert_eq!(out, 7);
     }
 }

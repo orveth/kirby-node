@@ -1725,6 +1725,36 @@ fn load_api_key(path: &str) -> anyhow::Result<String> {
     Ok(key)
 }
 
+/// The inbound-event allowlist for a boot session. NIP-17 DMs (task #12) permit `DirectMessage`;
+/// a wired settlement provider (Inc 1b) permits `PaymentSettled` so the earn/oracle loop's
+/// settled-poll is DELIVERABLE through the gateway (`PollInbox` delivers only
+/// `want_kinds ∩ allowlist`, gateway.rs) — without this a settlement-wired agent enqueues a
+/// `PaymentSettled` on a credit that the genome can never poll. Kept as a free fn so the boot
+/// wiring and its tooth share ONE source of truth. An agent with neither DMs nor settlement gets
+/// an EMPTY allowlist (inbound disabled, default-deny) — byte-identical to pre-1b.
+pub(crate) fn boot_inbound_allowlist(
+    dm_enabled: bool,
+    settlement_wired: bool,
+) -> Vec<kirby_proto::InboundKind> {
+    let mut kinds = Vec::new();
+    if dm_enabled {
+        kinds.push(kirby_proto::InboundKind::DirectMessage);
+    }
+    if settlement_wired {
+        kinds.push(kirby_proto::InboundKind::PaymentSettled);
+    }
+    kinds
+}
+
+/// Whether to attach the gateway's [`InboundQueue`](crate::nerve::InboundQueue). BOTH inbound
+/// producers need it: the NIP-17 DM task feeds it (DM path) and `settle_charge` enqueues
+/// `PaymentSettled` onto it (settlement path) — so it is attached when EITHER is wired. ★The DM
+/// TASK spawn stays SEPARATELY `dm_enabled`-gated below (a settlement-only, DM-disabled agent
+/// attaches the queue for the settled-poll but must NOT reach the DM task's `dm_key_path.expect`).
+pub(crate) fn boot_attaches_inbound_queue(dm_enabled: bool, settlement_wired: bool) -> bool {
+    dm_enabled || settlement_wired
+}
+
 /// As [`boot_and_observe`], but the caller supplies the [`Rail`] the gateway's
 /// perform step (spec 3.2 step 4) uses. The C-6 brokered act (gate G5) passes the
 /// real [`crate::rail::CdkEcashRail`] so a genome `RequestCapability` settles ecash
@@ -1768,15 +1798,15 @@ pub async fn boot_and_observe_with_rail(
         .as_ref()
         .map(|s| s.dm_key_path.is_some() || s.dm_under_q)
         .unwrap_or(false);
+    // Inc 1b (FIX 1): a wired settlement provider makes `PaymentSettled` allowlisted + the inbound
+    // queue attached, so the earn/oracle loop's settled-poll is deliverable in production. Read
+    // `.is_some()` BEFORE `settlement` is moved into the gateway attach below.
+    let settlement_wired = settlement.is_some();
     let session = Session {
         task_descriptor: config.task.clone(),
         budget_sats: config.budget_sats,
         allowlisted_destinations: config.allow.clone(),
-        allowlisted_inbound_kinds: if dm_enabled {
-            vec![kirby_proto::InboundKind::DirectMessage]
-        } else {
-            Vec::new()
-        },
+        allowlisted_inbound_kinds: boot_inbound_allowlist(dm_enabled, settlement_wired),
     };
     // The meter and the gateway share ONE treasury instance (one authoritative
     // counter, D-9): metered ticks and capability spends debit the same balance.
@@ -1788,9 +1818,11 @@ pub async fn boot_and_observe_with_rail(
     if let Some(provider) = settlement {
         service = service.with_settlement_provider_dyn(provider);
     }
-    // Attach the inbound queue (the consumer side) when DMs are enabled; the run_dm_inbound task
-    // (spawned after the VM is up) feeds the SAME handle.
-    let inbox_queue = if dm_enabled {
+    // Attach the inbound queue (the consumer side) when DMs are enabled OR a settlement provider is
+    // wired: the run_dm_inbound task (DM path) and `settle_charge`'s PaymentSettled enqueue
+    // (settlement path) both feed the SAME handle. The DM TASK spawn stays `dm_enabled`-gated below
+    // — a settlement-only, DM-disabled agent attaches the queue but spawns no DM task.
+    let inbox_queue = if boot_attaches_inbound_queue(dm_enabled, settlement_wired) {
         let queue = crate::nerve::InboundQueue::new();
         service = service.with_inbound_queue(queue.clone());
         Some(queue)
@@ -1909,8 +1941,12 @@ pub async fn boot_and_observe_with_rail(
     // kind:10050 inbox-relay list (best-effort -- a relay hiccup must not fail boot), then run the
     // producer that feeds the gateway's inbox queue. The task is torn down with the run via the
     // oneshot sender held in the ServeGuard (dropping it fires run_dm_inbound's shutdown arm).
-    let dm_shutdown = match (inbox_queue, config.social.as_ref()) {
-        (Some(queue), Some(social)) => {
+    // ★ The DM inbound task is DM-gated (dm_enabled), NOT merely queue-gated: a settlement-only,
+    // DM-disabled agent has `inbox_queue = Some(..)` (for the settled-poll) but MUST NOT spawn the
+    // DM task or reach its `dm_key_path.expect` below. Requiring `dm_enabled` here keeps the DM
+    // path exactly as before while the queue serves PaymentSettled.
+    let dm_shutdown = match (dm_enabled, inbox_queue, config.social.as_ref()) {
+        (true, Some(queue), Some(social)) => {
             // The NIP-17 DM identity, built ONCE (used for the kind:10050 publish + run_dm_inbound).
             // BORN-UNIFIED (P1, gated on `dm_under_q` + a FROST keystore): the identity IS the group
             // key Q -- a QSigner so the 10050 signs under Q and inbound DMs unwrap under Q via
@@ -2494,5 +2530,102 @@ mod config_plane_tests {
             assert_wallet_backs_counter(0, 50_000).is_err(),
             "the Assert path on a transiently-0 wallet bails — the false-broke the fix prevents"
         );
+    }
+}
+
+#[cfg(test)]
+mod bolt11_settlement_inbound_wiring_tests {
+    //! FIX 1 (bolt11 1b rev2): production must be able to DELIVER `PaymentSettled` to the genome.
+    //! Boot allowlists `PaymentSettled` and attaches the inbound queue WHENEVER a settlement
+    //! provider is wired (not only when DMs are enabled), so the oracle/earn loop's settled-poll
+    //! (`poll_one_oracle_event` / `poll_one_payment_settled`, want_kinds:[PaymentSettled]) is
+    //! deliverable. This drives the SAME `boot_inbound_allowlist` + `boot_attaches_inbound_queue`
+    //! the boot path uses — for a settlement-wired, DM-DISABLED agent — and asserts a queued
+    //! `PaymentSettled` polls back through the gateway.
+    //!
+    //! RED-on-revert: change `boot_inbound_allowlist` to omit `PaymentSettled` (or
+    //! `boot_attaches_inbound_queue` to `dm_enabled` only) and the poll returns an EMPTY batch:
+    //! the settled notice is undeliverable in production — exactly the latent trap this fix closes.
+    use super::{boot_attaches_inbound_queue, boot_inbound_allowlist};
+    use crate::gateway::{GatewayService, Session};
+    use crate::nerve::InboundQueue;
+    use crate::rail::MockRail;
+    use crate::treasury::Treasury;
+    use kirby_proto::node_gateway_server::NodeGateway;
+    use kirby_proto::{InboundKind, InboxRequest, PaymentSettled};
+    use prost::Message as _;
+    use std::sync::Arc;
+
+    #[test]
+    fn allowlist_and_queue_track_settlement_and_dm_independently() {
+        // Neither: inbound disabled (default-deny, byte-identical to pre-1b).
+        assert!(boot_inbound_allowlist(false, false).is_empty());
+        assert!(!boot_attaches_inbound_queue(false, false));
+        // Settlement only: PaymentSettled allowlisted + queue attached, but NO DirectMessage.
+        let s = boot_inbound_allowlist(false, true);
+        assert!(s.contains(&InboundKind::PaymentSettled) && !s.contains(&InboundKind::DirectMessage));
+        assert!(boot_attaches_inbound_queue(false, true));
+        // DM only: DirectMessage allowlisted + queue attached, but NO PaymentSettled.
+        let d = boot_inbound_allowlist(true, false);
+        assert!(d.contains(&InboundKind::DirectMessage) && !d.contains(&InboundKind::PaymentSettled));
+        assert!(boot_attaches_inbound_queue(true, false));
+        // Both: both kinds allowlisted.
+        let b = boot_inbound_allowlist(true, true);
+        assert!(b.contains(&InboundKind::DirectMessage) && b.contains(&InboundKind::PaymentSettled));
+    }
+
+    #[tokio::test]
+    async fn settlement_wired_dm_disabled_agent_delivers_payment_settled() {
+        // A settlement-only agent: DMs OFF, a settlement provider wired.
+        let dm_enabled = false;
+        let settlement_wired = true;
+
+        let treasury = Treasury::open_temporary(1_000).expect("open temporary treasury");
+        let session = Session {
+            task_descriptor: "settlement-only".into(),
+            budget_sats: 1_000,
+            allowlisted_destinations: Vec::new(),
+            allowlisted_inbound_kinds: boot_inbound_allowlist(dm_enabled, settlement_wired),
+        };
+        let queue = InboundQueue::new();
+        let mut service = GatewayService::new(treasury, Arc::new(MockRail::new()), session);
+        if boot_attaches_inbound_queue(dm_enabled, settlement_wired) {
+            service = service.with_inbound_queue(queue.clone());
+        }
+
+        // The daemon enqueues a PaymentSettled on a genuine credit (the `settle_charge` path).
+        let payload =
+            PaymentSettled { charge_id: "charge-xyz".into(), verified_sats: 21 }.encode_to_vec();
+        queue.push_typed(
+            InboundKind::PaymentSettled,
+            payload,
+            String::new(),
+            0,
+            "charge-xyz".into(),
+        );
+
+        // The genome's settled-poll: want_kinds narrowed to [PaymentSettled].
+        let resp = service
+            .poll_inbox(tonic::Request::new(InboxRequest {
+                schema_version: kirby_proto::SCHEMA_VERSION,
+                want_kinds: vec![InboundKind::PaymentSettled as i32],
+                ack_seq: 0,
+                wait_ms: 0,
+            }))
+            .await
+            .expect("poll_inbox")
+            .into_inner();
+
+        assert_eq!(
+            resp.events.len(),
+            1,
+            "the queued PaymentSettled is deliverable end-to-end for a settlement-wired agent \
+             (RED if the allowlist omits PaymentSettled or the queue is not attached)"
+        );
+        let ev = &resp.events[0];
+        assert_eq!(ev.kind, InboundKind::PaymentSettled as i32);
+        let decoded = PaymentSettled::decode(ev.payload.as_slice()).expect("decode PaymentSettled");
+        assert_eq!(decoded.verified_sats, 21);
+        assert_eq!(decoded.charge_id, "charge-xyz");
     }
 }
