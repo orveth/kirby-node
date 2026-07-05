@@ -116,20 +116,35 @@ impl WalletConfigContent {
     /// a parse failure is relay corruption, not a normal case; dropping one keyset's floor (mint
     /// remains truth; only that keyset is at risk, logged loudly) is safer than failing the boot.
     pub fn counters_by_id(&self) -> HashMap<Id, u32> {
-        self.counters
+        self.counters_by_id_checked().0
+    }
+
+    /// As [`Self::counters_by_id`], but ALSO returns whether ANY keyset was DROPPED (an unparseable
+    /// hex id) — the config-plane ROUND-4 category (d) HOLEY-FLOOR signal. `dropped=true` means this
+    /// config floor read is INCOMPLETE (a keyset's floor is missing), so the caller must fail-closed
+    /// and DEFER establishment: the per-db establishment latch is global but the floor is per-keyset,
+    /// and establishing on a partial floor would let the dropped keyset derive from index 0 = NUT-13
+    /// reuse. The drop behavior is UNCHANGED (still logged + skipped); we merely SIGNAL incompleteness.
+    pub fn counters_by_id_checked(&self) -> (HashMap<Id, u32>, bool) {
+        let mut dropped = false;
+        let map = self
+            .counters
             .iter()
             .filter_map(|(hex, &counter)| match hex.parse::<Id>() {
                 Ok(id) => Some((id, counter)),
                 Err(e) => {
+                    dropped = true;
                     tracing::warn!(
                         keyset_hex = %hex,
                         error = %e,
-                        "NIP-60 load: dropping a counter with an unparseable keyset id (corruption)"
+                        "NIP-60 load: dropping a counter with an unparseable keyset id (corruption) — \
+                         config floor read marked HOLEY (establishment defers, category (d))"
                     );
                     None
                 }
             })
-            .collect()
+            .collect();
+        (map, dropped)
     }
 }
 
@@ -442,6 +457,11 @@ pub struct ReconcileRead {
     pub read_k: usize,
     /// `served >= read_k` — the boot solvency gate uses this to decide Assert vs Proceed.
     pub authoritative: bool,
+    /// §K3 (config-plane ROUND-4): `false` when at least one self-authored 7375 event FAILED to
+    /// decrypt — the read is DEGRADED (a genuine backup we could not read; its id is EXCLUDED from
+    /// `fetched_ids`). The boot/retry paths fold this into `restore_ok` so recovery_complete stays
+    /// CLOSED against an incomplete candidate set (never del-chain / roll over a backup we couldn't read).
+    pub decode_ok: bool,
 }
 
 /// The result of a quorum-aware config-floor read (returned by [`Nip60Store::load_config_quorum`],
@@ -498,9 +518,10 @@ pub struct Nip60Store {
     /// with `read_established` (finding 1 + R2-#3 — during the post-establish/pre-recovery window the
     /// wallet is transiently-empty, so an empty rollover would del-chain the real 7375 backups).
     /// `recovery_complete` opens ONLY after restore AND drain both succeed — a STRUCTURAL
-    /// frozen-until-recovery guard, not order-dependent. Defaults `true` (a bare/test store publishes
-    /// freely, same posture as `read_established` in the test constructors); the boot path injects the
-    /// deferred latch so a boot cannot publish/rollover until recovery completes.
+    /// frozen-until-recovery guard, not order-dependent. §N1 (config-plane ROUND-4): the PRODUCTION
+    /// `connect` constructor defaults this FALSE (fail-closed — a missing/reordered boot wiring keeps
+    /// the gate SHUT, not open); the boot path injects the deferred shared latch. The `#[cfg(test)]`
+    /// constructors default `true` (a bare store that goes straight to `rollover` publishes freely).
     recovery_complete: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -543,9 +564,12 @@ impl Nip60Store {
             read_timeout: Duration::from_secs(NIP60_READ_TIMEOUT_SECS),
             mint_allowlist,
             read_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            // Defaults TRUE; the boot path overwrites it with the shared recovery-complete latch via
-            // `set_recovery_complete` BEFORE any publish/rollover (all writes are gated below).
-            recovery_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            // §N1 (config-plane ROUND-4) FAIL-CLOSED DEFAULT: defaults FALSE (gate SHUT), consistent
+            // with `read_established`'s fail-closed default beside it. Production behavior is identical
+            // — the boot path overwrites this with the shared recovery-complete latch via
+            // `set_recovery_complete` BEFORE any publish/rollover — but any missing/reordered wiring
+            // then fails CLOSED (no publish/rollover) rather than OPEN (a thin head / empty rollover).
+            recovery_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -685,16 +709,33 @@ impl Nip60Store {
         );
         let mut fetched_ids: Vec<String> = Vec::with_capacity(per.events.len());
         let mut decoded: Vec<(String, TokenEventContent)> = Vec::new();
+        // §K3 (config-plane ROUND-4) DECODE FAIL-CLOSED: a self-authored 7375 event we CANNOT decrypt
+        // is a GENUINE backup we could not READ (a rotated/legacy encryption key, or corruption — the
+        // author filter is our own pubkey, so it is ours). `decode_ok` goes false so the caller forces
+        // restore_ok=false (recovery_complete stays closed against an incomplete candidate set).
+        let mut decode_ok = true;
         for ev in per.events.into_iter() {
             let id_hex = ev.id.to_hex();
-            fetched_ids.push(id_hex.clone());
             match self.crypto.decrypt(&ev.content) {
-                Ok(content) => decoded.push((id_hex, content)),
-                Err(e) => tracing::warn!(
-                    event_id = %ev.id,
-                    error = %e,
-                    "NIP-60 reconcile: skipping an undecryptable token event (foreign under our author)"
-                ),
+                Ok(content) => {
+                    // Push the id ONLY after a successful decode: the id seeds the flusher's live-id /
+                    // deletion set (rollover del-chains it). ★ deletion-never-delete-unread — NEVER
+                    // del-chain a backup we could not decrypt (K3): an undecryptable id must NOT enter
+                    // fetched_ids/live_ids, else the first rollover del-chains a genuine backup we
+                    // couldn't read = LOSS. So the push lives INSIDE the Ok arm.
+                    fetched_ids.push(id_hex.clone());
+                    decoded.push((id_hex, content));
+                }
+                Err(e) => {
+                    decode_ok = false;
+                    tracing::warn!(
+                        event_id = %ev.id,
+                        error = %e,
+                        "NIP-60 reconcile: undecryptable self-authored 7375 event — EXCLUDED from the \
+                         live-id/deletion set (never del-chain an unread backup) AND the read marked \
+                         DEGRADED (decode_ok=false → recovery defers, K3)"
+                    );
+                }
             }
         }
         let candidates = reconcile_token_set(&decoded, &self.mint_allowlist);
@@ -705,6 +746,7 @@ impl Nip60Store {
             total: per.total,
             read_k: self.read_k,
             authoritative,
+            decode_ok,
         })
     }
 
@@ -3297,6 +3339,112 @@ mod tests {
             !old_gate && should_spawn_config_retry(false, false),
             "the OLD `!established` gate skips the seam the NEW gate catches (F3 fix)"
         );
+    }
+
+    // ---- T24 (config-plane ROUND-4, K3 — decode fail-closed, deletion-side): an UNDECRYPTABLE
+    // self-authored 7375 event marks the read DEGRADED (`decode_ok=false`, folded into restore_ok →
+    // recovery defers) AND its id is EXCLUDED from `fetched_ids` (so it never seeds live_ids/deletion →
+    // the first rollover cannot del-chain a genuine backup we could not read). deletion-never-delete-unread.
+    //
+    // RED-on-revert: move the `fetched_ids.push` back BEFORE the decrypt (and drop the `decode_ok=false`
+    // on the Err arm) → the undecryptable id re-enters fetched_ids AND decode_ok stays true → both
+    // asserts fail → RED (the undecryptable backup would be del-chained + recovery would converge).
+    #[tokio::test]
+    async fn t24_undecryptable_backup_excluded_from_deletion_and_marks_degraded() {
+        let crypto = test_crypto(0x78);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+
+        // Seed an UNDECRYPTABLE self-authored 7375 event: signed under OUR key (so the author filter
+        // returns it) but its content is NOT valid NIP-44 ciphertext → `crypto.decrypt` fails. This
+        // stands in for a rotated/legacy encryption key or corruption — a genuine backup we can't read.
+        let outcome = transport
+            .send_event(KIND_NIP60_TOKEN, "not-valid-nip44-ciphertext".to_string(), Vec::new())
+            .await
+            .expect("seed a raw undecryptable self-authored token event");
+        let undecryptable_id = outcome.event_id.to_hex();
+
+        let read = store.reconcile_on_load_with_ids().await.expect("reconcile");
+        assert!(
+            !read.decode_ok,
+            "K3: an undecryptable self-authored 7375 event marks the read DEGRADED (decode_ok=false)"
+        );
+        assert!(
+            !read.fetched_ids.contains(&undecryptable_id),
+            "K3: the undecryptable backup's id is EXCLUDED from fetched_ids (never del-chain an unread \
+             backup — revert push-before-decrypt → id present → RED). fetched_ids={:?}",
+            read.fetched_ids
+        );
+        // Boot folds decode_ok into restore_ok: even a genuinely-successful restore is forced to
+        // restore_ok=false when the read is degraded → recovery_complete stays closed.
+        let restore_ok =
+            crate::nip60_reconcile::RestoreOutcome::Restored { imported: 0 }.is_ok() && read.decode_ok;
+        assert!(
+            !restore_ok,
+            "K3: a degraded decode forces restore_ok=false (recovery_complete stays CLOSED, backup preserved)"
+        );
+    }
+
+    // ---- T26 (config-plane ROUND-4, N1 — fail-closed default): the PRODUCTION `connect` constructor
+    // defaults `recovery_complete` FALSE (gate SHUT) BEFORE any boot wiring — consistent with
+    // `read_established`'s fail-closed default. Production behavior is identical (boot wires the shared
+    // latch), but a missing/reordered wiring then fails CLOSED (no publish/rollover), not OPEN.
+    //
+    // RED-on-revert: change the `connect` default back to `AtomicBool::new(true)` → a freshly-connected
+    // store has recovery_complete=TRUE before wiring → this assert fails → RED (a thin head / empty
+    // rollover could publish through an unwired store).
+    #[tokio::test]
+    async fn t26_connect_defaults_recovery_complete_closed() {
+        // A real connect() against a local (unreachable) relay still returns Ok — nostr connect is
+        // best-effort — so we can inspect the INITIAL recovery_complete default before any boot wiring.
+        let event_key = [0x79u8; 32];
+        let store = Nip60Store::connect(
+            &event_key,
+            &["ws://127.0.0.1:1".to_string()],
+            Some(1),
+            Some(1),
+            allow_m(),
+        )
+        .await
+        .expect("connect builds the store");
+        assert!(
+            !store.recovery_complete.load(std::sync::atomic::Ordering::SeqCst),
+            "N1: connect defaults recovery_complete CLOSED (false) — a missing/reordered wiring fails \
+             CLOSED, not OPEN (revert default→true → RED)"
+        );
+    }
+
+    // ---- T27 (config-plane ROUND-4, category (d), CONFIG-SOURCE half): `counters_by_id_checked`
+    // SIGNALS a dropped keyset. An unparseable-hex config keyset is skipped AND `dropped=true`; a
+    // clean config floor is `dropped=false`. This is the config read source the establishment guard
+    // (`floor_complete`) fails-closed on (the LOCAL source is covered in mint_rig T27, the DECISION in
+    // nip60_counter T27).
+    //
+    // RED-on-revert: stop setting `dropped=true` on an unparseable keyset in `counters_by_id_checked`
+    // (return `false`) → a holey config floor looks complete → establishment fires on it → the dropped
+    // keyset derives from index 0 = NUT-13 reuse → this `dropped` assert fails → RED.
+    #[test]
+    fn t27_config_counters_by_id_signals_a_dropped_keyset() {
+        // A clean config floor (well-formed hex) → not holey.
+        let clean = WalletConfigContent {
+            mints: vec![],
+            counters: std::collections::HashMap::from([("009a1f293253e41e".to_string(), 5u32)]),
+        };
+        let (clean_map, clean_dropped) = clean.counters_by_id_checked();
+        assert_eq!(clean_map.len(), 1, "the well-formed keyset parses");
+        assert!(!clean_dropped, "a clean config floor is NOT holey");
+
+        // A holey config floor: one good keyset + one unparseable-hex keyset → dropped=true.
+        let holey = WalletConfigContent {
+            mints: vec![],
+            counters: std::collections::HashMap::from([
+                ("009a1f293253e41e".to_string(), 5u32),
+                ("not-a-valid-keyset-hex".to_string(), 9u32),
+            ]),
+        };
+        let (holey_map, holey_dropped) = holey.counters_by_id_checked();
+        assert!(holey_dropped, "an unparseable config keyset marks the floor HOLEY (revert dropped→false → RED)");
+        assert_eq!(holey_map.len(), 1, "only the well-formed keyset is kept; the corrupt one is dropped");
     }
 
     // ---- T12 (config-plane REVISION, finding-2; R2-#3 RE-KEYED to recovery_complete): EVERY 17375

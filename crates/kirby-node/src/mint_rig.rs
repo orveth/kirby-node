@@ -140,6 +140,18 @@ impl WalletKey {
 /// below-quorum token read (can't confirm empty) OR present token backups → DEFER, never
 /// establish-at-0 against possibly-unread proofs (that would derive at index 0 = reuse). Callers
 /// with no relays (NIP-60 off) pass `true`/`true` (a genuinely-new local wallet).
+///
+/// `config_floor_dropped` (config-plane ROUND-4, category (d) — HOLEY-FLOOR-NOT-GENUINE): whether the
+/// config floor read that produced `initial_counters` DROPPED any keyset (an unparseable-hex keyset in
+/// [`crate::nip60::WalletConfigContent::counters_by_id_checked`]). Combined with the LOCAL read's own
+/// dropped signal ([`read_local_keyset_counters`]) into `floor_complete`; a holey floor from EITHER
+/// source DEFERS establishment (the per-db latch must not flip on a partial floor — else the dropped
+/// keyset derives from index 0 = NUT-13 reuse). Callers with no config drop (NIP-60 off, clean read)
+/// pass `false`.
+// The plane-read inputs (config/token authority + emptiness + holey signals) are each a distinct
+// money-safety decision the establishment gate consumes; grouping them into a struct would only
+// obscure the four-state + holey-floor logic. The arg count is deliberate.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_persistent_wallet(
     mint_url: &str,
     db_path: &Path,
@@ -148,6 +160,7 @@ pub async fn open_persistent_wallet(
     config_authoritative: bool,
     token_authoritative: bool,
     token_empty: bool,
+    config_floor_dropped: bool,
 ) -> anyhow::Result<(Arc<Wallet>, Arc<crate::nip60_counter::Nip60CounterDb>)> {
     // The store lives in db_path's directory; ensure it exists.
     if let Some(parent) = db_path.parent() {
@@ -174,7 +187,7 @@ pub async fn open_persistent_wallet(
     // a SECOND connection to the same live WAL db — intentional, and it mirrors production (the
     // background flusher + gateway share the store the same way). Fail-safe: an empty map on any
     // error == today's floor-only behavior (the floor still applies).
-    let local_map = read_local_keyset_counters(db_path);
+    let (local_map, local_floor_dropped) = read_local_keyset_counters(db_path);
 
     // Seed the mirror with the UNION-MAX of the loaded floor and the local counters: for every
     // keyset in EITHER set, take the higher of the two. This makes the publish-mirror COMPLETE (no
@@ -191,6 +204,15 @@ pub async fn open_persistent_wallet(
     // DEFERRED (state 2) — we cannot distinguish genuinely-new from restore-pending-on-an-unreached
     // relay, and fast-forwarding to a thin/stale floor would derive at reused NUT-13 indices.
     let resume = !local_map.is_empty();
+
+    // ★★★ INVARIANT #3 — HOLEY-FLOOR-NOT-GENUINE (config-plane ROUND-4, category (d)): the floor is
+    // GENUINE (complete) only when NEITHER read source dropped a keyset — the config floor read
+    // (`config_floor_dropped`, from `counters_by_id_checked`) AND the local counter read
+    // (`local_floor_dropped`, from `read_local_keyset_counters`). A holey floor from EITHER source
+    // must NOT flip the per-db establishment latch: the latch is global but the floor is per-keyset, so
+    // a dropped keyset would derive from index 0 = NUT-13 reuse. `floor_complete=false` DEFERS below
+    // (regardless of resume/config/token) — the ONE guard covering BOTH read sources.
+    let floor_complete = !(config_floor_dropped || local_floor_dropped);
 
     // Mirror the NUT-13 keyset counter through the NIP-60 decorator so it can travel in the
     // 17375 wallet-config for a cross-machine reconstruct. The mirror is SEEDED with `merged` (floor
@@ -210,7 +232,7 @@ pub async fn open_persistent_wallet(
     // (gate-exempt) to the seeded floor BEFORE the wallet derives anything — so a fresh-store
     // reconstruct never re-issues an already-used secret — and flips the latch ONLY when sound.
     let established = counter_db
-        .establish_if_sound(merged, resume, config_authoritative, token_authoritative, token_empty)
+        .establish_if_sound(merged, resume, config_authoritative, token_authoritative, token_empty, floor_complete)
         .await
         .map_err(|e| {
             anyhow::anyhow!("establish the NUT-13 counter to the reconstruct floor: {e}")
@@ -281,7 +303,15 @@ fn union_max_counters(
 /// returns an EMPTY map — NEVER panics, NEVER propagates an error that could fail boot. An empty map
 /// degrades to today's floor-only seeding (the 17375 floor still applies), so completeness is a
 /// best-effort ADDITION that can only ever match-or-beat the prior behavior.
-fn read_local_keyset_counters(db_path: &Path) -> HashMap<Id, u32> {
+///
+/// ★ RETURNS `(map, dropped)` (config-plane ROUND-4, category (d) — HOLEY-FLOOR-NOT-GENUINE): `dropped`
+/// is `true` when this read is INCOMPLETE — a corrupt row was skipped (unparseable keyset id / out-of-range
+/// counter) OR the whole read errored (open/table/query failure → empty-on-error). A genuinely EMPTY
+/// table (a fresh box — 0 rows, clean read) is `dropped=false` (it is NOT holey, just new). The caller
+/// gates establishment on `!dropped`: a holey floor must not flip the per-db latch (else the dropped
+/// keyset derives from index 0 = NUT-13 reuse). The behavior is otherwise UNCHANGED — a dropped row is
+/// still skipped with a warn, the map still degrades to floor-only; we merely SIGNAL the incompleteness.
+fn read_local_keyset_counters(db_path: &Path) -> (HashMap<Id, u32>, bool) {
     use rusqlite::OpenFlags;
     use std::str::FromStr as _;
 
@@ -292,7 +322,9 @@ fn read_local_keyset_counters(db_path: &Path) -> HashMap<Id, u32> {
             .or_else(|_| rusqlite::Connection::open(db_path))
     };
 
-    let read = || -> rusqlite::Result<HashMap<Id, u32>> {
+    // Returns `(map, dropped)`: `dropped` set if ANY row was skipped (corruption) so the caller can
+    // fail-closed on an incomplete floor (category (d)).
+    let read = || -> rusqlite::Result<(HashMap<Id, u32>, bool)> {
         let conn = open()?;
         let mut stmt = conn.prepare("SELECT keyset_id, counter FROM keyset_counter")?;
         let rows = stmt.query_map([], |row| {
@@ -301,6 +333,7 @@ fn read_local_keyset_counters(db_path: &Path) -> HashMap<Id, u32> {
             Ok((keyset_id, counter))
         })?;
         let mut map = HashMap::new();
+        let mut dropped = false;
         for row in rows {
             let (keyset_hex, counter) = row?;
             // Parse the hex id back to a cdk `Id`; a non-parseable id (only possible from a foreign
@@ -315,10 +348,12 @@ fn read_local_keyset_counters(db_path: &Path) -> HashMap<Id, u32> {
             let id = match Id::from_str(&keyset_hex) {
                 Ok(id) => id,
                 Err(e) => {
+                    // (d) HOLEY-FLOOR: this keyset's floor is now missing from the read → mark dropped.
+                    dropped = true;
                     tracing::warn!(
                         keyset_hex = %keyset_hex,
                         error = %e,
-                        "NIP-60 counter read: skipping a local keyset_counter row with an unparseable keyset id (corruption)"
+                        "NIP-60 counter read: skipping a local keyset_counter row with an unparseable keyset id (corruption) — floor read marked HOLEY (establishment defers, category (d))"
                     );
                     continue;
                 }
@@ -326,30 +361,33 @@ fn read_local_keyset_counters(db_path: &Path) -> HashMap<Id, u32> {
             let counter = match u32::try_from(counter) {
                 Ok(c) => c,
                 Err(_) => {
+                    dropped = true;
                     tracing::warn!(
                         keyset_hex = %keyset_hex,
                         counter,
-                        "NIP-60 counter read: skipping a keyset_counter row whose counter is out of u32 range (corruption); the 17375 floor still covers it"
+                        "NIP-60 counter read: skipping a keyset_counter row whose counter is out of u32 range (corruption) — floor read marked HOLEY (establishment defers, category (d))"
                     );
                     continue;
                 }
             };
             map.insert(id, counter);
         }
-        Ok(map)
+        Ok((map, dropped))
     };
 
     match read() {
-        Ok(map) => map,
+        Ok((map, dropped)) => (map, dropped),
         Err(e) => {
+            // (d) A whole-read failure cannot confirm completeness → HOLEY (dropped=true): the caller
+            // fails-closed (defers establishment) rather than establishing on a floor it could not read.
             tracing::warn!(
                 db_path = %db_path.display(),
                 error = %e,
                 "NIP-60 counter read: could not read the local keyset_counter table; \
-                 seeding the mirror from the 17375 floor only (fail-safe — completeness is skipped, \
-                 no regression vs the prior floor-only behavior)"
+                 seeding the mirror from the 17375 floor only (fail-safe) and marking the floor read \
+                 HOLEY so establishment defers (category (d) — never establish on an unread floor)"
             );
-            HashMap::new()
+            (HashMap::new(), true)
         }
     }
 }
@@ -490,7 +528,7 @@ mod tests {
         let floor: HashMap<Id, u32> = HashMap::new();
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true, false)
                 .await
                 .expect("open persistent wallet");
 
@@ -513,7 +551,7 @@ mod tests {
         let floor = HashMap::from([(k, 50u32)]);
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true, false)
                 .await
                 .expect("open persistent wallet");
 
@@ -539,7 +577,7 @@ mod tests {
         let floor: HashMap<Id, u32> = HashMap::new();
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true, false)
                 .await
                 .expect("open persistent wallet");
 
@@ -576,7 +614,7 @@ mod tests {
         store.increment_keyset_counter(&k1, 7).await.expect("k1");
         store.increment_keyset_counter(&k2, 3).await.expect("k2");
 
-        let read = read_local_keyset_counters(&db_path);
+        let (read, dropped) = read_local_keyset_counters(&db_path);
 
         assert_eq!(
             read,
@@ -584,6 +622,7 @@ mod tests {
             "the SELECT reads EXACTLY cdk's keyset_counter rows over a concurrent second connection; \
              an empty/wrong map here means the on-disk schema drifted from the hard-coded SELECT"
         );
+        assert!(!dropped, "a clean read of well-formed rows is NOT holey (category (d))");
         drop(store);
     }
 
@@ -594,10 +633,12 @@ mod tests {
         let tmp = TempDir::new("t6a");
         let missing = tmp.db_path();
         assert!(!missing.exists(), "precondition: no db file yet");
+        let (missing_map, missing_dropped) = read_local_keyset_counters(&missing);
         assert!(
-            read_local_keyset_counters(&missing).is_empty(),
+            missing_map.is_empty(),
             "a nonexistent db path yields an empty map (fail-safe), not a panic"
         );
+        assert!(missing_dropped, "a whole-read failure is HOLEY (dropped=true → establishment defers, category (d))");
 
         // (b) A real sqlite file that LACKS the keyset_counter table → the SELECT errors → empty.
         let tmp2 = TempDir::new("t6b");
@@ -607,10 +648,53 @@ mod tests {
             conn.execute_batch("CREATE TABLE unrelated (x INTEGER);")
                 .expect("make a table-less-of-keyset_counter db");
         }
+        let (no_table_map, no_table_dropped) = read_local_keyset_counters(&no_table);
         assert!(
-            read_local_keyset_counters(&no_table).is_empty(),
+            no_table_map.is_empty(),
             "a db missing the keyset_counter table yields an empty map (fail-safe), not a panic"
         );
+        assert!(no_table_dropped, "a missing-table read is HOLEY (dropped=true, category (d))");
+    }
+
+    // ---- T27 (config-plane ROUND-4, category (d), LOCAL-SOURCE half): `read_local_keyset_counters`
+    // SIGNALS an incomplete read. A corrupt row (unparseable keyset id) is skipped AND `dropped=true`;
+    // a genuinely-empty table (fresh box) is `dropped=false` (NOT holey, just new). This is the local
+    // read source the establishment guard (`floor_complete`) fails-closed on.
+    //
+    // RED-on-revert: stop setting `dropped=true` on a skipped corrupt row (return `false`) → the
+    // corrupt-row read looks complete → the caller establishes on a holey local floor → the dropped
+    // keyset derives from index 0 = NUT-13 reuse → this `dropped` assert fails → RED.
+    #[tokio::test]
+    async fn t27_local_keyset_read_signals_a_dropped_corrupt_row() {
+        // (a) A corrupt row (keyset_id NOT valid hex) → skipped + dropped=true.
+        let tmp = TempDir::new("t27-corrupt");
+        let db_path = tmp.db_path();
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("create sqlite db");
+            conn.execute_batch(
+                "CREATE TABLE keyset_counter (keyset_id TEXT PRIMARY KEY, counter INTEGER NOT NULL DEFAULT 0);\
+                 INSERT INTO keyset_counter (keyset_id, counter) VALUES ('009a1f293253e41e', 5);\
+                 INSERT INTO keyset_counter (keyset_id, counter) VALUES ('not-a-valid-keyset-hex', 9);",
+            )
+            .expect("seed a keyset_counter table with one good + one corrupt row");
+        }
+        let (map, dropped) = read_local_keyset_counters(&db_path);
+        assert!(dropped, "a skipped corrupt row marks the read HOLEY (revert dropped→false → RED)");
+        assert_eq!(map.len(), 1, "only the well-formed row is read; the corrupt one is skipped");
+
+        // (b) A genuinely-empty table (fresh box) → NOT holey.
+        let tmp2 = TempDir::new("t27-empty");
+        let empty_path = tmp2.db_path();
+        {
+            let conn = rusqlite::Connection::open(&empty_path).expect("create sqlite db");
+            conn.execute_batch(
+                "CREATE TABLE keyset_counter (keyset_id TEXT PRIMARY KEY, counter INTEGER NOT NULL DEFAULT 0);",
+            )
+            .expect("seed an EMPTY keyset_counter table");
+        }
+        let (empty_map, empty_dropped) = read_local_keyset_counters(&empty_path);
+        assert!(empty_map.is_empty(), "a fresh box has no local counters");
+        assert!(!empty_dropped, "a genuinely-empty table is NOT holey (a fresh box must still establish)");
     }
 
     // ---- T4 (config-plane §2.2, resume unaffected): a RESUME (local counter present) + a
@@ -633,7 +717,7 @@ mod tests {
 
         // config_authoritative = FALSE (a below-quorum config read).
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, false, true, true)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, false, true, true, false)
                 .await
                 .expect("open persistent wallet (resume)");
 
@@ -667,7 +751,7 @@ mod tests {
         let floor: HashMap<Id, u32> = HashMap::new();
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true, false)
                 .await
                 .expect("open persistent wallet (fresh box, ≥k, no head)");
 
@@ -717,6 +801,7 @@ mod tests {
             true,  // config_authoritative
             true,  // token_authoritative (≥k)
             false, // token_empty = false → token backups PRESENT
+            false, // config_floor_dropped = false (clean floor)
         )
         .await
         .expect("open persistent wallet (fresh box, ≥k config, token backups present)");
@@ -756,6 +841,7 @@ mod tests {
             true,  // config_authoritative
             false, // token_authoritative = false → token read BELOW quorum (can't confirm empty)
             true,  // token_empty (apparent) — but unproven below quorum
+            false, // config_floor_dropped = false (clean floor)
         )
         .await
         .expect("open persistent wallet (fresh box, ≥k config, below-quorum token read)");

@@ -187,6 +187,16 @@ impl Nip60CounterDb {
     ///           below-quorum token read or present token backups → DEFER (else index-0 reuse against
     ///           possibly-unread proofs — finding 4, token-quorum-symmetric).
     ///   state 3 fresh-box + config ≥k + NON-empty floor (a head)  → establish at the true floor.
+    ///
+    /// ★★★ INVARIANT #3 — HOLEY-FLOOR-NOT-GENUINE (config-plane ROUND-4, category (d)): a floor read
+    /// that silently DROPPED any keyset (an unparseable-hex config keyset in
+    /// [`crate::nip60::WalletConfigContent::counters_by_id_checked`], OR a corrupt/erroring local row
+    /// in [`crate::mint_rig::read_local_keyset_counters`]) is NOT a genuine floor. The per-db
+    /// establishment latch is GLOBAL but the floor is PER-KEYSET, so a partial floor must NOT flip the
+    /// latch — else the dropped keyset derives from index 0 = NUT-13 reuse. `floor_complete` carries
+    /// that signal from BOTH read sources; a holey (`false`) floor DEFERS regardless of
+    /// resume/config/token. Sits alongside the recovery_complete-genuine-inputs (boot.rs) +
+    /// deletion-never-delete-unread (nip60.rs reconcile) invariants.
     pub async fn establish_if_sound(
         &self,
         floor: HashMap<Id, u32>,
@@ -194,6 +204,7 @@ impl Nip60CounterDb {
         config_authoritative: bool,
         token_authoritative: bool,
         token_empty: bool,
+        floor_complete: bool,
     ) -> Result<bool, Error> {
         let established = should_establish_counter(
             resume,
@@ -201,6 +212,7 @@ impl Nip60CounterDb {
             floor.is_empty(),
             token_authoritative,
             token_empty,
+            floor_complete,
         );
         if established {
             // Seed the true floor into the publish-mirror (monotonic max — idempotent when the mirror
@@ -286,7 +298,17 @@ pub fn should_establish_counter(
     floor_empty: bool,
     token_authoritative: bool,
     token_empty: bool,
+    floor_complete: bool,
 ) -> bool {
+    // ★★★ INVARIANT #3 — HOLEY-FLOOR-NOT-GENUINE (config-plane ROUND-4, category (d)): a floor read
+    // that silently DROPPED any keyset (parse/read error, from EITHER config `counters_by_id_checked`
+    // OR local `read_local_keyset_counters`) is NOT a genuine floor. The per-db establishment latch is
+    // GLOBAL but the floor is PER-KEYSET, so a partial floor must NOT flip the latch — else the dropped
+    // keyset derives from index 0 = NUT-13 reuse. A holey floor DEFERS regardless of the four-state
+    // logic below (resume included: a resume whose local floor read was holey is equally un-genuine).
+    if !floor_complete {
+        return false;
+    }
     if resume {
         // state 1: a prior instance derived here — fast-forward is lift-up-only, always safe.
         true
@@ -825,7 +847,7 @@ mod tests {
         // (a) EMPTY floor + config ≥k + token PRESENT (token_authoritative, NOT empty) → DEFER.
         let db_a = boot_db().await;
         let established_a = db_a
-            .establish_if_sound(empty_floor(), false, true, true, false)
+            .establish_if_sound(empty_floor(), false, true, true, false, true)
             .await
             .expect("decision runs cleanly");
         assert!(!established_a, "token backups present → establish-at-0 REFUSED (defer)");
@@ -838,7 +860,7 @@ mod tests {
         // (b) EMPTY floor + config ≥k + token BELOW quorum (can't confirm empty) → DEFER.
         let db_b = boot_db().await;
         let established_b = db_b
-            .establish_if_sound(empty_floor(), false, true, false, true)
+            .establish_if_sound(empty_floor(), false, true, false, true, true)
             .await
             .expect("decision runs cleanly");
         assert!(!established_b, "below-quorum token read → establish-at-0 REFUSED (defer)");
@@ -847,16 +869,40 @@ mod tests {
         // (c) EMPTY floor + config ≥k + token quorum-confirmed EMPTY → establish AT 0 (genuinely new).
         let db_c = boot_db().await;
         let established_c = db_c
-            .establish_if_sound(empty_floor(), false, true, true, true)
+            .establish_if_sound(empty_floor(), false, true, true, true, true)
             .await
             .expect("decision runs cleanly");
         assert!(established_c, "both planes quorum-confirmed-empty → establish at 0 (genuinely new)");
         assert!(db_c.is_established(), "the latch establishes");
 
-        // The pure decision mirrors the action (RED-on-revert target).
-        assert!(!should_establish_counter(false, true, true, true, false), "token present → defer");
-        assert!(!should_establish_counter(false, true, true, false, true), "token below quorum → defer");
-        assert!(should_establish_counter(false, true, true, true, true), "both empty → establish at 0");
-        assert!(!should_establish_counter(false, false, true, true, true), "config below quorum → defer");
+        // The pure decision mirrors the action (RED-on-revert target). All complete-floor (the holey
+        // guard is exercised by T27); the last arg is `floor_complete`.
+        assert!(!should_establish_counter(false, true, true, true, false, true), "token present → defer");
+        assert!(!should_establish_counter(false, true, true, false, true, true), "token below quorum → defer");
+        assert!(should_establish_counter(false, true, true, true, true, true), "both empty → establish at 0");
+        assert!(!should_establish_counter(false, false, true, true, true, true), "config below quorum → defer");
+    }
+
+    // ---- T27 (config-plane ROUND-4, category (d) — HOLEY-FLOOR-NOT-GENUINE, DECISION half): a floor
+    // read that DROPPED any keyset (parse/read error) must NOT flip the establishment latch, for ANY
+    // otherwise-establishing state — resume, state-3 (head present), state-4 (both planes empty). The
+    // per-db latch is global, the floor per-keyset, so a partial floor establishing would derive the
+    // dropped keyset from index 0 = NUT-13 reuse. Complements the SOURCE-signal halves (T27 in nip60.rs
+    // for `counters_by_id_checked`, and in mint_rig.rs for `read_local_keyset_counters`).
+    //
+    // RED-on-revert: remove the `if !floor_complete { return false; }` guard at the top of
+    // `should_establish_counter` → a holey floor (floor_complete=false) then establishes on the
+    // four-state logic alone → these `!…` asserts flip to true → RED (establishes on an incomplete floor).
+    #[test]
+    fn t27_holey_floor_does_not_flip_the_latch_decision() {
+        // RESUME + holey → DEFER (a resume whose local read dropped a row is not a genuine floor).
+        assert!(!should_establish_counter(true, false, false, false, false, false), "resume + holey → defer");
+        assert!(should_establish_counter(true, false, false, false, false, true), "resume + complete → establish");
+        // state-3 (config ≥k, head present) + holey → DEFER.
+        assert!(!should_establish_counter(false, true, false, false, false, false), "head-present + holey → defer");
+        assert!(should_establish_counter(false, true, false, false, false, true), "head-present + complete → establish");
+        // state-4 (both planes quorum-confirmed-empty) + holey → DEFER.
+        assert!(!should_establish_counter(false, true, true, true, true, false), "both-empty + holey → defer");
+        assert!(should_establish_counter(false, true, true, true, true, true), "both-empty + complete → establish at 0");
     }
 }
