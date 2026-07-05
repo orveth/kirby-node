@@ -728,22 +728,57 @@ pub fn retry_established(counter_established: bool, read_established: bool, drai
     counter_established && read_established && drain_ok
 }
 
-/// R2-#3 recovery-drain outcome → `drain_ok` (the input to `recovery_complete`). The recovery-drain
-/// (`mint_unissued_quotes`) SUCCEEDING means the wallet is fully recovered and the store's
-/// publish/rollover gate may open — and a drain of NOTHING is STILL success:
+/// ROUND-3 F1 — the STRICT-DRAIN POST-STATE decision → `drain_ok` (an input to `recovery_complete`).
 ///
-/// - `Some(minted)` == the drain returned `Ok` (INCLUDING `Some(0)` — a genuinely-new agent with no
-///   unissued quotes, or a normal resume with none pending): the wallet is recovered → `true`. This
-///   is the finding-4 DURABILITY point — a new agent must NOT be wedged (never publishes its 17375
-///   head) just because it had nothing to drain.
-/// - `None` == the drain ERRORED (e.g. the mint is unreachable): NOT recovered → `false` → defer +
-///   self-heal on the next attempt (never a premature open against a not-fully-recovered wallet).
+/// ★ WHY THE POST-STATE, NOT THE RETURN CODE: CDK's `mint_unissued_quotes` (issue/mod.rs:340)
+/// SWALLOWS per-quote check/mint errors (warn + continue) and returns `Ok(total_minted)`. So its
+/// `Ok(0)` is AMBIGUOUS — EITHER "no unissued quotes" OR "quotes existed but ALL failed (mint
+/// down)". The old `minted.is_some()` proxy treated the mint-down case as success → a premature
+/// `recovery_complete` while Paid-but-unissued quotes stayed stranded (never re-drained). The
+/// GENUINE signal is the durable POST-STATE: query `get_unissued_mint_quotes` (already filtered to
+/// this wallet's mint/unit) AFTER the drain and require it to be EMPTY.
 ///
-/// Pure so the T18 (drain-of-nothing = success) and T19 (drain-fail = safe-defer) teeth exercise the
-/// decision directly, and BOTH boot drain sites (the healthy path + the bounded retry) route through
-/// it — a single-line change here regresses both.
-pub fn drain_succeeded(minted: Option<u64>) -> bool {
-    minted.is_some()
+/// `unissued_after`:
+/// - `Some(0)` — no unissued quotes REMAIN → genuinely drained → `true`. Covers the finding-4
+///   DURABILITY case (a new agent with nothing to drain must NOT be wedged) AND a successful drain.
+/// - `Some(n > 0)` — quotes REMAIN (the mint-down `Ok(0)` case) → NOT drained → `false` → defer +
+///   the bounded retry re-drives + self-heals when the mint recovers.
+/// - `None` — the post-state query itself FAILED → cannot confirm empty → `false` (fail-closed).
+///
+/// Pure so the T20 (post-state gate) / T18 (drain-of-nothing) / T19 (mint-down Ok(0) safe-defer)
+/// teeth exercise the decision directly; BOTH boot drain sites route through
+/// [`strict_drain_unissued_after`] → this function, so a single change regresses both.
+pub fn drain_complete(unissued_after: Option<usize>) -> bool {
+    matches!(unissued_after, Some(0))
+}
+
+/// ROUND-3 F1 — run the recovery-drain, then VERIFY THE POST-STATE. Calls `mint_unissued_quotes`
+/// for its EFFECT (mint whatever is mintable) but IGNORES its degrade-prone return, then reads the
+/// durable `get_unissued_mint_quotes` count for this wallet's mint/unit. Returns that count
+/// (`None` if the post-state query itself failed → treated as not-drained by [`drain_complete`],
+/// fail-closed). Applied at BOTH boot drain sites (the healthy path + the bounded retry).
+async fn strict_drain_unissued_after(wallet: &cdk::wallet::Wallet) -> Option<usize> {
+    match wallet.mint_unissued_quotes().await {
+        Ok(minted) => {
+            if u64::from(minted) > 0 {
+                tracing::info!(minted = %minted, "recovery-drain: minted deferred Paid-but-unissued quotes");
+            }
+        }
+        Err(e) => {
+            // CDK already swallows per-quote errors; a top-level Err is rarer (e.g. the store read
+            // itself failed). Either way the POST-STATE query below is authoritative — we do not
+            // trust this return.
+            tracing::warn!(error = %e, "recovery-drain: mint_unissued_quotes errored; the post-state get_unissued check is authoritative");
+        }
+    }
+    // POST-STATE: `Wallet::get_unissued_mint_quotes` already retains only this mint_url + unit.
+    match wallet.get_unissued_mint_quotes().await {
+        Ok(remaining) => Some(remaining.len()),
+        Err(e) => {
+            tracing::warn!(error = %e, "recovery-drain: post-state get_unissued_mint_quotes failed — cannot confirm the drain; DEFERRING recovery (fail-closed)");
+            None
+        }
+    }
 }
 
 /// The §7.2 wallet<->counter reconcile decision (brain-routstr R2-3/R2-5): the wallet
@@ -764,6 +799,20 @@ pub fn assert_wallet_backs_counter(wallet_balance: u64, treasury_remaining: u64)
         );
     }
     Ok(())
+}
+
+/// ROUND-3 F3 — the bounded-retry SPAWN condition. Spawn the convergence retry whenever the token
+/// read was NON-authoritative (`!read_established`) OR recovery is INCOMPLETE (`!recovery_complete`),
+/// NOT only when the counter is unestablished (the pre-F3 `!is_established()`).
+///
+/// ★ WHY: an ALREADY-established boot (state-3: a non-empty config floor established) with a
+/// below-quorum TOKEN read would, under the old `!established` gate, NEVER spawn a retry →
+/// `read_established` stuck false → `recovery_complete` never opens → the rollover gate blocked the
+/// WHOLE run (new mutations not NIP-60-backed). Keying the spawn on read/recovery incompleteness
+/// covers that case: the retry re-reads the token plane and completes restore + drain + the latch.
+/// Pure so the T22 tooth exercises it directly.
+pub fn should_spawn_config_retry(read_established: bool, recovery_complete: bool) -> bool {
+    !read_established || !recovery_complete
 }
 
 /// The config-plane bounded read-retry schedule (§2.4). The base interval (attempt 0), the cap on
@@ -828,38 +877,35 @@ pub(crate) async fn try_establish_counter(
     if !established {
         return Ok(false); // below quorum, or an unproven-empty token plane — back off and retry
     }
-    // Re-drive the restore-receive now that derivations are unblocked (§2.6b). Degrades internally.
-    let _restored = crate::nip60_reconcile::restore_from_relay_backup(Ok(read.candidates), wallet).await;
+    // Re-drive the restore-receive now that derivations are unblocked (§2.6b). Degrades internally,
+    // but returns an EXPLICIT outcome (ROUND-3 F2): `restore_ok` is a GENUINE success signal (incl. a
+    // genuinely-empty restore), NEVER a degraded-to-0 proxy — a DEGRADED restore must NOT converge.
+    let restore_outcome =
+        crate::nip60_reconcile::restore_from_relay_backup(Ok(read.candidates), wallet).await;
+    let restore_ok = restore_outcome.is_ok();
     // Drain any deferred Paid-but-unissued mint quotes (recovery-mint through the now-open choke
     // point; safe to call blindly — re-checks with the mint, self-skips amount_mintable()==0).
-    // §finding-3 RETRY COMPLETENESS: the drain is part of recovery. On a drain FAILURE we do NOT
-    // report converged (see `retry_established`) so the bounded loop keeps backing off and re-drives
-    // (idempotent) until the drain succeeds — a Paid-but-unissued quote must not be stranded until
-    // the next full boot.
-    let minted: Option<u64> = match wallet.mint_unissued_quotes().await {
-        Ok(amt) => {
-            tracing::info!(minted = %amt, "config-plane retry: drained deferred mint quotes");
-            Some(u64::from(amt))
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "config-plane retry: mint_unissued_quotes (recovery-drain) failed — NOT reporting \
-                 converged this attempt; the bounded loop backs off and re-drives (idempotent) \
-                 until the drain succeeds (config-plane finding-3)"
-            );
-            None
-        }
-    };
-    // A drain of NOTHING (`Some(0)`) is SUCCESS (finding-4 durability); only a drain ERROR (`None`)
-    // is not — the bounded loop then keeps backing off + re-drives until the mint is reachable.
-    let drain_ok = drain_succeeded(minted);
-    // R2-#2 convergence: established AND the TOKEN read reached ≥k (`token_authoritative` ==
-    // `read_established`) AND the drain succeeded. A below-quorum token read must NOT converge (else
-    // `read_established` stays false → the rollover gate is blocked forever). R2-#3: on FULL
-    // convergence, mark recovery COMPLETE (opens the store's PUBLISH + ROLLOVER gates) — restore AND
-    // drain have both succeeded, so the wallet's unspent set is real, not transiently-empty.
-    let converged = retry_established(counter_db.is_established(), token_authoritative, drain_ok);
+    // §finding-3 RETRY COMPLETENESS + ROUND-3 F1: the drain is part of recovery, and `drain_ok` is
+    // the POST-STATE (get_unissued EMPTY-after), NOT the degrade-prone `mint_unissued_quotes` return.
+    // On a not-drained POST-STATE (mint-down Ok(0), quotes remain) we do NOT report converged so the
+    // bounded loop keeps backing off + re-drives (idempotent) until the quotes are genuinely drained.
+    let unissued_after = strict_drain_unissued_after(wallet).await;
+    let drain_ok = drain_complete(unissued_after);
+    // ★★★ INVARIANT (ROUND-3, do NOT weaken): EVERY input to `recovery_complete` MUST be a
+    // GENUINE-success signal — an explicit outcome (`restore_ok` via `RestoreOutcome`) or a verified
+    // POST-STATE (`drain_ok` via `get_unissued`; `read_established` via the token quorum) — NEVER a
+    // library return code that degrades failure to a success-looking/benign value. CDK's
+    // `mint_unissued_quotes` `Ok(0)` and restore's adopt-nothing-`0` BOTH degrade failure to benign;
+    // this gate has been re-opened 3× by that exact trap. A future maintainer adding a recovery
+    // component MUST feed a genuine signal here, not a return code.
+    //
+    // R2-#2 + F1 + F2 convergence: established AND token ≥k (`token_authoritative` ==
+    // `read_established`) AND the POST-STATE drain is clean AND the restore genuinely succeeded. A
+    // below-quorum token read, an un-drained post-state, or a degraded restore must NOT converge
+    // (else `recovery_complete` opens against a not-fully-recovered wallet → empty-rollover del-chains
+    // the real backup). On FULL convergence, mark recovery COMPLETE (opens PUBLISH + ROLLOVER).
+    let converged =
+        retry_established(counter_db.is_established(), token_authoritative, drain_ok) && restore_ok;
     if converged {
         counter_db.mark_recovery_complete();
     }
@@ -1112,24 +1158,32 @@ async fn build_routstr_brain(
     // and the restore no-ops (degrades log-and-continue), re-driven by the bounded retry on a ≥k read.
     let nip60_read_authoritative;
     let nip60_read_info;
+    // ★ ROUND-3 F2: capture the EXPLICIT restore outcome (a GENUINE success signal, incl. a
+    // genuinely-empty restore) — NOT a degraded-to-0 proxy — so the recovery_complete gate (step 4b)
+    // can require `restore_ok` and a FAILED restore stays deferred (the real backup is preserved).
+    let nip60_restore_ok;
     match token_read {
         Some(Ok(read)) => {
             nip60_initial_live_ids = read.fetched_ids.clone();
             nip60_read_authoritative = read.authoritative;
             nip60_read_info = Some((read.served, read.total, read.read_k));
-            let _restored =
+            let restore_outcome =
                 crate::nip60_reconcile::restore_from_relay_backup(Ok(read.candidates), wallet.as_ref())
                     .await;
+            nip60_restore_ok = restore_outcome.is_ok();
         }
         Some(Err(e)) => {
             nip60_read_authoritative = false;
             nip60_read_info = None;
-            let _restored =
+            let restore_outcome =
                 crate::nip60_reconcile::restore_from_relay_backup(Err(e), wallet.as_ref()).await;
+            nip60_restore_ok = restore_outcome.is_ok(); // Degraded → false
         }
         None => {
+            // NIP-60 off: no relay restore to run → trivially "recovered" (nothing to gate).
             nip60_read_authoritative = true;
             nip60_read_info = None;
+            nip60_restore_ok = true;
         }
     }
 
@@ -1188,32 +1242,34 @@ async fn build_routstr_brain(
     //    against a not-fully-recovered wallet); the next boot re-drives. Placed AFTER the solvency
     //    check so that check sees the same balance as before (no behavior change to §7.2).
     if nip60_store.is_some() && counter_db.is_established() {
-        let drain = wallet.mint_unissued_quotes().await;
-        let (minted, drain_err) = match drain {
-            Ok(amt) => (Some(u64::from(amt)), None),
-            Err(e) => (None, Some(e)),
-        };
-        // A drain of NOTHING (`Some(0)`: a genuinely-new agent, or a resume with none pending) is
-        // SUCCESS (finding-4 durability — the new agent must still publish its 17375 head); only a
-        // drain ERROR (`None`) defers. `drain_succeeded` is the SAME decision the bounded retry uses.
-        if drain_succeeded(minted) {
-            if let Some(m) = minted {
-                if m > 0 {
-                    tracing::info!(
-                        minted = m,
-                        "boot: drained deferred Paid-but-unissued mint quotes on the healthy path (recovery-mint)"
-                    );
-                }
-            }
-            // restore (step 3) + drain both completed → open the publish/rollover gate.
+        // ROUND-3 F1: `drain_ok` is the POST-STATE (get_unissued EMPTY-after), NOT the degrade-prone
+        // `mint_unissued_quotes` return. A new agent with no quotes → empty → true; quotes-remain
+        // (mint-down Ok(0)) → non-empty → false → defer + the bounded retry self-heals.
+        let unissued_after = strict_drain_unissued_after(wallet.as_ref()).await;
+        let drain_ok = drain_complete(unissued_after);
+        // ★★★ INVARIANT (ROUND-3, do NOT weaken): EVERY input to `recovery_complete` MUST be a
+        // GENUINE-success signal — an explicit outcome (`restore_ok` via `RestoreOutcome`) or a
+        // verified POST-STATE (`drain_ok` via `get_unissued`; `read_established`/`nip60_read_authoritative`
+        // via the token quorum) — NEVER a library return code that degrades failure to a
+        // success-looking/benign value. CDK's `mint_unissued_quotes` `Ok(0)` and restore's
+        // adopt-nothing-`0` BOTH degrade failure to benign; this gate has been re-opened 3× by that
+        // exact trap. A future maintainer adding a recovery component MUST feed a genuine signal here.
+        //
+        // F2 unified precondition: recovery_complete = `restore_ok AND drain_ok AND read_established`
+        // (all genuine post-state, no degraded-0). Any false → recovery stays CLOSED → the 17375
+        // config publish (step 5) + the flusher rollover DEFER this run (money-safe: never
+        // publish/rollover against a not-fully-recovered wallet); the bounded retry (step 5b) re-drives.
+        if drain_ok && nip60_restore_ok && nip60_read_authoritative {
             counter_db.mark_recovery_complete();
-        } else if let Some(e) = drain_err {
+        } else {
             tracing::warn!(
-                error = %e,
-                "boot: recovery-drain (mint_unissued_quotes) FAILED on the healthy path — \
-                 recovery_complete NOT set, so the 17375 config publish + the flusher rollover \
-                 stay deferred this run (money-safe: no backup against a not-fully-recovered \
-                 wallet); the next boot re-drives (idempotent)"
+                restore_ok = nip60_restore_ok,
+                drain_ok,
+                read_established = nip60_read_authoritative,
+                "boot: recovery NOT complete on the healthy path (restore_ok AND drain_ok AND \
+                 read_established required, all genuine post-state) — recovery_complete NOT set, so \
+                 the 17375 config publish + the flusher rollover stay deferred this run (money-safe: \
+                 no backup against a not-fully-recovered wallet); the bounded retry re-drives (idempotent)"
             );
         }
     }
@@ -1248,18 +1304,27 @@ async fn build_routstr_brain(
         }
     }
 
-    // §2.4 BOUNDED READ-RETRY: when the counter was DEFERRED (fresh-box below-quorum boot, latch
-    // false), spawn a bounded backoff task that re-reads the config per-relay and, on a ≥k read,
-    // establishes the floor + re-drives restore + drains deferred mints (`try_establish_counter`).
-    // Boot PROCEEDS (the agent survives on its existing balance; the runtime meter still owns
-    // die-when-broke) — in the window it is ALIVE-BUT-FROZEN (every NUT-13 derivation blocked at the
-    // choke point, §2.5) with a LOUD stall percept, self-healing on ≥k. On bound-expiry it proceeds
-    // on existing balance, minting stays blocked, the stall stays visible (never a silent wedge).
+    // §2.4 BOUNDED READ-RETRY: spawn a bounded backoff task that re-reads BOTH planes per-relay and,
+    // on a ≥k read, establishes the floor + re-drives restore + drains deferred mints + marks
+    // recovery complete (`try_establish_counter`). Boot PROCEEDS (the agent survives on its existing
+    // balance; the runtime meter still owns die-when-broke) — self-healing on ≥k. On bound-expiry it
+    // proceeds on existing balance, the stall stays visible (never a silent wedge).
+    //
+    // ★ ROUND-3 F3 — SPAWN CONDITION: spawn whenever the token read was NON-authoritative OR recovery
+    // is INCOMPLETE, NOT only when the counter is unestablished. An ALREADY-established boot (state-3:
+    // a non-empty config floor, counter established) with a below-quorum TOKEN read would otherwise
+    // NEVER re-read → `read_established` stuck false → `recovery_complete` never opens → the rollover
+    // gate is blocked the WHOLE run (new mutations not NIP-60-backed). Retrying on incomplete-recovery
+    // re-reads the token plane and completes the read/restore/drain/latch when relays recover.
     if let Some(store) = &nip60_store {
-        if !counter_db.is_established() {
+        if should_spawn_config_retry(nip60_read_authoritative, counter_db.is_recovery_complete()) {
             tracing::warn!(
-                "stalled: below-quorum config, awaiting k relays — spawning the bounded config-plane \
-                 read-retry (§2.4); derivations remain blocked at the choke point until a ≥k read lands"
+                read_established = nip60_read_authoritative,
+                established = counter_db.is_established(),
+                recovery_complete = counter_db.is_recovery_complete(),
+                "stalled: config/token below quorum OR recovery incomplete — spawning the bounded \
+                 config-plane read-retry (§2.4, F3); derivations/rollover remain gated until a ≥k read \
+                 completes restore + drain (recovery_complete)"
             );
             let store = store.clone();
             let counter_db_retry = counter_db.clone();

@@ -2963,17 +2963,18 @@ mod tests {
         );
     }
 
-    // ---- T18 (config-plane ROUND-2, R2-#3 healthy-path drain; finding-4 DURABILITY): a drain of
-    // NOTHING is SUCCESS. A genuinely-new agent (establish-at-0 path, NO unissued quotes) drains
-    // `Ok(0)` → `drain_succeeded(Some(0))` is TRUE → recovery_complete OPENS → the new agent PUBLISHES
-    // its 17375 config head. A new agent must NOT be wedged (never backs up) just because it had
-    // nothing to drain. Observed end-to-end: recovery_complete flips AND the 17375 head reaches the
-    // relays (through the SAME shared latch + publish gate boot wires).
+    // ---- T18 (config-plane ROUND-2, R2-#3 healthy-path drain; finding-4 DURABILITY; ROUND-3 F1
+    // post-state): a drain of NOTHING is SUCCESS. A genuinely-new agent (establish-at-0 path, NO
+    // unissued quotes) drains, and the POST-STATE `get_unissued` is EMPTY (`unissued_after = Some(0)`)
+    // → `drain_complete(Some(0))` is TRUE → recovery_complete OPENS → the new agent PUBLISHES its
+    // 17375 config head. A new agent must NOT be wedged (never backs up) just because it had nothing
+    // to drain. Observed end-to-end: recovery_complete flips AND the 17375 head reaches the relays
+    // (through the SAME shared latch + publish gate boot wires).
     //
-    // RED-on-revert: change `boot::drain_succeeded` from `minted.is_some()` to
-    // `minted.is_some_and(|m| m > 0)` (i.e. treat `Ok(0)` as failure) → the drain-of-nothing assert
-    // fails, `mark_recovery_complete` is never reached, the gate stays closed → the 17375 head is
-    // never published → this tooth FAILS.
+    // RED-on-revert: change `boot::drain_complete` from `matches!(x, Some(0))` to
+    // `x.is_some_and(|n| n > 0)` (i.e. treat an empty post-state as failure) → the drain-of-nothing
+    // assert fails, `mark_recovery_complete` is never reached, the gate stays closed → the 17375 head
+    // is never published → this tooth FAILS.
     #[tokio::test]
     async fn t18_drain_of_nothing_opens_recovery_and_publishes_the_head() {
         let crypto = test_crypto(0x74);
@@ -3003,15 +3004,16 @@ mod tests {
         );
         let attempts_before = transport.attempts.lock().unwrap().len();
 
-        // DRAIN OF NOTHING: `mint_unissued_quotes` returned `Ok(0)` (no unissued quotes) → the SAME
-        // decision boot uses must treat it as SUCCESS.
-        let minted: Option<u64> = Some(0);
+        // DRAIN OF NOTHING: the drain ran and the POST-STATE `get_unissued` is EMPTY (no quotes
+        // remain) → the SAME decision boot uses must treat it as SUCCESS.
+        let unissued_after: Option<usize> = Some(0);
         assert!(
-            crate::boot::drain_succeeded(minted),
-            "finding-4: a drain of NOTHING (Ok(0)) is SUCCESS (revert to `amt > 0` → this is false → RED)"
+            crate::boot::drain_complete(unissued_after),
+            "finding-4: a drain of NOTHING (empty post-state) is SUCCESS (revert to `n > 0` → this is false → RED)"
         );
-        // Mirror boot's `if drain_succeeded(..) { mark_recovery_complete() }`.
-        if crate::boot::drain_succeeded(minted) {
+        // Mirror boot's healthy-path gate (drain dimension isolated: restore_ok/read_established held
+        // true here — T21 covers restore_ok, T16 covers read_established): mark iff drain_complete.
+        if crate::boot::drain_complete(unissued_after) {
             counter_db.mark_recovery_complete();
         }
 
@@ -3030,16 +3032,23 @@ mod tests {
         );
     }
 
-    // ---- T19 (config-plane ROUND-2, R2-#3 healthy-path drain coupling): a drain FAILURE is a
-    // SAFE-DEFER, not a wedge, and self-heals. When the recovery-drain errors (mint unreachable) WITH
-    // relays UP, recovery_complete stays CLOSED → the 17375 publish + the rollover DEFER (the old
-    // head/backup persist = NO loss), never a premature open. On a subsequent attempt where the drain
-    // SUCCEEDS, recovery_complete OPENS and publish proceeds (self-heal).
+    // ---- T19 (config-plane ROUND-3 F1, CORRECTED — supersedes the Err-mock false-comfort tooth):
+    // mint-down modeled CDK-REALISTICALLY as `mint_unissued_quotes` returning `Ok(0)` WHILE unissued
+    // quotes REMAIN in the store (per cdk issue/mod.rs:340 — per-quote errors are swallowed, so a
+    // mint-down surfaces as `Ok(0)`, NOT an `Err`). The GENUINE signal is the POST-STATE: after the
+    // drain, `get_unissued` is NON-empty (`unissued_after = Some(1)`) → `drain_complete(Some(1))` is
+    // FALSE → recovery_complete stays CLOSED → the 17375 publish + rollover DEFER (the real backup
+    // persists = NO loss), a Paid-but-unissued quote is NOT stranded (the bounded retry re-drives).
+    // On a later attempt where the quotes drain (post-state EMPTY) recovery OPENS (self-heal).
     //
-    // RED-on-revert (premature-open): change `boot::drain_succeeded` from `minted.is_some()` to
-    // `true` (open recovery WITHOUT requiring the drain to succeed) → the `!drain_succeeded(None)`
-    // assert fails AND the drain-fail branch marks recovery complete → the "closed while the drain
-    // fails" + "publish defers" asserts fail → this tooth FAILS.
+    // The OLD tooth modeled mint-down as an `Err` (`None`) — false comfort, because CDK never returns
+    // `Err` on a per-quote mint failure. T19+T20 together assert the REAL CDK `Ok(0)` semantics.
+    //
+    // RED-on-revert: change `boot::drain_complete` from `matches!(x, Some(0))` to `x.is_some()` (the
+    // degrade-prone proxy that treats "we called the drain" as success, ignoring the leftover count,
+    // the analog of the old `minted.is_some()`) → `drain_complete(Some(1))` becomes TRUE → the
+    // mint-down case marks recovery complete → the "closed while quotes remain" + "publish/rollover
+    // defer" + "no del-chain" asserts fail → this tooth FAILS.
     #[tokio::test]
     async fn t19_drain_fail_safe_defers_then_self_heals() {
         let crypto = test_crypto(0x75);
@@ -3053,7 +3062,7 @@ mod tests {
             .expect("seed a real prior backup");
         assert!(transport.distinct_token_ids().contains(&real_backup));
 
-        // Now wire the gate to a counter db whose recovery is NOT complete (the drain will fail).
+        // Now wire the gate to a counter db whose recovery is NOT complete (the drain won't clear).
         let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
         let counter_db = crate::nip60_counter::Nip60CounterDb::with_counters_established(
             Arc::new(mem),
@@ -3062,22 +3071,23 @@ mod tests {
         );
         store.set_recovery_complete(counter_db.recovery_complete_handle());
 
-        // DRAIN FAILS: `mint_unissued_quotes` → `Err` (mint unreachable) → modeled as `None`.
-        let drain_fail: Option<u64> = None;
+        // MINT DOWN, CDK-REALISTIC: `mint_unissued_quotes` returned `Ok(0)` (per-quote errors
+        // swallowed) but a quote REMAINS unissued → POST-STATE `get_unissued` is NON-empty.
+        let unissued_after: Option<usize> = Some(1);
         assert!(
-            !crate::boot::drain_succeeded(drain_fail),
-            "a drain ERROR is NOT success (revert to `true` → this is true → RED)"
+            !crate::boot::drain_complete(unissued_after),
+            "quotes REMAIN after the drain (mint-down Ok(0)) → NOT complete (revert to `is_some()` → this is true → RED)"
         );
-        // Mirror boot: on failure recovery is NOT marked.
-        if crate::boot::drain_succeeded(drain_fail) {
+        // Mirror boot: while the post-state is not clean, recovery is NOT marked.
+        if crate::boot::drain_complete(unissued_after) {
             counter_db.mark_recovery_complete();
         }
 
-        // SAFE-DEFER while the drain fails: recovery closed, publish refused, rollover bails (the real
+        // SAFE-DEFER while quotes remain: recovery closed, publish refused, rollover bails (the real
         // backup is NOT del-chained → no loss).
         assert!(
             !counter_db.is_recovery_complete(),
-            "recovery stays CLOSED while the drain fails (revert to premature-open → RED)"
+            "recovery stays CLOSED while unissued quotes remain (revert to premature-open → RED)"
         );
         assert!(
             store
@@ -3098,26 +3108,195 @@ mod tests {
         );
         assert!(
             !transport.any_delete_sent(),
-            "the real backup is NOT del-chained while the drain fails (no loss)"
+            "the real backup is NOT del-chained while quotes remain (no loss)"
         );
         assert!(
             transport.distinct_token_ids().contains(&real_backup),
-            "the prior backup PERSISTS through the failed-drain window"
+            "the prior backup PERSISTS through the mint-down window"
         );
 
-        // SELF-HEAL: a later attempt where the drain SUCCEEDS opens recovery and the publish proceeds.
-        let drain_ok: Option<u64> = Some(128);
-        if crate::boot::drain_succeeded(drain_ok) {
+        // SELF-HEAL: a later attempt where the quotes drain (POST-STATE empty) opens recovery.
+        let unissued_after_healed: Option<usize> = Some(0);
+        if crate::boot::drain_complete(unissued_after_healed) {
             counter_db.mark_recovery_complete();
         }
         assert!(
             counter_db.is_recovery_complete(),
-            "recovery OPENS once a subsequent drain succeeds (self-heal, not a permanent wedge)"
+            "recovery OPENS once the post-state drains clean (self-heal, not a permanent wedge)"
         );
         store
             .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
             .await
             .expect("the 17375 publish PROCEEDS after the drain self-heals");
+    }
+
+    // ---- T20 (config-plane ROUND-3 F1, drain POST-STATE gate): recovery_complete opens ONLY if the
+    // POST-STATE `get_unissued` is EMPTY after the drain. The two CDK cases, through the REAL gate:
+    //   • no-quotes / genuinely-drained → `unissued_after = Some(0)` → `drain_complete` TRUE → OPEN.
+    //   • mint-down `Ok(0)` with quotes remaining → `Some(n>0)` → `drain_complete` FALSE → CLOSED.
+    // This is the SEAM the old `minted.is_some()` proxy could not see: CDK's `Ok(0)` is ambiguous, so
+    // only the durable post-state disambiguates.
+    //
+    // RED-on-revert: change `boot::drain_complete` from `matches!(x, Some(0))` to `x.is_some()`
+    // (revert to the return-code proxy that treats any completed call as drained, i.e. the
+    // `drain_ok = minted.is_some()` behavior) → the mint-down `Some(1)` case opens recovery → this
+    // tooth's "CLOSED on quotes-remain" assert fails → RED.
+    #[tokio::test]
+    async fn t20_recovery_opens_only_on_empty_drain_post_state() {
+        // Decision-level: empty post-state opens, non-empty defers.
+        assert!(crate::boot::drain_complete(Some(0)), "empty post-state → drained → open");
+        assert!(!crate::boot::drain_complete(Some(3)), "quotes remain (mint-down Ok(0)) → NOT drained → defer");
+        assert!(!crate::boot::drain_complete(None), "post-state query failed → cannot confirm → defer (fail-closed)");
+
+        // Gate-level (through the SAME shared latch + publish gate boot wires): the mint-down case
+        // must NOT open recovery, so the 17375 publish stays REFUSED.
+        let crypto = test_crypto(0x76);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let mut store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
+        let counter_db = crate::nip60_counter::Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            std::collections::HashMap::new(),
+            true, // established (derivation open) but recovery pending
+        );
+        store.set_recovery_complete(counter_db.recovery_complete_handle());
+
+        // MINT-DOWN Ok(0), quotes remain → gate stays closed.
+        let mint_down: Option<usize> = Some(2);
+        if crate::boot::drain_complete(mint_down) {
+            counter_db.mark_recovery_complete();
+        }
+        assert!(
+            !counter_db.is_recovery_complete(),
+            "mint-down Ok(0) (quotes remain) must NOT open recovery (revert drain_ok→is_some() → opens → RED)"
+        );
+        assert!(
+            store
+                .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+                .await
+                .is_err(),
+            "the 17375 head is NOT published on a mint-down Ok(0) — the post-state gate held"
+        );
+    }
+
+    // ---- T21 (config-plane ROUND-3 F2, restore POST-STATE gate): a restore that FAILS (its EXPLICIT
+    // `RestoreOutcome::Degraded`, `restore_ok=false`) with a clean drain must NOT open recovery — the
+    // dirty flusher must NOT rollover/del-chain the REAL 7375 backup. This closes the F2 hazard where
+    // restore's degrade-to-0 looked identical to a successful-empty restore, so recovery_complete
+    // opened on the drain alone and the empty-rollover del-chained the durable backup = LOSS.
+    //
+    // Fail-closed CONFIRM: a degraded restore adopted NOTHING + boot continues (both proven in the
+    // nip60_reconcile teeth) AND sets restore_ok=false (proven here: recovery stays closed → the
+    // backup is preserved). Both properties, not either/or.
+    //
+    // RED-on-revert: revert `RestoreOutcome::is_ok` to always-true (the degrade-to-0 proxy, where a
+    // failed restore looks like success) OR drop `&& restore_ok` from the recovery gate → the mark
+    // fires on the drain alone → the empty rollover del-chains the real backup → the "no del-chain"
+    // assert fails → RED.
+    #[tokio::test]
+    async fn t21_failed_restore_defers_recovery_and_preserves_the_backup() {
+        let crypto = test_crypto(0x77);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let mut store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+
+        // Seed a REAL prior backup while the gate is open (with_transport defaults recovery=true).
+        let real_backup = store
+            .rollover("https://m", "sat", vec![dummy_proof("real-funds")], Vec::new())
+            .await
+            .expect("seed a real prior backup");
+        assert!(transport.distinct_token_ids().contains(&real_backup));
+
+        // Wire the gate to a counter db whose recovery is NOT complete.
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
+        let counter_db = crate::nip60_counter::Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            std::collections::HashMap::new(),
+            true, // established (derivation open) but recovery pending
+        );
+        store.set_recovery_complete(counter_db.recovery_complete_handle());
+
+        // The restore FAILED (explicit Degraded, restore_ok=false) but the drain is CLEAN (empty
+        // post-state) and the token read hit quorum. Mirror boot's healthy gate: recovery_complete =
+        // restore_ok AND drain_ok AND read_established. `is_ok()` is the REAL function — reverting it
+        // to always-true flips this tooth.
+        let restore_ok = crate::nip60_reconcile::RestoreOutcome::Degraded.is_ok(); // false
+        let drain_ok = crate::boot::drain_complete(Some(0)); // clean
+        let read_established = true;
+        assert!(!restore_ok, "a DEGRADED restore is restore_ok=false (revert is_ok→true → RED)");
+        if drain_ok && restore_ok && read_established {
+            counter_db.mark_recovery_complete();
+        }
+
+        // Recovery stays CLOSED (restore_ok=false) → publish refused, rollover bails, backup preserved.
+        assert!(
+            !counter_db.is_recovery_complete(),
+            "a failed restore keeps recovery CLOSED even with a clean drain (revert drop `&& restore_ok` → opens → RED)"
+        );
+        let attempts_before = transport.attempts.lock().unwrap().len();
+        let roll = store
+            .rollover("https://m", "sat", Vec::new(), vec![real_backup.to_hex()])
+            .await;
+        assert!(roll.is_err(), "the empty rollover BAILS while recovery is closed (restore failed)");
+        assert_eq!(
+            transport.attempts.lock().unwrap().len(),
+            attempts_before,
+            "no send attempted (the gate fires before publish_token)"
+        );
+        assert!(
+            !transport.any_delete_sent(),
+            "the REAL 7375 backup is NOT del-chained (F2 loss prevented)"
+        );
+        assert!(
+            transport.distinct_token_ids().contains(&real_backup),
+            "the durable backup PERSISTS through the failed-restore window"
+        );
+    }
+
+    // ---- T22 (config-plane ROUND-3 F3, retry SPAWN condition): an ALREADY-established counter with
+    // `read_established=false` (state-3: a non-empty config floor established, but the TOKEN read was
+    // below quorum) must STILL spawn the convergence retry — else `read_established` stays false,
+    // `recovery_complete` never opens, and the rollover gate is blocked the WHOLE run. The spawn is
+    // keyed on `should_spawn_config_retry(read_established, recovery_complete)` = NON-authoritative OR
+    // incomplete, NOT on `!established`.
+    //
+    // RED-on-revert: revert the spawn gate to the pre-F3 `!counter_db.is_established()`. For an
+    // already-established boot `is_established()=true` → `!established=false` → NO retry spawned →
+    // `read_established` stuck false → rollover blocked forever. The tooth asserts the NEW gate spawns
+    // where the OLD gate would not — reverting to `!established` makes the `should_spawn` assert fail.
+    #[test]
+    fn t22_retry_spawns_on_incomplete_recovery_even_when_established() {
+        use crate::boot::should_spawn_config_retry;
+
+        // THE SEAM: established=true, but token read below quorum → read_established=false → recovery
+        // incomplete. The NEW gate SPAWNS; the OLD `!established` gate would NOT (the F3 bug).
+        assert!(
+            should_spawn_config_retry(false, false),
+            "read below quorum + recovery incomplete → SPAWN (the OLD `!established` gate would skip → RED)"
+        );
+        // Even with recovery somehow marked, a below-quorum read still warrants a retry.
+        assert!(
+            should_spawn_config_retry(false, true),
+            "token read NON-authoritative → SPAWN (re-read the token plane)"
+        );
+        // Fully healthy: token ≥k AND recovery complete → NO retry (nothing to converge).
+        assert!(
+            !should_spawn_config_retry(true, true),
+            "token ≥k AND recovery complete → do NOT spawn (no work left)"
+        );
+        // Established but recovery pending (drain/restore not done) → SPAWN to finish the latch.
+        assert!(
+            should_spawn_config_retry(true, false),
+            "token ≥k but recovery incomplete → SPAWN (complete restore+drain+latch)"
+        );
+
+        // Counterfactual bite: the OLD gate `!established` on the seam (established=true) returns
+        // false — proving the NEW gate spawns exactly where the OLD one silently would not.
+        let established = true;
+        let old_gate = !established;
+        assert!(
+            !old_gate && should_spawn_config_retry(false, false),
+            "the OLD `!established` gate skips the seam the NEW gate catches (F3 fix)"
+        );
     }
 
     // ---- T12 (config-plane REVISION, finding-2; R2-#3 RE-KEYED to recovery_complete): EVERY 17375

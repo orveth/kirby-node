@@ -93,25 +93,68 @@ pub async fn reconcile_import(
     wallet.import_proofs(importable).await
 }
 
+/// The EXPLICIT outcome of a boot-time restore (config-plane ROUND-3, F2). Distinguishes a
+/// GENUINE success (including a genuinely-EMPTY restore — a new agent / normal reboot with nothing
+/// to adopt) from a DEGRADED error (relay-fetch failure, mint unreachable, a lost restore-race).
+///
+/// ★ WHY THIS EXISTS: the old `restore_from_relay_backup -> u64` degraded ALL errors to `0`, making
+/// a FAILED restore indistinguishable from a successful-empty one. `recovery_complete` then opened
+/// on the drain alone despite a failed restore → the dirty flusher rolled over the empty/stale
+/// wallet and del-chained the REAL 7375 backup = LOSS. This enum SIGNALS the failure upward instead
+/// of masking it as a benign `0`, so `recovery_complete` can require a GENUINE `restore_ok`. The
+/// fail-closed money-safety is UNCHANGED: a `Degraded` restore still adopted NOTHING and boot still
+/// continues — it just no longer LOOKS like success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// The restore genuinely completed — `imported` sats adopted (0 = genuinely-empty: a new agent,
+    /// a normal reboot with relay == local, or no unspent candidates). `restore_ok = true`.
+    Restored { imported: u64 },
+    /// The restore FAILED (relay fetch error, mint unreachable/NUT-07 error, or a lost
+    /// double-restore race). Fail-closed: adopted NOTHING, boot continues — but `restore_ok = false`
+    /// so `recovery_complete` stays CLOSED (publish/rollover defer, the real backup is preserved,
+    /// the bounded retry re-drives).
+    Degraded,
+}
+
+impl RestoreOutcome {
+    /// A GENUINE success signal (never a degraded-to-benign value) — the only variant that may
+    /// contribute `restore_ok = true` to the `recovery_complete` gate.
+    pub fn is_ok(self) -> bool {
+        matches!(self, RestoreOutcome::Restored { .. })
+    }
+
+    /// Sats adopted (0 for a genuinely-empty restore AND for a degraded error alike — callers that
+    /// care about success/failure MUST use [`Self::is_ok`], never treat `0` as failure).
+    pub fn imported(self) -> u64 {
+        match self {
+            RestoreOutcome::Restored { imported } => imported,
+            RestoreOutcome::Degraded => 0,
+        }
+    }
+}
+
 /// Boot-time restore-from-backup: fetch the relay-backed candidate proofs and reconcile-import
-/// them, DEGRADING (log + continue, return 0) on ANY error so an unreachable mint/relay never
-/// fails boot — the downstream solvency check is the money gate (a fresh box that could not restore
-/// has too low a balance and dies-broke, correctly). Returns the sats imported.
+/// them, DEGRADING (log + continue) on ANY error so an unreachable mint/relay never fails boot —
+/// the downstream solvency check is the money gate (a fresh box that could not restore has too low
+/// a balance and dies-broke, correctly). Returns an EXPLICIT [`RestoreOutcome`] (config-plane
+/// ROUND-3, F2): `Restored { imported }` on a genuine success (including a genuinely-empty restore),
+/// `Degraded` on any error — so `recovery_complete` can require a GENUINE `restore_ok` rather than
+/// trusting a degraded-to-0 proxy.
 ///
 /// `candidates` is the result of [`crate::nip60::Nip60Store::reconcile_on_load`]; the caller passes
 /// it in so this stays free of the relay transport and unit-testable. SAFE to call unconditionally
 /// at boot: novel-only makes a normal reboot (relay == local) a no-op, and the mint-swap in
 /// `import_proofs` is the single-writer arbiter — a lost double-restore race fails-closed here
-/// (Err → degrade → 0), never corrupting local state.
+/// (Err → `Degraded`, adopts nothing), never corrupting local state.
 pub async fn restore_from_relay_backup(
     candidates: anyhow::Result<Vec<Proof>>,
     wallet: &dyn ReconcileWallet,
-) -> u64 {
+) -> RestoreOutcome {
     let candidates = match candidates {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(error = %e, "NIP-60 restore: relay fetch failed; booting on local wallet state");
-            return 0;
+            tracing::warn!(error = %e, "NIP-60 restore: relay fetch failed; booting on local wallet state (DEGRADED — restore_ok=false, recovery stays deferred)");
+            return RestoreOutcome::Degraded;
         }
     };
     match reconcile_import(candidates, wallet).await {
@@ -122,12 +165,12 @@ pub async fn restore_from_relay_backup(
                     "NIP-60 restore: imported proofs from the relay backup"
                 );
             }
-            imported
+            RestoreOutcome::Restored { imported }
         }
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "NIP-60 restore: import failed (mint unreachable or a lost restore-race); booting on local wallet state"
+                "NIP-60 restore: import failed (mint unreachable or a lost restore-race); booting on local wallet state (DEGRADED — restore_ok=false, recovery stays deferred)"
             );
             // A failed `receive_proofs` may leave an incomplete cdk receive-saga (reserved inputs +
             // stored blinded messages). We DELIBERATELY do NOT compensate it here. cdk's saga
@@ -137,8 +180,10 @@ pub async fn restore_from_relay_backup(
             // deletes the saga (and its blinded-message recovery data), then the mint commits the
             // swap, stranding the outputs. The reserved inputs are NOT spendable (Reserved, not
             // Unspent), so they never inflate the solvency check; the saga is safely recovered at the
-            // next boot, once the mint has settled. Degrade to 0 and boot on durable local state.
-            0
+            // next boot, once the mint has settled. Degrade and boot on durable local state — but
+            // SIGNAL the failure (Degraded ⟹ restore_ok=false) so recovery stays deferred and the
+            // real backup is preserved (F2); still fail-closed (nothing adopted, no crash).
+            RestoreOutcome::Degraded
         }
     }
 }
@@ -347,18 +392,22 @@ mod tests {
         let p = dummy_proof("restore");
         let wallet = StubWallet::new(vec![], Some(vec![unspent(&p)]));
         let restored = restore_from_relay_backup(Ok(vec![p]), &wallet).await;
-        assert_eq!(restored, 1, "a fresh box restores its proofs from the relay backup");
+        assert!(restored.is_ok(), "a genuine restore is a GENUINE success (restore_ok=true)");
+        assert_eq!(restored.imported(), 1, "a fresh box restores its proofs from the relay backup");
         assert_eq!(wallet.imported().map(|v| v.len()), Some(1));
     }
 
-    /// Boot tooth (degrade): a relay-FETCH error degrades to 0 (boot continues; solvency is the
-    /// real gate) — never fails boot, never imports.
+    /// Boot tooth (F2 degrade — EXPLICIT outcome): a relay-FETCH error DEGRADES (boot continues;
+    /// solvency is the real gate) — never fails boot, never imports, and is signalled as `Degraded`
+    /// (NOT a success-looking 0) so `recovery_complete` can require a genuine `restore_ok`.
     #[tokio::test]
     async fn boot_restore_degrades_to_zero_when_the_relay_fetch_fails() {
         let wallet = StubWallet::new(vec![], Some(vec![]));
         let restored =
             restore_from_relay_backup(Err(anyhow::anyhow!("relay unreachable")), &wallet).await;
-        assert_eq!(restored, 0, "a relay-fetch error degrades to 0 (boot continues)");
+        assert!(!restored.is_ok(), "a fetch error is a DEGRADED failure (restore_ok=false), not success");
+        assert_eq!(restored, RestoreOutcome::Degraded, "a relay-fetch error degrades (boot continues)");
+        assert_eq!(restored.imported(), 0, "a degraded restore imported nothing");
         assert!(wallet.imported().is_none(), "no import on a fetch failure");
     }
 
@@ -369,7 +418,8 @@ mod tests {
         let p = dummy_proof("lost_race");
         let wallet = StubWallet::new(vec![], Some(vec![unspent(&p)])).failing_import();
         let restored = restore_from_relay_backup(Ok(vec![p]), &wallet).await;
-        assert_eq!(restored, 0, "the race LOSER degrades to 0 — no crash, boot continues");
+        assert!(!restored.is_ok(), "the race LOSER is DEGRADED (restore_ok=false), not a benign success");
+        assert_eq!(restored, RestoreOutcome::Degraded, "the race LOSER degrades — no crash, boot continues");
         assert!(wallet.imported().is_none(), "the loser adopts nothing (no state corruption)");
     }
 
@@ -384,7 +434,8 @@ mod tests {
             Some(vec![unspent(&p1), unspent(&p2)]),
         );
         let restored = restore_from_relay_backup(Ok(vec![p1, p2]), &wallet).await;
-        assert_eq!(restored, 0, "a normal reboot imports nothing (novel-only no-op)");
+        assert!(restored.is_ok(), "a normal reboot is a GENUINE (empty) success — a new agent must not be wedged");
+        assert_eq!(restored.imported(), 0, "a normal reboot imports nothing (novel-only no-op)");
         assert!(wallet.imported().is_none());
     }
 }
