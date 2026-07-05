@@ -728,6 +728,24 @@ pub fn retry_established(counter_established: bool, read_established: bool, drai
     counter_established && read_established && drain_ok
 }
 
+/// R2-#3 recovery-drain outcome → `drain_ok` (the input to `recovery_complete`). The recovery-drain
+/// (`mint_unissued_quotes`) SUCCEEDING means the wallet is fully recovered and the store's
+/// publish/rollover gate may open — and a drain of NOTHING is STILL success:
+///
+/// - `Some(minted)` == the drain returned `Ok` (INCLUDING `Some(0)` — a genuinely-new agent with no
+///   unissued quotes, or a normal resume with none pending): the wallet is recovered → `true`. This
+///   is the finding-4 DURABILITY point — a new agent must NOT be wedged (never publishes its 17375
+///   head) just because it had nothing to drain.
+/// - `None` == the drain ERRORED (e.g. the mint is unreachable): NOT recovered → `false` → defer +
+///   self-heal on the next attempt (never a premature open against a not-fully-recovered wallet).
+///
+/// Pure so the T18 (drain-of-nothing = success) and T19 (drain-fail = safe-defer) teeth exercise the
+/// decision directly, and BOTH boot drain sites (the healthy path + the bounded retry) route through
+/// it — a single-line change here regresses both.
+pub fn drain_succeeded(minted: Option<u64>) -> bool {
+    minted.is_some()
+}
+
 /// The §7.2 wallet<->counter reconcile decision (brain-routstr R2-3/R2-5): the wallet
 /// must back every sat the metabolism counter believes it has, so the gateway never
 /// authorizes a think the wallet can't fund. The invariant is `>=`, NEVER `==` (R2-3:
@@ -818,10 +836,10 @@ pub(crate) async fn try_establish_counter(
     // report converged (see `retry_established`) so the bounded loop keeps backing off and re-drives
     // (idempotent) until the drain succeeds — a Paid-but-unissued quote must not be stranded until
     // the next full boot.
-    let drain_ok = match wallet.mint_unissued_quotes().await {
+    let minted: Option<u64> = match wallet.mint_unissued_quotes().await {
         Ok(amt) => {
             tracing::info!(minted = %amt, "config-plane retry: drained deferred mint quotes");
-            true
+            Some(u64::from(amt))
         }
         Err(e) => {
             tracing::warn!(
@@ -830,9 +848,12 @@ pub(crate) async fn try_establish_counter(
                  converged this attempt; the bounded loop backs off and re-drives (idempotent) \
                  until the drain succeeds (config-plane finding-3)"
             );
-            false
+            None
         }
     };
+    // A drain of NOTHING (`Some(0)`) is SUCCESS (finding-4 durability); only a drain ERROR (`None`)
+    // is not — the bounded loop then keeps backing off + re-drives until the mint is reachable.
+    let drain_ok = drain_succeeded(minted);
     // R2-#2 convergence: established AND the TOKEN read reached ≥k (`token_authoritative` ==
     // `read_established`) AND the drain succeeded. A below-quorum token read must NOT converge (else
     // `read_established` stays false → the rollover gate is blocked forever). R2-#3: on FULL
@@ -1167,26 +1188,33 @@ async fn build_routstr_brain(
     //    against a not-fully-recovered wallet); the next boot re-drives. Placed AFTER the solvency
     //    check so that check sees the same balance as before (no behavior change to §7.2).
     if nip60_store.is_some() && counter_db.is_established() {
-        match wallet.mint_unissued_quotes().await {
-            Ok(minted) => {
-                if u64::from(minted) > 0 {
+        let drain = wallet.mint_unissued_quotes().await;
+        let (minted, drain_err) = match drain {
+            Ok(amt) => (Some(u64::from(amt)), None),
+            Err(e) => (None, Some(e)),
+        };
+        // A drain of NOTHING (`Some(0)`: a genuinely-new agent, or a resume with none pending) is
+        // SUCCESS (finding-4 durability — the new agent must still publish its 17375 head); only a
+        // drain ERROR (`None`) defers. `drain_succeeded` is the SAME decision the bounded retry uses.
+        if drain_succeeded(minted) {
+            if let Some(m) = minted {
+                if m > 0 {
                     tracing::info!(
-                        minted = %minted,
+                        minted = m,
                         "boot: drained deferred Paid-but-unissued mint quotes on the healthy path (recovery-mint)"
                     );
                 }
-                // restore (step 3) + drain both completed → open the publish/rollover gate.
-                counter_db.mark_recovery_complete();
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "boot: recovery-drain (mint_unissued_quotes) FAILED on the healthy path — \
-                     recovery_complete NOT set, so the 17375 config publish + the flusher rollover \
-                     stay deferred this run (money-safe: no backup against a not-fully-recovered \
-                     wallet); the next boot re-drives (idempotent)"
-                );
-            }
+            // restore (step 3) + drain both completed → open the publish/rollover gate.
+            counter_db.mark_recovery_complete();
+        } else if let Some(e) = drain_err {
+            tracing::warn!(
+                error = %e,
+                "boot: recovery-drain (mint_unissued_quotes) FAILED on the healthy path — \
+                 recovery_complete NOT set, so the 17375 config publish + the flusher rollover \
+                 stay deferred this run (money-safe: no backup against a not-fully-recovered \
+                 wallet); the next boot re-drives (idempotent)"
+            );
         }
     }
 

@@ -2963,6 +2963,163 @@ mod tests {
         );
     }
 
+    // ---- T18 (config-plane ROUND-2, R2-#3 healthy-path drain; finding-4 DURABILITY): a drain of
+    // NOTHING is SUCCESS. A genuinely-new agent (establish-at-0 path, NO unissued quotes) drains
+    // `Ok(0)` → `drain_succeeded(Some(0))` is TRUE → recovery_complete OPENS → the new agent PUBLISHES
+    // its 17375 config head. A new agent must NOT be wedged (never backs up) just because it had
+    // nothing to drain. Observed end-to-end: recovery_complete flips AND the 17375 head reaches the
+    // relays (through the SAME shared latch + publish gate boot wires).
+    //
+    // RED-on-revert: change `boot::drain_succeeded` from `minted.is_some()` to
+    // `minted.is_some_and(|m| m > 0)` (i.e. treat `Ok(0)` as failure) → the drain-of-nothing assert
+    // fails, `mark_recovery_complete` is never reached, the gate stays closed → the 17375 head is
+    // never published → this tooth FAILS.
+    #[tokio::test]
+    async fn t18_drain_of_nothing_opens_recovery_and_publishes_the_head() {
+        let crypto = test_crypto(0x74);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let mut store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+
+        // A genuinely-new agent: establish-at-0 → the counter is ESTABLISHED (derivation open) but
+        // recovery is NOT yet complete at construction (the boot constructor always starts it false).
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
+        let counter_db = crate::nip60_counter::Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            std::collections::HashMap::new(),
+            true, // establish-at-0 result
+        );
+        assert!(counter_db.is_established(), "establish-at-0: derivation is open");
+        assert!(!counter_db.is_recovery_complete(), "recovery not yet complete at construction");
+        // Wire the store's publish/rollover gate to the counter db's recovery latch (as boot does).
+        store.set_recovery_complete(counter_db.recovery_complete_handle());
+
+        // Before recovery: the 17375 publish is REFUSED (the gate is closed).
+        assert!(
+            store
+                .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+                .await
+                .is_err(),
+            "precondition: the 17375 head is NOT publishable before recovery opens"
+        );
+        let attempts_before = transport.attempts.lock().unwrap().len();
+
+        // DRAIN OF NOTHING: `mint_unissued_quotes` returned `Ok(0)` (no unissued quotes) → the SAME
+        // decision boot uses must treat it as SUCCESS.
+        let minted: Option<u64> = Some(0);
+        assert!(
+            crate::boot::drain_succeeded(minted),
+            "finding-4: a drain of NOTHING (Ok(0)) is SUCCESS (revert to `amt > 0` → this is false → RED)"
+        );
+        // Mirror boot's `if drain_succeeded(..) { mark_recovery_complete() }`.
+        if crate::boot::drain_succeeded(minted) {
+            counter_db.mark_recovery_complete();
+        }
+
+        // OBSERVABLE: recovery_complete OPENED and the 17375 head is now published to the relays.
+        assert!(
+            counter_db.is_recovery_complete(),
+            "recovery_complete OPENED for a no-quote new agent (drain of nothing = success)"
+        );
+        store
+            .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+            .await
+            .expect("the new agent PUBLISHES its 17375 config head once recovery opens");
+        assert!(
+            transport.attempts.lock().unwrap().len() > attempts_before,
+            "a 17375 config head was SENT to the relays (the funnel opened on drain-of-nothing success)"
+        );
+    }
+
+    // ---- T19 (config-plane ROUND-2, R2-#3 healthy-path drain coupling): a drain FAILURE is a
+    // SAFE-DEFER, not a wedge, and self-heals. When the recovery-drain errors (mint unreachable) WITH
+    // relays UP, recovery_complete stays CLOSED → the 17375 publish + the rollover DEFER (the old
+    // head/backup persist = NO loss), never a premature open. On a subsequent attempt where the drain
+    // SUCCEEDS, recovery_complete OPENS and publish proceeds (self-heal).
+    //
+    // RED-on-revert (premature-open): change `boot::drain_succeeded` from `minted.is_some()` to
+    // `true` (open recovery WITHOUT requiring the drain to succeed) → the `!drain_succeeded(None)`
+    // assert fails AND the drain-fail branch marks recovery complete → the "closed while the drain
+    // fails" + "publish defers" asserts fail → this tooth FAILS.
+    #[tokio::test]
+    async fn t19_drain_fail_safe_defers_then_self_heals() {
+        let crypto = test_crypto(0x75);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let mut store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+
+        // Seed a REAL prior backup while the gate is open (with_transport defaults recovery=true).
+        let real_backup = store
+            .rollover("https://m", "sat", vec![dummy_proof("real-funds")], Vec::new())
+            .await
+            .expect("seed a real prior backup");
+        assert!(transport.distinct_token_ids().contains(&real_backup));
+
+        // Now wire the gate to a counter db whose recovery is NOT complete (the drain will fail).
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
+        let counter_db = crate::nip60_counter::Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            std::collections::HashMap::new(),
+            true, // established (derivation open) but recovery pending
+        );
+        store.set_recovery_complete(counter_db.recovery_complete_handle());
+
+        // DRAIN FAILS: `mint_unissued_quotes` → `Err` (mint unreachable) → modeled as `None`.
+        let drain_fail: Option<u64> = None;
+        assert!(
+            !crate::boot::drain_succeeded(drain_fail),
+            "a drain ERROR is NOT success (revert to `true` → this is true → RED)"
+        );
+        // Mirror boot: on failure recovery is NOT marked.
+        if crate::boot::drain_succeeded(drain_fail) {
+            counter_db.mark_recovery_complete();
+        }
+
+        // SAFE-DEFER while the drain fails: recovery closed, publish refused, rollover bails (the real
+        // backup is NOT del-chained → no loss).
+        assert!(
+            !counter_db.is_recovery_complete(),
+            "recovery stays CLOSED while the drain fails (revert to premature-open → RED)"
+        );
+        assert!(
+            store
+                .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+                .await
+                .is_err(),
+            "the 17375 publish DEFERS while recovery is closed"
+        );
+        let attempts_before = transport.attempts.lock().unwrap().len();
+        let roll = store
+            .rollover("https://m", "sat", Vec::new(), vec![real_backup.to_hex()])
+            .await;
+        assert!(roll.is_err(), "the rollover DEFERS while recovery is closed");
+        assert_eq!(
+            transport.attempts.lock().unwrap().len(),
+            attempts_before,
+            "no send attempted (the gate fires before publish_token)"
+        );
+        assert!(
+            !transport.any_delete_sent(),
+            "the real backup is NOT del-chained while the drain fails (no loss)"
+        );
+        assert!(
+            transport.distinct_token_ids().contains(&real_backup),
+            "the prior backup PERSISTS through the failed-drain window"
+        );
+
+        // SELF-HEAL: a later attempt where the drain SUCCEEDS opens recovery and the publish proceeds.
+        let drain_ok: Option<u64> = Some(128);
+        if crate::boot::drain_succeeded(drain_ok) {
+            counter_db.mark_recovery_complete();
+        }
+        assert!(
+            counter_db.is_recovery_complete(),
+            "recovery OPENS once a subsequent drain succeeds (self-heal, not a permanent wedge)"
+        );
+        store
+            .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+            .await
+            .expect("the 17375 publish PROCEEDS after the drain self-heals");
+    }
+
     // ---- T12 (config-plane REVISION, finding-2; R2-#3 RE-KEYED to recovery_complete): EVERY 17375
     // writer is gated at the funnel. A pre-recovery `publish_config` (the flush_estate estate-publish
     // path, and any future writer) is REFUSED — no thin head is sent to the relays. Gating
