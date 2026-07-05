@@ -44,6 +44,7 @@
 //!   debited with no receipt or an act recorded with no debit.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use sled::transaction::{ConflictableTransactionError, TransactionError};
@@ -193,6 +194,49 @@ struct Inner {
     credit_ledger: sled::Tree,
     /// Held so the database is flushed and dropped with the treasury.
     db: sled::Db,
+    /// The cumulative metered VM-rent burned THIS RUN (Σ of the actual amounts `debit_metered`
+    /// debited). Rent leaves NO ledger row (it debits via `debit_metered`, spec 3.3), so it is
+    /// otherwise invisible to a treasury reader; this in-memory accumulator is the ONE place the
+    /// rent total is recoverable from the treasury handle. B2 needs it because the read-only
+    /// economics surfaces (the BOOKS DM composed in the gateway; the 31000 emitter) both derive
+    /// income via the balance identity `income = remaining + spent + rent - initial`, which
+    /// requires the SAME authoritative rent on every surface. Fed ONLY by `debit_metered` (the
+    /// daemon's meter path — never a genome act), so it cannot be inflated by a self-report. It is
+    /// per-run in-memory (NOT persisted), matching the meter's `burned_sats` semantics: a resume
+    /// starts it at 0 exactly as a fresh `Meter` does, so the two stay byte-equal. Shared across
+    /// treasury clones via the `Arc<Inner>`, so the gateway (a clone) reads the meter's live rent.
+    /// CAVEAT (keeper follow-up): because rent is per-run while the balance persists, the reconcile
+    /// identity is exact only WITHIN a run (design §B.3 "within one in-flight tick"); after a RESUME
+    /// the balance already reflects the prior run's rent but this counter is 0, so income would be
+    /// over-derived by that prior rent. Persisting rent would DIVERGE it from the meter's per-run
+    /// `burned_sats` (which the runway rate + G2 evidence depend on), so the fix is a keeper call,
+    /// not a unilateral B2 change. B2's live surfaces (a running agent's books) reconcile exactly.
+    rent_sats: AtomicU64,
+    /// A read-only DISPLAY hint: the seconds-to-broke the daemon's meter loop last computed
+    /// (`estimate_runway_secs`, the SAME runway the 31000 emitter publishes). NOT a ledger
+    /// quantity and NEVER read by the money path — it exists solely so the per-call BOOKS percept
+    /// composed in the gateway (which has no burn-rate clock of its own) can surface the live
+    /// runway the metered run computes. `u64::MAX` is the sentinel for "unknown" (`None`): the
+    /// initial value and what the loop publishes until a burn rate is established. Shared across
+    /// clones via the `Arc<Inner>`; published by [`Treasury::publish_runway_hint`], read by
+    /// [`Treasury::runway_secs_hint`].
+    runway_hint: AtomicU64,
+}
+
+/// The `runway_hint` sentinel meaning "unknown" (serialized as a `None`/null runway).
+const RUNWAY_HINT_UNKNOWN: u64 = u64::MAX;
+
+/// The profit margin = `income / (spent + rent)`, or `None` when no cost has been incurred yet
+/// (there is nothing to be a margin OVER — avoids a divide-by-zero and a bogus infinite margin).
+/// A single source so BOTH economics surfaces (the gateway BOOKS percept and the 31000 emitter)
+/// compute the ratio identically. `> 1.0` is profit; `< 1.0` is running at a loss this life.
+pub fn margin_ratio(income_sats: u64, spent_sats: u64, rent_sats: u64) -> Option<f64> {
+    let cost = spent_sats.saturating_add(rent_sats);
+    if cost == 0 {
+        None
+    } else {
+        Some(income_sats as f64 / cost as f64)
+    }
 }
 
 impl Treasury {
@@ -222,7 +266,14 @@ impl Treasury {
         db.flush()?;
 
         Ok(Treasury {
-            inner: Arc::new(Inner { balance, ledger, credit_ledger, db }),
+            inner: Arc::new(Inner {
+                balance,
+                ledger,
+                credit_ledger,
+                db,
+                rent_sats: AtomicU64::new(0),
+                runway_hint: AtomicU64::new(RUNWAY_HINT_UNKNOWN),
+            }),
         })
     }
 
@@ -236,7 +287,14 @@ impl Treasury {
         let credit_ledger = db.open_tree("credit_ledger")?;
         balance.insert(BALANCE_KEY, &initial_sats.to_be_bytes())?;
         Ok(Treasury {
-            inner: Arc::new(Inner { balance, ledger, credit_ledger, db }),
+            inner: Arc::new(Inner {
+                balance,
+                ledger,
+                credit_ledger,
+                db,
+                rent_sats: AtomicU64::new(0),
+                runway_hint: AtomicU64::new(RUNWAY_HINT_UNKNOWN),
+            }),
         })
     }
 
@@ -432,7 +490,42 @@ impl Treasury {
 
         // Durability: flush so a crash after a metered debit cannot lose it.
         self.inner.db.flush()?;
+        // Accumulate the rent total (B2): rent leaves no ledger row, so this in-memory counter is
+        // the ONLY treasury-side record of cumulative metered burn. Add the ACTUAL debited amount
+        // (never the requested `amount_sats`) so it stays exactly equal to the meter's `burned_sats`
+        // (which also adds `cost_sats` on `Debited`). A refused (`Insufficient`) tick debited
+        // nothing, so it adds nothing — the counter mirrors the balance movement precisely.
+        if let DebitOutcome::Debited { cost_sats, .. } = &outcome {
+            self.inner.rent_sats.fetch_add(*cost_sats, Ordering::Relaxed);
+        }
         Ok(outcome)
+    }
+
+    /// The cumulative metered VM-rent burned this run (Σ actual `debit_metered` debits). READ-ONLY;
+    /// the rent term of the economics identity `initial + income - spent - rent == remaining`. Fed
+    /// only by the daemon's meter path, so a genome cannot move it. Equals the live
+    /// `Meter::burned_sats`; the gateway (a treasury clone) reads it to compose the BOOKS percept
+    /// without holding the meter. Per-run in-memory (0 on a fresh open/resume, like the meter).
+    pub fn rent_sats(&self) -> u64 {
+        self.inner.rent_sats.load(Ordering::Relaxed)
+    }
+
+    /// Publish the latest seconds-to-broke the meter loop computed (the SAME runway the 31000
+    /// emitter shows), so the per-call BOOKS percept can surface it. `None` clears it to the
+    /// "unknown" sentinel. Display-only; never touched by the money path. Idempotent, last-writer.
+    pub fn publish_runway_hint(&self, runway_secs: Option<u64>) {
+        self.inner
+            .runway_hint
+            .store(runway_secs.unwrap_or(RUNWAY_HINT_UNKNOWN), Ordering::Relaxed);
+    }
+
+    /// The last-published seconds-to-broke display hint, or `None` when unknown (no burn rate yet,
+    /// or no meter loop is running — e.g. a bare gateway with no metered run). Display-only.
+    pub fn runway_secs_hint(&self) -> Option<u64> {
+        match self.inner.runway_hint.load(Ordering::Relaxed) {
+            RUNWAY_HINT_UNKNOWN => None,
+            secs => Some(secs),
+        }
     }
 
     /// Atomically debit `cost_sats` from the balance AND record the performed

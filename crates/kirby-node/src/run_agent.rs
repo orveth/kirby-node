@@ -316,6 +316,7 @@ fn agent_state_emitter(
 /// run). Used for the milestone states the metered loop does not cover: the terminal
 /// "dead" at budget-death, and the running state on the resume path. `runway_secs` is
 /// `None` (null) when no burn rate applies (resume; the final dead state).
+#[allow(clippy::too_many_arguments)] // +1 for the B2 economics overlay on the terminal face.
 async fn emit_agent_state(
     signer: &crate::nerve::BeaconSigner,
     config: &KirbyConfig,
@@ -324,14 +325,32 @@ async fn emit_agent_state(
     runway_secs: Option<u64>,
     lifecycle: &str,
     canonical_npub: Option<&str>,
+    economics: Option<(crate::treasury::EconomicsSnapshot, u64)>,
 ) {
-    let content = nerve::AgentStateContent::sovereign(
-        &config.agent_id,
-        treasury_sats,
-        runway_secs,
-        lifecycle,
-        backend.label(),
-    );
+    // B2: overlay the final economics when available (the terminal "dead" face), so the last
+    // replaceable 31000 keeps the true books instead of zeroing the live economics (codex). When
+    // present, `treasury_sats` is taken from the SAME snapshot (not the separately-sampled
+    // `treasury_sats` arg) so the event is internally consistent — `initial + income - spent - rent
+    // == treasury_sats` holds on the emitted face. When `None` (the resume demo: no meter loop, so
+    // rent this run is unknowable) the pre-B2 face is emitted with the sampled balance — honest
+    // "unknown"/default economics rather than a derived-but-wrong number.
+    let content = match &economics {
+        Some((snap, rent_sats)) => nerve::AgentStateContent::sovereign(
+            &config.agent_id,
+            snap.remaining_sats,
+            runway_secs,
+            lifecycle,
+            backend.label(),
+        )
+        .with_economics(snap, *rent_sats),
+        None => nerve::AgentStateContent::sovereign(
+            &config.agent_id,
+            treasury_sats,
+            runway_secs,
+            lifecycle,
+            backend.label(),
+        ),
+    };
     if let Err(e) = nerve::publish_agent_state(
         signer,
         &config.relay.url,
@@ -783,6 +802,8 @@ async fn run_bootstrap(
         None,
         "dead",
         canonical_npub.as_deref(),
+        // The true final books (B2): the meter captured them at halt from the live treasury.
+        outcome.final_economics,
     )
     .await;
 
@@ -849,6 +870,9 @@ async fn run_resume(
         None,
         "running",
         canonical_npub.as_deref(),
+        // Resume has no meter loop, so this run's rent is unknowable — omit economics (honest
+        // "unknown") rather than derive an inflated income against rent=0 (B2 resume caveat).
+        None,
     )
     .await;
 
@@ -868,6 +892,8 @@ async fn run_resume(
         None,
         "dead",
         canonical_npub.as_deref(),
+        // Resume teardown: no metered rent this run — omit economics (see the "running" emit).
+        None,
     )
     .await;
 

@@ -47,7 +47,7 @@ use cgroups_rs::fs::memory::MemController;
 #[cfg(target_os = "linux")]
 use cgroups_rs::fs::Cgroup;
 
-use crate::treasury::{DebitOutcome, Treasury, TreasuryError};
+use crate::treasury::{DebitOutcome, EconomicsSnapshot, Treasury, TreasuryError};
 
 /// The cgroup v2 unified mount root. The VM's cgroup is addressed relative to
 /// this (cgroups-rs takes the path relative to the mount).
@@ -643,6 +643,26 @@ impl Meter {
     /// the meter tick.
     pub fn capability_spent_best_effort(&self) -> u64 {
         self.treasury.spent_sats().unwrap_or(0)
+    }
+
+    /// The B2 economics snapshot plus the exact rent it was derived against, for the 31000 emitter
+    /// (design §B.2, surface 2). Reads the treasury's rent accumulator ONCE and folds the snapshot
+    /// against that same rent, so the returned pair is internally consistent (the balance identity
+    /// `initial + income - spent - rent == remaining` holds) and uses the SAME `Treasury::rent_sats`
+    /// the gateway's BOOKS percept reads — the two surfaces reconcile by construction. Returns
+    /// `None` on a treasury read fault; the emit is best-effort, so a fault just omits the economics
+    /// overlay that tick. Read-only.
+    pub fn economics(&self, initial_sats: u64) -> Option<(EconomicsSnapshot, u64)> {
+        let rent_sats = self.treasury.rent_sats();
+        let snap = self.treasury.economics_snapshot(initial_sats, rent_sats).ok()?;
+        Some((snap, rent_sats))
+    }
+
+    /// Publish the latest seconds-to-broke into the shared treasury display hint (B2), so the
+    /// per-call BOOKS percept the gateway composes can surface the SAME runway the emitter shows.
+    /// Display-only; never touches the money path.
+    pub fn publish_runway_hint(&self, runway_secs: Option<u64>) {
+        self.treasury.publish_runway_hint(runway_secs);
     }
 }
 

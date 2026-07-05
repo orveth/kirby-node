@@ -90,8 +90,17 @@ impl AgentStateEmitter {
         }
     }
 
-    /// Publish one live 31000 agent-state event (best-effort; logs on failure).
-    async fn emit(&self, treasury_sats: u64, runway_secs: Option<u64>) {
+    /// Publish one live 31000 agent-state event (best-effort; logs on failure). `economics`
+    /// (B2, design §B.2) carries the live snapshot + the rent it was derived against; when `Some`
+    /// the emitted face is overlaid with the economics figures from that ONE snapshot (income /
+    /// spent / rent / jobs / margin), reconcilable against the gateway's BOOKS percept. `None`
+    /// (the gate tests, or a treasury read fault) emits the pre-B2 face unchanged.
+    async fn emit(
+        &self,
+        treasury_sats: u64,
+        runway_secs: Option<u64>,
+        economics: Option<(crate::treasury::EconomicsSnapshot, u64)>,
+    ) {
         let lifecycle = self.phase(treasury_sats, runway_secs);
         let content = nerve::AgentStateContent::sovereign(
             &self.agent_id,
@@ -100,6 +109,11 @@ impl AgentStateEmitter {
             lifecycle,
             &self.backend,
         );
+        // Overlay the B2 economics from the same snapshot the BOOKS percept uses (§B.3 reconcile).
+        let content = match &economics {
+            Some((snap, rent_sats)) => content.with_economics(snap, *rent_sats),
+            None => content,
+        };
         if let Err(e) = nerve::publish_agent_state(
             &self.signer,
             &self.relay_url,
@@ -153,6 +167,11 @@ pub struct MeteredRunOutcome {
     /// Latest app-checkpoint submitted by the genome during this metered run, if
     /// the selected workload is checkpoint-aware.
     pub latest_checkpoint: Option<CheckpointArtifact>,
+    /// The FINAL B2 economics snapshot + the rent it was derived against, captured at halt from
+    /// the SAME source the live emitter used (design §B.2). The terminal "dead" 31000 carries this
+    /// so it publishes the TRUE final books instead of overwriting the last live face's economics
+    /// with zeros (codex). `None` only on a treasury read fault at halt.
+    pub final_economics: Option<(crate::treasury::EconomicsSnapshot, u64)>,
 }
 
 /// Inputs for a metered run. Reuses the boot config and adds the meter tick (the
@@ -414,6 +433,9 @@ pub async fn run(config: MeteredRunConfig) -> anyhow::Result<MeteredRunOutcome> 
         // until the daemon kills it). This is the G2 "daemon killed it" property.
         daemon_initiated_kill: true,
         latest_checkpoint,
+        // Capture the final books at halt (meter still alive; its rent accumulator holds the whole
+        // run's burn), so the terminal "dead" 31000 reports the true economics.
+        final_economics: meter.economics(budget_sats),
     })
 }
 
@@ -505,7 +527,12 @@ async fn tick_until_exhausted(
                     start,
                     now,
                 );
-                emitter.emit(remaining, runway_secs).await;
+                // B2: publish the runway into the shared treasury hint so the gateway's per-call
+                // BOOKS percept surfaces the SAME runway, and compose the economics snapshot for
+                // this 31000 face from the treasury (one source with the DM report, §B.3).
+                meter.publish_runway_hint(runway_secs);
+                let economics = meter.economics(emitter.budget_sats);
+                emitter.emit(remaining, runway_secs, economics).await;
                 next_emit = now + emitter.interval;
             }
         }

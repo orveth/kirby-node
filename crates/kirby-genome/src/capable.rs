@@ -50,10 +50,11 @@
 use kirby_proto::capability_request::Act;
 use kirby_proto::node_gateway_client::NodeGatewayClient;
 use kirby_proto::{
-    Actuate, CapabilityReceipt, CapabilityRequest, ChargeMethod, ChatMessage, Completion, Event,
-    HttpFetch, InboundBatch, InboundKind, InboxRequest, IssueCharge, Memory, MemoryOp,
-    NostrDmReply, NostrPublish, PaymentSettled, ACTUATE_KIND_HTTP_FETCH, ACTUATE_KIND_NOSTR_DM_REPLY,
-    ACTUATE_KIND_NOSTR_PUBLISH, NOSTR_KIND_TEXT_NOTE,
+    Actuate, CapabilityReceipt, CapabilityRequest, ChargeMethod, ChatMessage, Completion,
+    EconomicsPercept, Event, HttpFetch, InboundBatch, InboundKind, InboxRequest, IssueCharge, Memory,
+    MemoryOp, NostrDmReply, NostrPublish, PaymentSettled, SessionContext, SessionRequest,
+    ACTUATE_KIND_HTTP_FETCH, ACTUATE_KIND_NOSTR_DM_REPLY, ACTUATE_KIND_NOSTR_PUBLISH,
+    NOSTR_KIND_TEXT_NOTE,
 };
 // `prost::Message` (brought in unnamed) for `encode_to_vec`: the genome prost-encodes the
 // typed POST payload into the opaque `Actuate.payload`, staying JSON-free (F5).
@@ -783,6 +784,11 @@ pub(super) trait Gateway {
         memo: &str,
         idempotency_key: &str,
     ) -> Result<CapabilityReceipt, tonic::Status>;
+    /// Fetch a FRESH [`SessionContext`] via `GetSessionContext` (B2). The daemon composes the
+    /// `economics` percept LIVE per call, so the returned books are CURRENT (never a boot cache).
+    /// Reuses the EXISTING RPC — no new door — so the FREE BOOKS self-report reads authoritative
+    /// daemon-metered figures the genome cannot inflate.
+    async fn fetch_session_context(&mut self) -> Result<SessionContext, tonic::Status>;
 }
 
 impl Gateway for NodeGatewayClient<tonic::transport::Channel> {
@@ -814,6 +820,13 @@ impl Gateway for NodeGatewayClient<tonic::transport::Channel> {
             budget_sats: 0,
         };
         self.request_capability(req).await.map(|r| r.into_inner())
+    }
+    async fn fetch_session_context(&mut self) -> Result<SessionContext, tonic::Status> {
+        // The inherent tonic `get_session_context` (takes priority over this trait method of the
+        // other name). Reuses the boot RPC; the daemon re-composes economics live per call.
+        self.get_session_context(SessionRequest { schema_version: kirby_proto::SCHEMA_VERSION })
+            .await
+            .map(|r| r.into_inner())
     }
 }
 
@@ -2980,6 +2993,63 @@ async fn poll_one_oracle_event<G: Gateway>(
 /// before it is paid (charge -> settle -> answer, never answer-then-hope). Generic over
 /// [`Gateway`] so the real vsock client and the test mock drive identical logic.
 #[allow(clippy::too_many_arguments)]
+/// Render seconds as a compact human duration for the BOOKS runway line ("2d 3h", "3h 20m",
+/// "5m 10s", "45s") — the two coarsest non-zero units, so the runway reads at a glance.
+fn format_human_duration(secs: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    if secs >= DAY {
+        format!("{}d {}h", secs / DAY, (secs % DAY) / HOUR)
+    } else if secs >= HOUR {
+        format!("{}h {}m", secs / HOUR, (secs % HOUR) / MIN)
+    } else if secs >= MIN {
+        format!("{}m {}s", secs / MIN, secs % MIN)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Format the FREE "KIRBY BOOKS" self-report (design §B.2, surface 1) from the daemon's LIVE
+/// [`EconomicsPercept`]. The genome only FORMATS the daemon's authoritative figures — it never
+/// computes income — so a compromised genome cannot inflate its books (the honesty guarantee).
+/// Guards every divide (jobs==0 => avg n/a) and renders a `None` runway/margin honestly rather
+/// than a fabricated number. `None` percept (an old pre-B2 daemon, or a treasury read fault) => an
+/// explicit "unavailable" line, never a fake zero.
+fn format_oracle_books(economics: Option<&EconomicsPercept>) -> String {
+    let Some(e) = economics else {
+        return "KIRBY BOOKS\n(economics unavailable — the daemon reported no percept)".to_string();
+    };
+    // net can be NEGATIVE (running at a loss this life); widen to i128 so it never underflows.
+    let net = e.income_sats as i128 - e.spent_sats as i128 - e.rent_sats as i128;
+    let margin = match e.margin_ratio {
+        Some(m) => format!("{m:.2}x"),
+        None => "n/a".to_string(),
+    };
+    let runway = match e.runway_secs {
+        Some(secs) => format!("~{}", format_human_duration(secs)),
+        None => "unknown".to_string(),
+    };
+    let avg_cost = if e.jobs_settled > 0 {
+        format!("{} sats", e.spent_sats.saturating_add(e.rent_sats) / e.jobs_settled)
+    } else {
+        "n/a (no jobs paid yet)".to_string()
+    };
+    format!(
+        "KIRBY BOOKS\n\
+         treasury: {treasury} sats    income: {income} sats ({jobs} jobs paid)\n\
+         spent: {spent} sats (inference+fetches+replies)   rent: {rent} sats\n\
+         net: {net:+} sats this life   margin: {margin}\n\
+         runway: {runway} at current burn\n\
+         avg cost/job: {avg_cost}",
+        treasury = e.treasury_sats,
+        income = e.income_sats,
+        jobs = e.jobs_settled,
+        spent = e.spent_sats,
+        rent = e.rent_sats,
+    )
+}
+
 pub(super) async fn oracle_tick<G: Gateway>(
     gw: &mut G,
     seq: u64,
@@ -3150,16 +3220,43 @@ pub(super) async fn oracle_tick<G: Gateway>(
         let request = parse_oracle_request(&text);
         match &request {
             OracleRequest::Status => {
-                // Recognized in O1; the real books report is a FREE reply built in B2.
-                *inbox_ack_seq = ev.inbox_seq;
-                TickOutcome::Lived {
-                    think_cost: 0,
-                    treasury_remaining: last_treasury_remaining,
-                    recorded_write: false,
-                    action: Action::Note,
-                    verify: None,
-                    feedback: "oracle: STATUS/BOOKS recognized (the books report lands in B2)"
-                        .into(),
+                // FREE self-report (design §B.2, surface 1). Fetch the LIVE economics percept
+                // (GetSessionContext, re-composed daemon-side per call) and DM the BOOKS back.
+                // NO charge is issued (`issue_charge` is NOT called — the agent talking about
+                // itself is free, tooth T3); the reply rides the EXISTING nostr.dm_reply door. The
+                // dm_reply is itself metered (the agent pays to speak, exactly like the invoice
+                // DM) — "free" means the CUSTOMER is not charged, not that sending costs nothing.
+                let economics = match gw.fetch_session_context().await {
+                    Ok(ctx) => ctx.economics,
+                    Err(status) => {
+                        boot_log(&format!(
+                            "oracle seq={seq}: STATUS GetSessionContext errored ({status}); transient"
+                        ));
+                        return TickOutcome::Transient;
+                    }
+                };
+                let books = format_oracle_books(economics.as_ref());
+                // Reuse `execute_dm_reply` (the existing door). A Transient transport error does
+                // NOT consume the event (retry the SAME books next tick at the reused seq); any
+                // Done (delivered, or a soft broke/not-allowlisted skip) consumes + advances — no
+                // money is at stake in a free report, so an undelivered books is simply dropped.
+                match execute_dm_reply(gw, seq, &sender, &books, params).await {
+                    ActionOutcome::Transient => TickOutcome::Transient,
+                    ActionOutcome::Done { recorded_write, verify, feedback } => {
+                        *inbox_ack_seq = ev.inbox_seq;
+                        TickOutcome::Lived {
+                            think_cost: 0,
+                            treasury_remaining: last_treasury_remaining,
+                            recorded_write,
+                            action: if recorded_write {
+                                Action::DmReply { text: books }
+                            } else {
+                                Action::Note
+                            },
+                            verify,
+                            feedback,
+                        }
+                    }
                 }
             }
             OracleRequest::Unsupported => {
@@ -3433,6 +3530,10 @@ mod tests {
         dm_replies: Vec<NostrDmReply>,
         /// The daemon's inbound queue contents the mock serves on `read_inbox` (the scripted DMs).
         inbox: Vec<InboundEvent>,
+        /// The [`SessionContext`] the mock returns on `fetch_session_context` (B2). Its
+        /// `economics` percept is what the FREE BOOKS reply formats; a test sets it via
+        /// `with_economics`. Default (all-zero, `economics: None`) models an old pre-B2 daemon.
+        session_context: SessionContext,
         // Recording.
         requests: Vec<CapabilityRequest>,
         events: Vec<Event>,
@@ -3526,6 +3627,12 @@ mod tests {
                 created_at: 0,
                 correlation_id: charge_id.to_string(),
             });
+            self
+        }
+
+        /// Set the economics percept the mock serves on `fetch_session_context` (B2 BOOKS teeth).
+        fn with_economics(mut self, economics: EconomicsPercept) -> Self {
+            self.session_context.economics = Some(economics);
             self
         }
 
@@ -3659,6 +3766,10 @@ mod tests {
         async fn send_event(&mut self, event: Event) -> Result<(), tonic::Status> {
             self.events.push(event);
             Ok(())
+        }
+
+        async fn fetch_session_context(&mut self) -> Result<SessionContext, tonic::Status> {
+            Ok(self.session_context.clone())
         }
 
         async fn read_inbox(
@@ -3901,6 +4012,141 @@ mod tests {
         );
         assert!(pending.is_empty(), "the answered charge is cleared from the waiting-set");
         assert_eq!(ack, 2, "the settlement was consumed");
+    }
+
+    /// TOOTH T3 (B2 surface 1): a STATUS/BOOKS DM gets a FREE reply — the oracle issues NO charge
+    /// (`issue_charge` is never called), DMs the KIRBY BOOKS report formatted from the daemon's
+    /// LIVE economics percept, and consumes the event (no pending job opened).
+    ///
+    /// RED-on-revert: change the `OracleRequest::Status` arm to `issue_charge(...)` before/instead
+    /// of the free reply and `issue_charge_requests()` becomes > 0; revert it to the old no-reply
+    /// stub and the `DmReply`/`starts_with("KIRBY BOOKS")` assertions fail. LOAD-BEARING money
+    /// tooth: a status query must never bill the customer.
+    #[tokio::test]
+    async fn oracle_b2_status_query_is_free_and_reports_books() {
+        let sender = dm_sender_hex(7);
+        let params = test_params();
+        let economics = EconomicsPercept {
+            treasury_sats: 12_940,
+            income_sats: 1_050,
+            spent_sats: 640,
+            rent_sats: 210,
+            initial_sats: 12_740,
+            runway_secs: Some(12_000), // 3h 20m
+            margin_ratio: Some(1.23),
+            jobs_settled: 7,
+        };
+        // `thinking` only sets the actuate outcome AuthorizedAndPerformed (so the free dm_reply
+        // DELIVERS); the think reply is irrelevant — a STATUS query never thinks.
+        let mut gw = MockGateway::thinking("unused")
+            .with_dm(1, &sender, "BOOKS")
+            .with_economics(economics);
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        let out = oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        assert!(
+            matches!(out, TickOutcome::Lived { action: Action::DmReply { .. }, .. }),
+            "a STATUS query should DM the books, got {out:?}"
+        );
+        // FREE: NOT a single charge issued.
+        assert_eq!(
+            gw.issue_charge_requests(),
+            0,
+            "a STATUS/BOOKS query must NEVER issue a charge (free self-report, T3)"
+        );
+        // Exactly one DM: the books report.
+        assert_eq!(gw.dm_reply_requests(), 1, "one free books DM, no more");
+        let books = &gw.dm_replies[0].text;
+        assert!(books.starts_with("KIRBY BOOKS"), "the reply is the books report: {books}");
+        assert!(books.contains("treasury: 12940 sats"), "books shows the live treasury: {books}");
+        assert!(
+            books.contains("income: 1050 sats (7 jobs paid)"),
+            "books shows income + jobs: {books}"
+        );
+        assert!(books.contains("rent: 210 sats"), "books shows rent: {books}");
+        // net = 1050 - 640 - 210 = +200
+        assert!(books.contains("net: +200 sats this life"), "books shows signed net: {books}");
+        assert!(books.contains("margin: 1.23x"), "books shows the margin ratio: {books}");
+        assert!(books.contains("runway: ~3h 20m"), "books shows human runway: {books}");
+        // avg cost/job = (640 + 210) / 7 = 121
+        assert!(books.contains("avg cost/job: 121 sats"), "books shows avg cost/job: {books}");
+        assert_eq!(ack, 1, "the STATUS DM was consumed (cursor advanced)");
+        assert!(pending.is_empty(), "a free report opens NO pending charge");
+    }
+
+    /// A STATUS query against an OLD (pre-B2) daemon that returns no `economics` percept degrades
+    /// HONESTLY: still free, still a reply, but an explicit "unavailable" line — never a fabricated
+    /// zero-books. Guards the `None` percept path in `format_oracle_books`.
+    #[tokio::test]
+    async fn oracle_b2_status_query_without_percept_is_honest() {
+        let sender = dm_sender_hex(8);
+        let params = test_params();
+        // No `with_economics` => the mock's default SessionContext carries `economics: None`.
+        let mut gw = MockGateway::thinking("unused").with_dm(1, &sender, "STATUS");
+        let mut ack: u64 = 0;
+        let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+
+        let out = oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+        assert!(matches!(out, TickOutcome::Lived { action: Action::DmReply { .. }, .. }));
+        assert_eq!(gw.issue_charge_requests(), 0, "still free with no percept");
+        assert!(
+            gw.dm_replies[0].text.contains("economics unavailable"),
+            "no percept => honest 'unavailable', not a fake zero: {:?}",
+            gw.dm_replies[0].text
+        );
+        assert_eq!(ack, 1);
+    }
+
+    /// The BOOKS runway line renders `None` runway as "unknown" and guards the avg-cost divide when
+    /// no jobs have been paid — the divide-by-zero / null-field guards (B2), unit-level.
+    #[test]
+    fn oracle_b2_books_guards_none_runway_and_zero_jobs() {
+        let economics = EconomicsPercept {
+            treasury_sats: 1_000,
+            income_sats: 0,
+            spent_sats: 0,
+            rent_sats: 0,
+            initial_sats: 1_000,
+            runway_secs: None,
+            margin_ratio: None,
+            jobs_settled: 0,
+        };
+        let books = format_oracle_books(Some(&economics));
+        assert!(books.contains("runway: unknown"), "None runway => unknown: {books}");
+        assert!(books.contains("margin: n/a"), "None margin => n/a: {books}");
+        assert!(books.contains("avg cost/job: n/a"), "0 jobs => no divide: {books}");
+        assert!(books.contains("net: +0 sats"), "net at genesis is +0: {books}");
+    }
+
+    /// B2-4 (folded in by keeper:kirby): the worst-case AUTHORIZED per-quote cost ceiling is the
+    /// oracle THINK's `max_cost` + every fetch attempt across every feed at the per-fetch cap. On
+    /// the DEFAULT DiaristParams (default deployment: brain = memory = 64 sats):
+    ///
+    ///   ceiling = brain_max_cost + ORACLE_FETCH_ATTEMPTS × ORACLE_FEEDS.len() × fetch_max_cost
+    ///           = 64 + 2 × 3 × 64 = 448 sats
+    ///
+    /// The current `ORACLE_MIN_CHARGE_SATS` floor (10) is FAR below this (448). Per the charter we
+    /// do NOT silently pass and do NOT raise the floor ourselves — the floor value is a call for
+    /// keeper:kirby. This test DOCUMENTS the exact ceiling + components (so the number is captured
+    /// in code and re-verified in CI); it is NOT the T4 "floor >= ceiling" tooth, which stays
+    /// UNWRITTEN until keeper rules on the floor. Status: **B2-4 BLOCKED-ON-KEEPER**.
+    #[test]
+    fn oracle_b2_4_worst_case_ceiling_is_blocked_on_keeper() {
+        let brain_max_cost = crate::metabolism::DEFAULT_BRAIN_MAX_COST_SATS;
+        // `oracle_fetch` bills each fetch against `params.memory_max_cost` (the per-fetch cap).
+        let fetch_max_cost = crate::metabolism::DEFAULT_MEMORY_MAX_COST_SATS;
+        let ceiling = brain_max_cost
+            + (ORACLE_FETCH_ATTEMPTS as u64) * (ORACLE_FEEDS.len() as u64) * fetch_max_cost;
+        assert_eq!(
+            ceiling, 448,
+            "worst-case per-quote ceiling components changed — re-report the new number to keeper:kirby"
+        );
+        assert!(
+            ORACLE_MIN_CHARGE_SATS < ceiling,
+            "BLOCKED-ON-KEEPER: floor ({ORACLE_MIN_CHARGE_SATS}) < ceiling ({ceiling}). If keeper \
+             raises the floor to >= {ceiling}, REPLACE this with the real T4 (assert floor >= ceiling)"
+        );
     }
 
     /// TOOTH (O1): CORRELATION EXACTLY-ONCE. A duplicate PAYMENT_SETTLED for an already-answered

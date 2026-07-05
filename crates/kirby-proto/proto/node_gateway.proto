@@ -54,6 +54,24 @@ message SessionContext {
   repeated string allowlisted_destinations = 4; // mint ids and endpoint hosts, non-secret
   CheckpointRef restore_checkpoint = 5; // optional logical checkpoint ref for a fresh app-level restore
   bytes restore_checkpoint_blob = 6;    // inline checkpoint payload for the spike harness
+  EconomicsPercept economics = 7;       // read-only economics snapshot (B2), composed LIVE per call;
+                                        // optional message => back-compat (absent on old daemons)
+}
+
+// A read-only economics snapshot derived DAEMON-SIDE from the treasury ledger + meter (B2, design
+// §B.1). NOT a money door: nothing here mutates balance; it is a bookkeeping view the genome
+// reasons over and reports on. All figures are the daemon's authoritative meters — never a genome
+// self-report — so a compromised genome cannot inflate its books. Composed LIVE in
+// GetSessionContext (per-call, never a boot-time cache) from Treasury::economics_snapshot().
+message EconomicsPercept {
+  uint64 treasury_sats        = 1;  // live balance == Treasury::remaining() (ground truth)
+  uint64 income_sats          = 2;  // mint-verified earnings this life (derived == Σ credit_ledger)
+  uint64 spent_sats           = 3;  // Σ ledger debit rows (inference + egress + acts) this life
+  uint64 rent_sats            = 4;  // metered VM-rent burned so far (== meter.burned_sats())
+  uint64 initial_sats         = 5;  // the genesis budget (income excludes this; it is capital)
+  optional uint64 runway_secs = 6;  // seconds-to-broke at the current total burn (null until known)
+  optional double margin_ratio= 7;  // income_sats / (spent_sats + rent_sats); null until cost>0
+  uint64 jobs_settled         = 8;  // count of settled credits (jobs actually paid)
 }
 
 message EntropyRequest {
