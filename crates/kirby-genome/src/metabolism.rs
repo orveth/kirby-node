@@ -17,8 +17,10 @@ use kirby_proto::{CapabilityReceipt, Outcome};
 const DEFAULT_DIARIST_TICK_SECS: u64 = 60;
 const DEFAULT_DIARIST_RECALL_COUNT: usize = 5;
 const DEFAULT_BRAIN_MODEL: &str = "anthropic/claude-sonnet-4.6";
-const DEFAULT_BRAIN_MAX_COST_SATS: u64 = 64;
-const DEFAULT_MEMORY_MAX_COST_SATS: u64 = 64;
+// `pub(crate)` so the oracle's B2-4 worst-case per-quote ceiling tooth can compute the default
+// deployment's brain/fetch caps without hardcoding them (drift-proof).
+pub(crate) const DEFAULT_BRAIN_MAX_COST_SATS: u64 = 64;
+pub(crate) const DEFAULT_MEMORY_MAX_COST_SATS: u64 = 64;
 
 // The NIP-17 DM conversation knobs (#73). Defaulted so a bare `kirby run` JUST-WORKS; tunable
 // via the cmdline for the test/introspection surface. There is deliberately NO spend-cap knob:

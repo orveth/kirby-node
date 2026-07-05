@@ -1574,7 +1574,9 @@ pub async fn publish_lifecycle(
 /// number); `runway_secs` is the estimated seconds until broke at the current burn
 /// (`null` until a burn rate is established). On a sovereign node there is no Raft
 /// lease, so `lease_holder_node`/`lease_term` are always `null`.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+// NOT `Eq`: `margin_ratio: Option<f64>` (B2) makes `Eq` un-derivable (floats are only `PartialEq`).
+// `PartialEq` is retained (the tests `assert_eq!` on this content); nothing keys a set on it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct AgentStateContent {
     /// The agent this state event is about (e.g. "agent-0"); also the `d`-tag value.
     pub agent_id: String,
@@ -1595,6 +1597,29 @@ pub struct AgentStateContent {
     /// The Raft lease term, or `null` on a sovereign node (no Raft lease).
     #[serde(default)]
     pub lease_term: Option<u64>,
+    /// B2 economics self-reporting (design §B.2, surface 2). These ADDITIVE fields carry the same
+    /// figures as the [`kirby_proto::EconomicsPercept`], filled from the SAME
+    /// [`crate::treasury::Treasury::economics_snapshot`] the BOOKS DM percept uses, so the UI's
+    /// numbers and the genome's numbers come from ONE source and reconcile (design §B.3). ALL are
+    /// `#[serde(default)]` so an OLD reader (a 31000 event written before B2) still deserializes —
+    /// the missing fields default to 0 / `None` rather than erroring (back-compat, tooth T5).
+    /// Signed under Q (it is the 31000 beacon), so the economics face is sovereign + unforgeable.
+    ///
+    /// Mint-verified earnings this life (`== Σ credit_ledger`); a genome cannot inflate it.
+    #[serde(default)]
+    pub income_sats: u64,
+    /// Σ capability-act debits this life (inference + egress + acts); excludes rent.
+    #[serde(default)]
+    pub spent_sats: u64,
+    /// Metered VM-rent burned this run (`== meter.burned_sats()`).
+    #[serde(default)]
+    pub rent_sats: u64,
+    /// Count of settled credits — jobs a stranger actually paid.
+    #[serde(default)]
+    pub jobs_settled: u64,
+    /// Profit margin `income / (spent + rent)`, or `null` until any cost is incurred.
+    #[serde(default)]
+    pub margin_ratio: Option<f64>,
 }
 
 impl AgentStateContent {
@@ -1615,7 +1640,30 @@ impl AgentStateContent {
             backend: backend.to_string(),
             lease_holder_node: None,
             lease_term: None,
+            // B2 economics default to zero/None; the emitter overlays the live figures via
+            // `with_economics`. A caller that omits it (the gate tests) emits a byte-compatible
+            // pre-B2 face (all economics fields at their serde defaults).
+            income_sats: 0,
+            spent_sats: 0,
+            rent_sats: 0,
+            jobs_settled: 0,
+            margin_ratio: None,
         }
+    }
+
+    /// Overlay the B2 economics figures (design §B.2, surface 2) onto the content, from the SAME
+    /// [`crate::treasury::EconomicsSnapshot`] the BOOKS percept uses (one source, reconcilable —
+    /// §B.3). `rent_sats` is the meter's live burn (the snapshot derives income against it), and
+    /// `margin_ratio` is computed via the shared [`crate::treasury::margin_ratio`] so the 31000 and
+    /// the DM report agree to the ratio. Chained by the emitter; a caller that skips it leaves the
+    /// pre-B2 defaults.
+    pub fn with_economics(mut self, snap: &crate::treasury::EconomicsSnapshot, rent_sats: u64) -> Self {
+        self.income_sats = snap.income_sats;
+        self.spent_sats = snap.spent_sats;
+        self.rent_sats = rent_sats;
+        self.jobs_settled = snap.jobs_settled;
+        self.margin_ratio = crate::treasury::margin_ratio(snap.income_sats, snap.spent_sats, rent_sats);
+        self
     }
 }
 
@@ -2331,6 +2379,50 @@ mod tests {
         assert_eq!(dc.reason, "broke");
     }
 
+    /// TOOTH T5 (B2 back-compat): an OLD 31000 `AgentStateContent` JSON — written before B2, with
+    /// NO economics fields — still deserializes, the new fields taking their serde defaults (0 /
+    /// None) rather than erroring. Old readers/writers keep interoperating (additive schema).
+    ///
+    /// RED-on-revert: drop the `#[serde(default)]` on any new economics field (e.g. `income_sats`)
+    /// and this `from_str` fails with "missing field `income_sats`".
+    #[test]
+    fn t5_agent_state_content_is_back_compat_with_pre_b2_readers() {
+        // A pre-B2 31000 content payload: exactly the fields that existed before B2.
+        let old_json = r#"{"agent_id":"agent-0","treasury_sats":1234,"runway_secs":42,"lifecycle":"running","backend":"firecracker","lease_holder_node":null,"lease_term":null}"#;
+        let content: AgentStateContent =
+            serde_json::from_str(old_json).expect("a pre-B2 31000 content must still deserialize");
+        assert_eq!(content.treasury_sats, 1234);
+        assert_eq!(content.runway_secs, Some(42));
+        // The B2 additive fields default when absent (never an error).
+        assert_eq!(content.income_sats, 0);
+        assert_eq!(content.spent_sats, 0);
+        assert_eq!(content.rent_sats, 0);
+        assert_eq!(content.jobs_settled, 0);
+        assert_eq!(content.margin_ratio, None);
+    }
+
+    /// The B2 economics overlay round-trips through the 31000 JSON: `with_economics` fills the
+    /// fields and a fresh reader parses them back identically (forward-compat for a new reader).
+    #[test]
+    fn t5_agent_state_content_economics_overlay_round_trips() {
+        let snap = crate::treasury::EconomicsSnapshot {
+            remaining_sats: 1_330,
+            income_sats: 500,
+            spent_sats: 100,
+            jobs_settled: 2,
+        };
+        let content =
+            AgentStateContent::sovereign("agent-0", 1_330, Some(7), "running", "firecracker")
+                .with_economics(&snap, 70);
+        let json = serde_json::to_string(&content).unwrap();
+        let back: AgentStateContent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, content);
+        assert_eq!(back.income_sats, 500);
+        assert_eq!(back.rent_sats, 70);
+        assert_eq!(back.jobs_settled, 2);
+        assert_eq!(back.margin_ratio, crate::treasury::margin_ratio(500, 100, 70));
+    }
+
     #[test]
     fn agent_state_event_shape_matches_the_contract() {
         // 31000 running: addressable (d=agent_id), tags
@@ -2377,6 +2469,12 @@ mod tests {
                 backend: "firecracker".to_string(),
                 lease_holder_node: None,
                 lease_term: None,
+                // B2 economics: `sovereign` (no `with_economics` overlay) leaves them at defaults.
+                income_sats: 0,
+                spent_sats: 0,
+                rent_sats: 0,
+                jobs_settled: 0,
+                margin_ratio: None,
             }
         );
         // The lease fields serialize as JSON null (sovereign = no Raft lease).

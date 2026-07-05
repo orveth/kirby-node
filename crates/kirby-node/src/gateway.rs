@@ -21,9 +21,9 @@ use std::sync::Arc;
 use kirby_proto::capability_request::Act;
 use kirby_proto::node_gateway_server::{NodeGateway, NodeGatewayServer};
 use kirby_proto::{
-    Ack, CapabilityReceipt, CapabilityRequest, ChargeIssued, CheckpointBlob, EntropyNonce,
-    EntropyRequest, Event, InboundBatch, InboundKind, InboxRequest, Memory, MemoryOp, MemoryResult,
-    Outcome, PaymentSettled, SessionContext, SessionRequest, WriteStatus,
+    Ack, CapabilityReceipt, CapabilityRequest, ChargeIssued, CheckpointBlob, EconomicsPercept,
+    EntropyNonce, EntropyRequest, Event, InboundBatch, InboundKind, InboxRequest, Memory, MemoryOp,
+    MemoryResult, Outcome, PaymentSettled, SessionContext, SessionRequest, WriteStatus,
 };
 use prost::Message;
 use rand::TryRngCore;
@@ -1306,6 +1306,45 @@ impl GatewayService {
     fn balance(&self) -> Result<u64, TreasuryError> {
         self.treasury.remaining()
     }
+
+    /// Compose the read-only [`EconomicsPercept`] (B2) from the LIVE treasury at call time. Every
+    /// figure comes from ONE source — [`Treasury::economics_snapshot`] over the live ledger + the
+    /// treasury's own rent accumulator — so the BOOKS DM reply (which formats this percept) and the
+    /// 31000 emitter (which composes the SAME snapshot) reconcile by construction (design §B.3):
+    /// `initial + income - spent - rent == treasury`. `initial` is the injected genesis budget
+    /// (`session.budget_sats`, the same value the treasury was seeded with and the emitter's
+    /// dying-fraction uses). `rent` is the daemon meter's live burn, read from the shared treasury
+    /// accumulator (the gateway holds no meter). `runway_secs` is the display hint the metered run
+    /// publishes (the gateway has no burn-rate clock; `None` until the loop establishes a rate).
+    /// `margin_ratio` is income / (spent + rent), `None` until cost > 0. Returns `None` on a
+    /// treasury read fault (the session context still serves, sans economics — additive/optional).
+    ///
+    /// RESUME HONESTY (keeper:kirby ship-condition): returns `None` when a restore checkpoint is
+    /// present (the resume case). On resume there is no meter loop, so the rent accumulator is 0
+    /// while `remaining` already reflects the PRIOR run's rent burn — deriving income here would
+    /// yield a wrong number (understated by that prior rent), reported with no resume flag. So we
+    /// OMIT economics on resume and let the BOOKS reply degrade to the honest "economics
+    /// unavailable" path, exactly mirroring the 31000 emitter (`run_resume` passes `None`: "rent
+    /// unknowable on resume, omit rather than derive inflated"). The live (non-resume) path is
+    /// unchanged and verified exact.
+    fn compose_economics_percept(&self) -> Option<EconomicsPercept> {
+        if self.restore_checkpoint.is_some() {
+            return None;
+        }
+        let initial_sats = self.session.budget_sats;
+        let rent_sats = self.treasury.rent_sats();
+        let snap = self.treasury.economics_snapshot(initial_sats, rent_sats).ok()?;
+        Some(EconomicsPercept {
+            treasury_sats: snap.remaining_sats,
+            income_sats: snap.income_sats,
+            spent_sats: snap.spent_sats,
+            rent_sats,
+            initial_sats,
+            runway_secs: self.treasury.runway_secs_hint(),
+            margin_ratio: crate::treasury::margin_ratio(snap.income_sats, snap.spent_sats, rent_sats),
+            jobs_settled: snap.jobs_settled,
+        })
+    }
 }
 
 #[tonic::async_trait]
@@ -1330,6 +1369,11 @@ impl NodeGateway for GatewayService {
                 .as_ref()
                 .map(|checkpoint| checkpoint.payload.clone())
                 .unwrap_or_default(),
+            // B2: compose the read-only economics percept LIVE at call time (keeper:kirby's
+            // Decision-1 condition). This handler runs per RPC, and every figure is read from the
+            // live treasury HERE (never a struct cached at boot), so a BOOKS query always reflects
+            // the CURRENT books.
+            economics: self.compose_economics_percept(),
         }))
     }
 
@@ -1705,6 +1749,251 @@ mod tests {
             0,
             "no leaked settle_locks entries after a cancelled settle"
         );
+    }
+
+    /// Build a books-mode gateway over `treasury`. The session budget == `initial` (the deployment
+    /// invariant: `budget_sats == funding.initial_sats`, run_agent.rs), so it is the economics
+    /// `initial_sats` the percept uses.
+    fn books_gateway(treasury: Treasury, initial: u64) -> GatewayService {
+        let session = Session {
+            task_descriptor: "books".into(),
+            budget_sats: initial,
+            allowlisted_destinations: Vec::new(),
+            allowlisted_inbound_kinds: Vec::new(),
+        };
+        GatewayService::new(treasury, Arc::new(MockRail::new()), session)
+    }
+
+    /// TOOTH T1 (B2 §B.3): the books-reconcile identity `initial + income - spent - rent ==
+    /// treasury` holds across ALL THREE surfaces — the DM BOOKS percept (gateway), the 31000
+    /// `AgentStateContent` (emitter overlay), and `Treasury::remaining()` — for a treasury with
+    /// real income + spend + rent, and the three agree figure-for-figure (one source:
+    /// `economics_snapshot()`).
+    ///
+    /// RED-on-revert: make either surface compute a figure independently of `economics_snapshot`
+    /// (e.g. hardcode `income_sats: 0` in `compose_economics_percept`/`with_economics`, or drop the
+    /// `- initial` term in `Treasury::economics_snapshot`) and the cross-surface equality + the
+    /// identity break.
+    #[test]
+    fn t1_books_reconcile_identity_across_three_surfaces() {
+        let initial = 1_000u64;
+        let treasury = Treasury::open_temporary(initial).unwrap();
+        // income: two settled credits (500 total, 2 jobs).
+        treasury.credit_verified("job-1", 300).unwrap();
+        treasury.credit_verified("job-2", 200).unwrap();
+        // spend: two capability debits (100 total).
+        treasury
+            .debit_and_record("spend-1", 40, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        treasury
+            .debit_and_record("spend-2", 60, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        // rent: metered burn (70).
+        treasury.debit_metered(70).unwrap();
+
+        let remaining = treasury.remaining().unwrap();
+        assert_eq!(remaining, 1_000 + 500 - 100 - 70, "sanity: balance == 1330");
+
+        // Surface A — the DM BOOKS percept (composed live in the gateway).
+        let svc = books_gateway(treasury.clone(), initial);
+        let percept = svc.compose_economics_percept().expect("percept composes");
+
+        // Surface B — the 31000 AgentStateContent (emitter overlay), from the SAME snapshot.
+        let rent = treasury.rent_sats();
+        let snap = treasury.economics_snapshot(initial, rent).unwrap();
+        let content = crate::nerve::AgentStateContent::sovereign(
+            "agent-0", remaining, None, "running", "firecracker",
+        )
+        .with_economics(&snap, rent);
+
+        // Cross-surface agreement (one number, three surfaces).
+        assert_eq!(percept.treasury_sats, remaining);
+        assert_eq!(content.treasury_sats, remaining);
+        assert_eq!(percept.income_sats, 500);
+        assert_eq!(content.income_sats, 500);
+        assert_eq!(percept.spent_sats, 100);
+        assert_eq!(content.spent_sats, 100);
+        assert_eq!(percept.rent_sats, 70);
+        assert_eq!(content.rent_sats, 70);
+        assert_eq!(percept.jobs_settled, 2);
+        assert_eq!(content.jobs_settled, 2);
+
+        // The identity, on EACH surface.
+        assert_eq!(
+            percept.initial_sats + percept.income_sats - percept.spent_sats - percept.rent_sats,
+            percept.treasury_sats,
+            "identity holds on the DM BOOKS percept"
+        );
+        assert_eq!(
+            initial + content.income_sats - content.spent_sats - content.rent_sats,
+            content.treasury_sats,
+            "identity holds on the 31000 content"
+        );
+        assert_eq!(remaining, initial + 500 - 100 - 70, "identity holds on Treasury::remaining()");
+    }
+
+    /// TOOTH T2 (LOAD-BEARING, B2 §B.3): `income_sats` moves ONLY on a mint-verified credit. A
+    /// capability SPEND cannot manufacture income (remaining falls, spent rises, income unchanged),
+    /// and a genome `ReportEvent` (self-report) cannot mint income — it is advisory-only and never
+    /// touches the treasury. income is DERIVED from the daemon's authoritative balance identity, so
+    /// a genome has no field to inflate. A sovereign 31000 an agent could inflate is worse than
+    /// none — this is airtight.
+    ///
+    /// RED-on-revert: wire `report_event` to `credit_verified(...)` on the self-reported number
+    /// (the "self-report -> self-credit" bug) and the post-report income jumps; or drop the
+    /// `- initial` term in `economics_snapshot` and the first assertion (income == 500, not 1500)
+    /// fails.
+    #[tokio::test]
+    async fn t2_income_only_from_credits_never_self_reported() {
+        use kirby_proto::node_gateway_server::NodeGateway;
+        use kirby_proto::Event;
+        let initial = 1_000u64;
+        let treasury = Treasury::open_temporary(initial).unwrap();
+        let svc = books_gateway(treasury.clone(), initial);
+
+        // A mint-verified credit is the ONLY thing that raises income.
+        treasury.credit_verified("job-1", 500).unwrap();
+        let after_credit = svc.compose_economics_percept().unwrap();
+        assert_eq!(after_credit.income_sats, 500, "income == credited amount (== Σ credit_ledger)");
+        assert_eq!(after_credit.jobs_settled, 1);
+
+        // A capability SPEND does not create income.
+        treasury
+            .debit_and_record("spend-1", 120, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        let after_spend = svc.compose_economics_percept().unwrap();
+        assert_eq!(after_spend.income_sats, 500, "spending cannot manufacture income");
+        assert_eq!(after_spend.spent_sats, 120);
+
+        // A genome self-report (ReportEvent) is advisory-only: it must NOT move income.
+        svc.report_event(tonic::Request::new(Event {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            kind: "i-earned-a-million".into(),
+            detail: "1000000".into(),
+        }))
+        .await
+        .unwrap();
+        let after_report = svc.compose_economics_percept().unwrap();
+        assert_eq!(after_report.income_sats, 500, "a self-reported event cannot mint income (T2)");
+
+        // Only another mint-verified credit raises it.
+        treasury.credit_verified("job-2", 200).unwrap();
+        let after_second = svc.compose_economics_percept().unwrap();
+        assert_eq!(after_second.income_sats, 700);
+        assert_eq!(after_second.jobs_settled, 2);
+    }
+
+    /// TOOTH T6 (B2, keeper:kirby Decision-1): the BOOKS percept is composed LIVE per call, never a
+    /// boot cache. Two `GetSessionContext` calls straddling a treasury change return DIFFERENT
+    /// economics — the second reflects the NEW balance / income / rent.
+    ///
+    /// RED-on-revert: compose the percept ONCE in `GatewayService::new` and return the cached copy
+    /// from `get_session_context`, and the second call still shows the boot-time numbers -> fail.
+    #[tokio::test]
+    async fn t6_books_percept_is_live_per_call_not_boot_cached() {
+        use kirby_proto::node_gateway_server::NodeGateway;
+        use kirby_proto::SessionRequest;
+        let initial = 1_000u64;
+        let treasury = Treasury::open_temporary(initial).unwrap();
+        let svc = books_gateway(treasury.clone(), initial);
+
+        let req =
+            || tonic::Request::new(SessionRequest { schema_version: kirby_proto::SCHEMA_VERSION });
+        let first = svc
+            .get_session_context(req())
+            .await
+            .unwrap()
+            .into_inner()
+            .economics
+            .expect("economics present on first call");
+        assert_eq!(first.treasury_sats, 1_000);
+        assert_eq!(first.income_sats, 0);
+
+        // Drive a treasury change AFTER the service was built.
+        treasury.credit_verified("late-job", 400).unwrap();
+        treasury.debit_metered(50).unwrap();
+
+        let second = svc
+            .get_session_context(req())
+            .await
+            .unwrap()
+            .into_inner()
+            .economics
+            .expect("economics present on second call");
+        assert_eq!(
+            second.treasury_sats, 1_350,
+            "the percept re-reads the LIVE treasury per call (1000 + 400 - 50)"
+        );
+        assert_eq!(second.income_sats, 400);
+        assert_eq!(second.rent_sats, 50);
+        assert_eq!(second.jobs_settled, 1);
+    }
+
+    /// TOOTH (B2 resume-honesty, keeper:kirby ship-condition): a RESUMED gateway (restore
+    /// checkpoint present) OMITS the economics percept rather than reporting a wrong-non-zero
+    /// income. On resume the rent accumulator is 0 (in-memory, reset at boot) while the persisted
+    /// balance already reflects the prior run's rent, so a live derive would yield `income ==
+    /// income_true - rent_prior` — a silently-wrong number. The BOOKS reply then degrades to the
+    /// honest "economics unavailable" path (`format_oracle_books(None)`). Mirrors the 31000 emitter
+    /// (`run_resume` passes `None`).
+    ///
+    /// RED-on-revert: remove the `self.restore_checkpoint.is_some()` guard in
+    /// `compose_economics_percept` and the resumed gateway reports `Some` with the WRONG derived
+    /// income (here 400, not the true 500 — understated by the 100 sats of prior-run rent), so the
+    /// `economics.is_none()` assertion fails.
+    #[tokio::test]
+    async fn resume_percept_is_honest_none_not_wrong_income() {
+        use kirby_proto::node_gateway_server::NodeGateway;
+        use kirby_proto::SessionRequest;
+        let initial = 1_000u64;
+        // A unique on-disk store so the PRIOR run can be dropped (process ends) and the RESUME can
+        // reopen the SAME persisted treasury — the real resume condition (balance persists; the
+        // in-memory rent accumulator does NOT, exactly like a fresh boot's Meter).
+        let dir = std::env::temp_dir().join(format!(
+            "kirby-b2-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let path = dir.join("treasury");
+        {
+            // PRIOR RUN: a genuine credit of 500 raised income; 100 sats of rent burned. Drop it.
+            let prior = Treasury::open(&path, initial).unwrap();
+            prior.credit_verified("prior-job", 500).unwrap();
+            prior.debit_metered(100).unwrap();
+            assert_eq!(prior.remaining().unwrap(), 1_400);
+        }
+        // RESUME: reopen the persisted store. Balance persists (1400); the rent accumulator is a
+        // fresh in-memory 0. A live derive here WOULD compute income = 1400 + 0(spent) + 0(rent)
+        // - 1000 = 400 — WRONG (true income is 500, understated by the 100 sats of prior rent).
+        let resumed = Treasury::open(&path, initial).unwrap();
+        assert_eq!(resumed.rent_sats(), 0, "resume starts rent at 0 (in-memory)");
+        assert_eq!(resumed.remaining().unwrap(), 1_400, "balance persists across resume");
+
+        let session = Session {
+            task_descriptor: "books".into(),
+            budget_sats: initial,
+            allowlisted_destinations: Vec::new(),
+            allowlisted_inbound_kinds: Vec::new(),
+        };
+        let svc = GatewayService::new(resumed, Arc::new(MockRail::new()), session)
+            .with_restore_checkpoint(crate::checkpoint::CheckpointArtifact::new(
+                b"prior-state".to_vec(),
+            ));
+
+        let ctx = svc
+            .get_session_context(tonic::Request::new(SessionRequest {
+                schema_version: kirby_proto::SCHEMA_VERSION,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            ctx.economics.is_none(),
+            "a resumed agent must OMIT economics (honest 'unavailable'), never report a wrong income; got {:?}",
+            ctx.economics
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The Firecracker host-side vsock socket for a guest-initiated connection to
