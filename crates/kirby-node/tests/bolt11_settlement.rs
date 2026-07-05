@@ -63,12 +63,19 @@ struct CapturingStrandedSink {
 }
 
 impl StrandedQuoteSink for CapturingStrandedSink {
-    fn record_stranded(&self, quote_id: &str, amount_issued: u64, reason: &str) {
+    fn record_stranded(
+        &self,
+        quote_id: &str,
+        amount_issued: u64,
+        reason: &str,
+    ) -> anyhow::Result<()> {
         self.count.fetch_add(1, Ordering::SeqCst);
         self.calls
             .lock()
             .unwrap()
             .push((quote_id.to_string(), amount_issued, reason.to_string()));
+        // An in-memory capture has no durable store to fail.
+        Ok(())
     }
 }
 
@@ -78,6 +85,22 @@ impl CapturingStrandedSink {
     }
     fn last(&self) -> Option<(String, u64, String)> {
         self.calls.lock().unwrap().last().cloned()
+    }
+}
+
+/// A [`StrandedQuoteSink`] whose durable write ALWAYS fails (models a full disk / sled error) — for
+/// the Fix-2 tooth that a failed durable record HARD-FAILS the Lightning settlement instead of being
+/// silently swallowed.
+struct FailingStrandedSink;
+
+impl StrandedQuoteSink for FailingStrandedSink {
+    fn record_stranded(
+        &self,
+        _quote_id: &str,
+        _amount_issued: u64,
+        _reason: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("simulated durable stranded-sink write failure (disk/sled error)")
     }
 }
 
@@ -576,7 +599,8 @@ fn stranded_record_survives_a_store_reopen() {
     // 1) Write the record through the durable sink, then DROP the handle (models a process exit).
     {
         let sink = SledStrandedSink::open(&path).expect("open durable stranded sink");
-        sink.record_stranded(quote_id, amount_issued, reason);
+        sink.record_stranded(quote_id, amount_issued, reason)
+            .expect("durable write of the stranded record succeeds");
         // handle (and its sled Db) dropped here.
     }
 
@@ -700,4 +724,313 @@ async fn issue_charge_with_mismatched_method_is_rejected_fail_closed() {
         "a rejected mismatched charge must NOT carry a ChargeIssued (never settled on the wrong rail)"
     );
     assert_eq!(receipt.cost_sats, 0, "a rejected charge debits nothing");
+}
+
+// --------------------------------------------------------------------------------------------
+// ★ FIX 1 (HIGH, load-bearing) — settlement-minted proofs are MIRRORED to the NIP-60 relay backup
+// WITHOUT needing a later spend. This is the failover sats-loss guard: a stranger pays → we mint →
+// the node dies before any spend → on a restore-from-relay the minted proofs must ALREADY be on the
+// backup or they are LOST.
+//
+// The provider mints proofs DIRECTLY into the raw wallet (it does not go through the
+// Nip60BackedEcash decorator that flips the backup `dirty` flag), and the flusher is DIRTY-GATED
+// (`if !dirty { return }`). So without the provider's `mark_dirty` wiring, a settlement mint never
+// re-dirties the backup and the next flush is a NO-OP — the minted proofs never reach the relay.
+//
+// This tooth asserts REAL MIRROR CONTENT (not just the dirty flag): after a settlement mint + a
+// flush, it reads the PUBLISHED kind:7375 backup back off a real in-process relay
+// (`reconcile_on_load`, the exact set a failover restore recovers), decrypts+aggregates it, and
+// asserts every minted proof `y` is present. A baseline flush FIRST consumes the constructor-seeded
+// dirty=true, so the settlement's `mark_dirty` is the ONLY thing that can re-dirty the backup.
+//
+// RED-on-revert: delete the `if let Some(notifier) = &self.backup_notifier { notifier.mark_dirty(); }`
+// block on `LightningSettlement::verify_settlement`'s freshly-minted (PAID) path in rail.rs. The
+// settlement then mints proofs but never re-dirties the backup; flush #2 sees `!dirty` and no-ops;
+// the published backup still holds only flush #1's EMPTY snapshot; the minted `y`s are ABSENT from
+// the reconciled set → the `contains(y)` assertion FAILS (RED). Real sats-loss made visible.
+// --------------------------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settlement_minted_proofs_are_mirrored_to_the_nip60_backup_without_a_later_spend() {
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicBool;
+
+    use cdk::nuts::State;
+    use kirby_node::nip60::Nip60Store;
+    use kirby_node::rail::{CdkEcash, Nip60BackedEcash};
+    use nostr_relay_builder::MockRelay;
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let wallet = build_wallet(&mint.url()).await.expect("build daemon wallet");
+
+    // A real in-process nostr relay is the NIP-60 backup target (the mirror we inspect).
+    let relay = MockRelay::run().await.expect("boot in-process nostr relay");
+    let relay_url = relay.url().await.to_string();
+
+    // The NIP-60 store over the relay. Open the same write gates boot opens: mark recovery complete
+    // and run a reconcile to establish the read quorum, so the flusher's rollover can publish.
+    let event_key = [7u8; 32];
+    let mut store = Nip60Store::connect(
+        &event_key,
+        std::slice::from_ref(&relay_url),
+        None,
+        None,
+        vec![mint.url()], // trust this mint on reconcile (the proofs' token event names it)
+    )
+    .await
+    .expect("connect nip60 store");
+    store.set_recovery_complete(Arc::new(AtomicBool::new(true)));
+    // The nostr client connects asynchronously; poll the per-relay reconcile until it reports the
+    // read quorum established (served >= read_k), so the flusher's rollover is not skipped as a
+    // "non-authoritative boot". Bounded so a genuinely-unreachable relay fails loudly.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let read = store
+            .reconcile_on_load_with_ids()
+            .await
+            .expect("reconcile the relay");
+        if read.authoritative {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the in-process relay never reached read quorum (served < read_k)"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let store = Arc::new(store);
+
+    // The flusher + a dirty-notifier over the SAME shared BackupState (exactly the boot seam).
+    let (_decorator, flusher) = Nip60BackedEcash::with_flusher(
+        CdkEcash::new(wallet.clone()),
+        wallet.clone(),
+        store.clone(),
+        mint.url(),
+        "sat".to_string(),
+        Vec::new(),
+    );
+    let notifier = flusher.dirty_notifier();
+
+    // The provider under test, wired with the notifier (as boot wires it after the flusher exists).
+    let settlement = LightningSettlement::new(wallet.clone()).with_backup_notifier(notifier);
+
+    // FLUSH #1 (baseline): consume the constructor-seeded dirty=true (publishes the current — empty —
+    // snapshot). After this, dirty is clear, so the settlement mint's mark_dirty is the ONLY thing
+    // that can re-dirty the backup — which is what makes the revert bite.
+    flusher
+        .flush()
+        .await
+        .expect("baseline flush publishes the empty snapshot and clears the seeded dirty flag");
+
+    // A stranger pays: issue a bolt11, wait for the mint to mark it PAID, then settle. verify_settlement
+    // MINTS the ecash into the wallet and (via the notifier) marks the backup dirty. NO spend happens.
+    let charge = settlement
+        .issue(128, "a stranger pays real sats")
+        .await
+        .expect("issue a bolt11 charge");
+    await_quote_state(&wallet, &charge.charge_id, MintQuoteState::Paid).await;
+    let minted = settlement
+        .verify_settlement(&charge.charge_id, "")
+        .await
+        .expect("settle mints the ecash");
+    assert_eq!(minted, 128, "the mint minted the full requested amount");
+
+    // The minted proofs' ys — the wallet truth that MUST be mirrored.
+    let held = wallet
+        .get_proofs_with(Some(vec![State::Unspent]), None)
+        .await
+        .expect("read the wallet's unspent proofs");
+    let minted_ys: HashSet<_> = held.ys().expect("minted proof ys").into_iter().collect();
+    assert!(!minted_ys.is_empty(), "the settlement minted at least one unspent proof");
+
+    // FLUSH #2 (the mirror flush): must publish the minted proofs. Without the notifier wiring, dirty
+    // is still false here (flush #1 cleared it; the mint never re-set it), so this no-ops → RED.
+    flusher.flush().await.expect("mirror flush publishes the minted proofs");
+
+    // THE TOOTH: read the PUBLISHED relay backup back and assert it CARRIES every minted proof y.
+    // reconcile_on_load fetches the live kind:7375 events off the relay, decrypts + aggregates them —
+    // the exact proof set a failover restore recovers. A minted y missing here = sats lost on restore.
+    let backed_up = store
+        .reconcile_on_load()
+        .await
+        .expect("reconcile the published relay backup");
+    let backed_up_ys: HashSet<_> = backed_up
+        .ys()
+        .expect("backup proof ys")
+        .into_iter()
+        .collect();
+    for y in &minted_ys {
+        assert!(
+            backed_up_ys.contains(y),
+            "MONEY-SAFETY (Fix 1): a settlement-minted proof (y={y}) is MISSING from the published \
+             NIP-60 relay backup — it would be LOST on a failover restore-from-relay. Reverting the \
+             provider's mark_dirty wiring leaves flush #2 a no-op (dirty stays false), so the backup \
+             carries only flush #1's empty snapshot and lacks these ys (RED-on-revert)."
+        );
+    }
+
+    mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// FIX 2 (MED) — a durable stranded-sink WRITE FAILURE hard-fails the Lightning settlement instead of
+// being silently swallowed. If we cannot durably record a stranded PAID quote, we must NOT proceed
+// as if the money-safety record exists.
+//
+// Setup mirrors `issued_quote_with_no_held_proofs_...`: mint the proofs (quote → ISSUED), mark them
+// SPENT so the wallet holds ZERO unspent for the quote (the TRUE lost-response), then settle with a
+// sink whose durable write ALWAYS fails.
+//
+// RED-on-revert: revert the call site in `LightningSettlement::verify_settlement` to SWALLOW the sink
+// error (e.g. `let _ = self.stranded_sink.record_stranded(...);` before the fail-clean bail). The
+// settle then returns the ordinary fail-clean error whose message does NOT mention the durability
+// failure, so the `contains("DURABLY FAILED")` assertion FAILS (RED). (settle_charge still returns
+// Err either way — the tooth pins the HARD, LOUD durability-failure surfacing, not merely `is_err`.)
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn stranded_sink_write_failure_hard_fails_the_lightning_settlement() {
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let wallet = build_wallet(&mint.url()).await.expect("build daemon wallet");
+
+    let probe = LightningSettlement::new(wallet.clone());
+    let charge = probe.issue(300, "sink-fail-guard").await.expect("issue");
+
+    // The stranger pays; mint the proofs (flips the quote to ISSUED), then mark them SPENT so the
+    // wallet holds ZERO unspent → the ISSUED-but-not-held lost-response path (which records stranded).
+    await_quote_state(&wallet, &charge.charge_id, MintQuoteState::Paid).await;
+    let minted_proofs = wallet
+        .mint(&charge.charge_id, SplitTarget::default(), None)
+        .await
+        .expect("mint the settled ecash");
+    let minted_ys = minted_proofs.ys().expect("minted proof ys");
+    wallet
+        .localstore
+        .update_proofs_state(minted_ys, State::Spent)
+        .await
+        .expect("mark the minted proofs spent (wallet holds ZERO unspent)");
+
+    let treasury = Treasury::open_temporary(0).expect("treasury");
+    let session = Session {
+        task_descriptor: "sink-fail-guard".into(),
+        budget_sats: 0,
+        allowlisted_destinations: vec![ISSUE_CHARGE_DESTINATION.to_string()],
+        allowlisted_inbound_kinds: vec![InboundKind::PaymentSettled],
+    };
+    let svc = GatewayService::new(treasury, Arc::new(MockRail::new()), session)
+        .with_settlement_provider(
+            LightningSettlement::new(wallet.clone())
+                .with_stranded_sink(Arc::new(FailingStrandedSink)),
+        );
+
+    // THE TOOTH: the durable record fails → the settlement HARD-fails with a loud durability error.
+    // (CreditOutcome is not Debug, so match rather than unwrap_err.)
+    let err = match svc.settle_charge(&charge.charge_id, "").await {
+        Ok(_) => panic!("a failed durable stranded record must hard-fail the settlement"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("DURABLY FAILED"),
+        "the error must name the DURABLE record failure (swallowing it — the revert — yields the \
+         plain fail-clean message instead); got {msg:?}"
+    );
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        0,
+        "MONEY-MUST: a hard-failed settlement credits NOTHING",
+    );
+
+    mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// FIX 4 (MED) — the R2-4 content-aware dedupe now covers IssueCharge: a same-key re-issue with
+// DIVERGENT terms is REFUSED (debit 0) instead of returning a charge that no longer matches the
+// request. A same-key SAME-terms resume still returns the ORIGINAL ChargeIssued (dedupe intact).
+//
+// The replay below keeps the SAME method (Lightning) and diverges only on `amount_sats` — so the
+// D2 method-guard is NOT the thing rejecting it; the request_hash comparison is. That isolates this
+// tooth to Fix 4.
+//
+// RED-on-revert: revert the `Act::IssueCharge(ic) => issue_charge_request_hash(ic)` STEP-1 arm to
+// `_ => Vec::new()` (or revert the persist of `issue_charge_request_hash(ic)` in
+// `authorize_issue_charge` back to `Vec::new()`). Either revert leaves the stored/compared hash
+// empty, so the divergent replay is NOT refused — it returns the prior charge as DuplicateIgnored,
+// and the `Outcome::Unspecified` assertion FAILS (RED).
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn issue_charge_replay_with_divergent_terms_is_refused() {
+    use kirby_proto::capability_request::Act;
+    use kirby_proto::{CapabilityRequest, ChargeMethod, IssueCharge, Outcome};
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let wallet = build_wallet(&mint.url()).await.expect("build daemon wallet");
+    // lightning_gateway wires a LightningSettlement (method() == Lightning) over the wallet.
+    let (svc, _queue) = lightning_gateway(0, wallet);
+
+    let key = "issue-dedupe-key-1";
+    let first = CapabilityRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        idempotency_key: key.into(),
+        act: Some(Act::IssueCharge(IssueCharge {
+            amount_sats: 100,
+            memo: "job".into(),
+            method: ChargeMethod::Lightning as i32,
+        })),
+        budget_sats: 0,
+    };
+    let r1 = svc.authorize_capability(&first).await.expect("first issue");
+    assert_eq!(
+        r1.outcome,
+        Outcome::AuthorizedAndPerformed as i32,
+        "the first issue is authorized"
+    );
+    let charge1 = r1.charge.clone().expect("the first issue returns a charge");
+
+    // Same key, SAME method (so the method-guard is NOT what rejects), DIVERGENT amount (200 vs 100).
+    let divergent = CapabilityRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        idempotency_key: key.into(),
+        act: Some(Act::IssueCharge(IssueCharge {
+            amount_sats: 200,
+            memo: "job".into(),
+            method: ChargeMethod::Lightning as i32,
+        })),
+        budget_sats: 0,
+    };
+    let r2 = svc.authorize_capability(&divergent).await.expect("divergent replay");
+    assert_eq!(
+        r2.outcome,
+        Outcome::Unspecified as i32,
+        "a same-key IssueCharge replay with DIVERGENT terms (200 vs 100) must be REFUSED (debit 0); \
+         reverting the IssueCharge request_hash arm returns DuplicateIgnored here (RED-on-revert)"
+    );
+    assert!(r2.charge.is_none(), "a refused divergent replay carries no ChargeIssued");
+
+    // A same-key SAME-terms resume still dedupes to the ORIGINAL charge (the contract is preserved).
+    let resume = CapabilityRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        idempotency_key: key.into(),
+        act: Some(Act::IssueCharge(IssueCharge {
+            amount_sats: 100,
+            memo: "job".into(),
+            method: ChargeMethod::Lightning as i32,
+        })),
+        budget_sats: 0,
+    };
+    let r3 = svc.authorize_capability(&resume).await.expect("same-terms resume");
+    assert_eq!(
+        r3.outcome,
+        Outcome::DuplicateIgnored as i32,
+        "a same-key SAME-terms resume dedupes (returns the stored charge, not a refusal)"
+    );
+    assert_eq!(
+        r3.charge.expect("resume returns a charge").charge_id,
+        charge1.charge_id,
+        "the resume returns the SAME charge_id (customer correlation preserved)"
+    );
+
+    mint.shutdown().await;
 }

@@ -1852,6 +1852,22 @@ impl KirbyConfig {
                 "max_run_secs must be > 0 (it is the run safety ceiling in seconds; omit it to use the 600s default)"
             );
         }
+        // Inc 1b (Fix 3, LOUD-FAIL-EARLY): `brain.settlement_method` only wires a settlement provider
+        // on the routstr path (the earn-loop/oracle rail is built over the treasury wallet in
+        // `build_routstr_brain`). On any other backend the selector is DROPPED (boot passes `None`)
+        // and an operator's explicit `settlement_method = "lightning"|"cashu"` would be a silent
+        // no-op — the charge would only fail closed at runtime. Reject it at LOAD so the misconfig is
+        // caught with a clear message, not discovered as a dead earn loop in production.
+        if self.brain.settlement_method.is_some()
+            && self.brain.backend != BrainBackendKind::Routstr
+        {
+            anyhow::bail!(
+                "brain.settlement_method is set but brain.backend = {:?} (not \"routstr\"); a \
+                 settlement provider is only wired on the routstr backend, so this selector would be \
+                 silently ignored — remove it or set brain.backend = \"routstr\"",
+                self.brain.backend
+            );
+        }
         // Tenant identifiers feed filesystem treasury paths (treasury_path_for_agent),
         // host instance ids (jail / cgroup / TAP names), and lease-map keys, so they must
         // be safe: non-empty, length-capped, and restricted to an identifier charset with
@@ -2639,6 +2655,60 @@ mod tests {
         assert!(
             err.to_string().contains("brain.mint_url must be set"),
             "expected the routstr empty-mint_url error, got: {err}"
+        );
+    }
+
+    // Inc 1b (Fix 3): a `settlement_method` on a NON-routstr backend is a silent no-op at boot (the
+    // provider is only wired on the routstr path), so it is REJECTED loudly at config load.
+    // RED-on-revert: delete the `brain.settlement_method` unconditional check in `validate_for` — the
+    // misconfig then loads clean (the selector is silently dropped) and this `unwrap_err` panics.
+    #[test]
+    fn brain_settlement_method_on_non_routstr_backend_is_rejected() {
+        let toml = r#"
+            workload = "capable"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "stub"
+            max_cost_sats = 64
+            settlement_method = "lightning"
+        "#;
+        let err = KirbyConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("brain.settlement_method is set"),
+            "expected the non-routstr settlement_method rejection, got: {err}"
+        );
+    }
+
+    // The SAME selector on the routstr backend is ACCEPTED (the provider IS wired there) — proves the
+    // Fix-3 guard is scoped to the misconfig, not a blanket ban.
+    #[test]
+    fn brain_settlement_method_on_routstr_backend_is_accepted() {
+        let toml = r#"
+            workload = "capable"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr"
+            max_cost_sats = 64
+            node_url = "https://api.routstr.com"
+            mint_url = "https://mint.example.com"
+            wallet_db_path = "/var/lib/kirby/brain-wallet.sqlite"
+            settlement_method = "lightning"
+        "#;
+        assert!(
+            KirbyConfig::from_toml_str(toml).is_ok(),
+            "a settlement_method on the routstr backend must load cleanly (the provider is wired)"
         );
     }
 

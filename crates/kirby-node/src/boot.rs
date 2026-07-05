@@ -1247,41 +1247,12 @@ async fn build_routstr_brain(
     .await?;
     let ecash = CdkEcash::new(wallet.clone());
 
-    // Inc 1b (D1/D2): build the earn-loop SETTLEMENT provider over the SAME host-held wallet,
-    // selected by `[brain] settlement_method`. Built HERE (the only place the wallet lives) and
-    // returned as a trait object so the wallet itself never escapes to the gateway. `None` (the
-    // default) wires NO provider — byte-identical to pre-1b (IssueCharge fails closed). A Lightning
-    // provider is injected with a DURABLE sled-backed stranded-quote sink (D4): a bolt11 quote that
-    // the mint ISSUED but whose proofs never landed is recorded to disk for out-of-band recovery,
-    // surviving a crash. The sink lives beside the wallet db (under the same durable treasury dir).
-    let settlement_provider: Option<Arc<dyn SettlementProvider>> = match brain.settlement_method {
-        None => None,
-        Some(crate::config::SettlementMethod::Cashu) => {
-            tracing::info!("Inc 1b: wiring the CASHU settlement provider over the treasury wallet");
-            Some(Arc::new(CashuSettlement::new(wallet.clone())))
-        }
-        Some(crate::config::SettlementMethod::Lightning) => {
-            // Durable stranded-quote sink beside the wallet db (per-agent, under the durable
-            // treasury dir). REFUSE TO BOOT if it cannot open: a Lightning agent that cannot durably
-            // record a stranded real sat must not take live payments (D4 money-safety).
-            let stranded_path = Path::new(&brain.wallet_db_path).with_extension("stranded");
-            let sink = SledStrandedSink::open(&stranded_path).map_err(|e| {
-                anyhow::anyhow!(
-                    "Inc 1b: refusing to boot a Lightning-settlement agent — could not open the \
-                     durable stranded-quote sink at {}: {e}",
-                    stranded_path.display()
-                )
-            })?;
-            tracing::info!(
-                stranded_path = %stranded_path.display(),
-                "Inc 1b: wiring the LIGHTNING (bolt11) settlement provider over the treasury wallet \
-                 with a durable sled-backed stranded-quote sink"
-            );
-            Some(Arc::new(
-                LightningSettlement::new(wallet.clone()).with_stranded_sink(Arc::new(sink)),
-            ))
-        }
-    };
+    // Inc 1b (D1/D2): the earn-loop SETTLEMENT provider is built LATER (after the NIP-60 flusher
+    // exists) so a Lightning/Cashu provider can be handed the flusher's `BackupDirtyNotifier` — a
+    // settlement mint/receive writes proofs straight into the raw wallet (bypassing the
+    // Nip60BackedEcash decorator), so without that notifier the freshly-minted proofs would never
+    // flip the backup `dirty` flag and would be LOST on a failover restore (Fix 1 / real sats-loss).
+    // See the construction after the `(backend, flusher)` match below.
 
     // ★ config-plane REVISION (findings 1+2) + R2-#3 (TWO-LATCH): SHARE the RECOVERY-COMPLETE latch
     // INTO the store BEFORE it is `Arc`-wrapped + handed to the flusher, so the choke-point funnel
@@ -1586,6 +1557,54 @@ async fn build_routstr_brain(
                 (Arc::new(routstr), None)
             }
         };
+    // Inc 1b (D1/D2 + Fix 1): build the earn-loop SETTLEMENT provider over the SAME host-held wallet,
+    // selected by `[brain] settlement_method`. Built HERE (after the flusher) so it can be handed the
+    // flusher's `BackupDirtyNotifier`: a settlement mint/receive writes proofs directly into the raw
+    // wallet (NOT through the Nip60BackedEcash decorator), so the notifier is the ONLY thing that
+    // flips the backup `dirty` flag for those proofs — without it a stranger's freshly-minted proofs
+    // would not be mirrored to the relay backup until a later spend, and would be LOST on a failover
+    // restore (Fix 1, real sats-loss). `None` (the default) wires NO provider — byte-identical to
+    // pre-1b (IssueCharge fails closed). When NIP-60 is not configured there is no flusher and thus
+    // no notifier (`None`) — correct: there is no relay backup to mirror to. The wallet is returned
+    // as a trait object so it never escapes to the gateway. A Lightning provider also gets a DURABLE
+    // sled-backed stranded-quote sink (D4), beside the wallet db under the durable treasury dir.
+    let backup_notifier = flusher.as_ref().map(|f| f.dirty_notifier());
+    let settlement_provider: Option<Arc<dyn SettlementProvider>> = match brain.settlement_method {
+        None => None,
+        Some(crate::config::SettlementMethod::Cashu) => {
+            tracing::info!("Inc 1b: wiring the CASHU settlement provider over the treasury wallet");
+            let mut provider = CashuSettlement::new(wallet.clone());
+            if let Some(notifier) = backup_notifier.clone() {
+                provider = provider.with_backup_notifier(notifier);
+            }
+            Some(Arc::new(provider))
+        }
+        Some(crate::config::SettlementMethod::Lightning) => {
+            // Durable stranded-quote sink beside the wallet db (per-agent, under the durable
+            // treasury dir). REFUSE TO BOOT if it cannot open: a Lightning agent that cannot durably
+            // record a stranded real sat must not take live payments (D4 money-safety).
+            let stranded_path = Path::new(&brain.wallet_db_path).with_extension("stranded");
+            let sink = SledStrandedSink::open(&stranded_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Inc 1b: refusing to boot a Lightning-settlement agent — could not open the \
+                     durable stranded-quote sink at {}: {e}",
+                    stranded_path.display()
+                )
+            })?;
+            tracing::info!(
+                stranded_path = %stranded_path.display(),
+                "Inc 1b: wiring the LIGHTNING (bolt11) settlement provider over the treasury wallet \
+                 with a durable sled-backed stranded-quote sink"
+            );
+            let mut provider =
+                LightningSettlement::new(wallet.clone()).with_stranded_sink(Arc::new(sink));
+            if let Some(notifier) = backup_notifier.clone() {
+                provider = provider.with_backup_notifier(notifier);
+            }
+            Some(Arc::new(provider))
+        }
+    };
+
     // Cut B (#115): the counter-estate bundle for the graceful-teardown 17375 re-publish, built
     // ONLY when NIP-60 is configured (same gate as the flusher). `counter_db` is the SAME decorator
     // the wallet writes through, so its `keyset_counters()` at death is the live high-water mirror.

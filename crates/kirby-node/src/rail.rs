@@ -1929,6 +1929,39 @@ impl<E: EcashProvider> EcashProvider for Nip60BackedEcash<E> {
     }
 }
 
+/// A cheap handle over the SAME shared [`BackupState`] the [`Nip60BackedEcash`] decorator and the
+/// [`Nip60BackupFlusher`] share, exposing ONLY `mark_dirty()`. The settlement providers
+/// ([`CashuSettlement`] / [`LightningSettlement`]) mint/receive proofs DIRECTLY into the wallet's
+/// cdk store (they hold a raw `wallet.clone()`, not the decorator), so without this they would
+/// mutate the wallet without ever flipping the backup `dirty` flag — and the flusher is DIRTY-GATED
+/// (see [`Nip60BackupFlusher::flush`]: `if !st.dirty { return Ok(()) }`), NOT an unconditional
+/// cadence. A stranger's freshly-minted settlement proofs would then NOT be mirrored to the relay
+/// backup until some LATER spend flipped `dirty` — so a node that dies before any spend would LOSE
+/// those proofs on a failover restore-from-relay (real sats-loss). Injecting this notifier into the
+/// provider closes that gap: after a SUCCESSFUL mint/receive the provider calls `mark_dirty()`, so
+/// the next flush mirrors the new proofs.
+///
+/// ⚠️ MONEY-MUST (identical discipline to [`Nip60BackedEcash::mark_dirty`]): the wallet mutation is
+/// the TRUTH and durable BEFORE this flag flips; marking dirty is a CHEAP lock (no await held, no
+/// network) that can NEVER block or fail a settlement. Callers mark dirty ONLY on the Ok/
+/// mutation-happened path (an `Err` changed nothing to back up).
+#[derive(Clone)]
+pub struct BackupDirtyNotifier {
+    state: Arc<Mutex<BackupState>>,
+}
+
+impl BackupDirtyNotifier {
+    /// Flip the shared `dirty` flag so the next flush mirrors the wallet's current unspent set.
+    /// Reuses the exact poisoned-lock-recovery posture of [`Nip60BackedEcash::mark_dirty`].
+    pub fn mark_dirty(&self) {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.dirty = true;
+    }
+}
+
 /// The background half of Cut A: on a periodic tick (and once at graceful shutdown), if the shared
 /// [`BackupState`] is `dirty`, publish the wallet's CURRENT UNSPENT proof set as a NIP-60 rollover
 /// that del-chains the prior live events. Holds the SAME `Arc<Mutex<BackupState>>` the decorator
@@ -2096,6 +2129,14 @@ impl Nip60BackupFlusher {
         }
         rearm.disarm();
         Ok(())
+    }
+
+    /// A [`BackupDirtyNotifier`] over the SAME shared [`BackupState`] this flusher consumes. Boot
+    /// injects it into the settlement provider so a settlement mint/receive (which writes proofs
+    /// straight into the wallet, bypassing the decorator) still flips `dirty` and gets mirrored on
+    /// the next flush — closing the failover sats-loss gap (see [`BackupDirtyNotifier`]).
+    pub fn dirty_notifier(&self) -> BackupDirtyNotifier {
+        BackupDirtyNotifier { state: self.state.clone() }
     }
 
     /// TEST-ONLY: is the shared backup state currently dirty? Lets a tooth assert the hot-path
@@ -3414,11 +3455,23 @@ pub trait SettlementProvider: Send + Sync {
 /// never crosses vsock.
 pub struct CashuSettlement {
     wallet: Arc<cdk::Wallet>,
+    /// Flips the NIP-60 backup `dirty` flag after a successful `wallet.receive` so the
+    /// freshly-received proofs are mirrored to the relay backup on the next flush (failover
+    /// sats-loss guard — see [`BackupDirtyNotifier`]). `None` when NIP-60 is not configured
+    /// (nothing to mirror to); byte-identical to the pre-notifier behavior on that path.
+    backup_notifier: Option<BackupDirtyNotifier>,
 }
 
 impl CashuSettlement {
     pub fn new(wallet: Arc<cdk::Wallet>) -> Self {
-        Self { wallet }
+        Self { wallet, backup_notifier: None }
+    }
+
+    /// Inject a [`BackupDirtyNotifier`] (builder form) so a successful receive marks the NIP-60
+    /// backup dirty. Existing callers are unchanged: the notifier is opt-in (defaults `None`).
+    pub fn with_backup_notifier(mut self, notifier: BackupDirtyNotifier) -> Self {
+        self.backup_notifier = Some(notifier);
+        self
     }
 }
 
@@ -3442,6 +3495,13 @@ impl SettlementProvider for CashuSettlement {
             .receive(evidence, cdk::wallet::ReceiveOptions::default())
             .await
             .map_err(|e| anyhow::anyhow!("cashu settlement receive: {e}"))?;
+        // The receive succeeded: proofs landed in the wallet (the truth, already durable). Mark the
+        // NIP-60 backup dirty so the next flush mirrors them to the relay set — a mint/receive here
+        // bypasses the Nip60BackedEcash decorator (we hold a raw wallet), so this is the ONLY thing
+        // that flips dirty for a settlement receive. Cheap (no await/network); never fails a settle.
+        if let Some(notifier) = &self.backup_notifier {
+            notifier.mark_dirty();
+        }
         Ok(amount.into())
     }
 
@@ -3484,19 +3544,34 @@ pub struct LightningSettlement {
     /// its boot wiring is Inc 1b — see `record_stranded`). Safety does NOT depend on this
     /// marker's durability: the lost-response path FAILS CLEAN (no credit) regardless.
     stranded_sink: Arc<dyn StrandedQuoteSink + Send + Sync>,
+    /// Flips the NIP-60 backup `dirty` flag after a settlement MINTS proofs into the wallet (or the
+    /// ISSUED-recovery path confirms held proofs) so those minted proofs are mirrored to the relay
+    /// backup on the next flush — WITHOUT waiting for a later spend. This closes the failover
+    /// sats-loss gap: a stranger pays → we mint → the node dies before any spend → the minted proofs
+    /// must already be on the relay backup or they are LOST on restore. `None` when NIP-60 is not
+    /// configured (nothing to mirror to). See [`BackupDirtyNotifier`].
+    backup_notifier: Option<BackupDirtyNotifier>,
 }
 
 impl LightningSettlement {
     /// Build a settlement over the host-held wallet with the DEFAULT loud-error stranded sink.
     /// Existing callers are unchanged: a durable sink is opt-in via [`Self::with_stranded_sink`].
     pub fn new(wallet: Arc<cdk::Wallet>) -> Self {
-        Self { wallet, stranded_sink: Arc::new(LoudErrorStrandedSink) }
+        Self { wallet, stranded_sink: Arc::new(LoudErrorStrandedSink), backup_notifier: None }
     }
 
     /// Inject a [`StrandedQuoteSink`] (builder form): tests inject a capturing sink to assert the
     /// lost-response path records the stranded quote; Inc 1b injects the durable sled-backed sink.
     pub fn with_stranded_sink(mut self, sink: Arc<dyn StrandedQuoteSink + Send + Sync>) -> Self {
         self.stranded_sink = sink;
+        self
+    }
+
+    /// Inject a [`BackupDirtyNotifier`] (builder form) so a successful mint (or ISSUED-recovery of
+    /// held proofs) marks the NIP-60 backup dirty. Opt-in; defaults `None` (existing callers
+    /// unchanged). Boot wires it from the flusher over the SAME shared wallet.
+    pub fn with_backup_notifier(mut self, notifier: BackupDirtyNotifier) -> Self {
+        self.backup_notifier = Some(notifier);
         self
     }
 
@@ -3573,7 +3648,14 @@ impl LightningSettlement {
 pub trait StrandedQuoteSink {
     /// Record that `quote_id` is ISSUED-but-not-held: the mint claims `amount_issued` sats were
     /// issued, but the wallet does not hold them. `reason` is a short human note. MUST NOT credit.
-    fn record_stranded(&self, quote_id: &str, amount_issued: u64, reason: &str);
+    ///
+    /// Returns `Err` when a DURABLE sink could NOT persist the record (serialize/insert/flush
+    /// failure): a silently-swallowed write cannot back a "durably survives" guarantee, so the
+    /// caller ([`LightningSettlement::verify_settlement`]) turns a failed durable record into a HARD
+    /// settlement failure rather than proceeding as if the money-safety record exists. A non-durable
+    /// sink (the loud-error / a test capture) has no store to fail and returns `Ok(())`.
+    fn record_stranded(&self, quote_id: &str, amount_issued: u64, reason: &str)
+        -> anyhow::Result<()>;
 }
 
 /// The DEFAULT [`StrandedQuoteSink`]: emit a loud `tracing::error!` carrying the quote id, the
@@ -3586,7 +3668,12 @@ pub trait StrandedQuoteSink {
 pub struct LoudErrorStrandedSink;
 
 impl StrandedQuoteSink for LoudErrorStrandedSink {
-    fn record_stranded(&self, quote_id: &str, amount_issued: u64, reason: &str) {
+    fn record_stranded(
+        &self,
+        quote_id: &str,
+        amount_issued: u64,
+        reason: &str,
+    ) -> anyhow::Result<()> {
         tracing::error!(
             quote_id,
             amount_issued,
@@ -3596,6 +3683,9 @@ impl StrandedQuoteSink for LoudErrorStrandedSink {
              (recover_incomplete_sagas / NUT-09). [Inc 1b: replace this loud-error sink with a \
              durable sled-backed StrandedQuoteSink wired at boot.]"
         );
+        // The loud log IS this sink's whole job — it has no durable store to fail, so it always
+        // succeeds (returning Ok never lets a settle proceed on a non-durability it cannot detect).
+        Ok(())
     }
 }
 
@@ -3659,7 +3749,12 @@ impl SledStrandedSink {
 }
 
 impl StrandedQuoteSink for SledStrandedSink {
-    fn record_stranded(&self, quote_id: &str, amount_issued: u64, reason: &str) {
+    fn record_stranded(
+        &self,
+        quote_id: &str,
+        amount_issued: u64,
+        reason: &str,
+    ) -> anyhow::Result<()> {
         // Also emit the loud error so the event is visible in logs (the durable row is the
         // recovery memory; the log is the operator's live signal — keep both).
         tracing::error!(
@@ -3672,23 +3767,25 @@ impl StrandedQuoteSink for SledStrandedSink {
         );
         let record =
             StrandedRecord { quote_id: quote_id.to_string(), amount_issued, reason: reason.to_string() };
-        let encoded = match serde_json::to_vec(&record) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(quote_id, error = %e, "failed to serialize stranded record; the loud-error signal above stands, but the durable row was NOT written");
-                return;
-            }
-        };
+        // Any write failure below is SURFACED (not swallowed): a silently-failed durable write
+        // cannot back the "durably survives" guarantee, so the caller hard-fails the settlement.
+        // The loud log above still fires so the event is never invisible.
+        let encoded = serde_json::to_vec(&record).map_err(|e| {
+            tracing::error!(quote_id, error = %e, "failed to serialize stranded record; the loud-error signal above stands, but the durable row was NOT written");
+            anyhow::anyhow!("serialize stranded record for {quote_id}: {e}")
+        })?;
         // Blocking sled write + flush (cheap, off any await, mirrors SledSpawnLedger). Key by
         // quote_id so a re-settle of the same stranded quote overwrites idempotently (never a
         // duplicate row, never a lost one).
-        if let Err(e) = self.tree.insert(quote_id.as_bytes(), encoded) {
+        self.tree.insert(quote_id.as_bytes(), encoded).map_err(|e| {
             tracing::error!(quote_id, error = %e, "failed to write stranded record to sled");
-            return;
-        }
-        if let Err(e) = self.db.flush() {
+            anyhow::anyhow!("insert stranded record for {quote_id}: {e}")
+        })?;
+        self.db.flush().map_err(|e| {
             tracing::error!(quote_id, error = %e, "failed to flush stranded record to disk (row may be lost on crash)");
-        }
+            anyhow::anyhow!("flush stranded record for {quote_id}: {e}")
+        })?;
+        Ok(())
     }
 }
 
@@ -3786,6 +3883,14 @@ impl SettlementProvider for LightningSettlement {
                      summed UNSPENT proofs (NOT the mint-claimed amount_issued), no re-mint \
                      (orphaned-proofs recovery)"
                 );
+                // The held proofs are real unspent sats in the wallet that may not yet be on the
+                // relay backup (the prior mint could have crashed before a flush). Mark the NIP-60
+                // backup dirty so the next flush mirrors them — a raw settlement wallet bypasses the
+                // decorator, so nothing else flips dirty for these recovered proofs. Cheap; never
+                // fails the settle.
+                if let Some(notifier) = &self.backup_notifier {
+                    notifier.mark_dirty();
+                }
                 return Ok(held);
             }
             // The TRUE lost-response: the mint says ISSUED, but we hold NOTHING for this quote
@@ -3801,7 +3906,20 @@ impl SettlementProvider for LightningSettlement {
                 "issued-but-proofs-not-held (no wallet transaction records this quote's proofs); \
                  restore key is in CDK's saga (recover_incomplete_sagas / NUT-09)"
             };
-            self.stranded_sink.record_stranded(charge_id, amount_issued, reason);
+            // If the durable record itself FAILS, we must NOT proceed as if the money-safety record
+            // exists: surface it as a HARD settlement failure (loud). The fail-clean posture is
+            // unchanged (still credits nothing) — this only makes a durability failure hard + visible
+            // instead of a swallowed write behind a fail-clean bail.
+            self.stranded_sink
+                .record_stranded(charge_id, amount_issued, reason)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "bolt11 settlement: quote {charge_id} is ISSUED at the mint but the wallet \
+                         holds NO proofs (mint-claimed amount_issued={amount_issued}), AND recording \
+                         the stranded quote DURABLY FAILED ({e}) — refusing to proceed without the \
+                         money-safety record (fail-clean, credited nothing)"
+                    )
+                })?;
             anyhow::bail!(
                 "bolt11 settlement: quote {charge_id} is ISSUED at the mint but the wallet holds \
                  NO proofs for it (mint-claimed amount_issued={amount_issued}) — refusing to \
@@ -3825,6 +3943,15 @@ impl SettlementProvider for LightningSettlement {
             .total_amount()
             .map_err(|e| anyhow::anyhow!("total the minted proofs for {charge_id}: {e}"))?
             .into();
+        // The mint materialized the proofs into the wallet's cdk store (the truth, already durable).
+        // Mark the NIP-60 backup dirty so the NEXT flush mirrors these freshly-minted proofs to the
+        // relay backup WITHOUT waiting for a later spend — the failover sats-loss guard. A settlement
+        // mint writes straight into the raw wallet (bypassing the Nip60BackedEcash decorator), so
+        // this notifier is the ONLY thing that flips dirty for a minted settlement proof. Cheap (no
+        // await/network under the lock); can never block or fail the settlement.
+        if let Some(notifier) = &self.backup_notifier {
+            notifier.mark_dirty();
+        }
         tracing::info!(
             charge_id,
             minted_sats = minted,
