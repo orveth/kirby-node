@@ -252,6 +252,16 @@ impl GatewayService {
         self
     }
 
+    /// Attach a settlement provider we ALREADY hold behind `Arc<dyn SettlementProvider>` (the boot
+    /// path builds the provider next to the wallet and threads it as a trait object). Same effect
+    /// as [`Self::with_settlement_provider`]; the generic form stays for tests that pass a concrete
+    /// type. Boot wires exactly one provider (Cashu OR Lightning) selected by `[brain]
+    /// settlement_method`; `None` (the default) attaches nothing and IssueCharge fails closed.
+    pub fn with_settlement_provider_dyn(mut self, s: Arc<dyn SettlementProvider>) -> Self {
+        self.settlement = Some(s);
+        self
+    }
+
     /// TEST-ONLY: does `settle_locks` currently hold an entry for `charge_id`? Lets a tooth
     /// assert the per-charge map entry is cleaned up even when a settle is cancelled/panics.
     #[cfg(test)]
@@ -1065,6 +1075,22 @@ impl GatewayService {
             return Ok(denied(Outcome::UpstreamFailed, self.balance()?));
         };
 
+        // METHOD GUARD (D2, ★SHARP TOOTH, money-safety): boot wires exactly ONE settlement rail.
+        // A charge whose requested `method` does not match the wired provider's rail must be
+        // REJECTED (fail-closed, debit 0) BEFORE `settlement.issue` — never settle a Cashu charge
+        // on a Lightning provider (or vice-versa). The genome-supplied `ic.method` is an i32; the
+        // wired provider names its rail via `settlement.method()`.
+        let wired_method = settlement.method() as i32;
+        if ic.method != wired_method {
+            tracing::error!(
+                requested_method = ic.method,
+                wired_method,
+                "IssueCharge method does NOT match the wired settlement rail; rejecting fail-closed \
+                 (debit 0) — never settle a charge on the wrong rail"
+            );
+            return Ok(denied(Outcome::UpstreamFailed, self.balance()?));
+        }
+
         let issued: ChargeIssuedData = match settlement.issue(ic.amount_sats, &ic.memo).await {
             Ok(d) => d,
             Err(e) => {
@@ -1701,6 +1727,9 @@ mod tests {
             // Never resolves: park forever so the caller can cancel us mid-await.
             std::future::pending::<()>().await;
             unreachable!("pending future never resolves")
+        }
+        fn method(&self) -> kirby_proto::ChargeMethod {
+            kirby_proto::ChargeMethod::Cashu
         }
     }
 

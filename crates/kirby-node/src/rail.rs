@@ -3400,6 +3400,13 @@ pub trait SettlementProvider: Send + Sync {
     /// Returns the MINT-VERIFIED sats -- what the mint actually credited, NOT what was
     /// requested. The gateway passes this value directly to `treasury.credit_verified`.
     async fn verify_settlement(&self, charge_id: &str, evidence: &str) -> anyhow::Result<u64>;
+
+    /// The payment RAIL this provider settles on. The gateway compares an incoming
+    /// `IssueCharge.method` against this and REJECTS a mismatch (fail-closed, debit 0) BEFORE
+    /// calling `issue` — a charge must never be settled on the wrong rail (a Cashu charge issued
+    /// against a Lightning provider, or vice-versa). Boot wires exactly ONE provider, so this is
+    /// the single wired rail the daemon serves.
+    fn method(&self) -> kirby_proto::ChargeMethod;
 }
 
 /// Cashu settlement: issues a simple payment request and verifies by calling
@@ -3436,6 +3443,10 @@ impl SettlementProvider for CashuSettlement {
             .await
             .map_err(|e| anyhow::anyhow!("cashu settlement receive: {e}"))?;
         Ok(amount.into())
+    }
+
+    fn method(&self) -> kirby_proto::ChargeMethod {
+        kirby_proto::ChargeMethod::Cashu
     }
 }
 
@@ -3588,6 +3599,99 @@ impl StrandedQuoteSink for LoudErrorStrandedSink {
     }
 }
 
+/// The durable [`StrandedQuoteSink`] wired at boot (Inc 1b) for the `LightningSettlement`
+/// provider: a sled-backed tree that OUTLIVES the process, so a stranded bolt11 quote (mint
+/// ISSUED but the wallet holds NO proofs) is recorded to disk for out-of-band operator recovery
+/// even across a crash/restart. Mirrors [`crate::spawn::SledSpawnLedger`]'s durability discipline:
+/// one tree, key = `quote_id`, value = the JSON-serialized record, `db.flush()` after each write
+/// so a crash immediately after `record_stranded` cannot lose the row.
+///
+/// MONEY-SAFETY (D4): a stranded quote is a REAL sat the mint issued that the wallet does not
+/// hold; without a durable record it orphans silently. This sink is the durable memory the
+/// loud-error sink lacked. It NEVER credits (same contract as every `StrandedQuoteSink`); it only
+/// records the fact. `record_stranded` runs in a SYNC trait method off the async `verify_settlement`
+/// path, so the write is blocking-sled (like `SledSpawnLedger`) and is NOT held across any await.
+/// A write error is logged loudly (never silent) but does not panic the settle path — the
+/// lost-response already FAILS CLEAN (no credit) regardless of whether this record persists.
+pub struct SledStrandedSink {
+    tree: sled::Tree,
+    db: sled::Db,
+}
+
+/// The durable record a [`SledStrandedSink`] stores per stranded quote (JSON-serialized, keyed by
+/// `quote_id`). `amount_issued` is the mint's CLAIMED issued amount (its book, not ours — see
+/// `verify_settlement`); recorded only so an operator sees what the mint thinks it owes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct StrandedRecord {
+    pub quote_id: String,
+    pub amount_issued: u64,
+    pub reason: String,
+}
+
+impl SledStrandedSink {
+    /// Open (or create) the durable stranded-quote tree at `path` (a sled db dir). The tree name
+    /// `"stranded"` mirrors `SledSpawnLedger`'s `"spawned"`.
+    pub fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        let db = sled::open(path.as_ref())
+            .map_err(|e| anyhow::anyhow!("open stranded-quote sink at {}: {e}", path.as_ref().display()))?;
+        let tree =
+            db.open_tree("stranded").map_err(|e| anyhow::anyhow!("open stranded tree: {e}"))?;
+        Ok(SledStrandedSink { tree, db })
+    }
+
+    /// TEST/RECOVERY read-back: the durable record for `quote_id`, if any. Lets a tooth prove a
+    /// record SURVIVES a store drop + reopen (the durability that separates this from the
+    /// in-memory loud-error sink).
+    pub fn get(&self, quote_id: &str) -> anyhow::Result<Option<StrandedRecord>> {
+        let raw = self
+            .tree
+            .get(quote_id.as_bytes())
+            .map_err(|e| anyhow::anyhow!("read stranded record for {quote_id}: {e}"))?;
+        match raw {
+            None => Ok(None),
+            Some(bytes) => {
+                let rec: StrandedRecord = serde_json::from_slice(&bytes)
+                    .map_err(|e| anyhow::anyhow!("decode stranded record for {quote_id}: {e}"))?;
+                Ok(Some(rec))
+            }
+        }
+    }
+}
+
+impl StrandedQuoteSink for SledStrandedSink {
+    fn record_stranded(&self, quote_id: &str, amount_issued: u64, reason: &str) {
+        // Also emit the loud error so the event is visible in logs (the durable row is the
+        // recovery memory; the log is the operator's live signal — keep both).
+        tracing::error!(
+            quote_id,
+            amount_issued,
+            reason,
+            "STRANDED bolt11 mint quote recorded DURABLY (sled): the mint reports it ISSUED but \
+             the wallet holds NO proofs for it — crediting NOTHING (fail-clean). Recover via CDK's \
+             saga (recover_incomplete_sagas / NUT-09)."
+        );
+        let record =
+            StrandedRecord { quote_id: quote_id.to_string(), amount_issued, reason: reason.to_string() };
+        let encoded = match serde_json::to_vec(&record) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(quote_id, error = %e, "failed to serialize stranded record; the loud-error signal above stands, but the durable row was NOT written");
+                return;
+            }
+        };
+        // Blocking sled write + flush (cheap, off any await, mirrors SledSpawnLedger). Key by
+        // quote_id so a re-settle of the same stranded quote overwrites idempotently (never a
+        // duplicate row, never a lost one).
+        if let Err(e) = self.tree.insert(quote_id.as_bytes(), encoded) {
+            tracing::error!(quote_id, error = %e, "failed to write stranded record to sled");
+            return;
+        }
+        if let Err(e) = self.db.flush() {
+            tracing::error!(quote_id, error = %e, "failed to flush stranded record to disk (row may be lost on crash)");
+        }
+    }
+}
+
 /// The money-tooth gate: a bolt11 mint quote is only mintable once the mint reports it PAID.
 ///
 /// cdk 0.17.1's [`cdk::nuts::MintQuoteState`] (= `nut23::QuoteState`) has exactly THREE
@@ -3728,6 +3832,10 @@ impl SettlementProvider for LightningSettlement {
              mint-verified amount for the credit"
         );
         Ok(minted)
+    }
+
+    fn method(&self) -> kirby_proto::ChargeMethod {
+        kirby_proto::ChargeMethod::Lightning
     }
 }
 

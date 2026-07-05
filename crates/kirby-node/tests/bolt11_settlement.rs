@@ -44,8 +44,8 @@ use kirby_node::gateway::{GatewayService, Session};
 use kirby_node::mint_rig::build_wallet;
 use kirby_node::nerve::InboundQueue;
 use kirby_node::rail::{
-    ChargeIssuedData, LightningSettlement, MockRail, SettlementProvider, StrandedQuoteSink,
-    ISSUE_CHARGE_DESTINATION,
+    ChargeIssuedData, LightningSettlement, MockRail, SettlementProvider, SledStrandedSink,
+    StrandedQuoteSink, ISSUE_CHARGE_DESTINATION,
 };
 use kirby_node::treasury::{CreditOutcome, Treasury};
 
@@ -543,4 +543,161 @@ async fn mint_unreachable_during_settle_errs_and_credits_nothing() {
         0,
         "MONEY-MUST: a mint-down settle credits NOTHING and leaves no state a retry would double-count"
     );
+}
+
+// --------------------------------------------------------------------------------------------
+// TOOTH 4 (★DURABLE-SINK, Inc 1b/D4): a stranded-quote record written via `SledStrandedSink`
+// SURVIVES a real process restart (drop the store handle, REOPEN the tree from the SAME path).
+// This is what separates the durable sink from the in-memory `LoudErrorStrandedSink`: an orphaned
+// real sat's recovery marker must not evaporate on a crash.
+//
+// RED-on-revert: revert `SledStrandedSink::record_stranded` to NOT persist (e.g. delete the
+// `self.tree.insert(...) + self.db.flush()` block so it only logs — the in-memory/LoudError-only
+// behavior), and the reopened tree holds NOTHING → `reopened.get(...)` returns `None` → the
+// `assert_eq!(Some(..))` below FAILS (RED). It is NOT an in-memory check: the assertion reads a
+// freshly-`open`ed handle after the writer was dropped.
+// --------------------------------------------------------------------------------------------
+#[test]
+fn stranded_record_survives_a_store_reopen() {
+    // A unique on-disk path (mirrors the test TempDir pattern; NOT temp_dir for prod, but a test
+    // scratch dir is fine). Removed at the end.
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!(
+        "kirby-stranded-tooth-{}-{}",
+        std::process::id(),
+        n
+    ));
+
+    let quote_id = "quote-stranded-abc123";
+    let amount_issued = 4242u64;
+    let reason = "issued-but-proofs-not-held (tooth 4 durability)";
+
+    // 1) Write the record through the durable sink, then DROP the handle (models a process exit).
+    {
+        let sink = SledStrandedSink::open(&path).expect("open durable stranded sink");
+        sink.record_stranded(quote_id, amount_issued, reason);
+        // handle (and its sled Db) dropped here.
+    }
+
+    // 2) REOPEN the tree from the SAME path in a fresh handle and assert the record is present.
+    let reopened = SledStrandedSink::open(&path).expect("reopen durable stranded sink");
+    let got = reopened.get(quote_id).expect("read stranded record after reopen");
+    assert_eq!(
+        got,
+        Some(kirby_node::rail::StrandedRecord {
+            quote_id: quote_id.to_string(),
+            amount_issued,
+            reason: reason.to_string(),
+        }),
+        "MONEY-SAFETY (D4): a stranded-quote record MUST survive a store drop + reopen \
+         (durable, not in-memory) — reverting the sled insert/flush makes this None (RED)"
+    );
+
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+// --------------------------------------------------------------------------------------------
+// TOOTH 1 (WIRE, Inc 1b/D1): a LIGHTNING provider attached to the gateway via the NEW
+// `with_settlement_provider_dyn` (the boot-attach seam) serves an IssueCharge END-TO-END —
+// the gateway returns a real bolt11. This is the thing 1a proved MISSING (no production path
+// attached any provider). The genome sends `method = Lightning`; the wired provider is Lightning.
+//
+// RED-on-revert: delete the `.with_settlement_provider_dyn(...)` line below (leave the gateway
+// with `settlement: None`, exactly today's production default). `authorize_issue_charge` then
+// fails closed (denied, no `ChargeIssued`), so `receipt.charge` is `None`, the
+// `.expect("gateway returns a ChargeIssued")` panics, and this test FAILS (RED).
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn lightning_provider_attached_dyn_issues_a_bolt11_through_the_gateway() {
+    use kirby_proto::capability_request::Act;
+    use kirby_proto::{CapabilityRequest, ChargeMethod, IssueCharge, Outcome};
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let wallet = build_wallet(&mint.url()).await.expect("build daemon wallet");
+
+    let treasury = Treasury::open_temporary(0).expect("open temporary treasury");
+    let session = Session {
+        task_descriptor: "bolt11-wire-tooth".into(),
+        budget_sats: 0,
+        allowlisted_destinations: vec![ISSUE_CHARGE_DESTINATION.to_string()],
+        allowlisted_inbound_kinds: vec![InboundKind::PaymentSettled],
+    };
+    // THE ATTACH under test: the boot-path seam that threads a provider we hold as Arc<dyn ..>.
+    let provider: Arc<dyn SettlementProvider> = Arc::new(LightningSettlement::new(wallet));
+    let svc = GatewayService::new(treasury, Arc::new(MockRail::new()), session)
+        .with_settlement_provider_dyn(provider);
+
+    let req = CapabilityRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        idempotency_key: "wire-charge-1".into(),
+        act: Some(Act::IssueCharge(IssueCharge {
+            amount_sats: 777,
+            memo: "a stranger pays real sats".into(),
+            method: ChargeMethod::Lightning as i32,
+        })),
+        budget_sats: 0,
+    };
+    let receipt = svc.authorize_capability(&req).await.expect("authorize IssueCharge");
+    assert_eq!(
+        receipt.outcome,
+        Outcome::AuthorizedAndPerformed as i32,
+        "a wired Lightning provider must authorize a Lightning IssueCharge"
+    );
+    let charge = receipt.charge.expect("gateway returns a ChargeIssued");
+    // THE TOOTH: the invoice_or_request is a REAL bolt11 the stranger can pay from any wallet.
+    let _invoice: lightning_invoice::Bolt11Invoice = charge
+        .invoice_or_request
+        .parse()
+        .expect("the gateway-issued invoice_or_request must be a valid bolt11");
+    assert_eq!(charge.method, ChargeMethod::Lightning as i32, "echoes the Lightning rail");
+}
+
+// --------------------------------------------------------------------------------------------
+// TOOTH 2 (★METHOD-GUARD, Inc 1b/D2): with a LIGHTNING provider wired, an IssueCharge carrying
+// `method = Cashu` (a rail MISMATCH) is REJECTED fail-closed (denied, debit 0) — the charge is
+// NEVER settled on the wrong rail. The mint is LIVE, so the guard is the ONLY thing stopping the
+// mismatched charge from minting a bolt11.
+//
+// RED-on-revert: delete the method-guard block in `authorize_issue_charge` (the
+// `if ic.method != wired_method { .. }`); the mismatched Cashu charge then proceeds into
+// `settlement.issue` on the LIVE Lightning provider, a `ChargeIssued` is returned, the outcome
+// flips to AuthorizedAndPerformed, and both assertions below FAIL (RED).
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn issue_charge_with_mismatched_method_is_rejected_fail_closed() {
+    use kirby_proto::capability_request::Act;
+    use kirby_proto::{CapabilityRequest, ChargeMethod, IssueCharge, Outcome};
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let wallet = build_wallet(&mint.url()).await.expect("build daemon wallet");
+
+    // lightning_gateway wires a LightningSettlement (method() == Lightning) over the wallet.
+    let (svc, _queue) = lightning_gateway(0, wallet);
+
+    let req = CapabilityRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        idempotency_key: "mismatch-charge-1".into(),
+        act: Some(Act::IssueCharge(IssueCharge {
+            amount_sats: 500,
+            memo: "cashu charge on a lightning rail".into(),
+            // MISMATCH: the wired provider is Lightning; the charge asks for Cashu.
+            method: ChargeMethod::Cashu as i32,
+        })),
+        budget_sats: 0,
+    };
+    let receipt = svc.authorize_capability(&req).await.expect("authorize IssueCharge");
+    assert_eq!(
+        receipt.outcome,
+        Outcome::UpstreamFailed as i32,
+        "MONEY-SAFETY: a method mismatch (Cashu charge, Lightning provider) must be DENIED fail-closed"
+    );
+    assert!(
+        receipt.charge.is_none(),
+        "a rejected mismatched charge must NOT carry a ChargeIssued (never settled on the wrong rail)"
+    );
+    assert_eq!(receipt.cost_sats, 0, "a rejected charge debits nothing");
 }

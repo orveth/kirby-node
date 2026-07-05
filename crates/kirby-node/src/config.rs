@@ -762,8 +762,10 @@ pub struct BrainConfig {
     #[serde(default)]
     pub node_url: String,
     /// (routstr) The mint the treasury wallet holds + spends ecash at (the node's
-    /// accepted mint, §11). Required iff `backend = "routstr"`.
-    #[serde(default)]
+    /// accepted mint, §11). Defaults to [`default_brain_mint_url`] (btcforplebs) so a
+    /// zero-config agent mints + settles bolt11 there without operator config; the routstr
+    /// validation (satisfied by this default) still requires it non-empty. Operators override.
+    #[serde(default = "default_brain_mint_url")]
     pub mint_url: String,
     /// (routstr) EXTRA mint URLs to trust for NIP-60 reconcile beyond `mint_url`. The effective
     /// allowlist ([`Self::effective_mint_allowlist`]) always includes `mint_url` (the wallet's own
@@ -813,10 +815,41 @@ pub struct BrainConfig {
     /// R2-3). Measured in Layer B (fake mint) / Layer C (real mint).
     #[serde(default = "default_brain_fee_headroom_sats")]
     pub fee_headroom_sats: u64,
+    /// (Inc 1b/D2) Which settlement rail the daemon wires for the earn-loop `IssueCharge` act.
+    /// `None` (the serde default) attaches NO settlement provider — byte-identical to today: an
+    /// IssueCharge fails closed (no rail configured). `Some(Cashu)` wires a [`crate::rail::CashuSettlement`]
+    /// (a stranger pays a cashu token); `Some(Lightning)` wires a [`crate::rail::LightningSettlement`]
+    /// (a stranger pays a bolt11 from any Lightning wallet — the milestone-2 rail). Boot wires
+    /// EXACTLY the one selected here over the same host-held treasury wallet; the gateway's method
+    /// guard then rejects any charge whose method does not match the wired rail.
+    #[serde(default)]
+    pub settlement_method: Option<SettlementMethod>,
+}
+
+/// Which settlement RAIL the daemon wires for the earn-loop (Inc 1b/D2). Selects ONE provider at
+/// boot; the runtime multi-rail router (a durable charge_id→method map) is a deferred increment,
+/// not needed for the "a stranger pays real sats" milestone. Serialized `snake_case` in
+/// `[brain] settlement_method` (`"cashu"` | `"lightning"`); absent ⇒ `None` ⇒ no provider wired.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementMethod {
+    /// Wire a [`crate::rail::CashuSettlement`]: the payer hands the daemon a cashu token.
+    Cashu,
+    /// Wire a [`crate::rail::LightningSettlement`]: the payer pays a bolt11 mint quote from any
+    /// Lightning wallet (the milestone-2 stranger-pays-real-sats rail).
+    Lightning,
 }
 
 fn default_brain_model() -> String {
     "anthropic/claude-sonnet-4.6".to_string()
+}
+/// The zero-config default mint (D3): a NUT-04 bolt11/sat + NUT-20 mint. A bare agent mints
+/// (and settles bolt11 charges) at btcforplebs with no operator config; operators still override
+/// via `[brain] mint_url`. The documented fallback is `https://mint.cubabitcoin.org` (comment
+/// only — no automatic failover). The bolt11 settlement mint IS the treasury wallet's mint (one
+/// wallet, shared), so this single default serves both spending and earning.
+fn default_brain_mint_url() -> String {
+    "https://mint.btcforplebs.com".to_string()
 }
 fn default_brain_max_cost_sats() -> u64 {
     64
@@ -868,7 +901,7 @@ impl Default for BrainConfig {
             bytes_per_sat: default_brain_bytes_per_sat(),
             backend: BrainBackendKind::default(),
             node_url: String::new(),
-            mint_url: String::new(),
+            mint_url: default_brain_mint_url(),
             mint_allowlist: Vec::new(),
             wallet_db_path: String::new(),
             api_key_path: String::new(),
@@ -876,6 +909,7 @@ impl Default for BrainConfig {
             request_timeout_secs: default_brain_request_timeout_secs(),
             recovery_timeout_secs: default_brain_recovery_timeout_secs(),
             fee_headroom_sats: default_brain_fee_headroom_sats(),
+            settlement_method: None,
         }
     }
 }
@@ -2557,7 +2591,10 @@ mod tests {
     }
 
     #[test]
-    fn brain_routstr_missing_mint_url_is_rejected() {
+    fn brain_routstr_omitted_mint_url_defaults_to_btcforplebs_and_validates() {
+        // Inc 1b/D3: mint_url now DEFAULTS to btcforplebs, so a routstr config that OMITS mint_url
+        // no longer errors — the default satisfies the "mint_url must be set" guard. (Previously
+        // this omission was rejected; the zero-config default is the milestone-2 behavior.)
         let toml = r#"
             workload = "capable"
             genome_image = { path = "/tmp/k/img" }
@@ -2573,10 +2610,35 @@ mod tests {
             node_url = "https://api.routstr.com"
             wallet_db_path = "/var/lib/kirby/brain-wallet.sqlite"
         "#;
+        let cfg = KirbyConfig::from_toml_str(toml)
+            .expect("a routstr brain omitting mint_url must now validate on the btcforplebs default");
+        assert_eq!(cfg.brain.mint_url, "https://mint.btcforplebs.com");
+    }
+
+    #[test]
+    fn brain_routstr_explicit_empty_mint_url_is_still_rejected() {
+        // The guard still bites an EXPLICITLY blanked mint_url (an operator who clears it on
+        // purpose): only the OMITTED case picks up the default.
+        let toml = r#"
+            workload = "capable"
+            genome_image = { path = "/tmp/k/img" }
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            backend = "routstr"
+            max_cost_sats = 64
+            node_url = "https://api.routstr.com"
+            mint_url = ""
+            wallet_db_path = "/var/lib/kirby/brain-wallet.sqlite"
+        "#;
         let err = KirbyConfig::from_toml_str(toml).unwrap_err();
         assert!(
             err.to_string().contains("brain.mint_url must be set"),
-            "expected the routstr missing-mint_url error, got: {err}"
+            "expected the routstr empty-mint_url error, got: {err}"
         );
     }
 
@@ -2777,9 +2839,43 @@ mod tests {
             .expect("a routstr_key brain with a node + keyfile must validate without a mint/wallet");
         assert_eq!(cfg.brain.backend, BrainBackendKind::RoutstrKey);
         assert_eq!(cfg.brain.api_key_path, "/var/lib/kirby/brain-api.key");
-        assert!(cfg.brain.mint_url.is_empty(), "no mint is required for the prepaid-key backend");
+        // Inc 1b/D3: mint_url now DEFAULTS to btcforplebs (the zero-config bolt11/spend mint). The
+        // prepaid-key backend IGNORES it (no local wallet), so the harmless default is fine — the
+        // key backend still needs no mint/wallet of its OWN.
+        assert_eq!(
+            cfg.brain.mint_url, "https://mint.btcforplebs.com",
+            "mint_url defaults to btcforplebs (ignored by the prepaid-key backend)"
+        );
         assert!(cfg.brain.wallet_db_path.is_empty(), "no wallet is required for the prepaid-key backend");
         assert_eq!(cfg.brain.max_tokens, 1024, "max_tokens defaults to 1024 (bounds the reserve)");
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // TOOTH 3 (mint_url DEFAULT, Inc 1b/D3): a zero-config `BrainConfig` — both `Default::default()`
+    // AND a serde-deserialized empty `[brain]` table — has `mint_url == btcforplebs`, so a
+    // zero-config agent mints (and settles bolt11) there with no operator config.
+    //
+    // RED-on-revert: revert the default back to empty (change `mint_url` to `String::new()` in the
+    // `Default` impl AND drop `#[serde(default = "default_brain_mint_url")]` back to `#[serde(default)]`);
+    // both asserts below then see `""` and FAIL (RED).
+    // --------------------------------------------------------------------------------------------
+    #[test]
+    fn brain_mint_url_defaults_to_btcforplebs() {
+        // The struct Default (the zero-config template / `KirbyConfig::default()` path).
+        assert_eq!(
+            BrainConfig::default().mint_url,
+            "https://mint.btcforplebs.com",
+            "BrainConfig::default().mint_url must be the btcforplebs zero-config default"
+        );
+        // The serde path: an empty `[brain]` table deserializes mint_url from the serde default.
+        let brain: BrainConfig = toml::from_str("").expect("empty [brain] table deserializes");
+        assert_eq!(
+            brain.mint_url, "https://mint.btcforplebs.com",
+            "a serde-deserialized zero-config BrainConfig must default mint_url to btcforplebs"
+        );
+        // settlement_method defaults to None (no provider wired unless configured — byte-identical
+        // to pre-1b; the D2 behavior-preservation invariant).
+        assert_eq!(brain.settlement_method, None);
     }
 
     #[test]

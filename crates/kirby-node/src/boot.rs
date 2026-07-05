@@ -34,8 +34,9 @@ use crate::gateway::{GatewayService, Session};
 // when a memory relay set is configured. `nerve` is cross-platform (host-side nostr-sdk).
 use crate::nerve::NodeIdentity;
 use crate::rail::{
-    Actuator, BrainBackend, CdkEcash, CompositeRail, EngramStore, MemoryBackend, MockRail,
-    NostrActuator, Rail, RoutstrBrain, RoutstrKeyBrain, StubBrain, StubMemory,
+    Actuator, BrainBackend, CashuSettlement, CdkEcash, CompositeRail, EngramStore, LightningSettlement,
+    MemoryBackend, MockRail, NostrActuator, Rail, RoutstrBrain, RoutstrKeyBrain, SettlementProvider,
+    SledStrandedSink, StubBrain, StubMemory,
 };
 use crate::sandbox::{GatewayTransport, GuestImage, GuestSpec, SandboxBackend, SandboxInstance};
 use crate::treasury::Treasury;
@@ -411,7 +412,7 @@ pub async fn boot_and_observe(
         // real Routstr node, paid from the treasury.
         Some(brain) if brain.backend == BrainBackendKind::Routstr => {
             let treasury_remaining = peek_treasury_remaining(&config).await?;
-            let (brain_backend, nip60_flusher, nip60_counter_estate) =
+            let (brain_backend, nip60_flusher, nip60_counter_estate, settlement_provider) =
                 build_routstr_brain(brain, treasury_remaining, &config.nip60, &config.fleet_relay)
                     .await?;
             // Carry the Cut A (#115) backup flusher AND the Cut B counter-estate bundle (both `Some`
@@ -426,6 +427,7 @@ pub async fn boot_and_observe(
                 )),
                 nip60_flusher,
                 nip60_counter_estate,
+                settlement_provider,
             )
             .await;
         }
@@ -498,7 +500,7 @@ pub async fn boot_and_observe(
     // The non-Routstr arms configure no NIP-60 backup flusher NOR counter estate (only the real
     // cdk-wallet brain has a wallet + counter mirror to back up); the Routstr arm returns early above
     // carrying both.
-    boot_and_observe_with_rail(config, rail, None, None).await
+    boot_and_observe_with_rail(config, rail, None, None, None).await
 }
 
 /// Attach an optional outward [`Actuator`] to a [`CompositeRail`] (the agent's voice), returning
@@ -1101,6 +1103,11 @@ async fn build_routstr_brain(
     // (store + counter decorator + mint url). `Some` exactly when `[nip60]` is configured; threaded
     // into the ServeGuard so `flush_estate` re-publishes the current counter mirror at death.
     Option<Nip60CounterEstate>,
+    // Inc 1b (D1/D2): the earn-loop SETTLEMENT provider, built HERE (where the host-held wallet
+    // lives) and threaded to the gateway attach. `Some(Cashu|Lightning)` per `[brain]
+    // settlement_method`; `None` when unset (no provider wired — byte-identical to pre-1b). The
+    // wallet stays buried inside this function; only the provider (a trait object) escapes.
+    Option<Arc<dyn SettlementProvider>>,
 )> {
     let db_path = Path::new(&brain.wallet_db_path);
     // Resolve the wallet spend seed ONCE through the WalletKey seam (interim: the byte-identical
@@ -1239,6 +1246,42 @@ async fn build_routstr_brain(
     )
     .await?;
     let ecash = CdkEcash::new(wallet.clone());
+
+    // Inc 1b (D1/D2): build the earn-loop SETTLEMENT provider over the SAME host-held wallet,
+    // selected by `[brain] settlement_method`. Built HERE (the only place the wallet lives) and
+    // returned as a trait object so the wallet itself never escapes to the gateway. `None` (the
+    // default) wires NO provider — byte-identical to pre-1b (IssueCharge fails closed). A Lightning
+    // provider is injected with a DURABLE sled-backed stranded-quote sink (D4): a bolt11 quote that
+    // the mint ISSUED but whose proofs never landed is recorded to disk for out-of-band recovery,
+    // surviving a crash. The sink lives beside the wallet db (under the same durable treasury dir).
+    let settlement_provider: Option<Arc<dyn SettlementProvider>> = match brain.settlement_method {
+        None => None,
+        Some(crate::config::SettlementMethod::Cashu) => {
+            tracing::info!("Inc 1b: wiring the CASHU settlement provider over the treasury wallet");
+            Some(Arc::new(CashuSettlement::new(wallet.clone())))
+        }
+        Some(crate::config::SettlementMethod::Lightning) => {
+            // Durable stranded-quote sink beside the wallet db (per-agent, under the durable
+            // treasury dir). REFUSE TO BOOT if it cannot open: a Lightning agent that cannot durably
+            // record a stranded real sat must not take live payments (D4 money-safety).
+            let stranded_path = Path::new(&brain.wallet_db_path).with_extension("stranded");
+            let sink = SledStrandedSink::open(&stranded_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Inc 1b: refusing to boot a Lightning-settlement agent — could not open the \
+                     durable stranded-quote sink at {}: {e}",
+                    stranded_path.display()
+                )
+            })?;
+            tracing::info!(
+                stranded_path = %stranded_path.display(),
+                "Inc 1b: wiring the LIGHTNING (bolt11) settlement provider over the treasury wallet \
+                 with a durable sled-backed stranded-quote sink"
+            );
+            Some(Arc::new(
+                LightningSettlement::new(wallet.clone()).with_stranded_sink(Arc::new(sink)),
+            ))
+        }
+    };
 
     // ★ config-plane REVISION (findings 1+2) + R2-#3 (TWO-LATCH): SHARE the RECOVERY-COMPLETE latch
     // INTO the store BEFORE it is `Arc`-wrapped + handed to the flusher, so the choke-point funnel
@@ -1549,7 +1592,7 @@ async fn build_routstr_brain(
     let counter_estate = nip60_store
         .as_ref()
         .map(|store| (store.clone(), counter_db.clone(), brain.mint_url.clone()));
-    Ok((backend, flusher, counter_estate))
+    Ok((backend, flusher, counter_estate, settlement_provider))
 }
 
 /// Build the [`RoutstrKeyBrain`] backend for `backend = "routstr_key"` (the prepaid,
@@ -1685,6 +1728,11 @@ pub async fn boot_and_observe_with_rail(
     // awaited `flush_estate` re-publishes the CURRENT 17375 counter mirror at graceful death. `None`
     // for every other path → no counter estate publish, unchanged behavior.
     nip60_counter_estate: Option<Nip60CounterEstate>,
+    // Inc 1b (D1): the earn-loop SETTLEMENT provider, when the config selected one (`[brain]
+    // settlement_method`). `Some` only on the Routstr path that built it over the host-held wallet;
+    // `None` for every other path (api-key/stub/mock/test), leaving IssueCharge fail-closed exactly
+    // as before. Attached to the gateway below via `with_settlement_provider_dyn`.
+    settlement: Option<Arc<dyn SettlementProvider>>,
 ) -> anyhow::Result<(Box<dyn SandboxInstance>, BootOutcome, Treasury, EventStream, ServeGuard)> {
     // The persisted, daemon-owned treasury (D-9). A per-node temp store keeps two
     // node processes distinct on one host. The session is the non-secret snapshot
@@ -1715,6 +1763,12 @@ pub async fn boot_and_observe_with_rail(
     // counter, D-9): metered ticks and capability spends debit the same balance.
     let meter_treasury = treasury.clone();
     let mut service = GatewayService::new(treasury, rail, session);
+    // Inc 1b (D1): attach the earn-loop settlement provider (built over the host-held wallet in
+    // `build_routstr_brain`). Without one, IssueCharge fails closed (debit 0) exactly as before —
+    // so a non-configured agent is byte-identical to pre-1b. This is the wiring 1a proved missing.
+    if let Some(provider) = settlement {
+        service = service.with_settlement_provider_dyn(provider);
+    }
     // Attach the inbound queue (the consumer side) when DMs are enabled; the run_dm_inbound task
     // (spawned after the VM is up) feeds the SAME handle.
     let inbox_queue = if dm_enabled {
