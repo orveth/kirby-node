@@ -462,6 +462,13 @@ pub struct ReconcileRead {
     /// `fetched_ids`). The boot/retry paths fold this into `restore_ok` so recovery_complete stays
     /// CLOSED against an incomplete candidate set (never del-chain / roll over a backup we couldn't read).
     pub decode_ok: bool,
+    /// §K3-corr (config-plane ROUND-5): `true` when NO 7375 events were served at all (the RAW count,
+    /// decodable or not). This — NOT `fetched_ids.is_empty()` — is the `token_empty` signal the
+    /// establish decision must consume: post-K3 `fetched_ids` is decoded-ONLY, so an all-undecryptable
+    /// read has empty `fetched_ids` yet holds a real unreadable backup. Establishing-at-0 on that would
+    /// derive from index 0 against unread proofs = NUT-13 reuse. A genuinely-empty read (no events
+    /// served) is `true` → establish-at-0 still works for a new agent.
+    pub raw_events_empty: bool,
 }
 
 /// The result of a quorum-aware config-floor read (returned by [`Nip60Store::load_config_quorum`],
@@ -707,6 +714,19 @@ impl Nip60Store {
             authoritative,
             "NIP-60 reconcile: per-relay read quorum"
         );
+        // §K3-corr (config-plane ROUND-5): the RAW token-presence signal, captured BEFORE the decode
+        // loop consumes `per.events`. This is "were ANY events served (decodable OR NOT)", DISTINCT
+        // from `fetched_ids.is_empty()` which post-K3 means "no DECODABLE events". The establish
+        // decision's `token_empty` MUST read THIS (an all-undecryptable read is NOT genuinely-empty —
+        // it holds a real unreadable backup — so it must NOT establish-at-0).
+        //
+        // ★ TWO DISTINCT SIGNALS — DO NOT RE-CONFLATE: `fetched_ids` = decoded-ONLY (the deletion-seed,
+        // K3 — never del-chain a backup we could not read); `raw_events_empty` = the emptiness-signal
+        // for the establish decision. An overloaded variable serving two money-semantic purposes is
+        // exactly the trap that let K3 silently change the OTHER meaning (fetched_ids went decoded-only
+        // → `fetched_ids.is_empty()` silently flipped from "no events served" to "no decodable events",
+        // opening establish-at-0 against an unread backup = NUT-13 reuse).
+        let raw_events_empty = per.events.is_empty();
         let mut fetched_ids: Vec<String> = Vec::with_capacity(per.events.len());
         let mut decoded: Vec<(String, TokenEventContent)> = Vec::new();
         // §K3 (config-plane ROUND-4) DECODE FAIL-CLOSED: a self-authored 7375 event we CANNOT decrypt
@@ -747,6 +767,7 @@ impl Nip60Store {
             read_k: self.read_k,
             authoritative,
             decode_ok,
+            raw_events_empty,
         })
     }
 
@@ -3382,6 +3403,111 @@ mod tests {
         assert!(
             !restore_ok,
             "K3: a degraded decode forces restore_ok=false (recovery_complete stays CLOSED, backup preserved)"
+        );
+    }
+
+    // ---- T28 (config-plane ROUND-5, K3-corr — raw-token-presence for the establish decision): the
+    // regression K3 introduced. K3 made `fetched_ids` decoded-ONLY, so `fetched_ids.is_empty()` post-K3
+    // means "no DECODABLE events" — an ALL-undecryptable self-authored 7375 read (a real, unreadable
+    // backup) looks empty and would establish-at-0 (config_authoritative + token_authoritative +
+    // token_empty) → derive from index 0 against unread proofs = NUT-13 REUSE. The establish decision's
+    // `token_empty` must be the RAW presence signal (`token_plane_empty` → `raw_events_empty`), still
+    // ANDed with `token_authoritative` (quorum symmetry preserved).
+    //
+    // RED-on-revert: change `boot::token_plane_empty` to `read.fetched_ids.is_empty()` (the buggy
+    // decoded-only form) → the all-undecryptable read yields token_empty=true → establish_if_sound
+    // establishes at 0 → the "DEFERS" assert fails → RED (index-0 reuse against an unread backup).
+    #[tokio::test]
+    async fn t28_all_undecryptable_read_defers_establish_at_zero() {
+        use crate::boot::token_plane_empty;
+
+        let crypto = test_crypto(0x7a);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let store = Nip60Store::with_transport_and_read_k(crypto.clone(), transport.clone(), 3, 2, 2, allow_m());
+
+        // Seed ONE undecryptable self-authored 7375 event (signed under OUR key → the author filter
+        // returns it; content is NOT valid NIP-44 → decode fails). Stored on all 3 UP relays → served=3.
+        transport
+            .send_event(KIND_NIP60_TOKEN, "not-valid-nip44-ciphertext".to_string(), Vec::new())
+            .await
+            .expect("seed an undecryptable self-authored token event");
+
+        let read = store.reconcile_on_load_with_ids().await.expect("reconcile");
+        // THE SEAM: the two signals DISAGREE — fetched_ids is decoded-only-EMPTY, but the RAW read is
+        // NON-empty (a real backup was served, we just couldn't read it), and the read hit quorum.
+        assert!(read.fetched_ids.is_empty(), "K3: fetched_ids is decoded-only → empty (undecryptable excluded)");
+        assert!(!read.raw_events_empty, "K3-corr: the RAW read is NON-empty (an event WAS served)");
+        assert!(read.authoritative, "≥k relays served the (undecryptable) event → token_authoritative");
+        assert!(!read.decode_ok, "the read is decode-degraded");
+        assert!(
+            !token_plane_empty(&read),
+            "token_plane_empty is the RAW presence (false here) — revert to fetched_ids.is_empty() → true → RED"
+        );
+
+        // WIRED establish path: fresh box, empty config floor, config ≥k, token ≥k, token_empty from the
+        // RAW signal → must DEFER (do NOT establish-at-0 against an unread backup).
+        async fn fresh_counter_db() -> Nip60CounterDb {
+            let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
+            Nip60CounterDb::with_counters_established(Arc::new(mem), std::collections::HashMap::new(), false)
+        }
+        let db = fresh_counter_db().await;
+        let established = db
+            .establish_if_sound(
+                std::collections::HashMap::new(),
+                false,                       // resume=false (fresh box)
+                true,                        // config_authoritative
+                read.authoritative,          // token_authoritative (≥k)
+                token_plane_empty(&read),    // token_empty = RAW presence (false → NOT empty)
+                true,                        // floor_complete
+            )
+            .await
+            .expect("establish decision runs cleanly");
+        assert!(
+            !established,
+            "K3-corr: an all-undecryptable (raw-NON-empty) read must NOT establish-at-0 (revert \
+             token_plane_empty→fetched_ids.is_empty() → establishes → RED = NUT-13 index-0 reuse)"
+        );
+        assert!(!db.is_established(), "the latch stays deferred (derivations blocked at the choke point)");
+
+        // ★ QUORUM-SYMMETRY sub-case A — genuinely-new agent (NO events served, ≥k): raw-empty=true +
+        // token_authoritative=true → establish-at-0 (must NOT over-defer a real new agent).
+        let empty_transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let empty_store = Nip60Store::with_transport_and_read_k(crypto.clone(), empty_transport, 3, 2, 2, allow_m());
+        let empty_read = empty_store.reconcile_on_load_with_ids().await.expect("reconcile empty");
+        assert!(empty_read.raw_events_empty, "no events served → raw-empty=true");
+        assert!(empty_read.authoritative, "3 up relays confirmed empty → ≥k → authoritative");
+        let db_new = fresh_counter_db().await;
+        let established_new = db_new
+            .establish_if_sound(
+                std::collections::HashMap::new(),
+                false,
+                true,
+                empty_read.authoritative,
+                token_plane_empty(&empty_read), // true (genuinely empty)
+                true,
+            )
+            .await
+            .expect("establish decision runs cleanly");
+        assert!(established_new, "genuinely-new (quorum-confirmed zero events) → establish-at-0 (don't over-defer)");
+
+        // ★ QUORUM-SYMMETRY sub-case B — a BELOW-quorum all-empty raw read (token_authoritative=false)
+        // still DEFERS regardless of raw-empty: the de-overload did NOT weaken the token-quorum term.
+        let db_belowq = fresh_counter_db().await;
+        let established_belowq = db_belowq
+            .establish_if_sound(
+                std::collections::HashMap::new(),
+                false,
+                true,  // config_authoritative
+                false, // token_authoritative = FALSE (below quorum) — can't confirm emptiness
+                true,  // raw-empty apparent, but unproven below quorum
+                true,
+            )
+            .await
+            .expect("establish decision runs cleanly");
+        assert!(
+            !established_belowq,
+            "below-quorum token read DEFERS even with raw-empty=true (token_authoritative term intact — \
+             quorum symmetry survives the K3-corr de-overload)"
         );
     }
 

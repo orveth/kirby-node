@@ -743,6 +743,24 @@ pub fn retry_should_proceed(already_established: bool, fresh_establish: bool) ->
     already_established || fresh_establish
 }
 
+/// ROUND-5 K3-corr — the `token_empty` signal the ESTABLISH decision consumes. It MUST be the RAW
+/// token-presence (`raw_events_empty`: were ANY 7375 events served, decodable or not), NOT
+/// `fetched_ids.is_empty()`.
+///
+/// ★ WHY (the regression K3 introduced): K3 correctly made `fetched_ids` decoded-ONLY (so an
+/// undecryptable id never seeds the deletion set). But `fetched_ids.is_empty()` then means "no
+/// DECODABLE events" — so an ALL-undecryptable self-authored 7375 read (a real, unreadable backup)
+/// looks empty. Feeding that as `token_empty=true` to `establish_if_sound` (with config_authoritative +
+/// token_authoritative) establishes-at-0 despite unread proofs → derive from index 0 = NUT-13 REUSE.
+/// `decode_ok=false` blocks recovery_complete but NOT the establish (which reads token_empty). The raw
+/// presence signal fixes it precisely: events-served-but-undecodable → NOT empty → defer; a genuinely
+/// empty read (no events served) → empty → establish-at-0 still works for a new agent. Both boot
+/// establish sites (healthy + retry) route through here so a single change regresses both. Pure so T28
+/// exercises it directly.
+pub fn token_plane_empty(read: &crate::nip60::ReconcileRead) -> bool {
+    read.raw_events_empty
+}
+
 /// ROUND-3 F1 / ROUND-4 K1-corr — the STRICT-DRAIN POST-STATE decision → `drain_ok` (an input to
 /// `recovery_complete`).
 ///
@@ -941,7 +959,10 @@ pub(crate) async fn try_establish_counter(
     // READ derives nothing, so it is safe before establishment (§2.6b — only the IMPORT must follow).
     let read = store.reconcile_on_load_with_ids().await?;
     let token_authoritative = read.authoritative;
-    let token_empty = read.fetched_ids.is_empty();
+    // §K3-corr (ROUND-5): token_empty for the ESTABLISH decision is the RAW presence signal (via
+    // `token_plane_empty`), NOT `fetched_ids.is_empty()`. Still ANDed with `token_authoritative` in
+    // the four-condition guard (quorum symmetry preserved — a below-quorum read defers regardless).
+    let token_empty = token_plane_empty(&read);
     // §K3: fold the decode-degraded signal into restore_ok below (an undecryptable self-authored 7375
     // event → the candidate set is incomplete → recovery must not converge).
     let decode_ok = read.decode_ok;
@@ -1176,7 +1197,11 @@ async fn build_routstr_brain(
             match &read {
                 Ok(r) => {
                     token_authoritative = r.authoritative;
-                    token_empty = r.fetched_ids.is_empty();
+                    // §K3-corr (ROUND-5): RAW presence (via `token_plane_empty`), NOT
+                    // `fetched_ids.is_empty()` (decoded-only post-K3) — an all-undecryptable read holds
+                    // a real unreadable backup and must NOT establish-at-0 (index-0 = NUT-13 reuse).
+                    // Still gated by the separate `token_authoritative` term (quorum symmetry intact).
+                    token_empty = token_plane_empty(r);
                 }
                 Err(_) => {
                     // A failed token read cannot confirm empty → treat as below-quorum: DEFER
