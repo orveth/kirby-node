@@ -1147,6 +1147,45 @@ impl Nip60Config {
         };
         (relays, k, read_k, durability)
     }
+
+    /// As [`Self::resolve`], but FAIL-CLOSED on a config that violates the quorum-intersection
+    /// invariant (config-plane cut §2.8b, T9). The boot path calls THIS (not `resolve`) so a
+    /// misconfigured relay set can never boot the counter-establishment machinery into a state
+    /// where the fresh-box "≥k + no head ⟹ genuinely new, establish at 0" conclusion (§2.2 state
+    /// 4) is unsound.
+    ///
+    /// ⚠️ SOUNDNESS FLOOR: state-4 (establish-at-0) is sound ONLY if any written counter head is
+    /// guaranteed visible to any read quorum — i.e. `read_k + write_k > n` (read/write overlap by
+    /// pigeonhole). Without it a head could live only on the `n - read_k` unreached relays, a ≥k
+    /// read would miss it, and establish-at-0 would REUSE the prior instance's NUT-13 indices (the
+    /// H1 money-loss hazard, entered through a weak WRITE quorum). The default (both `n/2+1`
+    /// majority) satisfies it for all n (`2·(n/2+1) ≥ n+1 > n`); this check guards an EXPLICIT
+    /// misconfig (e.g. `write_k = Some(1)` on n=3 → 1+2 = 3, not > 3), refusing to boot loudly.
+    pub fn resolve_checked(
+        &self,
+        fleet_relay: &str,
+    ) -> anyhow::Result<(Vec<String>, usize, usize, Nip60Durability)> {
+        let (relays, write_k, read_k, durability) = self.resolve(fleet_relay);
+        let n = relays.len();
+        anyhow::ensure!(
+            quorum_intersection_ok(read_k, write_k, n),
+            "NIP-60 relay config REFUSES TO BOOT: read_k ({read_k}) + write_k ({write_k}) = {} \
+             must be > n ({n}) so a written counter head is always visible to a read quorum \
+             (quorum-intersection, config-plane §2.8b). Without it a fresh-box restore could \
+             establish the NUT-13 counter at 0 while a real head lives only on unreached relays → \
+             index REUSE / money loss. Raise read_k and/or write_k (the default majority n/2+1 on \
+             both sides satisfies this for every n).",
+            read_k + write_k
+        );
+        Ok((relays, write_k, read_k, durability))
+    }
+}
+
+/// The quorum-intersection invariant (config-plane §2.8b): a written head is guaranteed visible to
+/// any read quorum iff `read_k + write_k > n` (read/write set overlap by pigeonhole). Pure + total
+/// so the T9 fail-closed tooth exercises it directly.
+pub fn quorum_intersection_ok(read_k: usize, write_k: usize, n: usize) -> bool {
+    read_k + write_k > n
 }
 
 #[cfg(test)]
@@ -1236,6 +1275,50 @@ mod nip60_config_tests {
         };
         let (_relays, k, _read_k, _d) = cfg.resolve("ws://fleet:7777");
         assert_eq!(k, 3, "an over-large write_k clamps to N");
+    }
+
+    // ---- T9 (config-plane §2.8b): quorum-intersection is enforced FAIL-CLOSED at resolve. -------
+    //
+    // A config with `read_k + write_k <= n` (e.g. write_k=1 on n=3 → read_k default 2 → 1+2=3, not
+    // > 3) MUST refuse to boot via `resolve_checked` — never resolve into a state where the
+    // fresh-box establish-at-0 conclusion (§2.2 state 4) can fire unsoundly. The default majority
+    // on both sides always satisfies the invariant.
+    //
+    // RED-on-revert: change `resolve_checked` to skip the `ensure!` (or `quorum_intersection_ok`
+    // to always return true) → the bad config resolves silently → the `is_err()` assert fails.
+    #[test]
+    fn t9_quorum_intersection_is_enforced_fail_closed_at_resolve() {
+        // The pure invariant: read_k + write_k > n.
+        assert!(quorum_intersection_ok(2, 2, 3), "2+2=4 > 3 (default majority on n=3) holds");
+        assert!(!quorum_intersection_ok(2, 1, 3), "2+1=3 is NOT > 3 (write_k=1 misconfig) violates");
+        assert!(quorum_intersection_ok(1, 1, 1), "1+1=2 > 1 (single-relay dev) holds");
+
+        // A misconfigured write_k=1 on n=3 (read_k defaults to majority 2) → 1+2=3, not > 3 → FAIL.
+        let bad = Nip60Config {
+            relays: vec!["a".into(), "b".into(), "c".into()],
+            write_k: Some(1),
+            ..Default::default()
+        };
+        let err = bad
+            .resolve_checked("ws://fleet:7777")
+            .expect_err("write_k=1 on n=3 violates read_k+write_k>n → resolve_checked must FAIL-CLOSED");
+        assert!(
+            err.to_string().contains("REFUSES TO BOOT"),
+            "the fail-closed error names the refusal (got: {err})"
+        );
+
+        // The DEFAULT (majority both sides) satisfies the invariant for n=1,2,3 → resolve_checked Ok.
+        for relays in [
+            vec!["a".to_string()],
+            vec!["a".into(), "b".into()],
+            vec!["a".into(), "b".into(), "c".into()],
+        ] {
+            let ok = Nip60Config { relays: relays.clone(), ..Default::default() };
+            let (_r, wk, rk, _d) = ok
+                .resolve_checked("ws://fleet:7777")
+                .unwrap_or_else(|e| panic!("default majority on n={} must satisfy intersection: {e}", relays.len()));
+            assert!(rk + wk > relays.len(), "default majority satisfies read_k+write_k>n");
+        }
     }
 
     #[test]

@@ -122,11 +122,45 @@ impl WalletKey {
 /// the returned handle exposes `keyset_counters()` for the publisher.
 /// Funding the live wallet is out-of-band (§11); this only OPENS an already-funded (or
 /// fresh) store.
+/// `config_authoritative`: whether the 17375 counter-floor config read that produced
+/// `initial_counters` reached read-quorum (config-plane §2.1). It drives the FOUR-STATE
+/// establishment latch (§2.2): on a fresh box (empty local counter table) a BELOW-quorum config
+/// read cannot be trusted to establish the floor (a real head may live on an unreached relay →
+/// index reuse), so the counter is DEFERRED (latch false, fast-forward NOT run, every derivation
+/// blocked at the choke point until the bounded retry lands a ≥k read). A RESUME (non-empty local
+/// counter) is always safe (fast-forward is lift-up-only) and establishes immediately; a fresh box
+/// with a ≥k read establishes at the true floor (or at 0 when genuinely new — sound only under the
+/// quorum-intersection invariant, §2.8b). Callers with no relays (NIP-60 off) pass `true`.
+///
+/// `token_authoritative` / `token_empty`: the TOKEN-plane (kind 7375 proofs) read result, threaded
+/// in for the finding-4 AIRTIGHT establish-at-0 guard (config-plane revision). `token_authoritative`
+/// = the token read reached read-quorum (`served >= read_k`); `token_empty` = it fetched NO token
+/// events. establish-at-0 (state 4) fires ONLY when BOTH planes are quorum-confirmed-empty:
+/// `config_authoritative AND config-head-absent AND token_authoritative AND token_empty`. A
+/// below-quorum token read (can't confirm empty) OR present token backups → DEFER, never
+/// establish-at-0 against possibly-unread proofs (that would derive at index 0 = reuse). Callers
+/// with no relays (NIP-60 off) pass `true`/`true` (a genuinely-new local wallet).
+///
+/// `config_floor_dropped` (config-plane ROUND-4, category (d) — HOLEY-FLOOR-NOT-GENUINE): whether the
+/// config floor read that produced `initial_counters` DROPPED any keyset (an unparseable-hex keyset in
+/// [`crate::nip60::WalletConfigContent::counters_by_id_checked`]). Combined with the LOCAL read's own
+/// dropped signal ([`read_local_keyset_counters`]) into `floor_complete`; a holey floor from EITHER
+/// source DEFERS establishment (the per-db latch must not flip on a partial floor — else the dropped
+/// keyset derives from index 0 = NUT-13 reuse). Callers with no config drop (NIP-60 off, clean read)
+/// pass `false`.
+// The plane-read inputs (config/token authority + emptiness + holey signals) are each a distinct
+// money-safety decision the establishment gate consumes; grouping them into a struct would only
+// obscure the four-state + holey-floor logic. The arg count is deliberate.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_persistent_wallet(
     mint_url: &str,
     db_path: &Path,
     seed: [u8; 64],
     initial_counters: HashMap<Id, u32>,
+    config_authoritative: bool,
+    token_authoritative: bool,
+    token_empty: bool,
+    config_floor_dropped: bool,
 ) -> anyhow::Result<(Arc<Wallet>, Arc<crate::nip60_counter::Nip60CounterDb>)> {
     // The store lives in db_path's directory; ensure it exists.
     if let Some(parent) = db_path.parent() {
@@ -153,7 +187,7 @@ pub async fn open_persistent_wallet(
     // a SECOND connection to the same live WAL db — intentional, and it mirrors production (the
     // background flusher + gateway share the store the same way). Fail-safe: an empty map on any
     // error == today's floor-only behavior (the floor still applies).
-    let local_map = read_local_keyset_counters(db_path);
+    let (local_map, local_floor_dropped) = read_local_keyset_counters(db_path);
 
     // Seed the mirror with the UNION-MAX of the loaded floor and the local counters: for every
     // keyset in EITHER set, take the higher of the two. This makes the publish-mirror COMPLETE (no
@@ -162,26 +196,59 @@ pub async fn open_persistent_wallet(
     // harmless (the local counter wins).
     let merged = union_max_counters(&initial_counters, &local_map);
 
+    // FOUR-STATE establishment (config-plane §2.2), authority-first. The RESUME signal is the LOCAL
+    // counter table: a NON-empty local counter means a prior instance already derived here, so
+    // fast-forward (lift-up-only) is safe and the latch establishes immediately (state 1). A fresh
+    // box (empty local table) can only conclude the floor is safe to establish from an
+    // AUTHORITATIVE (≥k) config read (states 3+4); a below-quorum config read on a fresh box is
+    // DEFERRED (state 2) — we cannot distinguish genuinely-new from restore-pending-on-an-unreached
+    // relay, and fast-forwarding to a thin/stale floor would derive at reused NUT-13 indices.
+    let resume = !local_map.is_empty();
+
+    // ★★★ INVARIANT #3 — HOLEY-FLOOR-NOT-GENUINE (config-plane ROUND-4, category (d)): the floor is
+    // GENUINE (complete) only when NEITHER read source dropped a keyset — the config floor read
+    // (`config_floor_dropped`, from `counters_by_id_checked`) AND the local counter read
+    // (`local_floor_dropped`, from `read_local_keyset_counters`). A holey floor from EITHER source
+    // must NOT flip the per-db establishment latch: the latch is global but the floor is per-keyset, so
+    // a dropped keyset would derive from index 0 = NUT-13 reuse. `floor_complete=false` DEFERS below
+    // (regardless of resume/config/token) — the ONE guard covering BOTH read sources.
+    let floor_complete = !(config_floor_dropped || local_floor_dropped);
+
     // Mirror the NUT-13 keyset counter through the NIP-60 decorator so it can travel in the
     // 17375 wallet-config for a cross-machine reconstruct. The mirror is SEEDED with `merged` (floor
     // ∪ local, max per keyset) so a later publish can never regress the counter below what the relay
-    // OR the local store recorded (the no-regress + completeness MONEY-MUST). The returned handle
-    // exposes `keyset_counters()` for the publisher.
-    let counter_db = Arc::new(crate::nip60_counter::Nip60CounterDb::with_counters(
+    // OR the local store recorded (the no-regress + completeness MONEY-MUST). Constructed DEFERRED
+    // (latch false); the SINGLE guarded establish choke point below flips it only when sound.
+    let counter_db = Arc::new(crate::nip60_counter::Nip60CounterDb::with_counters_established(
         Arc::new(localstore),
-        merged,
+        merged.clone(),
+        false,
     ));
-    // Fast-forward the INNER NUT-13 derivation counter to the seeded floor BEFORE the wallet
-    // derives anything, so a fresh-store reconstruct never re-issues an already-used secret (the
-    // shadow seed alone fixes only the PUBLISH mirror, not what cdk derives from). It now lifts the
-    // inner counter for the COMPLETE merged set (floor ∪ local); for a local-only keyset the merged
-    // value equals the inner counter already, so that arm is a no-op (never a spurious burn) — its
-    // purpose is a complete + non-regressing SHADOW for the publish, not to advance local keysets.
-    // No-op on a fresh / non-reconstruct boot (empty floor + empty local table).
-    counter_db
-        .fast_forward_inner_to_floor()
+    // ★ R2-#1: route the establish DECISION through the ONE guarded choke point
+    // ([`Nip60CounterDb::establish_if_sound`]) — the SAME function the bounded retry
+    // ([`crate::boot::try_establish_counter`]) calls, so no site can establish-at-0 without ALL FOUR
+    // conditions (four-state, authority-first, finding-4 token-quorum-symmetric guard). It seeds the
+    // floor (idempotent with the construction seed), fast-forwards the INNER derivation counter
+    // (gate-exempt) to the seeded floor BEFORE the wallet derives anything — so a fresh-store
+    // reconstruct never re-issues an already-used secret — and flips the latch ONLY when sound.
+    let established = counter_db
+        .establish_if_sound(merged, resume, config_authoritative, token_authoritative, token_empty, floor_complete)
         .await
-        .map_err(|e| anyhow::anyhow!("fast-forward NUT-13 counter to the reconstruct floor: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!("establish the NUT-13 counter to the reconstruct floor: {e}")
+        })?;
+    if !established {
+        // State 2 (fresh box + below-quorum config), OR state 4 with an unproven-empty token plane:
+        // DEFER. Nothing was seeded/lifted; the latch stays false so the choke point blocks every
+        // derivation until a ≥k config read (the bounded retry) establishes the true floor.
+        tracing::warn!(
+            db = %db_path.display(),
+            "NIP-60 counter DEFERRED: fresh-box restore below config read-quorum OR an unproven-empty \
+             token plane — derivations blocked at the choke point (money-safe, no reused NUT-13 \
+             index) until a ≥k config read establishes the true floor (stalled: below-quorum config, \
+             awaiting k relays)"
+        );
+    }
 
     let wallet = Wallet::new(mint_url, CurrencyUnit::Sat, counter_db.clone(), seed, None)
         .map_err(|e| anyhow::anyhow!("build persistent cdk wallet against {mint_url}: {e}"))?;
@@ -236,7 +303,15 @@ fn union_max_counters(
 /// returns an EMPTY map — NEVER panics, NEVER propagates an error that could fail boot. An empty map
 /// degrades to today's floor-only seeding (the 17375 floor still applies), so completeness is a
 /// best-effort ADDITION that can only ever match-or-beat the prior behavior.
-fn read_local_keyset_counters(db_path: &Path) -> HashMap<Id, u32> {
+///
+/// ★ RETURNS `(map, dropped)` (config-plane ROUND-4, category (d) — HOLEY-FLOOR-NOT-GENUINE): `dropped`
+/// is `true` when this read is INCOMPLETE — a corrupt row was skipped (unparseable keyset id / out-of-range
+/// counter) OR the whole read errored (open/table/query failure → empty-on-error). A genuinely EMPTY
+/// table (a fresh box — 0 rows, clean read) is `dropped=false` (it is NOT holey, just new). The caller
+/// gates establishment on `!dropped`: a holey floor must not flip the per-db latch (else the dropped
+/// keyset derives from index 0 = NUT-13 reuse). The behavior is otherwise UNCHANGED — a dropped row is
+/// still skipped with a warn, the map still degrades to floor-only; we merely SIGNAL the incompleteness.
+fn read_local_keyset_counters(db_path: &Path) -> (HashMap<Id, u32>, bool) {
     use rusqlite::OpenFlags;
     use std::str::FromStr as _;
 
@@ -247,7 +322,9 @@ fn read_local_keyset_counters(db_path: &Path) -> HashMap<Id, u32> {
             .or_else(|_| rusqlite::Connection::open(db_path))
     };
 
-    let read = || -> rusqlite::Result<HashMap<Id, u32>> {
+    // Returns `(map, dropped)`: `dropped` set if ANY row was skipped (corruption) so the caller can
+    // fail-closed on an incomplete floor (category (d)).
+    let read = || -> rusqlite::Result<(HashMap<Id, u32>, bool)> {
         let conn = open()?;
         let mut stmt = conn.prepare("SELECT keyset_id, counter FROM keyset_counter")?;
         let rows = stmt.query_map([], |row| {
@@ -256,6 +333,7 @@ fn read_local_keyset_counters(db_path: &Path) -> HashMap<Id, u32> {
             Ok((keyset_id, counter))
         })?;
         let mut map = HashMap::new();
+        let mut dropped = false;
         for row in rows {
             let (keyset_hex, counter) = row?;
             // Parse the hex id back to a cdk `Id`; a non-parseable id (only possible from a foreign
@@ -270,10 +348,12 @@ fn read_local_keyset_counters(db_path: &Path) -> HashMap<Id, u32> {
             let id = match Id::from_str(&keyset_hex) {
                 Ok(id) => id,
                 Err(e) => {
+                    // (d) HOLEY-FLOOR: this keyset's floor is now missing from the read → mark dropped.
+                    dropped = true;
                     tracing::warn!(
                         keyset_hex = %keyset_hex,
                         error = %e,
-                        "NIP-60 counter read: skipping a local keyset_counter row with an unparseable keyset id (corruption)"
+                        "NIP-60 counter read: skipping a local keyset_counter row with an unparseable keyset id (corruption) — floor read marked HOLEY (establishment defers, category (d))"
                     );
                     continue;
                 }
@@ -281,30 +361,33 @@ fn read_local_keyset_counters(db_path: &Path) -> HashMap<Id, u32> {
             let counter = match u32::try_from(counter) {
                 Ok(c) => c,
                 Err(_) => {
+                    dropped = true;
                     tracing::warn!(
                         keyset_hex = %keyset_hex,
                         counter,
-                        "NIP-60 counter read: skipping a keyset_counter row whose counter is out of u32 range (corruption); the 17375 floor still covers it"
+                        "NIP-60 counter read: skipping a keyset_counter row whose counter is out of u32 range (corruption) — floor read marked HOLEY (establishment defers, category (d))"
                     );
                     continue;
                 }
             };
             map.insert(id, counter);
         }
-        Ok(map)
+        Ok((map, dropped))
     };
 
     match read() {
-        Ok(map) => map,
+        Ok((map, dropped)) => (map, dropped),
         Err(e) => {
+            // (d) A whole-read failure cannot confirm completeness → HOLEY (dropped=true): the caller
+            // fails-closed (defers establishment) rather than establishing on a floor it could not read.
             tracing::warn!(
                 db_path = %db_path.display(),
                 error = %e,
                 "NIP-60 counter read: could not read the local keyset_counter table; \
-                 seeding the mirror from the 17375 floor only (fail-safe — completeness is skipped, \
-                 no regression vs the prior floor-only behavior)"
+                 seeding the mirror from the 17375 floor only (fail-safe) and marking the floor read \
+                 HOLEY so establishment defers (category (d) — never establish on an unread floor)"
             );
-            HashMap::new()
+            (HashMap::new(), true)
         }
     }
 }
@@ -445,7 +528,7 @@ mod tests {
         let floor: HashMap<Id, u32> = HashMap::new();
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true, false)
                 .await
                 .expect("open persistent wallet");
 
@@ -468,7 +551,7 @@ mod tests {
         let floor = HashMap::from([(k, 50u32)]);
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true, false)
                 .await
                 .expect("open persistent wallet");
 
@@ -494,7 +577,7 @@ mod tests {
         let floor: HashMap<Id, u32> = HashMap::new();
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true, false)
                 .await
                 .expect("open persistent wallet");
 
@@ -531,7 +614,7 @@ mod tests {
         store.increment_keyset_counter(&k1, 7).await.expect("k1");
         store.increment_keyset_counter(&k2, 3).await.expect("k2");
 
-        let read = read_local_keyset_counters(&db_path);
+        let (read, dropped) = read_local_keyset_counters(&db_path);
 
         assert_eq!(
             read,
@@ -539,6 +622,7 @@ mod tests {
             "the SELECT reads EXACTLY cdk's keyset_counter rows over a concurrent second connection; \
              an empty/wrong map here means the on-disk schema drifted from the hard-coded SELECT"
         );
+        assert!(!dropped, "a clean read of well-formed rows is NOT holey (category (d))");
         drop(store);
     }
 
@@ -549,10 +633,12 @@ mod tests {
         let tmp = TempDir::new("t6a");
         let missing = tmp.db_path();
         assert!(!missing.exists(), "precondition: no db file yet");
+        let (missing_map, missing_dropped) = read_local_keyset_counters(&missing);
         assert!(
-            read_local_keyset_counters(&missing).is_empty(),
+            missing_map.is_empty(),
             "a nonexistent db path yields an empty map (fail-safe), not a panic"
         );
+        assert!(missing_dropped, "a whole-read failure is HOLEY (dropped=true → establishment defers, category (d))");
 
         // (b) A real sqlite file that LACKS the keyset_counter table → the SELECT errors → empty.
         let tmp2 = TempDir::new("t6b");
@@ -562,9 +648,213 @@ mod tests {
             conn.execute_batch("CREATE TABLE unrelated (x INTEGER);")
                 .expect("make a table-less-of-keyset_counter db");
         }
+        let (no_table_map, no_table_dropped) = read_local_keyset_counters(&no_table);
         assert!(
-            read_local_keyset_counters(&no_table).is_empty(),
+            no_table_map.is_empty(),
             "a db missing the keyset_counter table yields an empty map (fail-safe), not a panic"
+        );
+        assert!(no_table_dropped, "a missing-table read is HOLEY (dropped=true, category (d))");
+    }
+
+    // ---- T27 (config-plane ROUND-4, category (d), LOCAL-SOURCE half): `read_local_keyset_counters`
+    // SIGNALS an incomplete read. A corrupt row (unparseable keyset id) is skipped AND `dropped=true`;
+    // a genuinely-empty table (fresh box) is `dropped=false` (NOT holey, just new). This is the local
+    // read source the establishment guard (`floor_complete`) fails-closed on.
+    //
+    // RED-on-revert: stop setting `dropped=true` on a skipped corrupt row (return `false`) → the
+    // corrupt-row read looks complete → the caller establishes on a holey local floor → the dropped
+    // keyset derives from index 0 = NUT-13 reuse → this `dropped` assert fails → RED.
+    #[tokio::test]
+    async fn t27_local_keyset_read_signals_a_dropped_corrupt_row() {
+        // (a) A corrupt row (keyset_id NOT valid hex) → skipped + dropped=true.
+        let tmp = TempDir::new("t27-corrupt");
+        let db_path = tmp.db_path();
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("create sqlite db");
+            conn.execute_batch(
+                "CREATE TABLE keyset_counter (keyset_id TEXT PRIMARY KEY, counter INTEGER NOT NULL DEFAULT 0);\
+                 INSERT INTO keyset_counter (keyset_id, counter) VALUES ('009a1f293253e41e', 5);\
+                 INSERT INTO keyset_counter (keyset_id, counter) VALUES ('not-a-valid-keyset-hex', 9);",
+            )
+            .expect("seed a keyset_counter table with one good + one corrupt row");
+        }
+        let (map, dropped) = read_local_keyset_counters(&db_path);
+        assert!(dropped, "a skipped corrupt row marks the read HOLEY (revert dropped→false → RED)");
+        assert_eq!(map.len(), 1, "only the well-formed row is read; the corrupt one is skipped");
+
+        // (b) A genuinely-empty table (fresh box) → NOT holey.
+        let tmp2 = TempDir::new("t27-empty");
+        let empty_path = tmp2.db_path();
+        {
+            let conn = rusqlite::Connection::open(&empty_path).expect("create sqlite db");
+            conn.execute_batch(
+                "CREATE TABLE keyset_counter (keyset_id TEXT PRIMARY KEY, counter INTEGER NOT NULL DEFAULT 0);",
+            )
+            .expect("seed an EMPTY keyset_counter table");
+        }
+        let (empty_map, empty_dropped) = read_local_keyset_counters(&empty_path);
+        assert!(empty_map.is_empty(), "a fresh box has no local counters");
+        assert!(!empty_dropped, "a genuinely-empty table is NOT holey (a fresh box must still establish)");
+    }
+
+    // ---- T4 (config-plane §2.2, resume unaffected): a RESUME (local counter present) + a
+    // BELOW-quorum config read must NOT be deferred — the latch establishes immediately (resume is
+    // safe: fast-forward is lift-up-only) and derivations flow. A false-defer on resume would freeze
+    // a healthy reboot (regression).
+    //
+    // RED-on-revert: change the four-state logic in `open_persistent_wallet` to key on
+    // `config_authoritative` ALONE (drop the `resume ||`) → resume + below-quorum → established=false
+    // → `is_established()` is false / the derivation below is blocked → RED.
+    #[tokio::test]
+    async fn t4_resume_with_below_quorum_config_is_not_deferred() {
+        use cdk::cdk_database::WalletDatabase as _;
+        let tmp = TempDir::new("t4cp");
+        let db_path = tmp.db_path();
+        let k = kid("009a1f293253e41e");
+        // A prior instance already derived here → local counter table is NON-empty (RESUME).
+        seed_local_store(&db_path, &[(k, 100)]).await;
+        let floor: HashMap<Id, u32> = HashMap::new();
+
+        // config_authoritative = FALSE (a below-quorum config read).
+        let (_wallet, counter_db) =
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, false, true, true, false)
+                .await
+                .expect("open persistent wallet (resume)");
+
+        assert!(
+            counter_db.is_established(),
+            "RESUME must establish immediately even below config-quorum (no false-defer, §2.2 state 1)"
+        );
+        // Derivations flow (the choke point does not bite on resume).
+        let v = counter_db
+            .increment_keyset_counter(&k, 1)
+            .await
+            .expect("a resume wallet derives freely (not deferred)");
+        assert!(v >= 100, "the resume inner counter is at least its local value");
+    }
+
+    // ---- T8 (config-plane §2.2 state 4, create-fund guard): a fresh box + a ≥k config read + NO
+    // prior head → the counter establishes at 0 and derivations FLOW (a genuinely-new agent must NOT
+    // be false-blocked — this is create-fund / new-agent creation). Sound ONLY under the
+    // quorum-intersection invariant (§2.8b, T9): ≥k-with-no-head ⟹ no head was ever written.
+    //
+    // RED-on-revert: change the four-state logic to establish ONLY on `resume` (defer even at ≥k) →
+    // a fresh-box ≥k boot is deferred → the derivation below is blocked → a new agent can't operate
+    // → RED.
+    #[tokio::test]
+    async fn t8_fresh_box_quorum_no_head_establishes_at_zero_and_derives() {
+        use cdk::cdk_database::WalletDatabase as _;
+        let tmp = TempDir::new("t8cp");
+        let db_path = tmp.db_path();
+        let k = kid("009a1f293253e41e");
+        // Genuinely new: NO local store seeding, empty floor. config_authoritative = TRUE (≥k read).
+        let floor: HashMap<Id, u32> = HashMap::new();
+
+        let (_wallet, counter_db) =
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true, false)
+                .await
+                .expect("open persistent wallet (fresh box, ≥k, no head)");
+
+        assert!(
+            counter_db.is_established(),
+            "fresh-box + ≥k + no-head → establish at 0 (state 4); a new agent must NOT be false-blocked"
+        );
+        // The counter starts at 0 (nothing to fast-forward) and derivations flow from index 0.
+        let first = counter_db
+            .increment_keyset_counter(&k, 0)
+            .await
+            .expect("read the fresh inner counter");
+        assert_eq!(first, 0, "a genuinely-new counter establishes at 0 (no phantom floor)");
+        let after = counter_db
+            .increment_keyset_counter(&k, 5)
+            .await
+            .expect("a new agent derives freely from 0 (create-fund flows)");
+        assert!(after >= 5, "derivations flow for a genuinely-new agent");
+    }
+
+    // ---- T13 (config-plane REVISION, finding-4 AIRTIGHT establish-at-0 guard, TOKEN-QUORUM-
+    // SYMMETRIC): establish-at-0 requires BOTH planes quorum-confirmed-empty. Two cases must bite:
+    //   (a) token backups PRESENT (token read ≥k, NON-empty) → establish-at-0 REFUSED (defer).
+    //   (b) token read BELOW quorum (can't confirm empty)    → establish-at-0 REFUSED (defer).
+    // Both: a fresh box (empty local) + ≥k config + NO config head (empty floor). Reverting the guard
+    // to ignore the token plane (establish whenever config_authoritative) establishes at 0 against
+    // possibly-unread proofs → derives at reused index → RED.
+
+    // ---- T13(a): token backups PRESENT → establish-at-0 REFUSED. ---------------------------------
+    // RED-on-revert: change the state-4 arm from `token_authoritative && token_empty` to `true`
+    // (ignore the token plane) → this establishes at 0 → `is_established()` is true → the assert
+    // fails (establish-at-0 fired against present token backups = index-0 reuse hazard).
+    #[tokio::test]
+    async fn t13a_establish_at_zero_refused_when_token_backups_present() {
+        use cdk::cdk_database::WalletDatabase as _;
+        let tmp = TempDir::new("t13a");
+        let db_path = tmp.db_path();
+        let k = kid("009a1f293253e41e");
+        // Fresh box: NO local seeding, empty floor. config ≥k (config_authoritative=true), no head.
+        let floor: HashMap<Id, u32> = HashMap::new();
+        // Token plane: read reached quorum (authoritative) but token backups are PRESENT (NOT empty).
+        let (_wallet, counter_db) = open_persistent_wallet(
+            "http://127.0.0.1:1",
+            &db_path,
+            test_seed(),
+            floor,
+            true,  // config_authoritative
+            true,  // token_authoritative (≥k)
+            false, // token_empty = false → token backups PRESENT
+            false, // config_floor_dropped = false (clean floor)
+        )
+        .await
+        .expect("open persistent wallet (fresh box, ≥k config, token backups present)");
+
+        assert!(
+            !counter_db.is_established(),
+            "establish-at-0 REFUSED when token backups are present (defer, no index-0 reuse) — \
+             revert (ignore the token plane) → establishes at 0 → RED"
+        );
+        // Deferred ⇒ derivations are BLOCKED at the choke point (no reused-index derivation).
+        assert!(
+            counter_db.increment_keyset_counter(&k, 1).await.is_err(),
+            "a deferred fresh box blocks derivations at the choke point"
+        );
+    }
+
+    // ---- T13(b) ★ TOKEN-QUORUM-SYMMETRY: token read BELOW quorum → establish-at-0 REFUSED. -------
+    // The critical case the corrected guard adds over "NOT token_backups_exist": a below-quorum token
+    // read CANNOT confirm empty, so treating it as empty would establish-at-0 against unread proofs.
+    // RED-on-revert: change the state-4 arm to allow establish-at-0 on a below-quorum token read
+    // (e.g. `token_empty` alone, or `true`) → this establishes → `is_established()` true → RED.
+    #[tokio::test]
+    async fn t13b_establish_at_zero_refused_when_token_read_below_quorum() {
+        use cdk::cdk_database::WalletDatabase as _;
+        let tmp = TempDir::new("t13b");
+        let db_path = tmp.db_path();
+        let k = kid("009a1f293253e41e");
+        // Fresh box: NO local seeding, empty floor. config ≥k, no head.
+        let floor: HashMap<Id, u32> = HashMap::new();
+        // Token plane: read is BELOW quorum → cannot confirm empty (even though fetched_ids is empty,
+        // token_authoritative=false means the emptiness is unproven).
+        let (_wallet, counter_db) = open_persistent_wallet(
+            "http://127.0.0.1:1",
+            &db_path,
+            test_seed(),
+            floor,
+            true,  // config_authoritative
+            false, // token_authoritative = false → token read BELOW quorum (can't confirm empty)
+            true,  // token_empty (apparent) — but unproven below quorum
+            false, // config_floor_dropped = false (clean floor)
+        )
+        .await
+        .expect("open persistent wallet (fresh box, ≥k config, below-quorum token read)");
+
+        assert!(
+            !counter_db.is_established(),
+            "establish-at-0 REFUSED when the token read is below quorum (emptiness unproven) — \
+             revert (treat below-quorum as empty) → establishes at 0 against possibly-unread proofs \
+             → RED (token-quorum-symmetry)"
+        );
+        assert!(
+            counter_db.increment_keyset_counter(&k, 1).await.is_err(),
+            "a deferred fresh box blocks derivations at the choke point"
         );
     }
 

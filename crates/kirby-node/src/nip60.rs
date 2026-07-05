@@ -116,20 +116,35 @@ impl WalletConfigContent {
     /// a parse failure is relay corruption, not a normal case; dropping one keyset's floor (mint
     /// remains truth; only that keyset is at risk, logged loudly) is safer than failing the boot.
     pub fn counters_by_id(&self) -> HashMap<Id, u32> {
-        self.counters
+        self.counters_by_id_checked().0
+    }
+
+    /// As [`Self::counters_by_id`], but ALSO returns whether ANY keyset was DROPPED (an unparseable
+    /// hex id) — the config-plane ROUND-4 category (d) HOLEY-FLOOR signal. `dropped=true` means this
+    /// config floor read is INCOMPLETE (a keyset's floor is missing), so the caller must fail-closed
+    /// and DEFER establishment: the per-db establishment latch is global but the floor is per-keyset,
+    /// and establishing on a partial floor would let the dropped keyset derive from index 0 = NUT-13
+    /// reuse. The drop behavior is UNCHANGED (still logged + skipped); we merely SIGNAL incompleteness.
+    pub fn counters_by_id_checked(&self) -> (HashMap<Id, u32>, bool) {
+        let mut dropped = false;
+        let map = self
+            .counters
             .iter()
             .filter_map(|(hex, &counter)| match hex.parse::<Id>() {
                 Ok(id) => Some((id, counter)),
                 Err(e) => {
+                    dropped = true;
                     tracing::warn!(
                         keyset_hex = %hex,
                         error = %e,
-                        "NIP-60 load: dropping a counter with an unparseable keyset id (corruption)"
+                        "NIP-60 load: dropping a counter with an unparseable keyset id (corruption) — \
+                         config floor read marked HOLEY (establishment defers, category (d))"
                     );
                     None
                 }
             })
-            .collect()
+            .collect();
+        (map, dropped)
     }
 }
 
@@ -442,6 +457,35 @@ pub struct ReconcileRead {
     pub read_k: usize,
     /// `served >= read_k` — the boot solvency gate uses this to decide Assert vs Proceed.
     pub authoritative: bool,
+    /// §K3 (config-plane ROUND-4): `false` when at least one self-authored 7375 event FAILED to
+    /// decrypt — the read is DEGRADED (a genuine backup we could not read; its id is EXCLUDED from
+    /// `fetched_ids`). The boot/retry paths fold this into `restore_ok` so recovery_complete stays
+    /// CLOSED against an incomplete candidate set (never del-chain / roll over a backup we couldn't read).
+    pub decode_ok: bool,
+    /// §K3-corr (config-plane ROUND-5): `true` when NO 7375 events were served at all (the RAW count,
+    /// decodable or not). This — NOT `fetched_ids.is_empty()` — is the `token_empty` signal the
+    /// establish decision must consume: post-K3 `fetched_ids` is decoded-ONLY, so an all-undecryptable
+    /// read has empty `fetched_ids` yet holds a real unreadable backup. Establishing-at-0 on that would
+    /// derive from index 0 against unread proofs = NUT-13 reuse. A genuinely-empty read (no events
+    /// served) is `true` → establish-at-0 still works for a new agent.
+    pub raw_events_empty: bool,
+}
+
+/// The result of a quorum-aware config-floor read (returned by [`Nip60Store::load_config_quorum`],
+/// config-plane §2.1). Carries the per-relay quorum metadata alongside the decrypted config so the
+/// boot path can decide whether the NUT-13 counter floor is safe to ESTABLISH (a below-quorum read
+/// on a fresh box must DEFER — §2.2). The config-plane analog of [`ReconcileRead`] (token plane).
+pub struct ConfigRead {
+    /// The decrypted wallet-config lww-head, or `None` when the agent has never published one.
+    pub config: Option<WalletConfigContent>,
+    /// DISTINCT relays that served events (or confirmed empty) within the read timeout.
+    pub served: usize,
+    /// READ-capable relays in the pool (denominator).
+    pub total: usize,
+    /// The read_k threshold this store was configured with.
+    pub read_k: usize,
+    /// `served >= read_k` — the boot path uses this to decide establish vs defer (§2.2).
+    pub config_authoritative: bool,
 }
 
 /// The NIP-60 wallet relay store: publishes the agent's Cashu proofs as NIP-44-encrypted
@@ -472,6 +516,20 @@ pub struct Nip60Store {
     /// `false` at construction; flipped by the reconcile. Accessed via SeqCst atomics so
     /// the rollover gate (which holds `&self`) can read it without `&mut self`.
     read_established: Arc<std::sync::atomic::AtomicBool>,
+    /// The config-plane ROUND-2 (R2-#3, TWO-LATCH) RECOVERY-COMPLETE latch, SHARED (an `Arc` clone of
+    /// the [`crate::nip60_counter::Nip60CounterDb`]'s own `recovery_complete` latch, injected via
+    /// [`Self::set_recovery_complete`] at boot). The choke-point FUNNEL both money-safety findings
+    /// key on this, RE-KEYED off the derivation-establishment latch onto recovery-completion:
+    /// `publish_config` refuses to write a 17375 head while `false` (finding 2 — never publish the
+    /// counter head until the wallet is FULLY restored), and `rollover` bails while `false` AND'd
+    /// with `read_established` (finding 1 + R2-#3 — during the post-establish/pre-recovery window the
+    /// wallet is transiently-empty, so an empty rollover would del-chain the real 7375 backups).
+    /// `recovery_complete` opens ONLY after restore AND drain both succeed — a STRUCTURAL
+    /// frozen-until-recovery guard, not order-dependent. §N1 (config-plane ROUND-4): the PRODUCTION
+    /// `connect` constructor defaults this FALSE (fail-closed — a missing/reordered boot wiring keeps
+    /// the gate SHUT, not open); the boot path injects the deferred shared latch. The `#[cfg(test)]`
+    /// constructors default `true` (a bare store that goes straight to `rollover` publishes freely).
+    recovery_complete: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Nip60Store {
@@ -513,7 +571,25 @@ impl Nip60Store {
             read_timeout: Duration::from_secs(NIP60_READ_TIMEOUT_SECS),
             mint_allowlist,
             read_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // §N1 (config-plane ROUND-4) FAIL-CLOSED DEFAULT: defaults FALSE (gate SHUT), consistent
+            // with `read_established`'s fail-closed default beside it. Production behavior is identical
+            // — the boot path overwrites this with the shared recovery-complete latch via
+            // `set_recovery_complete` BEFORE any publish/rollover — but any missing/reordered wiring
+            // then fails CLOSED (no publish/rollover) rather than OPEN (a thin head / empty rollover).
+            recovery_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Share the R2-#3 recovery-complete latch into this store (TWO-LATCH): the boot path passes
+    /// [`crate::nip60_counter::Nip60CounterDb::recovery_complete_handle`] so the choke-point funnel
+    /// (`publish_config`) and the rollover gate read the SAME recovery state — publish/rollover open
+    /// ONLY after restore AND drain both succeed. Called on the OWNED store at boot, before it is
+    /// `Arc`-wrapped + shared with the background flusher, so every later clone sees the shared latch.
+    pub fn set_recovery_complete(
+        &mut self,
+        latch: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.recovery_complete = latch;
     }
 
     /// Build a store over an arbitrary [`Nip60Transport`] — the seam the unit tests inject a mock
@@ -540,6 +616,9 @@ impl Nip60Store {
             // TRUE: existing tests that go straight to `rollover` without a prior reconcile don't
             // hit the R2 gate. R2 drill tests use `with_transport_and_read_k` + explicit reconcile.
             read_established: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            // TRUE by default (bare store publishes freely). The T11/T12/T17 config-plane teeth flip
+            // it false directly to model a defer / mid-recovery window.
+            recovery_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -565,6 +644,9 @@ impl Nip60Store {
             mint_allowlist,
             // FALSE: the R2 drill tests start with a below-quorum boot and drive reconcile to flip.
             read_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // TRUE by default: the R2 token-plane drills don't exercise the recovery latch (the
+            // config-plane teeth that do flip it explicitly).
+            recovery_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -632,18 +714,48 @@ impl Nip60Store {
             authoritative,
             "NIP-60 reconcile: per-relay read quorum"
         );
+        // §K3-corr (config-plane ROUND-5): the RAW token-presence signal, captured BEFORE the decode
+        // loop consumes `per.events`. This is "were ANY events served (decodable OR NOT)", DISTINCT
+        // from `fetched_ids.is_empty()` which post-K3 means "no DECODABLE events". The establish
+        // decision's `token_empty` MUST read THIS (an all-undecryptable read is NOT genuinely-empty —
+        // it holds a real unreadable backup — so it must NOT establish-at-0).
+        //
+        // ★ TWO DISTINCT SIGNALS — DO NOT RE-CONFLATE: `fetched_ids` = decoded-ONLY (the deletion-seed,
+        // K3 — never del-chain a backup we could not read); `raw_events_empty` = the emptiness-signal
+        // for the establish decision. An overloaded variable serving two money-semantic purposes is
+        // exactly the trap that let K3 silently change the OTHER meaning (fetched_ids went decoded-only
+        // → `fetched_ids.is_empty()` silently flipped from "no events served" to "no decodable events",
+        // opening establish-at-0 against an unread backup = NUT-13 reuse).
+        let raw_events_empty = per.events.is_empty();
         let mut fetched_ids: Vec<String> = Vec::with_capacity(per.events.len());
         let mut decoded: Vec<(String, TokenEventContent)> = Vec::new();
+        // §K3 (config-plane ROUND-4) DECODE FAIL-CLOSED: a self-authored 7375 event we CANNOT decrypt
+        // is a GENUINE backup we could not READ (a rotated/legacy encryption key, or corruption — the
+        // author filter is our own pubkey, so it is ours). `decode_ok` goes false so the caller forces
+        // restore_ok=false (recovery_complete stays closed against an incomplete candidate set).
+        let mut decode_ok = true;
         for ev in per.events.into_iter() {
             let id_hex = ev.id.to_hex();
-            fetched_ids.push(id_hex.clone());
             match self.crypto.decrypt(&ev.content) {
-                Ok(content) => decoded.push((id_hex, content)),
-                Err(e) => tracing::warn!(
-                    event_id = %ev.id,
-                    error = %e,
-                    "NIP-60 reconcile: skipping an undecryptable token event (foreign under our author)"
-                ),
+                Ok(content) => {
+                    // Push the id ONLY after a successful decode: the id seeds the flusher's live-id /
+                    // deletion set (rollover del-chains it). ★ deletion-never-delete-unread — NEVER
+                    // del-chain a backup we could not decrypt (K3): an undecryptable id must NOT enter
+                    // fetched_ids/live_ids, else the first rollover del-chains a genuine backup we
+                    // couldn't read = LOSS. So the push lives INSIDE the Ok arm.
+                    fetched_ids.push(id_hex.clone());
+                    decoded.push((id_hex, content));
+                }
+                Err(e) => {
+                    decode_ok = false;
+                    tracing::warn!(
+                        event_id = %ev.id,
+                        error = %e,
+                        "NIP-60 reconcile: undecryptable self-authored 7375 event — EXCLUDED from the \
+                         live-id/deletion set (never del-chain an unread backup) AND the read marked \
+                         DEGRADED (decode_ok=false → recovery defers, K3)"
+                    );
+                }
             }
         }
         let candidates = reconcile_token_set(&decoded, &self.mint_allowlist);
@@ -654,6 +766,8 @@ impl Nip60Store {
             total: per.total,
             read_k: self.read_k,
             authoritative,
+            decode_ok,
+            raw_events_empty,
         })
     }
 
@@ -668,6 +782,30 @@ impl Nip60Store {
     /// (N5) to heal a slightly-stale counter from a mid-mint crash. Same ≥k durability gate as a
     /// token publish — a sub-quorum config write is NOT durable and errors.
     pub async fn publish_config(&self, config: &WalletConfigContent) -> anyhow::Result<EventId> {
+        // §finding-2 CHOKE-POINT FUNNEL GATE (R2-#3 RE-KEYED to recovery_complete): `publish_config`
+        // is the ONLY `send_event(17375,..)`, so gating it here covers EVERY 17375 writer (boot step-5
+        // + the graceful-teardown flush_estate estate publish + any future writer) — bypass-proof,
+        // matching the counter-gate pattern. Publish a 17375 HEAD only once the wallet is FULLY
+        // RECOVERED (restore AND drain both succeeded — `recovery_complete`). Before recovery the
+        // counter mirror is THIN/empty; publishing it would regress the true head on the reached
+        // relays and poison every future boot. `recovery_complete` ⟹ the counter is established AND
+        // the wallet is restored, so this is strictly tighter than the round-1 counter-established
+        // gate. Refuse with a clean Err — both call sites log-and-continue (best-effort), and the
+        // bounded retry re-publishes once recovery completes.
+        if !self
+            .recovery_complete
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::warn!(
+                "NIP-60 wallet-config publish REFUSED at the choke-point funnel: wallet recovery not \
+                 complete (restore/drain pending) — refusing to publish a potentially-thin 17375 head \
+                 that would regress the true head (config-plane finding-2 / R2-#3)"
+            );
+            anyhow::bail!(
+                "NIP-60 wallet-config publish refused: wallet recovery not complete (config-plane \
+                 R2-#3 two-latch funnel gate) — kept the existing head, published nothing"
+            );
+        }
         let ciphertext = self.crypto.encrypt_config(config)?;
         let outcome = self
             .transport
@@ -708,15 +846,39 @@ impl Nip60Store {
     /// money-critical, so a decrypt failure is surfaced (fail-closed at the caller), NEVER silently
     /// treated as an empty floor — an empty floor would let a later publish regress the counter.
     pub async fn load_config(&self) -> anyhow::Result<Option<WalletConfigContent>> {
+        Ok(self.load_config_quorum().await?.config)
+    }
+
+    /// As [`Self::load_config`], but QUORUM-AWARE (config-plane §2.1): read the kind:17375
+    /// counter-floor per-relay (reusing the Cut A [`Nip60Transport::fetch_events_per_relay`]
+    /// primitive) so the boot path knows whether the floor read reached read-quorum BEFORE any
+    /// counter-consuming op. `config_authoritative = served >= read_k`. This is the config-plane
+    /// analog of [`Self::reconcile_on_load_with_ids`] (the token plane): a DISTINCT read of a
+    /// DISTINCT kind (17375 config head vs 7375 token proofs) with its own authority marker. A
+    /// below-quorum config read must NOT establish the NUT-13 counter floor on a fresh box (a real
+    /// head may live on an unreached relay → index reuse); the caller defers establishment (§2.2).
+    ///
+    /// ⚠️ Fail-closed like `load_config`: an undecryptable config HEAD is a HARD error (the counter
+    /// floor is money-critical), never silently an empty floor.
+    pub async fn load_config_quorum(&self) -> anyhow::Result<ConfigRead> {
         let filter = Filter::new()
             .kind(Kind::from(KIND_NIP60_WALLET_CONFIG))
             .author(self.crypto.public_key());
-        let events = self
+        // R2 config-plane: per-relay read so we can count DISTINCT relays that SERVED the config.
+        let per = self
             .transport
-            .fetch_events(filter, self.read_timeout)
+            .fetch_events_per_relay(filter, self.read_timeout)
             .await
-            .context("fetch NIP-60 wallet-config events")?;
-        match crate::engram::lww_head(&events) {
+            .context("fetch NIP-60 wallet-config events (per-relay)")?;
+        let config_authoritative = per.served >= self.read_k;
+        tracing::info!(
+            served = per.served,
+            total = per.total,
+            read_k = self.read_k,
+            config_authoritative,
+            "NIP-60 load_config: per-relay config read quorum"
+        );
+        let config = match crate::engram::lww_head(&per.events) {
             Some(head) => {
                 let mut config = self
                     .crypto
@@ -729,10 +891,17 @@ impl Nip60Store {
                 config
                     .mints
                     .retain(|m| self.mint_allowlist.iter().any(|a| a == m));
-                Ok(Some(config))
+                Some(config)
             }
-            None => Ok(None),
-        }
+            None => None,
+        };
+        Ok(ConfigRead {
+            config,
+            served: per.served,
+            total: per.total,
+            read_k: self.read_k,
+            config_authoritative,
+        })
     }
 
     /// Roll over token events: replace the `superseded` events (their proofs consolidated into
@@ -772,6 +941,33 @@ impl Nip60Store {
             );
             anyhow::bail!(
                 "rollover skipped: read not established (non-authoritative boot)"
+            );
+        }
+
+        // §finding-1 RECOVERY GATE (R2-#3 RE-KEYED to recovery_complete): gate rollover on
+        // read_established AND recovery_complete. `read_established` is KEPT AND'd to preserve Cut A's
+        // token-QUORUM requirement (a recovery on a below-quorum candidate set must not roll over a
+        // shrunken snapshot). `recovery_complete` is the STRUCTURAL frozen-until-recovery guard: it
+        // opens ONLY after restore AND drain both succeed, so it also closes the round-1 gap where the
+        // counter was ESTABLISHED (choke point open) but the wallet was still transiently-EMPTY
+        // (restore mid-flight) — a rollover in that window would publish an EMPTY 7375 event then
+        // del-chain the REAL token backups → the durable backup LOST. recovery_complete=true ⟹ the
+        // counter is established AND restore+drain ran ⟹ the unspent set is real. Mirror the
+        // read_established bail: publish/prune NOTHING, keep the prior backup; the flusher's `?` +
+        // RearmOnDrop retries next tick (after the boot/retry marks recovery complete).
+        if !self
+            .recovery_complete
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::warn!(
+                "rollover: wallet recovery not complete (restore/drain deferred or in-progress) — kept \
+                 prior backup, published/pruned nothing; the wallet is transiently-empty until recovery \
+                 completes, so an empty rollover would del-chain the real 7375 backups (config-plane \
+                 finding-1 / R2-#3); will retry once recovery completes"
+            );
+            anyhow::bail!(
+                "rollover skipped: wallet recovery not complete (restore/drain deferred — config-plane \
+                 R2-#3 two-latch)"
             );
         }
 
@@ -2684,6 +2880,751 @@ mod tests {
         );
     }
 
+    // ---- T11 (config-plane REVISION, finding-1; R2-#3 RE-KEYED to recovery_complete): rollover BAILS
+    // during a below-quorum DEFER even when the TOKEN read is established. During a fresh-box
+    // below-quorum defer the restore-receive is blocked at the choke point → the wallet is
+    // transiently-EMPTY; an empty rollover here would publish an empty 7375 event then DEL-CHAIN the
+    // real backups. Gating rollover on `read_established AND recovery_complete` prevents that: with
+    // read_established=true but recovery_complete=false, rollover must bail BEFORE publish_token (no
+    // send, no delete), so the real prior backup stays intact.
+    //
+    // RED-on-revert: remove the `!recovery_complete` gate in `rollover` → with read_established=true
+    // the empty rollover proceeds → publishes an empty event + del-chains the real backup →
+    // `any_delete_sent()` is true / the prior snapshot is pruned → RED.
+    #[tokio::test]
+    async fn t11_rollover_blocked_during_counter_defer() {
+        let crypto = test_crypto(0x6b);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        // Seed a REAL prior snapshot (with_transport: read_established=true, recovery_complete=true).
+        let store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+        let first_id = store
+            .rollover("https://m", "sat", vec![dummy_proof("live")], Vec::new())
+            .await
+            .expect("seed a real prior snapshot (all relays UP, recovery complete)");
+        assert!(transport.distinct_token_ids().contains(&first_id));
+
+        // Simulate a fresh-box below-quorum DEFER: the TOKEN read is established (quorum ok) but the
+        // wallet recovery is NOT complete (restore deferred) — isolates the recovery gate.
+        store
+            .recovery_complete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            store.read_established.load(std::sync::atomic::Ordering::SeqCst),
+            "precondition: token read IS established (isolates the recovery gate)"
+        );
+
+        // An EMPTY rollover (the transiently-empty-wallet flush) del-chaining the real backup.
+        let attempts_before = transport.attempts.lock().unwrap().len();
+        let result = store
+            .rollover("https://m", "sat", Vec::new(), vec![first_id.to_hex()])
+            .await;
+        assert!(result.is_err(), "rollover must BAIL while recovery is not complete");
+        assert!(
+            result.unwrap_err().to_string().contains("recovery not complete"),
+            "the bail names the recovery gate (finding-1 / R2-#3)"
+        );
+        assert_eq!(
+            transport.attempts.lock().unwrap().len(),
+            attempts_before,
+            "finding-1: zero sends attempted (the gate fires before publish_token)"
+        );
+        assert!(
+            !transport.any_delete_sent(),
+            "finding-1: no NIP-09 delete attempted — the real backup is NOT del-chained"
+        );
+        assert!(
+            transport.distinct_token_ids().contains(&first_id),
+            "finding-1: the REAL 7375 backup is intact (revert the recovery gate → the empty rollover \
+             del-chains it → RED)"
+        );
+
+        // Recovery: mark recovery complete → the rollover proceeds as normal.
+        store
+            .recovery_complete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        store
+            .rollover("https://m", "sat", vec![dummy_proof("new")], vec![first_id.to_hex()])
+            .await
+            .expect("rollover succeeds once recovery is complete");
+        assert!(
+            transport.any_delete_sent(),
+            "recovery: after recovery completes, rollover publishes+prunes as normal"
+        );
+    }
+
+    // ---- T17 (config-plane ROUND-2, R2-#3, TWO-LATCH): a rollover MID-RECOVERY — the counter is
+    // ESTABLISHED (derivation choke point OPEN) but recovery is NOT yet complete (restore/drain still
+    // in-flight), so the wallet is transiently-EMPTY — does NOT roll over / del-chain the real backup.
+    // This is the exact window the round-1 counter-established gate MISSED: counter_established=true
+    // would have let the empty rollover through. R2-#3's recovery_complete gate closes it.
+    //
+    // RED-on-revert: remove the `!recovery_complete` gate in `rollover` (i.e. gate on the weaker
+    // establishment signal, as round-1 did) → with read_established=true the empty rollover proceeds
+    // → publishes an empty event + del-chains the real backup → `any_delete_sent()` true / the prior
+    // snapshot is pruned → RED.
+    #[tokio::test]
+    async fn t17_rollover_blocked_mid_recovery_before_recovery_complete() {
+        let crypto = test_crypto(0x71);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        // Seed a REAL prior snapshot (all relays UP; read_established=true, recovery_complete=true).
+        let store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+        let real_backup = store
+            .rollover("https://m", "sat", vec![dummy_proof("real-funds")], Vec::new())
+            .await
+            .expect("seed a real prior snapshot");
+        assert!(transport.distinct_token_ids().contains(&real_backup));
+
+        // MID-RECOVERY: the counter is ESTABLISHED (choke point open — restore/drain CAN derive) but
+        // recovery is NOT yet complete (restore is mid-flight → the wallet is transiently-empty). We
+        // model that by leaving read_established=true (the token read hit quorum) and flipping ONLY
+        // recovery_complete=false — the precise state the round-1 counter gate could not distinguish.
+        store
+            .recovery_complete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            store.read_established.load(std::sync::atomic::Ordering::SeqCst),
+            "precondition: token read IS established (isolates the recovery-complete gate)"
+        );
+
+        // A flusher tick fires an EMPTY rollover (transiently-empty wallet) that would del-chain the
+        // real backup. It MUST bail before publish_token.
+        let attempts_before = transport.attempts.lock().unwrap().len();
+        let result = store
+            .rollover("https://m", "sat", Vec::new(), vec![real_backup.to_hex()])
+            .await;
+        assert!(result.is_err(), "rollover must BAIL mid-recovery (recovery_complete=false)");
+        assert!(
+            result.unwrap_err().to_string().contains("recovery not complete"),
+            "the bail names the recovery-complete gate (R2-#3)"
+        );
+        assert_eq!(
+            transport.attempts.lock().unwrap().len(),
+            attempts_before,
+            "R2-#3: zero sends attempted (the gate fires before publish_token)"
+        );
+        assert!(
+            !transport.any_delete_sent(),
+            "R2-#3: no NIP-09 delete attempted — the real backup is NOT del-chained"
+        );
+        assert!(
+            transport.distinct_token_ids().contains(&real_backup),
+            "R2-#3: the REAL 7375 backup survives the mid-recovery flusher tick (revert the \
+             recovery_complete gate → the empty rollover del-chains it → RED)"
+        );
+
+        // Once recovery completes, the flusher's rollover proceeds as normal.
+        store
+            .recovery_complete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        store
+            .rollover("https://m", "sat", vec![dummy_proof("restored")], vec![real_backup.to_hex()])
+            .await
+            .expect("rollover succeeds once recovery is complete");
+        assert!(
+            transport.any_delete_sent(),
+            "after recovery completes, rollover publishes+prunes as normal"
+        );
+    }
+
+    // ---- T18 (config-plane ROUND-2, R2-#3 healthy-path drain; finding-4 DURABILITY; ROUND-3 F1
+    // post-state): a drain of NOTHING is SUCCESS. A genuinely-new agent (establish-at-0 path, NO
+    // unissued quotes) drains, and the POST-STATE `get_unissued` is EMPTY (`unissued_after = Some(0)`)
+    // → `drain_complete(Some(0))` is TRUE → recovery_complete OPENS → the new agent PUBLISHES its
+    // 17375 config head. A new agent must NOT be wedged (never backs up) just because it had nothing
+    // to drain. Observed end-to-end: recovery_complete flips AND the 17375 head reaches the relays
+    // (through the SAME shared latch + publish gate boot wires).
+    //
+    // RED-on-revert: change `boot::drain_complete` from `matches!(x, Some(0))` to
+    // `x.is_some_and(|n| n > 0)` (i.e. treat an empty post-state as failure) → the drain-of-nothing
+    // assert fails, `mark_recovery_complete` is never reached, the gate stays closed → the 17375 head
+    // is never published → this tooth FAILS.
+    #[tokio::test]
+    async fn t18_drain_of_nothing_opens_recovery_and_publishes_the_head() {
+        let crypto = test_crypto(0x74);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let mut store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+
+        // A genuinely-new agent: establish-at-0 → the counter is ESTABLISHED (derivation open) but
+        // recovery is NOT yet complete at construction (the boot constructor always starts it false).
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
+        let counter_db = crate::nip60_counter::Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            std::collections::HashMap::new(),
+            true, // establish-at-0 result
+        );
+        assert!(counter_db.is_established(), "establish-at-0: derivation is open");
+        assert!(!counter_db.is_recovery_complete(), "recovery not yet complete at construction");
+        // Wire the store's publish/rollover gate to the counter db's recovery latch (as boot does).
+        store.set_recovery_complete(counter_db.recovery_complete_handle());
+
+        // Before recovery: the 17375 publish is REFUSED (the gate is closed).
+        assert!(
+            store
+                .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+                .await
+                .is_err(),
+            "precondition: the 17375 head is NOT publishable before recovery opens"
+        );
+        let attempts_before = transport.attempts.lock().unwrap().len();
+
+        // DRAIN OF NOTHING: the drain ran and the POST-STATE `get_unissued` is EMPTY (no quotes
+        // remain) → the SAME decision boot uses must treat it as SUCCESS.
+        let unissued_after: Option<usize> = Some(0);
+        assert!(
+            crate::boot::drain_complete(unissued_after),
+            "finding-4: a drain of NOTHING (empty post-state) is SUCCESS (revert to `n > 0` → this is false → RED)"
+        );
+        // Mirror boot's healthy-path gate (drain dimension isolated: restore_ok/read_established held
+        // true here — T21 covers restore_ok, T16 covers read_established): mark iff drain_complete.
+        if crate::boot::drain_complete(unissued_after) {
+            counter_db.mark_recovery_complete();
+        }
+
+        // OBSERVABLE: recovery_complete OPENED and the 17375 head is now published to the relays.
+        assert!(
+            counter_db.is_recovery_complete(),
+            "recovery_complete OPENED for a no-quote new agent (drain of nothing = success)"
+        );
+        store
+            .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+            .await
+            .expect("the new agent PUBLISHES its 17375 config head once recovery opens");
+        assert!(
+            transport.attempts.lock().unwrap().len() > attempts_before,
+            "a 17375 config head was SENT to the relays (the funnel opened on drain-of-nothing success)"
+        );
+    }
+
+    // ---- T19 (config-plane ROUND-3 F1, CORRECTED — supersedes the Err-mock false-comfort tooth):
+    // mint-down modeled CDK-REALISTICALLY as `mint_unissued_quotes` returning `Ok(0)` WHILE unissued
+    // quotes REMAIN in the store (per cdk issue/mod.rs:340 — per-quote errors are swallowed, so a
+    // mint-down surfaces as `Ok(0)`, NOT an `Err`). The GENUINE signal is the POST-STATE: after the
+    // drain, `get_unissued` is NON-empty (`unissued_after = Some(1)`) → `drain_complete(Some(1))` is
+    // FALSE → recovery_complete stays CLOSED → the 17375 publish + rollover DEFER (the real backup
+    // persists = NO loss), a Paid-but-unissued quote is NOT stranded (the bounded retry re-drives).
+    // On a later attempt where the quotes drain (post-state EMPTY) recovery OPENS (self-heal).
+    //
+    // The OLD tooth modeled mint-down as an `Err` (`None`) — false comfort, because CDK never returns
+    // `Err` on a per-quote mint failure. T19+T20 together assert the REAL CDK `Ok(0)` semantics.
+    //
+    // RED-on-revert: change `boot::drain_complete` from `matches!(x, Some(0))` to `x.is_some()` (the
+    // degrade-prone proxy that treats "we called the drain" as success, ignoring the leftover count,
+    // the analog of the old `minted.is_some()`) → `drain_complete(Some(1))` becomes TRUE → the
+    // mint-down case marks recovery complete → the "closed while quotes remain" + "publish/rollover
+    // defer" + "no del-chain" asserts fail → this tooth FAILS.
+    #[tokio::test]
+    async fn t19_drain_fail_safe_defers_then_self_heals() {
+        let crypto = test_crypto(0x75);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let mut store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+
+        // Seed a REAL prior backup while the gate is open (with_transport defaults recovery=true).
+        let real_backup = store
+            .rollover("https://m", "sat", vec![dummy_proof("real-funds")], Vec::new())
+            .await
+            .expect("seed a real prior backup");
+        assert!(transport.distinct_token_ids().contains(&real_backup));
+
+        // Now wire the gate to a counter db whose recovery is NOT complete (the drain won't clear).
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
+        let counter_db = crate::nip60_counter::Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            std::collections::HashMap::new(),
+            true, // established (derivation open) but recovery pending
+        );
+        store.set_recovery_complete(counter_db.recovery_complete_handle());
+
+        // MINT DOWN, CDK-REALISTIC: `mint_unissued_quotes` returned `Ok(0)` (per-quote errors
+        // swallowed) but a quote REMAINS unissued → POST-STATE `get_unissued` is NON-empty.
+        let unissued_after: Option<usize> = Some(1);
+        assert!(
+            !crate::boot::drain_complete(unissued_after),
+            "quotes REMAIN after the drain (mint-down Ok(0)) → NOT complete (revert to `is_some()` → this is true → RED)"
+        );
+        // Mirror boot: while the post-state is not clean, recovery is NOT marked.
+        if crate::boot::drain_complete(unissued_after) {
+            counter_db.mark_recovery_complete();
+        }
+
+        // SAFE-DEFER while quotes remain: recovery closed, publish refused, rollover bails (the real
+        // backup is NOT del-chained → no loss).
+        assert!(
+            !counter_db.is_recovery_complete(),
+            "recovery stays CLOSED while unissued quotes remain (revert to premature-open → RED)"
+        );
+        assert!(
+            store
+                .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+                .await
+                .is_err(),
+            "the 17375 publish DEFERS while recovery is closed"
+        );
+        let attempts_before = transport.attempts.lock().unwrap().len();
+        let roll = store
+            .rollover("https://m", "sat", Vec::new(), vec![real_backup.to_hex()])
+            .await;
+        assert!(roll.is_err(), "the rollover DEFERS while recovery is closed");
+        assert_eq!(
+            transport.attempts.lock().unwrap().len(),
+            attempts_before,
+            "no send attempted (the gate fires before publish_token)"
+        );
+        assert!(
+            !transport.any_delete_sent(),
+            "the real backup is NOT del-chained while quotes remain (no loss)"
+        );
+        assert!(
+            transport.distinct_token_ids().contains(&real_backup),
+            "the prior backup PERSISTS through the mint-down window"
+        );
+
+        // SELF-HEAL: a later attempt where the quotes drain (POST-STATE empty) opens recovery.
+        let unissued_after_healed: Option<usize> = Some(0);
+        if crate::boot::drain_complete(unissued_after_healed) {
+            counter_db.mark_recovery_complete();
+        }
+        assert!(
+            counter_db.is_recovery_complete(),
+            "recovery OPENS once the post-state drains clean (self-heal, not a permanent wedge)"
+        );
+        store
+            .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+            .await
+            .expect("the 17375 publish PROCEEDS after the drain self-heals");
+    }
+
+    // ---- T20 (config-plane ROUND-3 F1, drain POST-STATE gate): recovery_complete opens ONLY if the
+    // POST-STATE `get_unissued` is EMPTY after the drain. The two CDK cases, through the REAL gate:
+    //   • no-quotes / genuinely-drained → `unissued_after = Some(0)` → `drain_complete` TRUE → OPEN.
+    //   • mint-down `Ok(0)` with quotes remaining → `Some(n>0)` → `drain_complete` FALSE → CLOSED.
+    // This is the SEAM the old `minted.is_some()` proxy could not see: CDK's `Ok(0)` is ambiguous, so
+    // only the durable post-state disambiguates.
+    //
+    // RED-on-revert: change `boot::drain_complete` from `matches!(x, Some(0))` to `x.is_some()`
+    // (revert to the return-code proxy that treats any completed call as drained, i.e. the
+    // `drain_ok = minted.is_some()` behavior) → the mint-down `Some(1)` case opens recovery → this
+    // tooth's "CLOSED on quotes-remain" assert fails → RED.
+    #[tokio::test]
+    async fn t20_recovery_opens_only_on_empty_drain_post_state() {
+        // Decision-level: empty post-state opens, non-empty defers.
+        assert!(crate::boot::drain_complete(Some(0)), "empty post-state → drained → open");
+        assert!(!crate::boot::drain_complete(Some(3)), "quotes remain (mint-down Ok(0)) → NOT drained → defer");
+        assert!(!crate::boot::drain_complete(None), "post-state query failed → cannot confirm → defer (fail-closed)");
+
+        // Gate-level (through the SAME shared latch + publish gate boot wires): the mint-down case
+        // must NOT open recovery, so the 17375 publish stays REFUSED.
+        let crypto = test_crypto(0x76);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let mut store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
+        let counter_db = crate::nip60_counter::Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            std::collections::HashMap::new(),
+            true, // established (derivation open) but recovery pending
+        );
+        store.set_recovery_complete(counter_db.recovery_complete_handle());
+
+        // MINT-DOWN Ok(0), quotes remain → gate stays closed.
+        let mint_down: Option<usize> = Some(2);
+        if crate::boot::drain_complete(mint_down) {
+            counter_db.mark_recovery_complete();
+        }
+        assert!(
+            !counter_db.is_recovery_complete(),
+            "mint-down Ok(0) (quotes remain) must NOT open recovery (revert drain_ok→is_some() → opens → RED)"
+        );
+        assert!(
+            store
+                .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+                .await
+                .is_err(),
+            "the 17375 head is NOT published on a mint-down Ok(0) — the post-state gate held"
+        );
+    }
+
+    // ---- T21 (config-plane ROUND-3 F2, restore POST-STATE gate): a restore that FAILS (its EXPLICIT
+    // `RestoreOutcome::Degraded`, `restore_ok=false`) with a clean drain must NOT open recovery — the
+    // dirty flusher must NOT rollover/del-chain the REAL 7375 backup. This closes the F2 hazard where
+    // restore's degrade-to-0 looked identical to a successful-empty restore, so recovery_complete
+    // opened on the drain alone and the empty-rollover del-chained the durable backup = LOSS.
+    //
+    // Fail-closed CONFIRM: a degraded restore adopted NOTHING + boot continues (both proven in the
+    // nip60_reconcile teeth) AND sets restore_ok=false (proven here: recovery stays closed → the
+    // backup is preserved). Both properties, not either/or.
+    //
+    // RED-on-revert: revert `RestoreOutcome::is_ok` to always-true (the degrade-to-0 proxy, where a
+    // failed restore looks like success) OR drop `&& restore_ok` from the recovery gate → the mark
+    // fires on the drain alone → the empty rollover del-chains the real backup → the "no del-chain"
+    // assert fails → RED.
+    #[tokio::test]
+    async fn t21_failed_restore_defers_recovery_and_preserves_the_backup() {
+        let crypto = test_crypto(0x77);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let mut store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+
+        // Seed a REAL prior backup while the gate is open (with_transport defaults recovery=true).
+        let real_backup = store
+            .rollover("https://m", "sat", vec![dummy_proof("real-funds")], Vec::new())
+            .await
+            .expect("seed a real prior backup");
+        assert!(transport.distinct_token_ids().contains(&real_backup));
+
+        // Wire the gate to a counter db whose recovery is NOT complete.
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
+        let counter_db = crate::nip60_counter::Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            std::collections::HashMap::new(),
+            true, // established (derivation open) but recovery pending
+        );
+        store.set_recovery_complete(counter_db.recovery_complete_handle());
+
+        // The restore FAILED (explicit Degraded, restore_ok=false) but the drain is CLEAN (empty
+        // post-state) and the token read hit quorum. Mirror boot's healthy gate: recovery_complete =
+        // restore_ok AND drain_ok AND read_established. `is_ok()` is the REAL function — reverting it
+        // to always-true flips this tooth.
+        let restore_ok = crate::nip60_reconcile::RestoreOutcome::Degraded.is_ok(); // false
+        let drain_ok = crate::boot::drain_complete(Some(0)); // clean
+        let read_established = true;
+        assert!(!restore_ok, "a DEGRADED restore is restore_ok=false (revert is_ok→true → RED)");
+        if drain_ok && restore_ok && read_established {
+            counter_db.mark_recovery_complete();
+        }
+
+        // Recovery stays CLOSED (restore_ok=false) → publish refused, rollover bails, backup preserved.
+        assert!(
+            !counter_db.is_recovery_complete(),
+            "a failed restore keeps recovery CLOSED even with a clean drain (revert drop `&& restore_ok` → opens → RED)"
+        );
+        let attempts_before = transport.attempts.lock().unwrap().len();
+        let roll = store
+            .rollover("https://m", "sat", Vec::new(), vec![real_backup.to_hex()])
+            .await;
+        assert!(roll.is_err(), "the empty rollover BAILS while recovery is closed (restore failed)");
+        assert_eq!(
+            transport.attempts.lock().unwrap().len(),
+            attempts_before,
+            "no send attempted (the gate fires before publish_token)"
+        );
+        assert!(
+            !transport.any_delete_sent(),
+            "the REAL 7375 backup is NOT del-chained (F2 loss prevented)"
+        );
+        assert!(
+            transport.distinct_token_ids().contains(&real_backup),
+            "the durable backup PERSISTS through the failed-restore window"
+        );
+    }
+
+    // ---- T22 (config-plane ROUND-3 F3, retry SPAWN condition): an ALREADY-established counter with
+    // `read_established=false` (state-3: a non-empty config floor established, but the TOKEN read was
+    // below quorum) must STILL spawn the convergence retry — else `read_established` stays false,
+    // `recovery_complete` never opens, and the rollover gate is blocked the WHOLE run. The spawn is
+    // keyed on `should_spawn_config_retry(read_established, recovery_complete)` = NON-authoritative OR
+    // incomplete, NOT on `!established`.
+    //
+    // RED-on-revert: revert the spawn gate to the pre-F3 `!counter_db.is_established()`. For an
+    // already-established boot `is_established()=true` → `!established=false` → NO retry spawned →
+    // `read_established` stuck false → rollover blocked forever. The tooth asserts the NEW gate spawns
+    // where the OLD gate would not — reverting to `!established` makes the `should_spawn` assert fail.
+    #[test]
+    fn t22_retry_spawns_on_incomplete_recovery_even_when_established() {
+        use crate::boot::should_spawn_config_retry;
+
+        // THE SEAM: established=true, but token read below quorum → read_established=false → recovery
+        // incomplete. The NEW gate SPAWNS; the OLD `!established` gate would NOT (the F3 bug).
+        assert!(
+            should_spawn_config_retry(false, false),
+            "read below quorum + recovery incomplete → SPAWN (the OLD `!established` gate would skip → RED)"
+        );
+        // Even with recovery somehow marked, a below-quorum read still warrants a retry.
+        assert!(
+            should_spawn_config_retry(false, true),
+            "token read NON-authoritative → SPAWN (re-read the token plane)"
+        );
+        // Fully healthy: token ≥k AND recovery complete → NO retry (nothing to converge).
+        assert!(
+            !should_spawn_config_retry(true, true),
+            "token ≥k AND recovery complete → do NOT spawn (no work left)"
+        );
+        // Established but recovery pending (drain/restore not done) → SPAWN to finish the latch.
+        assert!(
+            should_spawn_config_retry(true, false),
+            "token ≥k but recovery incomplete → SPAWN (complete restore+drain+latch)"
+        );
+
+        // Counterfactual bite: the OLD gate `!established` on the seam (established=true) returns
+        // false — proving the NEW gate spawns exactly where the OLD one silently would not.
+        let established = true;
+        let old_gate = !established;
+        assert!(
+            !old_gate && should_spawn_config_retry(false, false),
+            "the OLD `!established` gate skips the seam the NEW gate catches (F3 fix)"
+        );
+    }
+
+    // ---- T24 (config-plane ROUND-4, K3 — decode fail-closed, deletion-side): an UNDECRYPTABLE
+    // self-authored 7375 event marks the read DEGRADED (`decode_ok=false`, folded into restore_ok →
+    // recovery defers) AND its id is EXCLUDED from `fetched_ids` (so it never seeds live_ids/deletion →
+    // the first rollover cannot del-chain a genuine backup we could not read). deletion-never-delete-unread.
+    //
+    // RED-on-revert: move the `fetched_ids.push` back BEFORE the decrypt (and drop the `decode_ok=false`
+    // on the Err arm) → the undecryptable id re-enters fetched_ids AND decode_ok stays true → both
+    // asserts fail → RED (the undecryptable backup would be del-chained + recovery would converge).
+    #[tokio::test]
+    async fn t24_undecryptable_backup_excluded_from_deletion_and_marks_degraded() {
+        let crypto = test_crypto(0x78);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+
+        // Seed an UNDECRYPTABLE self-authored 7375 event: signed under OUR key (so the author filter
+        // returns it) but its content is NOT valid NIP-44 ciphertext → `crypto.decrypt` fails. This
+        // stands in for a rotated/legacy encryption key or corruption — a genuine backup we can't read.
+        let outcome = transport
+            .send_event(KIND_NIP60_TOKEN, "not-valid-nip44-ciphertext".to_string(), Vec::new())
+            .await
+            .expect("seed a raw undecryptable self-authored token event");
+        let undecryptable_id = outcome.event_id.to_hex();
+
+        let read = store.reconcile_on_load_with_ids().await.expect("reconcile");
+        assert!(
+            !read.decode_ok,
+            "K3: an undecryptable self-authored 7375 event marks the read DEGRADED (decode_ok=false)"
+        );
+        assert!(
+            !read.fetched_ids.contains(&undecryptable_id),
+            "K3: the undecryptable backup's id is EXCLUDED from fetched_ids (never del-chain an unread \
+             backup — revert push-before-decrypt → id present → RED). fetched_ids={:?}",
+            read.fetched_ids
+        );
+        // Boot folds decode_ok into restore_ok: even a genuinely-successful restore is forced to
+        // restore_ok=false when the read is degraded → recovery_complete stays closed.
+        let restore_ok =
+            crate::nip60_reconcile::RestoreOutcome::Restored { imported: 0 }.is_ok() && read.decode_ok;
+        assert!(
+            !restore_ok,
+            "K3: a degraded decode forces restore_ok=false (recovery_complete stays CLOSED, backup preserved)"
+        );
+    }
+
+    // ---- T28 (config-plane ROUND-5, K3-corr — raw-token-presence for the establish decision): the
+    // regression K3 introduced. K3 made `fetched_ids` decoded-ONLY, so `fetched_ids.is_empty()` post-K3
+    // means "no DECODABLE events" — an ALL-undecryptable self-authored 7375 read (a real, unreadable
+    // backup) looks empty and would establish-at-0 (config_authoritative + token_authoritative +
+    // token_empty) → derive from index 0 against unread proofs = NUT-13 REUSE. The establish decision's
+    // `token_empty` must be the RAW presence signal (`token_plane_empty` → `raw_events_empty`), still
+    // ANDed with `token_authoritative` (quorum symmetry preserved).
+    //
+    // RED-on-revert: change `boot::token_plane_empty` to `read.fetched_ids.is_empty()` (the buggy
+    // decoded-only form) → the all-undecryptable read yields token_empty=true → establish_if_sound
+    // establishes at 0 → the "DEFERS" assert fails → RED (index-0 reuse against an unread backup).
+    #[tokio::test]
+    async fn t28_all_undecryptable_read_defers_establish_at_zero() {
+        use crate::boot::token_plane_empty;
+
+        let crypto = test_crypto(0x7a);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let store = Nip60Store::with_transport_and_read_k(crypto.clone(), transport.clone(), 3, 2, 2, allow_m());
+
+        // Seed ONE undecryptable self-authored 7375 event (signed under OUR key → the author filter
+        // returns it; content is NOT valid NIP-44 → decode fails). Stored on all 3 UP relays → served=3.
+        transport
+            .send_event(KIND_NIP60_TOKEN, "not-valid-nip44-ciphertext".to_string(), Vec::new())
+            .await
+            .expect("seed an undecryptable self-authored token event");
+
+        let read = store.reconcile_on_load_with_ids().await.expect("reconcile");
+        // THE SEAM: the two signals DISAGREE — fetched_ids is decoded-only-EMPTY, but the RAW read is
+        // NON-empty (a real backup was served, we just couldn't read it), and the read hit quorum.
+        assert!(read.fetched_ids.is_empty(), "K3: fetched_ids is decoded-only → empty (undecryptable excluded)");
+        assert!(!read.raw_events_empty, "K3-corr: the RAW read is NON-empty (an event WAS served)");
+        assert!(read.authoritative, "≥k relays served the (undecryptable) event → token_authoritative");
+        assert!(!read.decode_ok, "the read is decode-degraded");
+        assert!(
+            !token_plane_empty(&read),
+            "token_plane_empty is the RAW presence (false here) — revert to fetched_ids.is_empty() → true → RED"
+        );
+
+        // WIRED establish path: fresh box, empty config floor, config ≥k, token ≥k, token_empty from the
+        // RAW signal → must DEFER (do NOT establish-at-0 against an unread backup).
+        async fn fresh_counter_db() -> Nip60CounterDb {
+            let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
+            Nip60CounterDb::with_counters_established(Arc::new(mem), std::collections::HashMap::new(), false)
+        }
+        let db = fresh_counter_db().await;
+        let established = db
+            .establish_if_sound(
+                std::collections::HashMap::new(),
+                false,                       // resume=false (fresh box)
+                true,                        // config_authoritative
+                read.authoritative,          // token_authoritative (≥k)
+                token_plane_empty(&read),    // token_empty = RAW presence (false → NOT empty)
+                true,                        // floor_complete
+            )
+            .await
+            .expect("establish decision runs cleanly");
+        assert!(
+            !established,
+            "K3-corr: an all-undecryptable (raw-NON-empty) read must NOT establish-at-0 (revert \
+             token_plane_empty→fetched_ids.is_empty() → establishes → RED = NUT-13 index-0 reuse)"
+        );
+        assert!(!db.is_established(), "the latch stays deferred (derivations blocked at the choke point)");
+
+        // ★ QUORUM-SYMMETRY sub-case A — genuinely-new agent (NO events served, ≥k): raw-empty=true +
+        // token_authoritative=true → establish-at-0 (must NOT over-defer a real new agent).
+        let empty_transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let empty_store = Nip60Store::with_transport_and_read_k(crypto.clone(), empty_transport, 3, 2, 2, allow_m());
+        let empty_read = empty_store.reconcile_on_load_with_ids().await.expect("reconcile empty");
+        assert!(empty_read.raw_events_empty, "no events served → raw-empty=true");
+        assert!(empty_read.authoritative, "3 up relays confirmed empty → ≥k → authoritative");
+        let db_new = fresh_counter_db().await;
+        let established_new = db_new
+            .establish_if_sound(
+                std::collections::HashMap::new(),
+                false,
+                true,
+                empty_read.authoritative,
+                token_plane_empty(&empty_read), // true (genuinely empty)
+                true,
+            )
+            .await
+            .expect("establish decision runs cleanly");
+        assert!(established_new, "genuinely-new (quorum-confirmed zero events) → establish-at-0 (don't over-defer)");
+
+        // ★ QUORUM-SYMMETRY sub-case B — a BELOW-quorum all-empty raw read (token_authoritative=false)
+        // still DEFERS regardless of raw-empty: the de-overload did NOT weaken the token-quorum term.
+        let db_belowq = fresh_counter_db().await;
+        let established_belowq = db_belowq
+            .establish_if_sound(
+                std::collections::HashMap::new(),
+                false,
+                true,  // config_authoritative
+                false, // token_authoritative = FALSE (below quorum) — can't confirm emptiness
+                true,  // raw-empty apparent, but unproven below quorum
+                true,
+            )
+            .await
+            .expect("establish decision runs cleanly");
+        assert!(
+            !established_belowq,
+            "below-quorum token read DEFERS even with raw-empty=true (token_authoritative term intact — \
+             quorum symmetry survives the K3-corr de-overload)"
+        );
+    }
+
+    // ---- T26 (config-plane ROUND-4, N1 — fail-closed default): the PRODUCTION `connect` constructor
+    // defaults `recovery_complete` FALSE (gate SHUT) BEFORE any boot wiring — consistent with
+    // `read_established`'s fail-closed default. Production behavior is identical (boot wires the shared
+    // latch), but a missing/reordered wiring then fails CLOSED (no publish/rollover), not OPEN.
+    //
+    // RED-on-revert: change the `connect` default back to `AtomicBool::new(true)` → a freshly-connected
+    // store has recovery_complete=TRUE before wiring → this assert fails → RED (a thin head / empty
+    // rollover could publish through an unwired store).
+    #[tokio::test]
+    async fn t26_connect_defaults_recovery_complete_closed() {
+        // A real connect() against a local (unreachable) relay still returns Ok — nostr connect is
+        // best-effort — so we can inspect the INITIAL recovery_complete default before any boot wiring.
+        let event_key = [0x79u8; 32];
+        let store = Nip60Store::connect(
+            &event_key,
+            &["ws://127.0.0.1:1".to_string()],
+            Some(1),
+            Some(1),
+            allow_m(),
+        )
+        .await
+        .expect("connect builds the store");
+        assert!(
+            !store.recovery_complete.load(std::sync::atomic::Ordering::SeqCst),
+            "N1: connect defaults recovery_complete CLOSED (false) — a missing/reordered wiring fails \
+             CLOSED, not OPEN (revert default→true → RED)"
+        );
+    }
+
+    // ---- T27 (config-plane ROUND-4, category (d), CONFIG-SOURCE half): `counters_by_id_checked`
+    // SIGNALS a dropped keyset. An unparseable-hex config keyset is skipped AND `dropped=true`; a
+    // clean config floor is `dropped=false`. This is the config read source the establishment guard
+    // (`floor_complete`) fails-closed on (the LOCAL source is covered in mint_rig T27, the DECISION in
+    // nip60_counter T27).
+    //
+    // RED-on-revert: stop setting `dropped=true` on an unparseable keyset in `counters_by_id_checked`
+    // (return `false`) → a holey config floor looks complete → establishment fires on it → the dropped
+    // keyset derives from index 0 = NUT-13 reuse → this `dropped` assert fails → RED.
+    #[test]
+    fn t27_config_counters_by_id_signals_a_dropped_keyset() {
+        // A clean config floor (well-formed hex) → not holey.
+        let clean = WalletConfigContent {
+            mints: vec![],
+            counters: std::collections::HashMap::from([("009a1f293253e41e".to_string(), 5u32)]),
+        };
+        let (clean_map, clean_dropped) = clean.counters_by_id_checked();
+        assert_eq!(clean_map.len(), 1, "the well-formed keyset parses");
+        assert!(!clean_dropped, "a clean config floor is NOT holey");
+
+        // A holey config floor: one good keyset + one unparseable-hex keyset → dropped=true.
+        let holey = WalletConfigContent {
+            mints: vec![],
+            counters: std::collections::HashMap::from([
+                ("009a1f293253e41e".to_string(), 5u32),
+                ("not-a-valid-keyset-hex".to_string(), 9u32),
+            ]),
+        };
+        let (holey_map, holey_dropped) = holey.counters_by_id_checked();
+        assert!(holey_dropped, "an unparseable config keyset marks the floor HOLEY (revert dropped→false → RED)");
+        assert_eq!(holey_map.len(), 1, "only the well-formed keyset is kept; the corrupt one is dropped");
+    }
+
+    // ---- T12 (config-plane REVISION, finding-2; R2-#3 RE-KEYED to recovery_complete): EVERY 17375
+    // writer is gated at the funnel. A pre-recovery `publish_config` (the flush_estate estate-publish
+    // path, and any future writer) is REFUSED — no thin head is sent to the relays. Gating
+    // `publish_config` itself (the ONLY send_event(17375,..)) covers all call sites bypass-proof.
+    //
+    // RED-on-revert: remove the `!recovery_complete` gate in `publish_config` → the pre-recovery
+    // publish reaches the transport (acks >= k) and returns Ok → `result.is_err()` fails AND a send
+    // was attempted → RED.
+    #[tokio::test]
+    async fn t12_publish_config_gated_at_funnel_when_not_established() {
+        let crypto = test_crypto(0x6c);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+
+        // PRE-RECOVERY: recovery is NOT complete (the flush_estate pre-recovery publish path).
+        store
+            .recovery_complete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let attempts_before = transport.attempts.lock().unwrap().len();
+        let result = store
+            .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+            .await;
+        assert!(
+            result.is_err(),
+            "finding-2: publish_config REFUSED at the funnel while recovery is not complete"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("recovery not complete"),
+            "the refusal names the recovery funnel gate (finding-2 / R2-#3)"
+        );
+        assert_eq!(
+            transport.attempts.lock().unwrap().len(),
+            attempts_before,
+            "finding-2: NO 17375 send attempted (the funnel gate fires before send_event) — revert \
+             the gate → a thin head publishes → RED"
+        );
+
+        // Mark recovery complete → the publish now reaches the transport.
+        store
+            .recovery_complete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        store
+            .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+            .await
+            .expect("publish_config succeeds once recovery is complete");
+        assert!(
+            transport.attempts.lock().unwrap().len() > attempts_before,
+            "a post-recovery publish reaches the transport (the funnel opens on recovery)"
+        );
+    }
+
     // ---- D2 (partial-set union): the per-relay union includes events from all UP relays ----------
     //
     // relay 0 has the LATEST token event (two proofs), relays 1+2 only have the older event (one
@@ -2877,5 +3818,250 @@ mod tests {
         assert_eq!(imported2, 0, "D4: the second restore is a no-op (novel-only gate prevents double-count)");
         let got2 = wallet.imported.lock().unwrap().clone();
         assert_eq!(got2.len(), 1, "D4: still only one proof imported total (no double-count)");
+    }
+
+    // ============================================================================================
+    // Config-plane cut (#45) heavy teeth — real cdk-fakewallet mint + wallet over the choke-point
+    // decorator. T5 (recovery-mint blocked at the choke point) and T3 (retry converges the FULL
+    // path: ≥k → establish → restore pulls funds → solvency PASSES).
+    // ============================================================================================
+
+    // ---- T5 (config-plane §2.2, kirby weight-hardest): mint_unissued_quotes() on a below-quorum
+    // fresh box is BLOCKED at the choke point — recovery-mint physically cannot derive (it routes
+    // through `increment_keyset_counter`), so no reused NUT-13 index. Establishing then lets the
+    // SAME quote mint.
+    //
+    // A Paid-but-unissued mint quote is the durable recovery anchor (CDK's get_unissued_mint_quotes).
+    // With the establishment latch FALSE, `mint_unissued_quotes` attempts the mint → the choke point
+    // errs → CDK logs+continues → NOTHING minted (balance stays 0). After `establish()` the same
+    // quote mints and the balance rises.
+    //
+    // RED-on-revert: remove the `!counter_established` guard in
+    // `Nip60CounterDb::increment_keyset_counter` → the deferred `mint_unissued_quotes` mints from the
+    // thin state → the "balance stays 0 while deferred" assert fails.
+    #[tokio::test]
+    async fn t5_recovery_mint_is_blocked_at_the_choke_point_when_deferred() {
+        use cdk::amount::Amount;
+        use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod};
+        use cdk::wallet::Wallet;
+
+        let mint = mint_fixture::FakeMint::start(18863)
+            .await
+            .expect("boot the local fakewallet mint");
+        let mint_url = mint.url();
+
+        // A wallet whose localstore IS a DEFERRED choke-point decorator (fresh-box below-quorum).
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("wallet store");
+        let counter_db = Arc::new(crate::nip60_counter::Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            std::collections::HashMap::new(),
+            false, // DEFERRED: derivations blocked at the choke point
+        ));
+        assert!(!counter_db.is_established(), "precondition: counter deferred");
+        let wallet = Wallet::new(&mint_url, CurrencyUnit::Sat, counter_db.clone(), [9u8; 64], None)
+            .expect("build wallet over the deferred choke-point decorator");
+
+        // Create a mint quote and drive it to PAID (the fakewallet auto-pays); poll the mint until
+        // the quote is mintable, so the block below is genuinely the CHOKE POINT, not an unpaid quote.
+        let quote = wallet
+            .mint_quote(PaymentMethod::BOLT11, Some(Amount::from(128)), None, None)
+            .await
+            .expect("request a mint quote");
+        let mut paid = false;
+        for _ in 0..40 {
+            if let Ok(q) = wallet.check_mint_quote_status(&quote.id).await {
+                if q.state == MintQuoteState::Paid && q.amount_mintable() > Amount::ZERO {
+                    paid = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        assert!(paid, "the fakewallet must mark the quote PAID so the deferred block is the choke point");
+
+        // DEFERRED: recovery-mint attempts to derive → choke point errs → CDK skips → nothing minted.
+        // THE MONEY-SAFETY PROOF: a Paid, mintable quote yields ZERO proofs because the derivation
+        // is blocked at the choke point (no reused NUT-13 index derived from thin state).
+        let minted_deferred = wallet
+            .mint_unissued_quotes()
+            .await
+            .expect("mint_unissued_quotes returns cleanly (skips the un-mintable-because-gated quote)");
+        let bal_deferred = wallet.total_balance().await.map(u64::from).unwrap_or(0);
+        assert_eq!(
+            u64::from(minted_deferred), 0,
+            "recovery-mint is BLOCKED at the choke point while deferred — nothing minted"
+        );
+        assert_eq!(
+            bal_deferred, 0,
+            "MONEY-SAFETY: no proofs derived from thin state (revert the gate → this mints 128 → RED)"
+        );
+        // Belt-and-suspenders: a DIRECT counter-reserve is refused too (the exact op recovery-mint
+        // routes through), and it mutated nothing while deferred.
+        {
+            use cdk::cdk_database::WalletDatabase as _;
+            let kid: Id = "009a1f293253e41e".parse().unwrap();
+            assert!(
+                counter_db.increment_keyset_counter(&kid, 1).await.is_err(),
+                "the choke point refuses a direct derivation while deferred"
+            );
+        }
+
+        // ESTABLISH: the choke point opens. A fresh Paid quote now mints, proving the ONLY thing
+        // that blocked recovery-mint was the establishment latch (not the mint / not the quote). A
+        // fresh quote is used because the deferred attempt above left the first quote's cdk mint-saga
+        // partially advanced (recovery of a poisoned in-flight saga is cdk's boot-step-2 concern, not
+        // this tooth's).
+        counter_db.establish();
+        let quote2 = wallet
+            .mint_quote(PaymentMethod::BOLT11, Some(Amount::from(128)), None, None)
+            .await
+            .expect("request a second mint quote");
+        let mut paid2 = false;
+        for _ in 0..40 {
+            if let Ok(q) = wallet.check_mint_quote_status(&quote2.id).await {
+                if q.state == MintQuoteState::Paid && q.amount_mintable() > Amount::ZERO {
+                    paid2 = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        assert!(paid2, "the second quote is PAID");
+        let minted_ok = wallet
+            .mint_unissued_quotes()
+            .await
+            .expect("mint_unissued_quotes succeeds once the counter is established");
+        assert!(
+            u64::from(minted_ok) >= 128,
+            "after establish, a Paid quote mints (recovery-mint converges once the choke point opens): minted={minted_ok}"
+        );
+        let bal_ok = wallet.total_balance().await.map(u64::from).unwrap_or(0);
+        assert!(bal_ok >= 128, "the wallet balance rose after establishing: {bal_ok}");
+
+        mint.shutdown().await;
+    }
+
+    // ---- T3 (config-plane §2.4, RUNTIME FULL PATH): the bounded retry genuinely converges. After a
+    // ≥k config read lands, `try_establish_counter` flips the latch, fast-forwards the floor,
+    // re-reconciles, RESTORES the relay-backed proofs into a fresh wallet (PULLS FUNDS), and the
+    // wallet then BACKS the counter → solvency PASSES → the agent is LIVE. Not a compile check: it
+    // drives the real establishment function against a real mint + a real per-relay store that goes
+    // from below-quorum to ≥k.
+    //
+    // RED-on-revert: change `try_establish_counter` to always `return Ok(false)` (never establish) →
+    // the counter stays deferred forever → the restore imports nothing → the balance stays 0 →
+    // solvency never passes → the asserts fail.
+    #[tokio::test]
+    async fn t3_bounded_retry_converges_full_path_establish_restore_solvent() {
+        use cdk::nuts::State;
+        use cdk::wallet::Wallet;
+
+        let mint = mint_fixture::FakeMint::start(18864)
+            .await
+            .expect("boot the local fakewallet mint");
+        let mint_url = mint.url();
+
+        // SOURCE wallet: fund it, then publish its unspent proofs to the relay backup (the funds a
+        // failover box will restore).
+        let source = crate::mint_rig::build_wallet(&mint_url).await.expect("build source wallet");
+        crate::mint_rig::fund_wallet(source.clone(), 256).await.expect("fund the source wallet");
+        let source_proofs: Vec<Proof> = source
+            .get_proofs_with(Some(vec![State::Unspent]), None)
+            .await
+            .expect("read the source wallet's unspent proofs");
+        assert!(!source_proofs.is_empty(), "the source wallet holds unspent proofs to back up");
+
+        // A per-relay store (n=3, read_k=2), read_established starts FALSE. Publish the proofs while
+        // all relays are UP (durable, acks=3 >= k=2).
+        let crypto = test_crypto(0x73);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let store = Arc::new(Nip60Store::with_transport_and_read_k(
+            crypto.clone(),
+            transport.clone(),
+            3,
+            2,
+            2,
+            vec![mint_url.clone()],
+        ));
+        store
+            .publish_token(&TokenEventContent {
+                mint: mint_url.clone(),
+                unit: "sat".to_string(),
+                proofs: source_proofs.clone(),
+                del: Vec::new(),
+            })
+            .await
+            .expect("publish the source proofs as a durable token backup");
+        // ★ R2-#1: a real failover backs up BOTH the 7375 token proofs AND the 17375 counter HEAD
+        // (the NUT-13 floor). Under the single guarded establish choke point, a fresh box with token
+        // backups but NO config head must DEFER (finding-4 — can't reconstruct the floor from proofs,
+        // = index-0 reuse hazard; see T13a). So publish a config head (non-empty floor → state-3
+        // establish-at-the-true-floor) alongside the token backup, while all relays are UP. The
+        // store's recovery_complete defaults true (with_transport_and_read_k) so this publish is
+        // allowed; the value is a real floor for the mint's keyset.
+        let floor_kid: Id = "009a1f293253e41e".parse().expect("valid keyset id");
+        store
+            .publish_wallet_config(
+                std::collections::HashMap::from([(floor_kid, 1u32)]),
+                vec![mint_url.clone()],
+            )
+            .await
+            .expect("publish the source counter head (17375 floor) as the reconstruct anchor");
+
+        // TARGET: a FRESH failover wallet over a DEFERRED choke-point decorator (empty local store).
+        let mem = cdk_sqlite::wallet::memory::empty().await.expect("target wallet store");
+        let counter_db = Arc::new(crate::nip60_counter::Nip60CounterDb::with_counters_established(
+            Arc::new(mem),
+            std::collections::HashMap::new(),
+            false, // fresh-box below-quorum → deferred
+        ));
+        let target = Wallet::new(&mint_url, cdk::nuts::CurrencyUnit::Sat, counter_db.clone(), [3u8; 64], None)
+            .expect("build the fresh target wallet over the deferred decorator");
+
+        // BELOW-QUORUM: 2 of 3 relays down → a config read serves 1 < read_k=2.
+        transport.set_up(1, false);
+        transport.set_up(2, false);
+        let attempt_below = crate::boot::try_establish_counter(&store, &counter_db, &target)
+            .await
+            .expect("a below-quorum establish attempt returns cleanly");
+        assert!(!attempt_below, "below-quorum → the retry does NOT establish");
+        assert!(!counter_db.is_established(), "counter still deferred below quorum");
+        // A derivation is genuinely blocked in this window.
+        {
+            use cdk::cdk_database::WalletDatabase as _;
+            let kid: Id = "009a1f293253e41e".parse().unwrap();
+            assert!(
+                counter_db.increment_keyset_counter(&kid, 1).await.is_err(),
+                "derivations are BLOCKED at the choke point while deferred (alive-but-frozen)"
+            );
+        }
+        assert_eq!(target.total_balance().await.map(u64::from).unwrap_or(0), 0, "target unfunded while deferred");
+
+        // RECOVERY: relays back UP → a ≥k config read lands → the retry establishes + restores.
+        transport.set_up(1, true);
+        transport.set_up(2, true);
+        let attempt_ok = crate::boot::try_establish_counter(&store, &counter_db, &target)
+            .await
+            .expect("the ≥k establish attempt runs the full path");
+        assert!(attempt_ok, "≥k → the retry ESTABLISHES the counter");
+        assert!(counter_db.is_established(), "counter established after the ≥k read");
+
+        // FULL PATH: restore PULLED FUNDS into the target wallet.
+        let target_balance = target.total_balance().await.map(u64::from).unwrap_or(0);
+        assert!(
+            target_balance >= 256,
+            "restore pulled the relay-backed funds into the fresh wallet (got {target_balance})"
+        );
+
+        // SOLVENCY PASSES → the agent is LIVE: token read ≥k AND counter established → authoritative,
+        // and the restored wallet backs the counter (treasury <= restored balance).
+        assert!(
+            crate::boot::boot_solvency_authoritative(true, counter_db.is_established()),
+            "the full path makes the solvency read authoritative"
+        );
+        crate::boot::assert_wallet_backs_counter(target_balance, 256)
+            .expect("solvency PASSES — the restored wallet backs the counter (agent LIVE)");
+
+        mint.shutdown().await;
     }
 }

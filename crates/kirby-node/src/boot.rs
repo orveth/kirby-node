@@ -688,6 +688,195 @@ pub fn solvency_gate(authoritative: bool) -> SolvencyGate {
     }
 }
 
+/// The §2.8 boot solvency authority: authoritative ONLY when BOTH the token read reached quorum
+/// AND the NUT-13 counter was established. Pure so the T10 false-broke tooth exercises it directly.
+///
+/// ⚠️ The composition is the FIX: keying solvency on the TOKEN read ALONE (the pre-config-plane
+/// behavior) false-brokes a fresh box whose token read hit quorum but whose config read was
+/// below-quorum (counter deferred → restore-receive no-op'd → wallet transiently 0 → Assert →
+/// `assert_wallet_backs_counter(0, initial_sats)` bails, self-heal unreachable). ANDing in
+/// `counter_established` routes that reachable seam to ProceedNonAuthoritative instead. This does
+/// NOT blur die-when-broke — the runtime meter (meter.rs), not this boot-only check, owns genuine
+/// death (§2.8).
+pub fn boot_solvency_authoritative(nip60_read_authoritative: bool, counter_established: bool) -> bool {
+    nip60_read_authoritative && counter_established
+}
+
+/// The §2.3 write-back gate: publish the 17375 counter head ONLY when the config read reached
+/// read-quorum. Below-quorum → skip (never republish a potentially-thin head that would regress the
+/// true head — finding-2, propagating). Pure so the T1 tooth exercises it directly.
+pub fn should_publish_config(config_authoritative: bool) -> bool {
+    config_authoritative
+}
+
+/// Finding-3 (config-plane REVISION) retry completeness + R2-#2 token-plane convergence:
+/// [`try_establish_counter`] reports ESTABLISHED (`Ok(true)` — which STOPS the bounded retry loop)
+/// ONLY when ALL THREE hold: the counter was established, the TOKEN read reached quorum
+/// (`read_established` — R2-#2), AND the recovery-drain (`mint_unissued_quotes`) succeeded.
+///
+/// - drain-fail (finding-3): a Paid-but-unissued mint quote would be stranded until the next full
+///   boot; keep retrying (idempotent) until the drain succeeds.
+/// - token below-quorum (R2-#2): the counter may establish (state-3, a head present) on a
+///   below-quorum token read, but `read_established` then stays false → the rollover gate is blocked
+///   FOREVER if the loop exits. So convergence REQUIRES the token plane too — keep backing off until
+///   the token read also reaches ≥k (flipping `read_established`), then converge.
+///
+/// Establishment (fast_forward lift-up-only), the token read, and the drain
+/// (mint_unissued_quotes self-skips already-issued/0) are all IDEMPOTENT, so re-running is safe.
+/// Pure so the T14/T16 teeth exercise it directly.
+pub fn retry_established(counter_established: bool, read_established: bool, drain_ok: bool) -> bool {
+    counter_established && read_established && drain_ok
+}
+
+/// ROUND-4 K4 — the retry RESUME-SKIP decision: whether [`try_establish_counter`] should PROCEED to
+/// restore/drain/convergence, given whether the counter was ALREADY established and (only for a
+/// not-yet-established counter) the fresh establish decision.
+///
+/// ★ WHY: an ALREADY-established counter (RESUME, or a prior retry attempt established the floor) must
+/// NOT re-run the establish DECISION. `try_establish_counter` calls `establish_if_sound` with
+/// `resume=false`, so on a still-BELOW-quorum config read it would DEFER (state 2) and wrongly cause an
+/// early return — wedging a boot whose ONLY remaining gap is the token plane (the counter is already
+/// established; token quorum just needs to recover). An already-established counter proceeds
+/// UNCONDITIONALLY; only a not-yet-established counter is gated on its fresh establish decision.
+/// Pure so the T25 tooth exercises it directly.
+pub fn retry_should_proceed(already_established: bool, fresh_establish: bool) -> bool {
+    already_established || fresh_establish
+}
+
+/// ROUND-5 K3-corr — the `token_empty` signal the ESTABLISH decision consumes. It MUST be the RAW
+/// token-presence (`raw_events_empty`: were ANY 7375 events served, decodable or not), NOT
+/// `fetched_ids.is_empty()`.
+///
+/// ★ WHY (the regression K3 introduced): K3 correctly made `fetched_ids` decoded-ONLY (so an
+/// undecryptable id never seeds the deletion set). But `fetched_ids.is_empty()` then means "no
+/// DECODABLE events" — so an ALL-undecryptable self-authored 7375 read (a real, unreadable backup)
+/// looks empty. Feeding that as `token_empty=true` to `establish_if_sound` (with config_authoritative +
+/// token_authoritative) establishes-at-0 despite unread proofs → derive from index 0 = NUT-13 REUSE.
+/// `decode_ok=false` blocks recovery_complete but NOT the establish (which reads token_empty). The raw
+/// presence signal fixes it precisely: events-served-but-undecodable → NOT empty → defer; a genuinely
+/// empty read (no events served) → empty → establish-at-0 still works for a new agent. Both boot
+/// establish sites (healthy + retry) route through here so a single change regresses both. Pure so T28
+/// exercises it directly.
+pub fn token_plane_empty(read: &crate::nip60::ReconcileRead) -> bool {
+    read.raw_events_empty
+}
+
+/// ROUND-3 F1 / ROUND-4 K1-corr — the STRICT-DRAIN POST-STATE decision → `drain_ok` (an input to
+/// `recovery_complete`).
+///
+/// ★ WHY THE POST-STATE, NOT THE RETURN CODE: CDK's `mint_unissued_quotes` (issue/mod.rs:340)
+/// SWALLOWS per-quote check/mint errors (warn + continue) and returns `Ok(total_minted)`. So its
+/// `Ok(0)` is AMBIGUOUS — EITHER "no unissued quotes" OR "quotes existed but ALL failed (mint
+/// down)". The old `minted.is_some()` proxy treated the mint-down case as success → a premature
+/// `recovery_complete` while Paid-but-unissued quotes stayed stranded (never re-drained).
+///
+/// ★ ROUND-4 K1-corr — MINTABLE-ONLY, not a raw count: `get_unissued_mint_quotes` INCLUDES normal
+/// open UNPAID quotes (cdk returns bolt11 quotes with `amount_issued = 0`, unpaid included), so the
+/// ROUND-3 `len() == 0` over-strict rule NEVER cleared while any open unpaid charge existed → recovery
+/// wedged forever on a routine unpaid quote. The GENUINE signal is: after the drain, RE-CHECK each
+/// still-unissued quote's state and count only the MINTABLE-BUT-UNMINTED leftovers (a paid quote the
+/// mint failed to issue = the mint-down case). Confirmed-UNPAID zero-mintable quotes are IGNORED (a
+/// normal open charge must not wedge recovery); a per-quote CHECK ERROR is fail-closed. This function
+/// takes that already-reduced `mintable_after` count so it stays pure + trivially testable.
+///
+/// `mintable_after` (produced by [`mintable_remaining`] from the post-drain per-quote verdicts):
+/// - `Some(0)` — no MINTABLE-but-unminted quote remains → genuinely drained → `true`. Covers the
+///   finding-4 DURABILITY case (a new agent with nothing to drain) AND a normal open UNPAID quote
+///   (K1-corr — an unpaid charge must NOT wedge recovery) AND a successful drain.
+/// - `Some(n > 0)` — a paid/mintable-but-unminted leftover REMAINS (the mint-down case) → NOT
+///   drained → `false` → defer + the bounded retry re-drives + self-heals when the mint recovers.
+/// - `None` — a per-quote state check errored OR the post-state query itself FAILED → cannot confirm
+///   → `false` (fail-closed).
+///
+/// Pure so the T20 (post-state gate) / T18 (drain-of-nothing) / T19 (mint-down safe-defer) / T23
+/// (K1-corr unpaid-doesn't-wedge) teeth exercise the decision directly; BOTH boot drain sites route
+/// through [`strict_drain_unissued_after`] → [`mintable_remaining`] → this function.
+pub fn drain_complete(mintable_after: Option<usize>) -> bool {
+    matches!(mintable_after, Some(0))
+}
+
+/// The post-drain state of one still-unissued mint quote (ROUND-4 K1-corr), from RE-CHECKING it with
+/// the mint after `mint_unissued_quotes` ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteDrainState {
+    /// `amount_mintable > 0` — a PAID/mintable quote the mint failed to issue (the mint-down leftover).
+    /// A working mint would have drained it, so its presence means the drain is NOT complete.
+    MintableUnminted,
+    /// `amount_mintable == 0` and confirmed unpaid (or fully issued) — a NORMAL open charge. IGNORED:
+    /// a routine unpaid quote must NOT wedge recovery (the ROUND-3 `len==0` over-strict bug K1-corr fixes).
+    ConfirmedUnpaid,
+    /// The per-quote state RE-CHECK itself errored — we cannot confirm the quote is not mintable →
+    /// fail-closed (treat the whole drain as unconfirmable).
+    CheckErrored,
+}
+
+/// ROUND-4 K1-corr — fold the post-drain per-quote verdicts into the [`drain_complete`] input.
+/// Returns `Some(count of MintableUnminted)` when EVERY quote was cleanly classified (mintable or
+/// confirmed-unpaid), or `None` (fail-closed) if ANY quote's re-check errored. Confirmed-UNPAID quotes
+/// are NOT counted — a normal open unpaid charge must not wedge recovery. Pure so T23 exercises it.
+///
+/// RED-on-revert: count ALL still-unissued quotes (`Some(verdicts.len())`, the ROUND-3 `len==0`
+/// model) instead of only the mintable leftovers → a lone ConfirmedUnpaid quote yields `Some(1)` →
+/// `drain_complete` false → recovery wedges on a routine unpaid charge → T23 RED.
+pub fn mintable_remaining(verdicts: &[QuoteDrainState]) -> Option<usize> {
+    if verdicts.iter().any(|v| matches!(v, QuoteDrainState::CheckErrored)) {
+        return None; // a state check errored → cannot confirm the drain (fail-closed)
+    }
+    Some(
+        verdicts
+            .iter()
+            .filter(|v| matches!(v, QuoteDrainState::MintableUnminted))
+            .count(),
+    )
+}
+
+/// ROUND-3 F1 / ROUND-4 K1-corr — run the recovery-drain, then VERIFY THE POST-STATE (MINTABLE-only).
+/// Calls `mint_unissued_quotes` for its EFFECT (mint whatever is mintable) but IGNORES its
+/// degrade-prone return, then reads the durable still-unissued quotes for this wallet's mint/unit and
+/// RE-CHECKS each one's state with the mint, classifying it via [`QuoteDrainState`]. Returns the
+/// [`mintable_remaining`] fold (`None` if the post-state query itself failed → treated as not-drained
+/// by [`drain_complete`], fail-closed). Applied at BOTH boot drain sites (healthy path + bounded retry).
+async fn strict_drain_unissued_after(wallet: &cdk::wallet::Wallet) -> Option<usize> {
+    match wallet.mint_unissued_quotes().await {
+        Ok(minted) => {
+            if u64::from(minted) > 0 {
+                tracing::info!(minted = %minted, "recovery-drain: minted deferred Paid-but-unissued quotes");
+            }
+        }
+        Err(e) => {
+            // CDK already swallows per-quote errors; a top-level Err is rarer (e.g. the store read
+            // itself failed). Either way the POST-STATE re-check below is authoritative — we do not
+            // trust this return.
+            tracing::warn!(error = %e, "recovery-drain: mint_unissued_quotes errored; the post-state get_unissued re-check is authoritative");
+        }
+    }
+    // POST-STATE: `Wallet::get_unissued_mint_quotes` already retains only this mint_url + unit. A query
+    // failure is fail-closed (cannot confirm the drain).
+    let remaining = match wallet.get_unissued_mint_quotes().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "recovery-drain: post-state get_unissued_mint_quotes failed — cannot confirm the drain; DEFERRING recovery (fail-closed)");
+            return None;
+        }
+    };
+    // ★ K1-corr — MINTABLE-only: RE-CHECK each still-unissued quote with the mint. A paid/mintable
+    // leftover (mint-down) or a check error is fail-closed; a confirmed-unpaid zero-mintable quote (a
+    // normal open charge) is IGNORED so it does not wedge recovery.
+    let mut verdicts = Vec::with_capacity(remaining.len());
+    for quote in remaining {
+        let verdict = match wallet.check_mint_quote(&quote.id).await {
+            Ok(q) if u64::from(q.amount_mintable()) > 0 => QuoteDrainState::MintableUnminted,
+            Ok(_) => QuoteDrainState::ConfirmedUnpaid,
+            Err(e) => {
+                tracing::warn!(quote_id = %quote.id, error = %e, "recovery-drain: post-state re-check of an unissued quote errored — cannot confirm not-mintable; DEFERRING recovery (fail-closed)");
+                QuoteDrainState::CheckErrored
+            }
+        };
+        verdicts.push(verdict);
+    }
+    mintable_remaining(&verdicts)
+}
+
 /// The §7.2 wallet<->counter reconcile decision (brain-routstr R2-3/R2-5): the wallet
 /// must back every sat the metabolism counter believes it has, so the gateway never
 /// authorizes a think the wallet can't fund. The invariant is `>=`, NEVER `==` (R2-3:
@@ -706,6 +895,143 @@ pub fn assert_wallet_backs_counter(wallet_balance: u64, treasury_remaining: u64)
         );
     }
     Ok(())
+}
+
+/// ROUND-3 F3 — the bounded-retry SPAWN condition. Spawn the convergence retry whenever the token
+/// read was NON-authoritative (`!read_established`) OR recovery is INCOMPLETE (`!recovery_complete`),
+/// NOT only when the counter is unestablished (the pre-F3 `!is_established()`).
+///
+/// ★ WHY: an ALREADY-established boot (state-3: a non-empty config floor established) with a
+/// below-quorum TOKEN read would, under the old `!established` gate, NEVER spawn a retry →
+/// `read_established` stuck false → `recovery_complete` never opens → the rollover gate blocked the
+/// WHOLE run (new mutations not NIP-60-backed). Keying the spawn on read/recovery incompleteness
+/// covers that case: the retry re-reads the token plane and completes restore + drain + the latch.
+/// Pure so the T22 tooth exercises it directly.
+pub fn should_spawn_config_retry(read_established: bool, recovery_complete: bool) -> bool {
+    !read_established || !recovery_complete
+}
+
+/// The config-plane bounded read-retry schedule (§2.4). The base interval (attempt 0), the cap on
+/// a single interval, and the bounded attempt count — a BOUNDED, OBSERVABLE window that self-heals
+/// on a ≥k read and never wedges silent-forever.
+const CONFIG_RETRY_BASE: Duration = Duration::from_secs(2);
+const CONFIG_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(60);
+const CONFIG_RETRY_MAX_ATTEMPTS: u32 = 12;
+
+/// The config-plane retry BACKOFF (§2.4, T6): a BOUNDED exponential — `base` doubled each attempt,
+/// capped at `max`, and NEVER below `base`. ★ HARD money-safety requirement: the retry must BACK
+/// OFF, never SPIN — the runtime meter (meter.rs:565) debits the treasury every tick independent of
+/// the wallet, so a hot retry loop would raise measured CPU burn and hasten REAL death. A non-zero
+/// floor (`>= base`) is exactly what keeps a defer window from debiting faster than baseline idle.
+/// Pure + total so the T6 tooth exercises it directly.
+pub fn config_retry_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
+    let factor = 1u64.checked_shl(attempt.min(32)).unwrap_or(u64::MAX);
+    let secs = base.as_secs().saturating_mul(factor);
+    Duration::from_secs(secs).clamp(base, max)
+}
+
+/// ONE config-plane establishment attempt (§2.4): re-read both planes per-relay and, if sound,
+/// ESTABLISH the counter and re-drive the full recovery path. Returns `Ok(true)` ONLY when the
+/// attempt fully CONVERGED (established AND token ≥k AND drain OK — R2-#2), `Ok(false)` otherwise
+/// (the retry loop backs off and tries again).
+///
+/// ORDERING (§2.6b — establishment PRECEDES the re-driven restore-receive so it derives at correct
+/// indices): (1) read the CONFIG plane (`load_config_quorum`) AND the TOKEN plane
+/// (`reconcile_on_load_with_ids` — flips `read_established`, yields the restore candidates);
+/// (2) route the establish DECISION through the ONE guarded choke point
+/// ([`crate::nip60_counter::Nip60CounterDb::establish_if_sound`] — R2-#1: the SAME guard the initial
+/// open uses, so the retry can NOT establish-at-0 on config quorum alone), which seeds the true
+/// floor + fast-forwards the inner counter (gate-exempt) + flips the establishment latch when sound;
+/// (3) re-drive the restore-receive (now unblocked); (4) drain deferred Paid-but-unissued mint
+/// quotes via `mint_unissued_quotes`; (5) on full convergence, mark recovery COMPLETE (R2-#3 —
+/// opens the store's publish + rollover gates). A DEFER at step 2 (below-quorum config, or an
+/// empty floor with a present/below-quorum token plane) seeds/lifts NOTHING and returns `Ok(false)`.
+pub(crate) async fn try_establish_counter(
+    store: &crate::nip60::Nip60Store,
+    counter_db: &crate::nip60_counter::Nip60CounterDb,
+    wallet: &cdk::wallet::Wallet,
+) -> anyhow::Result<bool> {
+    let cr = store.load_config_quorum().await?;
+    // ★ R2-#1 + R2-#2: read the TOKEN plane BEFORE the establish decision, so (a) the SINGLE guarded
+    // establish choke point can consume the token plane's authority (finding-4, token-quorum-symmetric
+    // — the retry must NOT establish-at-0 on config quorum alone), and (b) the read flips the store's
+    // `read_established` (the rollover gate's token-quorum half) + yields the restore candidates. The
+    // READ derives nothing, so it is safe before establishment (§2.6b — only the IMPORT must follow).
+    let read = store.reconcile_on_load_with_ids().await?;
+    let token_authoritative = read.authoritative;
+    // §K3-corr (ROUND-5): token_empty for the ESTABLISH decision is the RAW presence signal (via
+    // `token_plane_empty`), NOT `fetched_ids.is_empty()`. Still ANDed with `token_authoritative` in
+    // the four-condition guard (quorum symmetry preserved — a below-quorum read defers regardless).
+    let token_empty = token_plane_empty(&read);
+    // §K3: fold the decode-degraded signal into restore_ok below (an undecryptable self-authored 7375
+    // event → the candidate set is incomplete → recovery must not converge).
+    let decode_ok = read.decode_ok;
+    // §category (d): the config floor read's HOLEY signal (a dropped/unparseable keyset). The retry
+    // reads only the config plane (no local read), so floor_complete here reflects the config source;
+    // the local source is guarded at the initial open (open_persistent_wallet).
+    let (floor, config_floor_dropped) =
+        cr.config.as_ref().map(|c| c.counters_by_id_checked()).unwrap_or_default();
+    let floor_complete = !config_floor_dropped;
+    // ★ ROUND-4 K4 — RESUME-SKIP: an already-established counter (RESUME, or a prior attempt) must NOT
+    // re-run the establish DECISION — with resume=false + a still-below-quorum config it would DEFER
+    // (state 2) and wrongly early-return, wedging a boot whose only gap is the token plane. Only a
+    // NOT-yet-established counter routes the decision through the ONE guarded choke point
+    // (`establish_if_sound` — R2-#1, the SAME guard the initial open uses; establish-at-0 fires only
+    // when the token plane is quorum-confirmed empty, and a holey floor defers — category (d)).
+    let already_established = counter_db.is_established();
+    let fresh_establish = if already_established {
+        false // skip the decision entirely (K4) — proceed straight to restore/drain/convergence
+    } else {
+        counter_db
+            .establish_if_sound(
+                floor,
+                false,
+                cr.config_authoritative,
+                token_authoritative,
+                token_empty,
+                floor_complete,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("config-plane retry: establish decision: {e}"))?
+    };
+    if !retry_should_proceed(already_established, fresh_establish) {
+        return Ok(false); // below quorum, unproven-empty token plane, or holey floor — back off and retry
+    }
+    // Re-drive the restore-receive now that derivations are unblocked (§2.6b). Degrades internally,
+    // but returns an EXPLICIT outcome (ROUND-3 F2): `restore_ok` is a GENUINE success signal (incl. a
+    // genuinely-empty restore), NEVER a degraded-to-0 proxy — a DEGRADED restore must NOT converge.
+    // §K3: AND-in `decode_ok` — an undecryptable self-authored backup makes the candidate set
+    // incomplete, so recovery must not converge (the real backup is preserved, retry re-drives).
+    let restore_outcome =
+        crate::nip60_reconcile::restore_from_relay_backup(Ok(read.candidates), wallet).await;
+    let restore_ok = restore_outcome.is_ok() && decode_ok;
+    // Drain any deferred Paid-but-unissued mint quotes (recovery-mint through the now-open choke
+    // point; safe to call blindly — re-checks with the mint, self-skips amount_mintable()==0).
+    // §finding-3 RETRY COMPLETENESS + ROUND-3 F1: the drain is part of recovery, and `drain_ok` is
+    // the POST-STATE (get_unissued EMPTY-after), NOT the degrade-prone `mint_unissued_quotes` return.
+    // On a not-drained POST-STATE (mint-down Ok(0), quotes remain) we do NOT report converged so the
+    // bounded loop keeps backing off + re-drives (idempotent) until the quotes are genuinely drained.
+    let unissued_after = strict_drain_unissued_after(wallet).await;
+    let drain_ok = drain_complete(unissued_after);
+    // ★★★ INVARIANT (ROUND-3, do NOT weaken): EVERY input to `recovery_complete` MUST be a
+    // GENUINE-success signal — an explicit outcome (`restore_ok` via `RestoreOutcome`) or a verified
+    // POST-STATE (`drain_ok` via `get_unissued`; `read_established` via the token quorum) — NEVER a
+    // library return code that degrades failure to a success-looking/benign value. CDK's
+    // `mint_unissued_quotes` `Ok(0)` and restore's adopt-nothing-`0` BOTH degrade failure to benign;
+    // this gate has been re-opened 3× by that exact trap. A future maintainer adding a recovery
+    // component MUST feed a genuine signal here, not a return code.
+    //
+    // R2-#2 + F1 + F2 convergence: established AND token ≥k (`token_authoritative` ==
+    // `read_established`) AND the POST-STATE drain is clean AND the restore genuinely succeeded. A
+    // below-quorum token read, an un-drained post-state, or a degraded restore must NOT converge
+    // (else `recovery_complete` opens against a not-fully-recovered wallet → empty-rollover del-chains
+    // the real backup). On FULL convergence, mark recovery COMPLETE (opens PUBLISH + ROLLOVER).
+    let converged =
+        retry_established(counter_db.is_established(), token_authoritative, drain_ok) && restore_ok;
+    if converged {
+        counter_db.mark_recovery_complete();
+    }
+    Ok(converged)
 }
 
 /// Read the AUTHORITATIVE `treasury_remaining` before wiring the brain wallet to it, so
@@ -788,11 +1114,21 @@ async fn build_routstr_brain(
     // counter mirror is SEEDED with the floor before any publish — a later publish can then never
     // regress the counter below what the relay recorded (the no-regress MONEY-MUST). No relays →
     // no store, empty floor, the wallet opens exactly as a non-NIP-60 agent.
-    let nip60_store = if nip60.relays.is_empty() {
+    //
+    // ★ config-plane REVISION (structural prerequisite): the store is built OWNED + MUTABLE here (NOT
+    // yet `Arc`-wrapped). The token-plane READ (7375, quorum) is SPLIT from the token IMPORT and run
+    // EARLY (below), so the establish decision (finding 4) can consume the token plane's authority;
+    // and after the wallet opens we inject the counter-establishment latch into the store (findings
+    // 1+2) before `Arc`-wrapping + sharing it with the flusher.
+    let mut nip60_store = if nip60.relays.is_empty() {
         None
     } else {
         let event_key = crate::nip60_key::derive_nip60_event_key(&seed);
-        let (relays, write_k, read_k, durability) = nip60.resolve(fleet_relay);
+        // §2.8b: FAIL-CLOSED on a quorum-intersection violation (read_k + write_k > n) BEFORE
+        // connecting — a config that can't guarantee read/write overlap must never boot the
+        // establishment machinery into a state where fresh-box establish-at-0 (§2.2 state 4) is
+        // unsound (index reuse via a weak write quorum). Default majority both sides satisfies it.
+        let (relays, write_k, read_k, durability) = nip60.resolve_checked(fleet_relay)?;
         if let Some(warning) = durability.warning() {
             tracing::warn!(nip60_durability = %warning, "NIP-60 wallet backup: sub-quorum durability");
         }
@@ -810,9 +1146,9 @@ async fn build_routstr_brain(
             tier = ?durability,
             "NIP-60 wallet backup relay posture"
         );
-        // Arc so the boot-time reconcile/publish AND the Cut A (#115) background backup flusher
-        // can share ONE store (all its methods take `&self`).
-        Some(Arc::new(
+        // Owned (Arc-wrapped after the latch injection below); the Cut A (#115) background backup
+        // flusher shares the store once it is `Arc`-wrapped (all its methods take `&self`).
+        Some(
             crate::nip60::Nip60Store::connect(
                 &event_key,
                 &relays,
@@ -821,26 +1157,100 @@ async fn build_routstr_brain(
                 brain.effective_mint_allowlist(),
             )
             .await?,
-        ))
+        )
     };
 
-    // The counter floor loaded from the 17375 head (empty with no store / a fresh wallet).
-    let initial_counters = match &nip60_store {
-        Some(store) => store
-            .load_config()
-            .await?
-            .map(|config| config.counters_by_id())
-            .unwrap_or_default(),
-        None => std::collections::HashMap::new(),
-    };
+    // ★ config-plane REVISION — BOTH plane reads run BEFORE the wallet opens (structural
+    // prerequisite): the CONFIG read (17375 floor + quorum, §2.1) AND the TOKEN read (7375 proofs +
+    // quorum) so the establish decision (finding 4) can consume both planes' authority. The token
+    // READ is split from the token IMPORT: the READ (`ReconcileRead` — served/fetched_ids/authoritative)
+    // does NOT need the wallet; only the IMPORT (`restore_from_relay_backup` → receive_proofs) does,
+    // and it stays AFTER the wallet opens (step 3). Both reads reuse the Cut A per-relay primitive
+    // (`fetch_events_per_relay`) so they are quorum-aware.
+    //   config_authoritative — the 17375 floor read reached read-quorum (drives states 2/3/4).
+    //   token_authoritative  — the 7375 token read reached read-quorum (served >= read_k).
+    //   token_empty          — the token read fetched NO token events (fetched_ids empty).
+    // establish-at-0 (state 4) fires ONLY when config_authoritative AND config-head-absent AND
+    // token_authoritative AND token_empty (finding 4, token-quorum-symmetric). With no store (NIP-60
+    // off) the local wallet is authoritative by definition and genuinely-new (all true).
+    let initial_counters;
+    let config_authoritative;
+    let token_authoritative;
+    let token_empty;
+    // §category (d) HOLEY-FLOOR: whether the config floor read dropped any (unparseable-hex) keyset —
+    // threaded into `open_persistent_wallet` so a holey config floor defers establishment.
+    let config_floor_dropped;
+    // The early token READ result, carried to the IMPORT (step 3) so the read is not repeated: the
+    // candidates (to import), fetched_ids (flusher live-id seed), and quorum metadata (solvency).
+    let token_read: Option<anyhow::Result<crate::nip60::ReconcileRead>>;
+    match &nip60_store {
+        Some(store) => {
+            let cr = store.load_config_quorum().await?;
+            let (counters, dropped) =
+                cr.config.as_ref().map(|c| c.counters_by_id_checked()).unwrap_or_default();
+            initial_counters = counters;
+            config_floor_dropped = dropped;
+            config_authoritative = cr.config_authoritative;
+            // EARLY token read (quorum-aware). Errors degrade to below-quorum (defer establish-at-0);
+            // the read verdict flips the store's `read_established` (unblocks the rollover gate later).
+            let read = store.reconcile_on_load_with_ids().await;
+            match &read {
+                Ok(r) => {
+                    token_authoritative = r.authoritative;
+                    // §K3-corr (ROUND-5): RAW presence (via `token_plane_empty`), NOT
+                    // `fetched_ids.is_empty()` (decoded-only post-K3) — an all-undecryptable read holds
+                    // a real unreadable backup and must NOT establish-at-0 (index-0 = NUT-13 reuse).
+                    // Still gated by the separate `token_authoritative` term (quorum symmetry intact).
+                    token_empty = token_plane_empty(r);
+                }
+                Err(_) => {
+                    // A failed token read cannot confirm empty → treat as below-quorum: DEFER
+                    // establish-at-0 (never establish against a plane we could not read).
+                    token_authoritative = false;
+                    token_empty = false;
+                }
+            }
+            token_read = Some(read);
+        }
+        None => {
+            initial_counters = std::collections::HashMap::new();
+            config_floor_dropped = false;
+            config_authoritative = true;
+            token_authoritative = true;
+            token_empty = true;
+            token_read = None;
+        }
+    }
 
     // 1) Open the PERSISTENT wallet (file store + persisted seed, §7.1; funded out-of-band, §11),
     //    with the counter mirror SEEDED by the loaded floor — this seed PRECEDES the config publish
-    //    in step 4 (the no-regress ordering).
-    let (wallet, counter_db) =
-        crate::mint_rig::open_persistent_wallet(&brain.mint_url, db_path, seed, initial_counters)
-            .await?;
+    //    in step 4 (the no-regress ordering). `config_authoritative` gates the four-state
+    //    establishment (§2.2): on a fresh box a below-quorum read leaves the counter DEFERRED
+    //    (latch false → choke-point blocks derivations until the bounded retry lands a ≥k read).
+    let (wallet, counter_db) = crate::mint_rig::open_persistent_wallet(
+        &brain.mint_url,
+        db_path,
+        seed,
+        initial_counters,
+        config_authoritative,
+        token_authoritative,
+        token_empty,
+        config_floor_dropped,
+    )
+    .await?;
     let ecash = CdkEcash::new(wallet.clone());
+
+    // ★ config-plane REVISION (findings 1+2) + R2-#3 (TWO-LATCH): SHARE the RECOVERY-COMPLETE latch
+    // INTO the store BEFORE it is `Arc`-wrapped + handed to the flusher, so the choke-point funnel
+    // (`publish_config`) and the rollover gate read the SAME recovery state. The store's write gates
+    // are RE-KEYED off the derivation-establishment latch onto recovery-completion: publish/rollover
+    // open ONLY after the wallet is fully restored (restore AND drain both succeed), marked on the
+    // healthy path (below) or by the bounded retry — never against a transiently-empty wallet.
+    if let Some(store) = &mut nip60_store {
+        store.set_recovery_complete(counter_db.recovery_complete_handle());
+    }
+    // Freeze the store into an `Arc` now that the latch is wired (all further uses share this Arc).
+    let nip60_store = nip60_store.map(Arc::new);
 
     // 2) Recover incomplete cdk sagas FIRST (R2-4), BEFORE measuring the balance: a prior
     //    crash/timeout mid send/receive can strand reserved/pending proofs or leave a
@@ -875,28 +1285,44 @@ async fn build_routstr_brain(
     // so the rollover gate (condition b) blocks a potentially-shrunken backup publish until a
     // >=k read re-establishes authority. Default true when NIP-60 is not configured (no relay
     // reads → local wallet is authoritative by definition).
+    // ★ config-plane REVISION: the token READ already ran EARLY (before the wallet opened); here we
+    // consume its result to drive the IMPORT. The IMPORT (`restore_from_relay_backup` →
+    // receive_proofs) needs the wallet and stays here (step 3, after saga recovery), AND is
+    // implicitly gated by `counter_established`: during defer the derivation trips the choke point
+    // and the restore no-ops (degrades log-and-continue), re-driven by the bounded retry on a ≥k read.
     let nip60_read_authoritative;
     let nip60_read_info;
-    if let Some(store) = &nip60_store {
-        let reconciled = store.reconcile_on_load_with_ids().await;
-        let candidates = match reconciled {
-            Ok(read) => {
-                nip60_initial_live_ids = read.fetched_ids.clone();
-                nip60_read_authoritative = read.authoritative;
-                nip60_read_info = Some((read.served, read.total, read.read_k));
-                Ok(read.candidates)
-            }
-            Err(e) => {
-                nip60_read_authoritative = false;
-                nip60_read_info = None;
-                Err(e)
-            }
-        };
-        let _restored =
-            crate::nip60_reconcile::restore_from_relay_backup(candidates, wallet.as_ref()).await;
-    } else {
-        nip60_read_authoritative = true;
-        nip60_read_info = None;
+    // ★ ROUND-3 F2: capture the EXPLICIT restore outcome (a GENUINE success signal, incl. a
+    // genuinely-empty restore) — NOT a degraded-to-0 proxy — so the recovery_complete gate (step 4b)
+    // can require `restore_ok` and a FAILED restore stays deferred (the real backup is preserved).
+    let nip60_restore_ok;
+    match token_read {
+        Some(Ok(read)) => {
+            nip60_initial_live_ids = read.fetched_ids.clone();
+            nip60_read_authoritative = read.authoritative;
+            nip60_read_info = Some((read.served, read.total, read.read_k));
+            // §K3: capture the decode-degraded signal BEFORE moving `candidates`. An undecryptable
+            // self-authored 7375 event makes the candidate set incomplete → force restore_ok=false so
+            // recovery_complete stays closed (the real backup is preserved; the retry re-drives).
+            let decode_ok = read.decode_ok;
+            let restore_outcome =
+                crate::nip60_reconcile::restore_from_relay_backup(Ok(read.candidates), wallet.as_ref())
+                    .await;
+            nip60_restore_ok = restore_outcome.is_ok() && decode_ok;
+        }
+        Some(Err(e)) => {
+            nip60_read_authoritative = false;
+            nip60_read_info = None;
+            let restore_outcome =
+                crate::nip60_reconcile::restore_from_relay_backup(Err(e), wallet.as_ref()).await;
+            nip60_restore_ok = restore_outcome.is_ok(); // Degraded → false
+        }
+        None => {
+            // NIP-60 off: no relay restore to run → trivially "recovered" (nothing to gate).
+            nip60_read_authoritative = true;
+            nip60_read_info = None;
+            nip60_restore_ok = true;
+        }
     }
 
     // 4) Solvency check: the wallet must back every sat the counter believes it has. REFUSE
@@ -907,7 +1333,17 @@ async fn build_routstr_brain(
     //    balance as proven insolvency — proceed non-authoritatively (the rollover gate holds
     //    until >=k re-establishes; die-when-broke fires on a real spend shortfall).
     let wallet_balance = wallet.total_balance().await.map(u64::from).unwrap_or(0);
-    match solvency_gate(nip60_read_authoritative) {
+    // §2.8 solvency posture: authoritative ONLY when BOTH the token read reached quorum AND the
+    // NUT-13 counter was established (config-plane). A restore-deferred fresh box (counter NOT
+    // established) has a transiently-0 wallet (§2.6b: the restore-receive tripped the choke-point
+    // gate and no-op'd), so treating it as authoritative would false-broke bail even when the token
+    // read hit quorum — the reachable failover false-death seam (§2.8, T10). Deferring the assert
+    // does NOT blur die-when-broke: that lives in the runtime METER (meter.rs), not this boot-only
+    // refuse-to-start check; a genuinely-broke agent still dies at runtime when the treasury hits 0.
+    let counter_established = counter_db.is_established();
+    let solvency_authoritative =
+        boot_solvency_authoritative(nip60_read_authoritative, counter_established);
+    match solvency_gate(solvency_authoritative) {
         SolvencyGate::Assert => assert_wallet_backs_counter(wallet_balance, treasury_remaining)?,
         SolvencyGate::ProceedNonAuthoritative => {
             let (served, total, read_k) = nip60_read_info.unwrap_or((0, 0, 0));
@@ -915,13 +1351,64 @@ async fn build_routstr_brain(
                 served,
                 total,
                 read_k,
+                counter_established,
                 wallet_balance,
                 treasury_remaining,
-                "boot: restore below read-quorum ({served}/{total}, need {read_k}); \
-                 wallet {wallet_balance} vs counter {treasury_remaining} is a LOWER BOUND, \
-                 NOT treating as insolvent — proceeding non-authoritative, scheduling read-retry",
+                "boot: restore below read-quorum ({served}/{total}, need {read_k}) OR counter \
+                 deferred (established={counter_established}); wallet {wallet_balance} vs counter \
+                 {treasury_remaining} is a LOWER BOUND, NOT treating as insolvent — proceeding \
+                 non-authoritative, scheduling read-retry (stalled: below-quorum config, awaiting k relays)",
             );
-            // boot PROCEEDS; read_established stays false => rollover gate (§4) holds.
+            // boot PROCEEDS; read_established / counter_established stay false => rollover gate (§4)
+            // + choke-point gate (§2.2) hold; the bounded retry re-establishes on a ≥k read.
+        }
+    }
+
+    // 4b) ★ R2-#3 (TWO-LATCH) — open the RECOVERY-COMPLETE latch (which gates the store's PUBLISH +
+    //    ROLLOVER write paths) on the HEALTHY-boot path, ONLY after restore (step 3) AND the
+    //    recovery-drain below both complete. On a DEFERRED fresh-box boot the counter is NOT
+    //    established (the wallet is transiently-empty and the choke point is closed), so we do NOT
+    //    open the gate here — the bounded retry (§2.4) marks recovery complete after IT completes
+    //    restore+drain. Scoped to a configured NIP-60 store (the only place publish/rollover — and
+    //    thus recovery_complete — matter); with no store there is nothing to gate.
+    //
+    //    The drain (`mint_unissued_quotes`) is the recovery half symmetric to the retry path
+    //    (finding-3): it recovers Paid-but-unissued mint quotes through the now-open choke point,
+    //    idempotent + self-skipping when there is nothing to mint (a cheap `Ok(0)` on a normal
+    //    resume). On a drain FAILURE recovery_complete stays false → the 17375 config publish (step
+    //    5) + the flusher's rollover stay deferred THIS run (money-safe: never publish/rollover
+    //    against a not-fully-recovered wallet); the next boot re-drives. Placed AFTER the solvency
+    //    check so that check sees the same balance as before (no behavior change to §7.2).
+    if nip60_store.is_some() && counter_db.is_established() {
+        // ROUND-3 F1: `drain_ok` is the POST-STATE (get_unissued EMPTY-after), NOT the degrade-prone
+        // `mint_unissued_quotes` return. A new agent with no quotes → empty → true; quotes-remain
+        // (mint-down Ok(0)) → non-empty → false → defer + the bounded retry self-heals.
+        let unissued_after = strict_drain_unissued_after(wallet.as_ref()).await;
+        let drain_ok = drain_complete(unissued_after);
+        // ★★★ INVARIANT (ROUND-3, do NOT weaken): EVERY input to `recovery_complete` MUST be a
+        // GENUINE-success signal — an explicit outcome (`restore_ok` via `RestoreOutcome`) or a
+        // verified POST-STATE (`drain_ok` via `get_unissued`; `read_established`/`nip60_read_authoritative`
+        // via the token quorum) — NEVER a library return code that degrades failure to a
+        // success-looking/benign value. CDK's `mint_unissued_quotes` `Ok(0)` and restore's
+        // adopt-nothing-`0` BOTH degrade failure to benign; this gate has been re-opened 3× by that
+        // exact trap. A future maintainer adding a recovery component MUST feed a genuine signal here.
+        //
+        // F2 unified precondition: recovery_complete = `restore_ok AND drain_ok AND read_established`
+        // (all genuine post-state, no degraded-0). Any false → recovery stays CLOSED → the 17375
+        // config publish (step 5) + the flusher rollover DEFER this run (money-safe: never
+        // publish/rollover against a not-fully-recovered wallet); the bounded retry (step 5b) re-drives.
+        if drain_ok && nip60_restore_ok && nip60_read_authoritative {
+            counter_db.mark_recovery_complete();
+        } else {
+            tracing::warn!(
+                restore_ok = nip60_restore_ok,
+                drain_ok,
+                read_established = nip60_read_authoritative,
+                "boot: recovery NOT complete on the healthy path (restore_ok AND drain_ok AND \
+                 read_established required, all genuine post-state) — recovery_complete NOT set, so \
+                 the 17375 config publish + the flusher rollover stay deferred this run (money-safe: \
+                 no backup against a not-fully-recovered wallet); the bounded retry re-drives (idempotent)"
+            );
         }
     }
 
@@ -930,15 +1417,88 @@ async fn build_routstr_brain(
     //    counter is >= the loaded floor AND reflects any proofs restored this boot (no regression).
     //    Best-effort: a failure is logged, NOT fatal (the mint remains truth; the next counter
     //    change re-publishes).
+    //    §2.3 WRITE-BACK GATE: publish the counter head ONLY when the config read was authoritative
+    //    (≥k). A below-quorum config read may have loaded a THIN floor; republishing it as a NEW
+    //    17375 head would REGRESS the true head (a lower head on the reached relays) — poisoning
+    //    every future boot (finding-2, propagating). Below-quorum → skip the publish, keep the
+    //    existing head, warn; the bounded retry re-publishes once a ≥k read re-establishes.
     if let Some(store) = &nip60_store {
-        if let Err(e) = store
-            .publish_wallet_config(counter_db.keyset_counters(), vec![brain.mint_url.clone()])
-            .await
-        {
+        if should_publish_config(config_authoritative) {
+            if let Err(e) = store
+                .publish_wallet_config(counter_db.keyset_counters(), vec![brain.mint_url.clone()])
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "NIP-60 boot config publish failed (advisory; the seeded floor re-publishes on the next change)"
+                );
+            }
+        } else {
             tracing::warn!(
-                error = %e,
-                "NIP-60 boot config publish failed (advisory; the seeded floor re-publishes on the next change)"
+                "NIP-60 boot config publish SKIPPED: below config read-quorum — refusing to \
+                 republish a potentially-thin counter head (never regress the true head, §2.3); \
+                 the bounded retry re-publishes once a ≥k read re-establishes authority"
             );
+        }
+    }
+
+    // §2.4 BOUNDED READ-RETRY: spawn a bounded backoff task that re-reads BOTH planes per-relay and,
+    // on a ≥k read, establishes the floor + re-drives restore + drains deferred mints + marks
+    // recovery complete (`try_establish_counter`). Boot PROCEEDS (the agent survives on its existing
+    // balance; the runtime meter still owns die-when-broke) — self-healing on ≥k. On bound-expiry it
+    // proceeds on existing balance, the stall stays visible (never a silent wedge).
+    //
+    // ★ ROUND-3 F3 — SPAWN CONDITION: spawn whenever the token read was NON-authoritative OR recovery
+    // is INCOMPLETE, NOT only when the counter is unestablished. An ALREADY-established boot (state-3:
+    // a non-empty config floor, counter established) with a below-quorum TOKEN read would otherwise
+    // NEVER re-read → `read_established` stuck false → `recovery_complete` never opens → the rollover
+    // gate is blocked the WHOLE run (new mutations not NIP-60-backed). Retrying on incomplete-recovery
+    // re-reads the token plane and completes the read/restore/drain/latch when relays recover.
+    if let Some(store) = &nip60_store {
+        if should_spawn_config_retry(nip60_read_authoritative, counter_db.is_recovery_complete()) {
+            tracing::warn!(
+                read_established = nip60_read_authoritative,
+                established = counter_db.is_established(),
+                recovery_complete = counter_db.is_recovery_complete(),
+                "stalled: config/token below quorum OR recovery incomplete — spawning the bounded \
+                 config-plane read-retry (§2.4, F3); derivations/rollover remain gated until a ≥k read \
+                 completes restore + drain (recovery_complete)"
+            );
+            let store = store.clone();
+            let counter_db_retry = counter_db.clone();
+            let wallet_retry = wallet.clone();
+            tokio::spawn(async move {
+                for attempt in 0..CONFIG_RETRY_MAX_ATTEMPTS {
+                    let delay =
+                        config_retry_backoff(attempt, CONFIG_RETRY_BASE, CONFIG_RETRY_MAX_INTERVAL);
+                    tokio::time::sleep(delay).await;
+                    match try_establish_counter(&store, &counter_db_retry, &wallet_retry).await {
+                        Ok(true) => {
+                            tracing::info!(
+                                attempt,
+                                "config-plane retry: counter ESTABLISHED on a ≥k read — derivations \
+                                 unblocked, floor fast-forwarded, restore re-driven, deferred mints drained"
+                            );
+                            return;
+                        }
+                        Ok(false) => tracing::warn!(
+                            attempt,
+                            "stalled: below-quorum config, awaiting k relays (retry attempt {attempt} \
+                             still below quorum; backing off)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            attempt,
+                            error = %e,
+                            "config-plane retry attempt errored (will back off and retry)"
+                        ),
+                    }
+                }
+                tracing::warn!(
+                    "config-plane retry: bound expired still below quorum — proceeding on the \
+                     existing balance, minting/derivation stays BLOCKED (money-safe), the stall \
+                     stays visible; re-establishes on the next boot that reaches ≥k"
+                );
+            });
         }
     }
 
@@ -1634,5 +2194,232 @@ mod boot_saga_recovery_tests {
         let ok = async { Ok::<(), anyhow::Error>(()) };
         let out = recover_sagas_within(ok, Duration::from_secs(30)).await;
         assert!(out.is_ok(), "a clean recovery passes through unchanged");
+    }
+}
+
+#[cfg(test)]
+mod config_plane_tests {
+    use super::*;
+
+    // ---- T1 (config-plane §2.3): the write-back gate skips the config publish below read-quorum. -
+    //
+    // A below-quorum config read may have loaded a THIN 17375 floor; republishing it as a NEW head
+    // would REGRESS the true head on the reached relays (finding-2, propagating). The gate is wired
+    // through `should_publish_config`, so boot only calls `publish_wallet_config` when it returns
+    // true.
+    //
+    // RED-on-revert: change `should_publish_config` to always return `true` → boot publishes the
+    // thin head below quorum → this `assert!(!...)` fails.
+    #[test]
+    fn t1_write_back_gate_skips_publish_below_config_quorum() {
+        assert!(
+            !should_publish_config(false),
+            "below config read-quorum → the 17375 counter head is NOT republished (never regress \
+             the true head, §2.3)"
+        );
+        assert!(
+            should_publish_config(true),
+            "an authoritative (≥k) config read → the head IS republished as before"
+        );
+    }
+
+    // ---- T14 (config-plane REVISION, finding-3): the retry is not "converged" until the drain
+    // succeeds. `try_establish_counter` reports converged (`Ok(true)`, which STOPS the bounded loop)
+    // ONLY when the counter established AND the recovery-drain (`mint_unissued_quotes`) succeeded (with
+    // the token read ≥k — held true here to isolate the drain dimension). A drain FAILURE returns
+    // false so the loop keeps backing off and re-drives until the drain succeeds — a Paid-but-unissued
+    // quote must not be stranded until the next full boot.
+    //
+    // RED-on-revert: drop `&& drain_ok` from `retry_established`, or make `try_establish_counter`
+    // return `Ok(true)` unconditionally on drain-fail → `retry_established(true, true, false)` becomes
+    // true → the loop STOPS on a drain failure → this `assert!(!...)` fails.
+    #[test]
+    fn t14_retry_not_established_until_drain_succeeds() {
+        // Converged: counter established, token read ≥k, AND the drain succeeded → converge (stop).
+        assert!(
+            retry_established(true, true, true),
+            "established + token ≥k + drain OK → the retry converges (Ok(true), loop stops)"
+        );
+        // ★ Drain FAILED (even though the counter established + token ≥k): NOT converged → keep retrying.
+        assert!(
+            !retry_established(true, true, false),
+            "counter established + token ≥k but the drain FAILED → NOT converged → the bounded loop \
+             keeps backing off + re-drives (drop `&& drain_ok` → this is true → RED)"
+        );
+        // Counter not established → never converged, regardless of the other dimensions.
+        assert!(
+            !retry_established(false, true, true),
+            "counter not established → never converged"
+        );
+        assert!(!retry_established(false, false, false), "none → not converged");
+    }
+
+    // ---- T16 (config-plane ROUND-2, R2-#2): the retry does not CONVERGE (does not exit the loop)
+    // until the TOKEN read reaches ≥k (`read_established`). The counter may establish (state-3, a head
+    // present) on a below-quorum token read, but then `read_established` stays false → the rollover
+    // gate is blocked FOREVER if the loop exits. So convergence REQUIRES the token plane too: keep
+    // retrying (backoff) until the token read also reaches ≥k.
+    //
+    // RED-on-revert: drop the `read_established` term from `retry_established` (convergence ignores the
+    // token plane) → `retry_established(true, false, true)` becomes true → the loop EXITS Ok(true) with
+    // `read_established` stuck false → rollover blocked forever → this `assert!(!...)` fails.
+    #[test]
+    fn t16_retry_convergence_requires_the_token_plane() {
+        // Established + drain OK but the TOKEN read is BELOW quorum → NOT converged → keep retrying
+        // (so `read_established` can flip on a later ≥k read and the rollover gate can eventually open).
+        assert!(
+            !retry_established(true, false, true),
+            "established + drain OK but token BELOW quorum → NOT converged → the loop keeps retrying \
+             (drop the read_established term → this is true → loop exits rollover-blocked → RED)"
+        );
+        // All three (established + token ≥k + drain OK) → converge.
+        assert!(
+            retry_established(true, true, true),
+            "established + token ≥k + drain OK → converge"
+        );
+    }
+
+    // ---- T23 (config-plane ROUND-4, K1-corr — MINTABLE-only drain; unpaid-doesn't-wedge): a NORMAL
+    // open UNPAID quote present + NO paid/mintable-but-unminted leftover → the drain is COMPLETE
+    // (drain_ok=TRUE, recovery OPENS). The ROUND-3 `len==0` rule counted the unpaid quote and wedged
+    // recovery forever. `mintable_remaining` counts ONLY the mintable-but-unminted leftovers (the
+    // mint-down case) and IGNORES confirmed-unpaid quotes; a per-quote check error is fail-closed.
+    //
+    // RED-on-revert: change `mintable_remaining` to count ALL still-unissued quotes (`Some(verdicts.len())`,
+    // the ROUND-3 len==0 model) → a lone ConfirmedUnpaid quote yields Some(1) → `drain_complete` false
+    // → the "unpaid doesn't wedge" assert fails → RED (recovery wedges on a routine unpaid charge).
+    #[test]
+    fn t23_unpaid_quote_does_not_wedge_the_drain() {
+        use QuoteDrainState::*;
+        // A normal open UNPAID quote, nothing mintable → mintable_remaining = Some(0) → drained → OPEN.
+        assert_eq!(mintable_remaining(&[ConfirmedUnpaid]), Some(0), "an unpaid quote is IGNORED");
+        assert!(
+            drain_complete(mintable_remaining(&[ConfirmedUnpaid])),
+            "K1-corr: a normal open UNPAID quote must NOT wedge recovery (revert to len==0 → Some(1) → RED)"
+        );
+        // Several unpaid quotes + no mintable leftover → still drained.
+        assert!(
+            drain_complete(mintable_remaining(&[ConfirmedUnpaid, ConfirmedUnpaid])),
+            "multiple unpaid charges still do not wedge recovery"
+        );
+        // A paid/mintable-but-unminted leftover (mint-down) → NOT drained → defer.
+        assert_eq!(mintable_remaining(&[MintableUnminted]), Some(1), "a mintable leftover counts");
+        assert!(
+            !drain_complete(mintable_remaining(&[ConfirmedUnpaid, MintableUnminted])),
+            "a paid/mintable-but-unminted leftover (mint-down) still DEFERS recovery"
+        );
+        // A per-quote check error → None → fail-closed defer.
+        assert_eq!(mintable_remaining(&[CheckErrored]), None, "a check error is fail-closed (None)");
+        assert!(
+            !drain_complete(mintable_remaining(&[ConfirmedUnpaid, CheckErrored])),
+            "a per-quote check error defers recovery (fail-closed)"
+        );
+    }
+
+    // ---- T25 (config-plane ROUND-4, K4 — retry RESUME-SKIP): an ALREADY-established counter (RESUME,
+    // or a prior attempt established the floor) whose only remaining gap is the token plane must
+    // PROCEED to restore/drain/convergence on the retry — NOT early-return on a fresh establish
+    // decision that (with resume=false + a still-below-quorum config) would DEFER. So recovery can
+    // COMPLETE once token quorum recovers. `try_establish_counter` routes this through
+    // `retry_should_proceed(already_established, fresh_establish)`.
+    //
+    // RED-on-revert: revert to gating on the fresh establish decision ALONE (ignore already_established,
+    // i.e. `retry_should_proceed = fresh_establish`) → for an already-established counter whose fresh
+    // decision defers, `retry_should_proceed(true, false)` becomes false → early return → recovery
+    // NEVER completes → the SEAM assert fails → RED.
+    #[test]
+    fn t25_retry_resume_skip_proceeds_when_already_established() {
+        // THE SEAM: already established, but a fresh establish decision would DEFER (below-quorum
+        // config on resume=false). The retry MUST still proceed (only the token plane needs to heal).
+        assert!(
+            retry_should_proceed(true, false),
+            "already-established + fresh-decision-would-defer → PROCEED (revert to `fresh_establish` alone → false → RED)"
+        );
+        // Not yet established: proceed iff the fresh decision established.
+        assert!(retry_should_proceed(false, true), "not established + fresh establish → proceed");
+        assert!(!retry_should_proceed(false, false), "not established + fresh defer → back off");
+        // Already established + fresh decision also true → proceed (trivially).
+        assert!(retry_should_proceed(true, true), "already established → proceed");
+
+        // Counterfactual bite: the OLD gate (fresh decision alone) skips the seam the NEW gate catches.
+        let fresh_establish = false;
+        assert!(
+            !fresh_establish && retry_should_proceed(true, fresh_establish),
+            "the OLD `fresh_establish`-only gate would early-return where K4 proceeds"
+        );
+    }
+
+    // ---- T6 (config-plane §2.4): the retry BACKS OFF, never SPINS. -------------------------------
+    //
+    // The runtime meter debits the treasury every tick independent of the wallet, so a hot retry
+    // loop would raise measured CPU burn and hasten REAL death. `config_retry_backoff` must return a
+    // NON-ZERO, BOUNDED, MONOTONICALLY-NON-DECREASING delay — the mechanism that keeps a defer
+    // window from debiting faster than baseline idle.
+    //
+    // RED-on-revert: change `config_retry_backoff` to return `Duration::ZERO` (a spin) → the
+    // `>= base` / `> 0` assertions fail.
+    #[test]
+    fn t6_config_retry_backs_off_never_spins() {
+        let base = Duration::from_secs(2);
+        let max = Duration::from_secs(60);
+        let mut prev = Duration::ZERO;
+        for attempt in 0..14u32 {
+            let d = config_retry_backoff(attempt, base, max);
+            // NEVER a spin: strictly positive and at least the base interval.
+            assert!(d >= base, "attempt {attempt}: backoff {d:?} must be >= base {base:?} (never a spin)");
+            assert!(d > Duration::ZERO, "attempt {attempt}: backoff must be non-zero (never a spin)");
+            // BOUNDED: capped at max.
+            assert!(d <= max, "attempt {attempt}: backoff {d:?} must be <= max {max:?} (bounded)");
+            // MONOTONIC non-decreasing (exponential ramp), so it is not a fixed hot interval.
+            assert!(d >= prev, "attempt {attempt}: backoff must not decrease");
+            prev = d;
+        }
+        // The ramp actually grows before the cap (attempt 0 base=2s, attempt 2 = 8s), then caps.
+        assert_eq!(config_retry_backoff(0, base, max), Duration::from_secs(2));
+        assert_eq!(config_retry_backoff(2, base, max), Duration::from_secs(8));
+        assert_eq!(config_retry_backoff(30, base, max), max, "far-out attempts cap at max");
+    }
+
+    // ---- T10 (config-plane §2.8): the solvency false-broke FIX — restore-deferred proceeds. ------
+    //
+    // The reachable seam: fresh-box + config-below-quorum (counter DEFERRED, `counter_established` =
+    // false, restore-receive no-op'd, wallet transiently 0) + token-read ≥k (`nip60_read_authoritative`
+    // = true). Keying solvency on the TOKEN read ALONE takes the Assert branch →
+    // `assert_wallet_backs_counter(0, initial_sats)` bails → boot aborts, self-heal unreachable
+    // (FALSE-BROKE). ANDing in `counter_established` routes it to ProceedNonAuthoritative instead.
+    //
+    // RED-on-revert: change `boot_solvency_authoritative` to return `nip60_read_authoritative` (the
+    // token-only pre-fix behavior) → the seam takes Assert → the bail below fires → this test's
+    // "boot proceeds" expectation fails (it goes RED at the `matches!(... ProceedNonAuthoritative)`
+    // assertion, and the demonstrated Assert-path bail proves the abort).
+    #[test]
+    fn t10_solvency_false_broke_fix_restore_deferred_proceeds() {
+        // Established path (resume / ≥k restore ran / new-at-0): Assert as before, die-when-broke
+        // intact at boot for a genuinely-broke agent.
+        assert!(
+            boot_solvency_authoritative(true, true),
+            "token ≥k AND counter established → authoritative (Assert, unchanged)"
+        );
+        assert!(matches!(solvency_gate(boot_solvency_authoritative(true, true)), SolvencyGate::Assert));
+
+        // THE SEAM: token ≥k but counter DEFERRED → NOT authoritative → ProceedNonAuthoritative.
+        assert!(
+            !boot_solvency_authoritative(true, false),
+            "token ≥k but counter DEFERRED → NOT authoritative (the false-broke seam)"
+        );
+        assert!(
+            matches!(
+                solvency_gate(boot_solvency_authoritative(true, false)),
+                SolvencyGate::ProceedNonAuthoritative
+            ),
+            "restore-deferred fresh box must PROCEED (no false-broke bail), self-healing on ≥k"
+        );
+
+        // Prove the counterfactual bite: had we taken Assert on this seam, a transiently-0 wallet vs
+        // a nonzero seeded treasury WOULD bail (this is exactly what the fix routes around).
+        assert!(
+            assert_wallet_backs_counter(0, 50_000).is_err(),
+            "the Assert path on a transiently-0 wallet bails — the false-broke the fix prevents"
+        );
     }
 }
