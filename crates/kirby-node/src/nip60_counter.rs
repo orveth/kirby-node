@@ -65,12 +65,27 @@ pub struct Nip60CounterDb {
     /// times per op incl. a POST-network increment (receive/saga); a true→false mid-op flip would
     /// strand already-minted proofs. [`Self::establish`] only ever stores `true`.
     ///
-    /// SHARED (config-plane revision, findings 1+2): an `Arc<AtomicBool>` so the SAME latch is read
-    /// by the [`crate::nip60::Nip60Store`] choke-point funnel — the store's `publish_config`
-    /// (finding 2: gate every 17375 head write) and `rollover` (finding 1: bail during defer) load
-    /// this exact bool via [`Self::established_handle`], not a copy. One establishment flips both the
-    /// derivation gate here AND the store's write gates.
+    /// ★ config-plane ROUND-2 (R2-#3, TWO-LATCH): this latch gates DERIVATION ONLY now (the
+    /// choke point on [`WalletDatabase::increment_keyset_counter`]). It opens post-floor-established
+    /// so restore + drain CAN derive. The STORE's PUBLISH + ROLLOVER gates were re-keyed off this
+    /// latch onto [`Self::recovery_complete`] (which opens only AFTER restore AND drain both
+    /// succeed) — so a rollover/publish can never fire against a post-establish/pre-recovery
+    /// transiently-empty wallet.
     counter_established: Arc<AtomicBool>,
+    /// The config-plane ROUND-2 (R2-#3) RECOVERY-COMPLETE latch: gates the [`crate::nip60::Nip60Store`]
+    /// PUBLISH (17375 head) + ROLLOVER (7375 snapshot) write paths. Opens (false→true, MONOTONIC)
+    /// ONLY after the wallet is FULLY recovered — restore-receive AND the recovery-drain
+    /// (`mint_unissued_quotes`) both succeed — on BOTH the healthy-boot path and the bounded retry.
+    ///
+    /// WHY A SECOND LATCH (kirby ruled (b), structural frozen-until-recovery): `counter_established`
+    /// opens as soon as the FLOOR is established (so restore + drain can derive), which leaves a
+    /// window where the counter is established but the wallet is still transiently-EMPTY (restore
+    /// mid-flight). A rollover in that window would publish an empty 7375 event then del-chain the
+    /// REAL backup = fund loss. `recovery_complete` makes the freeze STRUCTURAL — publish/rollover
+    /// cannot fire pre-recovery regardless of ordering — rather than relying on the flip-timing of
+    /// `read_established` (order-dependent fragility). SHARED as an `Arc<AtomicBool>` with the store
+    /// via [`Self::recovery_complete_handle`], the SAME pattern as `counter_established`.
+    recovery_complete: Arc<AtomicBool>,
 }
 
 impl Nip60CounterDb {
@@ -84,9 +99,15 @@ impl Nip60CounterDb {
     /// Wrap `inner`, seeding the mirror with `initial` counters (the values loaded from
     /// the 17375 wallet-config on a reconstruct). The mirror only ever rises above these
     /// floors, so a later publish cannot regress the counter below what the relay already
-    /// recorded. Latch defaults `true` (see [`Self::new`]).
+    /// recorded. Both latches default `true` (see [`Self::new`]) — a bare wrapper derives AND
+    /// (via a store that never shares its handles) publishes freely.
     pub fn with_counters(inner: InnerStore, initial: HashMap<Id, u32>) -> Self {
-        Self::with_counters_established(inner, initial, true)
+        Self {
+            inner,
+            shadow: Mutex::new(initial),
+            counter_established: Arc::new(AtomicBool::new(true)),
+            recovery_complete: Arc::new(AtomicBool::new(true)),
+        }
     }
 
     /// Wrap `inner` with seeded `initial` floors AND an explicit establishment-latch value
@@ -94,6 +115,12 @@ impl Nip60CounterDb {
     /// discrimination (RESUME → true; fresh-box + ≥k config → true; fresh-box + below-quorum →
     /// FALSE = defer). A `false` latch gates every derivation at the choke point until
     /// [`Self::establish`] flips it (the bounded retry, on a ≥k config read).
+    ///
+    /// ★ R2-#3 (TWO-LATCH): `recovery_complete` ALWAYS starts `false` on this boot constructor —
+    /// even for a RESUME / ≥k-establish (`established = true`) — because the wallet is not yet
+    /// RESTORED at construction. The boot path flips it via [`Self::mark_recovery_complete`] AFTER
+    /// restore + drain complete (healthy path), or the bounded retry flips it after IT completes
+    /// restore + drain. Until then the store's PUBLISH + ROLLOVER gates stay closed.
     pub fn with_counters_established(
         inner: InnerStore,
         initial: HashMap<Id, u32>,
@@ -103,17 +130,8 @@ impl Nip60CounterDb {
             inner,
             shadow: Mutex::new(initial),
             counter_established: Arc::new(AtomicBool::new(established)),
+            recovery_complete: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    /// Hand out the SHARED establishment latch (config-plane revision, findings 1+2): the
-    /// [`crate::nip60::Nip60Store`] holds a clone of this exact `Arc<AtomicBool>` so its
-    /// choke-point funnel (`publish_config`, `rollover`) reads the SAME establishment state the
-    /// derivation gate here enforces. Called once at boot after the wallet opens, before the store
-    /// is shared with the flusher (see `boot::build_routstr_brain`). Cloning the `Arc` shares the
-    /// bool; a later [`Self::establish`] is then visible to the store with no extra wiring.
-    pub fn established_handle(&self) -> Arc<AtomicBool> {
-        self.counter_established.clone()
     }
 
     /// Flip the establishment latch `true` (MONOTONIC — false→true only, idempotent). Called once
@@ -128,6 +146,72 @@ impl Nip60CounterDb {
     /// path). The boot solvency gate (§2.8) and the retry (§2.4) read it.
     pub fn is_established(&self) -> bool {
         self.counter_established.load(Ordering::SeqCst)
+    }
+
+    /// Hand out the SHARED recovery-complete latch (R2-#3, TWO-LATCH): the [`crate::nip60::Nip60Store`]
+    /// holds a clone of this exact `Arc<AtomicBool>` (injected via
+    /// [`crate::nip60::Nip60Store::set_recovery_complete`]) so its PUBLISH + ROLLOVER gates read the
+    /// SAME recovery state this counter db owns. Called once at boot, before the store is `Arc`-wrapped
+    /// and shared with the flusher. A later [`Self::mark_recovery_complete`] is then visible to the
+    /// store with no extra wiring.
+    pub fn recovery_complete_handle(&self) -> Arc<AtomicBool> {
+        self.recovery_complete.clone()
+    }
+
+    /// Flip the recovery-complete latch `true` (MONOTONIC — false→true only, idempotent; never
+    /// reverts, mirroring [`Self::establish`]). Called ONLY after the wallet is FULLY recovered —
+    /// restore-receive AND the recovery-drain (`mint_unissued_quotes`) both succeed — on the
+    /// healthy-boot path or the bounded retry. Opening this latch unblocks the store's 17375-config
+    /// publish + 7375 rollover.
+    pub fn mark_recovery_complete(&self) {
+        self.recovery_complete.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the recovery-complete latch is set (a single cheap atomic load).
+    pub fn is_recovery_complete(&self) -> bool {
+        self.recovery_complete.load(Ordering::SeqCst)
+    }
+
+    /// R2-#1 — the SINGLE guarded establish DECISION + ACTION (the ONE choke point for the establish
+    /// decision). BOTH the initial open ([`crate::mint_rig::open_persistent_wallet`]) AND the bounded
+    /// retry ([`crate::boot::try_establish_counter`]) route the decision through HERE, so no site can
+    /// establish-at-0 without ALL FOUR conditions — structurally impossible to drift / miss a third
+    /// establish site. Given the four inputs, either ESTABLISH (seed the true `floor`, fast-forward
+    /// the INNER derivation counter gate-exempt, then flip the establishment latch) or DEFER (leave
+    /// the latch false, seed/lift NOTHING). Returns whether it established.
+    ///
+    ///   state 1 RESUME (local counter present)                    → establish (lift-up-only safe)
+    ///   state 2 fresh-box + config below-quorum                   → DEFER (can't trust the floor)
+    ///   state 4 fresh-box + config ≥k + EMPTY floor (no head)     → establish AT 0 ONLY IF the TOKEN
+    ///           plane is ALSO quorum-confirmed-empty (`token_authoritative AND token_empty`); a
+    ///           below-quorum token read or present token backups → DEFER (else index-0 reuse against
+    ///           possibly-unread proofs — finding 4, token-quorum-symmetric).
+    ///   state 3 fresh-box + config ≥k + NON-empty floor (a head)  → establish at the true floor.
+    pub async fn establish_if_sound(
+        &self,
+        floor: HashMap<Id, u32>,
+        resume: bool,
+        config_authoritative: bool,
+        token_authoritative: bool,
+        token_empty: bool,
+    ) -> Result<bool, Error> {
+        let established = should_establish_counter(
+            resume,
+            config_authoritative,
+            floor.is_empty(),
+            token_authoritative,
+            token_empty,
+        );
+        if established {
+            // Seed the true floor into the publish-mirror (monotonic max — idempotent when the mirror
+            // was already seeded at construction with the same floor), fast-forward the INNER
+            // derivation counter to it (GATE-EXEMPT via `self.inner`, so it lifts BEFORE the latch
+            // flips — invariant #1), THEN flip the latch.
+            self.seed_floor(floor);
+            self.fast_forward_inner_to_floor().await?;
+            self.establish();
+        }
+        Ok(established)
     }
 
     /// Fold fresh `floors` into the publish-mirror (monotonic max per keyset), so a subsequent
@@ -189,6 +273,33 @@ impl Nip60CounterDb {
             }
         }
         Ok(())
+    }
+}
+
+/// R2-#1 — the PURE four-condition establish DECISION shared by [`Nip60CounterDb::establish_if_sound`]
+/// (and thus by BOTH the initial open and the bounded retry). Factored out so the money-critical
+/// decision is unit-testable in isolation. See [`Nip60CounterDb::establish_if_sound`] for the state
+/// map. Establish-at-0 (empty floor, no head) fires ONLY when BOTH planes are quorum-confirmed-empty.
+pub fn should_establish_counter(
+    resume: bool,
+    config_authoritative: bool,
+    floor_empty: bool,
+    token_authoritative: bool,
+    token_empty: bool,
+) -> bool {
+    if resume {
+        // state 1: a prior instance derived here — fast-forward is lift-up-only, always safe.
+        true
+    } else if !config_authoritative {
+        // state 2: fresh box + below-quorum config — can't trust the floor, DEFER.
+        false
+    } else if floor_empty {
+        // state 4: fresh box + ≥k config + NO head — establish AT 0 ONLY when the TOKEN plane is
+        // ALSO quorum-confirmed-empty (else index-0 reuse against possibly-unread proofs).
+        token_authoritative && token_empty
+    } else {
+        // state 3: fresh box + ≥k config + a real head — establish at the true floor (lift up).
+        true
     }
 }
 
@@ -688,5 +799,64 @@ mod tests {
             "fast-forward (gate-exempt) lifted the inner counter to >= the floor even while the \
              latch was false (got {inner_now}, floor {floor}) — invariant #1 holds"
         );
+    }
+
+    // ---- T15 (config-plane ROUND-2, R2-#1): the SINGLE guarded establish choke point
+    // (`establish_if_sound`, which BOTH the initial open AND the bounded retry route through) does
+    // NOT establish-at-0 on config quorum alone. On an EMPTY config floor (no head) it establishes AT
+    // 0 ONLY when the TOKEN plane is quorum-confirmed-empty; a present OR below-quorum token read →
+    // STAYS DEFERRED. This binds the retry: since the retry calls this ONE function, reverting the
+    // guard here reverts the retry too.
+    //
+    // RED-on-revert: change the empty-floor branch of `should_establish_counter` from
+    // `token_authoritative && token_empty` to `config_authoritative` (or `true`) — i.e. "establish on
+    // config quorum alone" — → cases (a)/(b) below then establish at 0 → `!is_established()` fails →
+    // RED (index-0 reuse against possibly-unread proofs).
+    #[tokio::test]
+    async fn t15_single_guarded_establish_defers_at_zero_without_both_planes_empty() {
+        let id = test_keyset_id();
+        // A fresh boot-constructed decorator (deferred latch), like open_persistent_wallet builds.
+        async fn boot_db() -> Nip60CounterDb {
+            let mem = cdk_sqlite::wallet::memory::empty().await.expect("store");
+            Nip60CounterDb::with_counters_established(Arc::new(mem), HashMap::new(), false)
+        }
+        let empty_floor = HashMap::<Id, u32>::new;
+
+        // (a) EMPTY floor + config ≥k + token PRESENT (token_authoritative, NOT empty) → DEFER.
+        let db_a = boot_db().await;
+        let established_a = db_a
+            .establish_if_sound(empty_floor(), false, true, true, false)
+            .await
+            .expect("decision runs cleanly");
+        assert!(!established_a, "token backups present → establish-at-0 REFUSED (defer)");
+        assert!(!db_a.is_established(), "the latch stays deferred");
+        assert!(
+            db_a.increment_keyset_counter(&id, 1).await.is_err(),
+            "a deferred counter blocks derivations at the choke point"
+        );
+
+        // (b) EMPTY floor + config ≥k + token BELOW quorum (can't confirm empty) → DEFER.
+        let db_b = boot_db().await;
+        let established_b = db_b
+            .establish_if_sound(empty_floor(), false, true, false, true)
+            .await
+            .expect("decision runs cleanly");
+        assert!(!established_b, "below-quorum token read → establish-at-0 REFUSED (defer)");
+        assert!(!db_b.is_established(), "the latch stays deferred");
+
+        // (c) EMPTY floor + config ≥k + token quorum-confirmed EMPTY → establish AT 0 (genuinely new).
+        let db_c = boot_db().await;
+        let established_c = db_c
+            .establish_if_sound(empty_floor(), false, true, true, true)
+            .await
+            .expect("decision runs cleanly");
+        assert!(established_c, "both planes quorum-confirmed-empty → establish at 0 (genuinely new)");
+        assert!(db_c.is_established(), "the latch establishes");
+
+        // The pure decision mirrors the action (RED-on-revert target).
+        assert!(!should_establish_counter(false, true, true, true, false), "token present → defer");
+        assert!(!should_establish_counter(false, true, true, false, true), "token below quorum → defer");
+        assert!(should_establish_counter(false, true, true, true, true), "both empty → establish at 0");
+        assert!(!should_establish_counter(false, false, true, true, true), "config below quorum → defer");
     }
 }

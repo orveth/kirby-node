@@ -191,61 +191,40 @@ pub async fn open_persistent_wallet(
     // DEFERRED (state 2) — we cannot distinguish genuinely-new from restore-pending-on-an-unreached
     // relay, and fast-forwarding to a thin/stale floor would derive at reused NUT-13 indices.
     let resume = !local_map.is_empty();
-    // The merged floor (config 17375 ∪ local) is EMPTY exactly when there is no counter to establish
-    // above 0 — i.e. establishing here means establishing AT 0 (state 4). On a fresh box (local
-    // empty) merged == the config floor, so `floor_empty` ⟺ config-head-absent (or a head with no
-    // counters). Establish-at-0 is the ONLY reuse-hazard establishment (an existing head is a real
-    // floor we lift UP to, always safe); it needs the finding-4 airtight guard.
-    let floor_empty = merged.is_empty();
-    // FOUR-STATE, authority-first, with the finding-4 airtight establish-at-0 guard:
-    //   state 1 RESUME (local counter present)                       → establish (lift-up-only safe).
-    //   state 2 fresh-box + config below-quorum                      → DEFER (can't trust the floor).
-    //   state 4 fresh-box + config ≥k + EMPTY floor (no head)        → establish AT 0 ONLY when the
-    //           TOKEN plane is ALSO quorum-confirmed-empty (token_authoritative AND token_empty);
-    //           a below-quorum token read or present token backups → DEFER (else index-0 reuse
-    //           against possibly-unread proofs — finding 4, token-quorum-symmetric).
-    //   state 3 fresh-box + config ≥k + NON-empty floor (real head)  → establish at the true floor.
-    let established = if resume {
-        true
-    } else if !config_authoritative {
-        false
-    } else if floor_empty {
-        token_authoritative && token_empty
-    } else {
-        true
-    };
 
     // Mirror the NUT-13 keyset counter through the NIP-60 decorator so it can travel in the
     // 17375 wallet-config for a cross-machine reconstruct. The mirror is SEEDED with `merged` (floor
     // ∪ local, max per keyset) so a later publish can never regress the counter below what the relay
-    // OR the local store recorded (the no-regress + completeness MONEY-MUST). The establishment
-    // latch is seeded by the four-state discrimination above; when `false` the choke-point gate
-    // blocks every derivation until the bounded retry (§2.4) lands a ≥k read.
+    // OR the local store recorded (the no-regress + completeness MONEY-MUST). Constructed DEFERRED
+    // (latch false); the SINGLE guarded establish choke point below flips it only when sound.
     let counter_db = Arc::new(crate::nip60_counter::Nip60CounterDb::with_counters_established(
         Arc::new(localstore),
-        merged,
-        established,
+        merged.clone(),
+        false,
     ));
-    if established {
-        // Fast-forward the INNER NUT-13 derivation counter to the seeded floor BEFORE the wallet
-        // derives anything, so a fresh-store reconstruct never re-issues an already-used secret (the
-        // shadow seed alone fixes only the PUBLISH mirror, not what cdk derives from). It lifts the
-        // inner counter for the COMPLETE merged set (floor ∪ local); for a local-only keyset the
-        // merged value equals the inner counter already, so that arm is a no-op (never a spurious
-        // burn). No-op on a genuinely-new boot (empty floor + empty local table → establish at 0,
-        // state 4, sound under the §2.8b quorum-intersection invariant).
-        counter_db.fast_forward_inner_to_floor().await.map_err(|e| {
-            anyhow::anyhow!("fast-forward NUT-13 counter to the reconstruct floor: {e}")
+    // ★ R2-#1: route the establish DECISION through the ONE guarded choke point
+    // ([`Nip60CounterDb::establish_if_sound`]) — the SAME function the bounded retry
+    // ([`crate::boot::try_establish_counter`]) calls, so no site can establish-at-0 without ALL FOUR
+    // conditions (four-state, authority-first, finding-4 token-quorum-symmetric guard). It seeds the
+    // floor (idempotent with the construction seed), fast-forwards the INNER derivation counter
+    // (gate-exempt) to the seeded floor BEFORE the wallet derives anything — so a fresh-store
+    // reconstruct never re-issues an already-used secret — and flips the latch ONLY when sound.
+    let established = counter_db
+        .establish_if_sound(merged, resume, config_authoritative, token_authoritative, token_empty)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("establish the NUT-13 counter to the reconstruct floor: {e}")
         })?;
-    } else {
-        // State 2 (fresh box + below-quorum config): DEFER. Do NOT fast-forward to a thin/stale
-        // floor; the latch stays false so the choke point blocks derivations until a ≥k config read
-        // establishes the true floor (the bounded retry re-drives this exact sequence).
+    if !established {
+        // State 2 (fresh box + below-quorum config), OR state 4 with an unproven-empty token plane:
+        // DEFER. Nothing was seeded/lifted; the latch stays false so the choke point blocks every
+        // derivation until a ≥k config read (the bounded retry) establishes the true floor.
         tracing::warn!(
             db = %db_path.display(),
-            "NIP-60 counter DEFERRED: fresh-box restore below config read-quorum — derivations \
-             blocked at the choke point (money-safe, no reused NUT-13 index) until a ≥k config read \
-             establishes the true floor (stalled: below-quorum config, awaiting k relays)"
+            "NIP-60 counter DEFERRED: fresh-box restore below config read-quorum OR an unproven-empty \
+             token plane — derivations blocked at the choke point (money-safe, no reused NUT-13 \
+             index) until a ≥k config read establishes the true floor (stalled: below-quorum config, \
+             awaiting k relays)"
         );
     }
 

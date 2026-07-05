@@ -709,16 +709,23 @@ pub fn should_publish_config(config_authoritative: bool) -> bool {
     config_authoritative
 }
 
-/// Finding-3 (config-plane REVISION) retry completeness: [`try_establish_counter`] reports
-/// ESTABLISHED (`Ok(true)` — which STOPS the bounded retry loop) ONLY when BOTH the counter was
-/// established AND the recovery-drain (`mint_unissued_quotes`) succeeded. A drain failure returns
-/// `false` so the loop keeps backing off and re-drives on the next attempt until the drain succeeds
-/// — otherwise a Paid-but-unissued mint quote would be stranded until the next full boot. Both the
-/// establishment (fast_forward lift-up-only) and the drain (mint_unissued_quotes safe-to-call-blindly,
-/// self-skips already-issued quotes) are IDEMPOTENT, so re-running is safe. Pure so the T14 tooth
-/// exercises it directly.
-pub fn retry_established(counter_established: bool, drain_ok: bool) -> bool {
-    counter_established && drain_ok
+/// Finding-3 (config-plane REVISION) retry completeness + R2-#2 token-plane convergence:
+/// [`try_establish_counter`] reports ESTABLISHED (`Ok(true)` — which STOPS the bounded retry loop)
+/// ONLY when ALL THREE hold: the counter was established, the TOKEN read reached quorum
+/// (`read_established` — R2-#2), AND the recovery-drain (`mint_unissued_quotes`) succeeded.
+///
+/// - drain-fail (finding-3): a Paid-but-unissued mint quote would be stranded until the next full
+///   boot; keep retrying (idempotent) until the drain succeeds.
+/// - token below-quorum (R2-#2): the counter may establish (state-3, a head present) on a
+///   below-quorum token read, but `read_established` then stays false → the rollover gate is blocked
+///   FOREVER if the loop exits. So convergence REQUIRES the token plane too — keep backing off until
+///   the token read also reaches ≥k (flipping `read_established`), then converge.
+///
+/// Establishment (fast_forward lift-up-only), the token read, and the drain
+/// (mint_unissued_quotes self-skips already-issued/0) are all IDEMPOTENT, so re-running is safe.
+/// Pure so the T14/T16 teeth exercise it directly.
+pub fn retry_established(counter_established: bool, read_established: bool, drain_ok: bool) -> bool {
+    counter_established && read_established && drain_ok
 }
 
 /// The §7.2 wallet<->counter reconcile decision (brain-routstr R2-3/R2-5): the wallet
@@ -760,48 +767,57 @@ pub fn config_retry_backoff(attempt: u32, base: Duration, max: Duration) -> Dura
     Duration::from_secs(secs).clamp(base, max)
 }
 
-/// ONE config-plane establishment attempt (§2.4): re-read the 17375 counter-floor per-relay and, if
-/// it reached read-quorum (≥k), ESTABLISH the counter and re-drive the full recovery path. Returns
-/// `Ok(true)` when it establishes this call, `Ok(false)` when still below quorum (the retry loop
-/// backs off and tries again).
+/// ONE config-plane establishment attempt (§2.4): re-read both planes per-relay and, if sound,
+/// ESTABLISH the counter and re-drive the full recovery path. Returns `Ok(true)` ONLY when the
+/// attempt fully CONVERGED (established AND token ≥k AND drain OK — R2-#2), `Ok(false)` otherwise
+/// (the retry loop backs off and tries again).
 ///
 /// ORDERING (§2.6b — establishment PRECEDES the re-driven restore-receive so it derives at correct
-/// indices): (1) re-seed the NEWLY-learned TRUE floor into the mirror (the open-time seed was a
-/// THIN/empty below-quorum floor); (2) fast-forward the inner counter to it (gate-exempt via
-/// self.inner); (3) flip the establishment latch + re-flip the token read (`reconcile_on_load_with_ids`
-/// → `read_established`); (4) re-drive the restore-receive (now unblocked); (5) drain deferred
-/// Paid-but-unissued mint quotes via `mint_unissued_quotes` (recovery-mint, now that the choke point
-/// is open). Shared with the token plane: one attempt re-establishes BOTH the config floor and the
-/// token `read_established`.
+/// indices): (1) read the CONFIG plane (`load_config_quorum`) AND the TOKEN plane
+/// (`reconcile_on_load_with_ids` — flips `read_established`, yields the restore candidates);
+/// (2) route the establish DECISION through the ONE guarded choke point
+/// ([`crate::nip60_counter::Nip60CounterDb::establish_if_sound`] — R2-#1: the SAME guard the initial
+/// open uses, so the retry can NOT establish-at-0 on config quorum alone), which seeds the true
+/// floor + fast-forwards the inner counter (gate-exempt) + flips the establishment latch when sound;
+/// (3) re-drive the restore-receive (now unblocked); (4) drain deferred Paid-but-unissued mint
+/// quotes via `mint_unissued_quotes`; (5) on full convergence, mark recovery COMPLETE (R2-#3 —
+/// opens the store's publish + rollover gates). A DEFER at step 2 (below-quorum config, or an
+/// empty floor with a present/below-quorum token plane) seeds/lifts NOTHING and returns `Ok(false)`.
 pub(crate) async fn try_establish_counter(
     store: &crate::nip60::Nip60Store,
     counter_db: &crate::nip60_counter::Nip60CounterDb,
     wallet: &cdk::wallet::Wallet,
 ) -> anyhow::Result<bool> {
     let cr = store.load_config_quorum().await?;
-    if !cr.config_authoritative {
-        return Ok(false); // still below quorum — the loop backs off and retries
-    }
-    // ≥k: seed the true floor, fast-forward (gate-exempt), THEN establish (ordering §2.6b).
-    if let Some(config) = cr.config {
-        counter_db.seed_floor(config.counters_by_id());
-    }
-    counter_db
-        .fast_forward_inner_to_floor()
-        .await
-        .map_err(|e| anyhow::anyhow!("config-plane retry: fast-forward NUT-13 counter to the true floor: {e}"))?;
-    counter_db.establish();
-    // Re-reconcile the token plane → flips `read_established` (unblocks the rollover gate) + yields
-    // the restore candidates for the re-driven restore-receive.
+    // ★ R2-#1 + R2-#2: read the TOKEN plane BEFORE the establish decision, so (a) the SINGLE guarded
+    // establish choke point can consume the token plane's authority (finding-4, token-quorum-symmetric
+    // — the retry must NOT establish-at-0 on config quorum alone), and (b) the read flips the store's
+    // `read_established` (the rollover gate's token-quorum half) + yields the restore candidates. The
+    // READ derives nothing, so it is safe before establishment (§2.6b — only the IMPORT must follow).
     let read = store.reconcile_on_load_with_ids().await?;
+    let token_authoritative = read.authoritative;
+    let token_empty = read.fetched_ids.is_empty();
+    let floor = cr.config.as_ref().map(|c| c.counters_by_id()).unwrap_or_default();
+    // ★ R2-#1: the ONE guarded establish — the SAME `establish_if_sound` the initial open calls. The
+    // retry is a fresh-box path (the initial open only defers on an empty local table), so resume =
+    // false; establish-at-0 (empty config floor) fires ONLY when the token plane is quorum-confirmed
+    // empty. On a DEFER (below-quorum config, or empty floor with a present/below-quorum token plane)
+    // this seeds/lifts NOTHING and returns false → the loop backs off and retries.
+    let established = counter_db
+        .establish_if_sound(floor, false, cr.config_authoritative, token_authoritative, token_empty)
+        .await
+        .map_err(|e| anyhow::anyhow!("config-plane retry: establish decision: {e}"))?;
+    if !established {
+        return Ok(false); // below quorum, or an unproven-empty token plane — back off and retry
+    }
     // Re-drive the restore-receive now that derivations are unblocked (§2.6b). Degrades internally.
     let _restored = crate::nip60_reconcile::restore_from_relay_backup(Ok(read.candidates), wallet).await;
     // Drain any deferred Paid-but-unissued mint quotes (recovery-mint through the now-open choke
     // point; safe to call blindly — re-checks with the mint, self-skips amount_mintable()==0).
-    // §finding-3 RETRY COMPLETENESS: the drain is part of establishment. On a drain FAILURE we do
-    // NOT report established (return Ok(false) via `retry_established`) so the bounded loop keeps
-    // backing off and re-drives (both establishment and drain are idempotent) until the drain
-    // succeeds — a Paid-but-unissued quote must not be stranded until the next full boot.
+    // §finding-3 RETRY COMPLETENESS: the drain is part of recovery. On a drain FAILURE we do NOT
+    // report converged (see `retry_established`) so the bounded loop keeps backing off and re-drives
+    // (idempotent) until the drain succeeds — a Paid-but-unissued quote must not be stranded until
+    // the next full boot.
     let drain_ok = match wallet.mint_unissued_quotes().await {
         Ok(amt) => {
             tracing::info!(minted = %amt, "config-plane retry: drained deferred mint quotes");
@@ -811,15 +827,22 @@ pub(crate) async fn try_establish_counter(
             tracing::warn!(
                 error = %e,
                 "config-plane retry: mint_unissued_quotes (recovery-drain) failed — NOT reporting \
-                 established this attempt; the bounded loop backs off and re-drives (idempotent) \
+                 converged this attempt; the bounded loop backs off and re-drives (idempotent) \
                  until the drain succeeds (config-plane finding-3)"
             );
             false
         }
     };
-    // The counter IS established (fast_forward + establish ran above); report established ONLY when
-    // the drain also succeeded, so the loop persists until recovery-mint converges.
-    Ok(retry_established(counter_db.is_established(), drain_ok))
+    // R2-#2 convergence: established AND the TOKEN read reached ≥k (`token_authoritative` ==
+    // `read_established`) AND the drain succeeded. A below-quorum token read must NOT converge (else
+    // `read_established` stays false → the rollover gate is blocked forever). R2-#3: on FULL
+    // convergence, mark recovery COMPLETE (opens the store's PUBLISH + ROLLOVER gates) — restore AND
+    // drain have both succeeded, so the wallet's unspent set is real, not transiently-empty.
+    let converged = retry_established(counter_db.is_established(), token_authoritative, drain_ok);
+    if converged {
+        counter_db.mark_recovery_complete();
+    }
+    Ok(converged)
 }
 
 /// Read the AUTHORITATIVE `treasury_remaining` before wiring the brain wallet to it, so
@@ -1016,12 +1039,14 @@ async fn build_routstr_brain(
     .await?;
     let ecash = CdkEcash::new(wallet.clone());
 
-    // ★ config-plane REVISION (findings 1+2): SHARE the counter-establishment latch INTO the store
-    // BEFORE it is `Arc`-wrapped + handed to the flusher, so the choke-point funnel (`publish_config`)
-    // and the rollover gate read the SAME establishment state the derivation gate enforces. One
-    // establishment (at open, or later via the bounded retry) then unblocks all three gates at once.
+    // ★ config-plane REVISION (findings 1+2) + R2-#3 (TWO-LATCH): SHARE the RECOVERY-COMPLETE latch
+    // INTO the store BEFORE it is `Arc`-wrapped + handed to the flusher, so the choke-point funnel
+    // (`publish_config`) and the rollover gate read the SAME recovery state. The store's write gates
+    // are RE-KEYED off the derivation-establishment latch onto recovery-completion: publish/rollover
+    // open ONLY after the wallet is fully restored (restore AND drain both succeed), marked on the
+    // healthy path (below) or by the bounded retry — never against a transiently-empty wallet.
     if let Some(store) = &mut nip60_store {
-        store.set_counter_established(counter_db.established_handle());
+        store.set_recovery_complete(counter_db.recovery_complete_handle());
     }
     // Freeze the store into an `Arc` now that the latch is wired (all further uses share this Arc).
     let nip60_store = nip60_store.map(Arc::new);
@@ -1123,6 +1148,45 @@ async fn build_routstr_brain(
             );
             // boot PROCEEDS; read_established / counter_established stay false => rollover gate (§4)
             // + choke-point gate (§2.2) hold; the bounded retry re-establishes on a ≥k read.
+        }
+    }
+
+    // 4b) ★ R2-#3 (TWO-LATCH) — open the RECOVERY-COMPLETE latch (which gates the store's PUBLISH +
+    //    ROLLOVER write paths) on the HEALTHY-boot path, ONLY after restore (step 3) AND the
+    //    recovery-drain below both complete. On a DEFERRED fresh-box boot the counter is NOT
+    //    established (the wallet is transiently-empty and the choke point is closed), so we do NOT
+    //    open the gate here — the bounded retry (§2.4) marks recovery complete after IT completes
+    //    restore+drain. Scoped to a configured NIP-60 store (the only place publish/rollover — and
+    //    thus recovery_complete — matter); with no store there is nothing to gate.
+    //
+    //    The drain (`mint_unissued_quotes`) is the recovery half symmetric to the retry path
+    //    (finding-3): it recovers Paid-but-unissued mint quotes through the now-open choke point,
+    //    idempotent + self-skipping when there is nothing to mint (a cheap `Ok(0)` on a normal
+    //    resume). On a drain FAILURE recovery_complete stays false → the 17375 config publish (step
+    //    5) + the flusher's rollover stay deferred THIS run (money-safe: never publish/rollover
+    //    against a not-fully-recovered wallet); the next boot re-drives. Placed AFTER the solvency
+    //    check so that check sees the same balance as before (no behavior change to §7.2).
+    if nip60_store.is_some() && counter_db.is_established() {
+        match wallet.mint_unissued_quotes().await {
+            Ok(minted) => {
+                if u64::from(minted) > 0 {
+                    tracing::info!(
+                        minted = %minted,
+                        "boot: drained deferred Paid-but-unissued mint quotes on the healthy path (recovery-mint)"
+                    );
+                }
+                // restore (step 3) + drain both completed → open the publish/rollover gate.
+                counter_db.mark_recovery_complete();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "boot: recovery-drain (mint_unissued_quotes) FAILED on the healthy path — \
+                     recovery_complete NOT set, so the 17375 config publish + the flusher rollover \
+                     stay deferred this run (money-safe: no backup against a not-fully-recovered \
+                     wallet); the next boot re-drives (idempotent)"
+                );
+            }
         }
     }
 
@@ -1928,34 +1992,60 @@ mod config_plane_tests {
         );
     }
 
-    // ---- T14 (config-plane REVISION, finding-3): the retry is not "established" until the drain
-    // succeeds. `try_establish_counter` reports established (`Ok(true)`, which STOPS the bounded loop)
-    // ONLY when BOTH the counter established AND the recovery-drain (`mint_unissued_quotes`) succeeded.
-    // A drain FAILURE returns false so the loop keeps backing off and re-drives until the drain
-    // succeeds — a Paid-but-unissued quote must not be stranded until the next full boot.
+    // ---- T14 (config-plane REVISION, finding-3): the retry is not "converged" until the drain
+    // succeeds. `try_establish_counter` reports converged (`Ok(true)`, which STOPS the bounded loop)
+    // ONLY when the counter established AND the recovery-drain (`mint_unissued_quotes`) succeeded (with
+    // the token read ≥k — held true here to isolate the drain dimension). A drain FAILURE returns
+    // false so the loop keeps backing off and re-drives until the drain succeeds — a Paid-but-unissued
+    // quote must not be stranded until the next full boot.
     //
-    // RED-on-revert: change `retry_established` to `counter_established` alone (drop `&& drain_ok`), or
-    // `try_establish_counter` to `Ok(true)` unconditionally on drain-fail → `retry_established(true,
-    // false)` becomes true → the loop STOPS on a drain failure → this `assert!(!...)` fails.
+    // RED-on-revert: drop `&& drain_ok` from `retry_established`, or make `try_establish_counter`
+    // return `Ok(true)` unconditionally on drain-fail → `retry_established(true, true, false)` becomes
+    // true → the loop STOPS on a drain failure → this `assert!(!...)` fails.
     #[test]
     fn t14_retry_not_established_until_drain_succeeds() {
-        // Converged: counter established AND the drain succeeded → report established (stop the loop).
+        // Converged: counter established, token read ≥k, AND the drain succeeded → converge (stop).
         assert!(
-            retry_established(true, true),
-            "established + drain OK → the retry converges (Ok(true), loop stops)"
+            retry_established(true, true, true),
+            "established + token ≥k + drain OK → the retry converges (Ok(true), loop stops)"
         );
-        // ★ Drain FAILED (even though the counter established): NOT established → keep retrying.
+        // ★ Drain FAILED (even though the counter established + token ≥k): NOT converged → keep retrying.
         assert!(
-            !retry_established(true, false),
-            "counter established but the drain FAILED → NOT reported established → the bounded loop \
-             keeps backing off + re-drives (revert to `counter_established` alone → this is true → RED)"
+            !retry_established(true, true, false),
+            "counter established + token ≥k but the drain FAILED → NOT converged → the bounded loop \
+             keeps backing off + re-drives (drop `&& drain_ok` → this is true → RED)"
         );
-        // Counter not established → never established, regardless of the drain.
+        // Counter not established → never converged, regardless of the other dimensions.
         assert!(
-            !retry_established(false, true),
-            "counter not established → never reported established"
+            !retry_established(false, true, true),
+            "counter not established → never converged"
         );
-        assert!(!retry_established(false, false), "neither → not established");
+        assert!(!retry_established(false, false, false), "none → not converged");
+    }
+
+    // ---- T16 (config-plane ROUND-2, R2-#2): the retry does not CONVERGE (does not exit the loop)
+    // until the TOKEN read reaches ≥k (`read_established`). The counter may establish (state-3, a head
+    // present) on a below-quorum token read, but then `read_established` stays false → the rollover
+    // gate is blocked FOREVER if the loop exits. So convergence REQUIRES the token plane too: keep
+    // retrying (backoff) until the token read also reaches ≥k.
+    //
+    // RED-on-revert: drop the `read_established` term from `retry_established` (convergence ignores the
+    // token plane) → `retry_established(true, false, true)` becomes true → the loop EXITS Ok(true) with
+    // `read_established` stuck false → rollover blocked forever → this `assert!(!...)` fails.
+    #[test]
+    fn t16_retry_convergence_requires_the_token_plane() {
+        // Established + drain OK but the TOKEN read is BELOW quorum → NOT converged → keep retrying
+        // (so `read_established` can flip on a later ≥k read and the rollover gate can eventually open).
+        assert!(
+            !retry_established(true, false, true),
+            "established + drain OK but token BELOW quorum → NOT converged → the loop keeps retrying \
+             (drop the read_established term → this is true → loop exits rollover-blocked → RED)"
+        );
+        // All three (established + token ≥k + drain OK) → converge.
+        assert!(
+            retry_established(true, true, true),
+            "established + token ≥k + drain OK → converge"
+        );
     }
 
     // ---- T6 (config-plane §2.4): the retry BACKS OFF, never SPINS. -------------------------------
