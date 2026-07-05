@@ -64,7 +64,13 @@ pub struct Nip60CounterDb {
     /// ★ INVARIANT #2 — MONOTONIC (false→true only, NEVER back). cdk touches the counter multiple
     /// times per op incl. a POST-network increment (receive/saga); a true→false mid-op flip would
     /// strand already-minted proofs. [`Self::establish`] only ever stores `true`.
-    counter_established: AtomicBool,
+    ///
+    /// SHARED (config-plane revision, findings 1+2): an `Arc<AtomicBool>` so the SAME latch is read
+    /// by the [`crate::nip60::Nip60Store`] choke-point funnel — the store's `publish_config`
+    /// (finding 2: gate every 17375 head write) and `rollover` (finding 1: bail during defer) load
+    /// this exact bool via [`Self::established_handle`], not a copy. One establishment flips both the
+    /// derivation gate here AND the store's write gates.
+    counter_established: Arc<AtomicBool>,
 }
 
 impl Nip60CounterDb {
@@ -96,8 +102,18 @@ impl Nip60CounterDb {
         Self {
             inner,
             shadow: Mutex::new(initial),
-            counter_established: AtomicBool::new(established),
+            counter_established: Arc::new(AtomicBool::new(established)),
         }
+    }
+
+    /// Hand out the SHARED establishment latch (config-plane revision, findings 1+2): the
+    /// [`crate::nip60::Nip60Store`] holds a clone of this exact `Arc<AtomicBool>` so its
+    /// choke-point funnel (`publish_config`, `rollover`) reads the SAME establishment state the
+    /// derivation gate here enforces. Called once at boot after the wallet opens, before the store
+    /// is shared with the flusher (see `boot::build_routstr_brain`). Cloning the `Arc` shares the
+    /// bool; a later [`Self::establish`] is then visible to the store with no extra wiring.
+    pub fn established_handle(&self) -> Arc<AtomicBool> {
+        self.counter_established.clone()
     }
 
     /// Flip the establishment latch `true` (MONOTONIC — false→true only, idempotent). Called once

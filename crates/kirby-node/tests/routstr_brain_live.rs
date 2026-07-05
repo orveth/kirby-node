@@ -46,7 +46,7 @@ async fn live_one_real_completion_drains_sats() {
         .resolve_seed()
         .expect("resolve the funded wallet's sibling seed");
     let (wallet, _counter_db) =
-        open_persistent_wallet(&mint, wallet_path, seed, std::collections::HashMap::new(), true)
+        open_persistent_wallet(&mint, wallet_path, seed, std::collections::HashMap::new(), true, true, true)
             .await
             .expect("open the funded live wallet");
     let before = wallet.total_balance().await.map(u64::from).unwrap_or(0);

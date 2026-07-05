@@ -131,12 +131,23 @@ impl WalletKey {
 /// counter) is always safe (fast-forward is lift-up-only) and establishes immediately; a fresh box
 /// with a ≥k read establishes at the true floor (or at 0 when genuinely new — sound only under the
 /// quorum-intersection invariant, §2.8b). Callers with no relays (NIP-60 off) pass `true`.
+///
+/// `token_authoritative` / `token_empty`: the TOKEN-plane (kind 7375 proofs) read result, threaded
+/// in for the finding-4 AIRTIGHT establish-at-0 guard (config-plane revision). `token_authoritative`
+/// = the token read reached read-quorum (`served >= read_k`); `token_empty` = it fetched NO token
+/// events. establish-at-0 (state 4) fires ONLY when BOTH planes are quorum-confirmed-empty:
+/// `config_authoritative AND config-head-absent AND token_authoritative AND token_empty`. A
+/// below-quorum token read (can't confirm empty) OR present token backups → DEFER, never
+/// establish-at-0 against possibly-unread proofs (that would derive at index 0 = reuse). Callers
+/// with no relays (NIP-60 off) pass `true`/`true` (a genuinely-new local wallet).
 pub async fn open_persistent_wallet(
     mint_url: &str,
     db_path: &Path,
     seed: [u8; 64],
     initial_counters: HashMap<Id, u32>,
     config_authoritative: bool,
+    token_authoritative: bool,
+    token_empty: bool,
 ) -> anyhow::Result<(Arc<Wallet>, Arc<crate::nip60_counter::Nip60CounterDb>)> {
     // The store lives in db_path's directory; ensure it exists.
     if let Some(parent) = db_path.parent() {
@@ -180,7 +191,29 @@ pub async fn open_persistent_wallet(
     // DEFERRED (state 2) — we cannot distinguish genuinely-new from restore-pending-on-an-unreached
     // relay, and fast-forwarding to a thin/stale floor would derive at reused NUT-13 indices.
     let resume = !local_map.is_empty();
-    let established = resume || config_authoritative;
+    // The merged floor (config 17375 ∪ local) is EMPTY exactly when there is no counter to establish
+    // above 0 — i.e. establishing here means establishing AT 0 (state 4). On a fresh box (local
+    // empty) merged == the config floor, so `floor_empty` ⟺ config-head-absent (or a head with no
+    // counters). Establish-at-0 is the ONLY reuse-hazard establishment (an existing head is a real
+    // floor we lift UP to, always safe); it needs the finding-4 airtight guard.
+    let floor_empty = merged.is_empty();
+    // FOUR-STATE, authority-first, with the finding-4 airtight establish-at-0 guard:
+    //   state 1 RESUME (local counter present)                       → establish (lift-up-only safe).
+    //   state 2 fresh-box + config below-quorum                      → DEFER (can't trust the floor).
+    //   state 4 fresh-box + config ≥k + EMPTY floor (no head)        → establish AT 0 ONLY when the
+    //           TOKEN plane is ALSO quorum-confirmed-empty (token_authoritative AND token_empty);
+    //           a below-quorum token read or present token backups → DEFER (else index-0 reuse
+    //           against possibly-unread proofs — finding 4, token-quorum-symmetric).
+    //   state 3 fresh-box + config ≥k + NON-empty floor (real head)  → establish at the true floor.
+    let established = if resume {
+        true
+    } else if !config_authoritative {
+        false
+    } else if floor_empty {
+        token_authoritative && token_empty
+    } else {
+        true
+    };
 
     // Mirror the NUT-13 keyset counter through the NIP-60 decorator so it can travel in the
     // 17375 wallet-config for a cross-machine reconstruct. The mirror is SEEDED with `merged` (floor
@@ -478,7 +511,7 @@ mod tests {
         let floor: HashMap<Id, u32> = HashMap::new();
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true)
                 .await
                 .expect("open persistent wallet");
 
@@ -501,7 +534,7 @@ mod tests {
         let floor = HashMap::from([(k, 50u32)]);
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true)
                 .await
                 .expect("open persistent wallet");
 
@@ -527,7 +560,7 @@ mod tests {
         let floor: HashMap<Id, u32> = HashMap::new();
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true)
                 .await
                 .expect("open persistent wallet");
 
@@ -621,7 +654,7 @@ mod tests {
 
         // config_authoritative = FALSE (a below-quorum config read).
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, false)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, false, true, true)
                 .await
                 .expect("open persistent wallet (resume)");
 
@@ -655,7 +688,7 @@ mod tests {
         let floor: HashMap<Id, u32> = HashMap::new();
 
         let (_wallet, counter_db) =
-            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true)
+            open_persistent_wallet("http://127.0.0.1:1", &db_path, test_seed(), floor, true, true, true)
                 .await
                 .expect("open persistent wallet (fresh box, ≥k, no head)");
 
@@ -674,6 +707,90 @@ mod tests {
             .await
             .expect("a new agent derives freely from 0 (create-fund flows)");
         assert!(after >= 5, "derivations flow for a genuinely-new agent");
+    }
+
+    // ---- T13 (config-plane REVISION, finding-4 AIRTIGHT establish-at-0 guard, TOKEN-QUORUM-
+    // SYMMETRIC): establish-at-0 requires BOTH planes quorum-confirmed-empty. Two cases must bite:
+    //   (a) token backups PRESENT (token read ≥k, NON-empty) → establish-at-0 REFUSED (defer).
+    //   (b) token read BELOW quorum (can't confirm empty)    → establish-at-0 REFUSED (defer).
+    // Both: a fresh box (empty local) + ≥k config + NO config head (empty floor). Reverting the guard
+    // to ignore the token plane (establish whenever config_authoritative) establishes at 0 against
+    // possibly-unread proofs → derives at reused index → RED.
+
+    // ---- T13(a): token backups PRESENT → establish-at-0 REFUSED. ---------------------------------
+    // RED-on-revert: change the state-4 arm from `token_authoritative && token_empty` to `true`
+    // (ignore the token plane) → this establishes at 0 → `is_established()` is true → the assert
+    // fails (establish-at-0 fired against present token backups = index-0 reuse hazard).
+    #[tokio::test]
+    async fn t13a_establish_at_zero_refused_when_token_backups_present() {
+        use cdk::cdk_database::WalletDatabase as _;
+        let tmp = TempDir::new("t13a");
+        let db_path = tmp.db_path();
+        let k = kid("009a1f293253e41e");
+        // Fresh box: NO local seeding, empty floor. config ≥k (config_authoritative=true), no head.
+        let floor: HashMap<Id, u32> = HashMap::new();
+        // Token plane: read reached quorum (authoritative) but token backups are PRESENT (NOT empty).
+        let (_wallet, counter_db) = open_persistent_wallet(
+            "http://127.0.0.1:1",
+            &db_path,
+            test_seed(),
+            floor,
+            true,  // config_authoritative
+            true,  // token_authoritative (≥k)
+            false, // token_empty = false → token backups PRESENT
+        )
+        .await
+        .expect("open persistent wallet (fresh box, ≥k config, token backups present)");
+
+        assert!(
+            !counter_db.is_established(),
+            "establish-at-0 REFUSED when token backups are present (defer, no index-0 reuse) — \
+             revert (ignore the token plane) → establishes at 0 → RED"
+        );
+        // Deferred ⇒ derivations are BLOCKED at the choke point (no reused-index derivation).
+        assert!(
+            counter_db.increment_keyset_counter(&k, 1).await.is_err(),
+            "a deferred fresh box blocks derivations at the choke point"
+        );
+    }
+
+    // ---- T13(b) ★ TOKEN-QUORUM-SYMMETRY: token read BELOW quorum → establish-at-0 REFUSED. -------
+    // The critical case the corrected guard adds over "NOT token_backups_exist": a below-quorum token
+    // read CANNOT confirm empty, so treating it as empty would establish-at-0 against unread proofs.
+    // RED-on-revert: change the state-4 arm to allow establish-at-0 on a below-quorum token read
+    // (e.g. `token_empty` alone, or `true`) → this establishes → `is_established()` true → RED.
+    #[tokio::test]
+    async fn t13b_establish_at_zero_refused_when_token_read_below_quorum() {
+        use cdk::cdk_database::WalletDatabase as _;
+        let tmp = TempDir::new("t13b");
+        let db_path = tmp.db_path();
+        let k = kid("009a1f293253e41e");
+        // Fresh box: NO local seeding, empty floor. config ≥k, no head.
+        let floor: HashMap<Id, u32> = HashMap::new();
+        // Token plane: read is BELOW quorum → cannot confirm empty (even though fetched_ids is empty,
+        // token_authoritative=false means the emptiness is unproven).
+        let (_wallet, counter_db) = open_persistent_wallet(
+            "http://127.0.0.1:1",
+            &db_path,
+            test_seed(),
+            floor,
+            true,  // config_authoritative
+            false, // token_authoritative = false → token read BELOW quorum (can't confirm empty)
+            true,  // token_empty (apparent) — but unproven below quorum
+        )
+        .await
+        .expect("open persistent wallet (fresh box, ≥k config, below-quorum token read)");
+
+        assert!(
+            !counter_db.is_established(),
+            "establish-at-0 REFUSED when the token read is below quorum (emptiness unproven) — \
+             revert (treat below-quorum as empty) → establishes at 0 against possibly-unread proofs \
+             → RED (token-quorum-symmetry)"
+        );
+        assert!(
+            counter_db.increment_keyset_counter(&k, 1).await.is_err(),
+            "a deferred fresh box blocks derivations at the choke point"
+        );
     }
 
     // ---- union_max_counters unit coverage (the pure merge under T1/T2). --------------------------

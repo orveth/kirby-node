@@ -489,6 +489,16 @@ pub struct Nip60Store {
     /// `false` at construction; flipped by the reconcile. Accessed via SeqCst atomics so
     /// the rollover gate (which holds `&self`) can read it without `&mut self`.
     read_established: Arc<std::sync::atomic::AtomicBool>,
+    /// The config-plane cut's NUT-13 counter-establishment latch, SHARED (an `Arc` clone of the
+    /// [`crate::nip60_counter::Nip60CounterDb`]'s own latch, injected via
+    /// [`Self::set_counter_established`] at boot). The choke-point FUNNEL both money-safety findings
+    /// key on: `publish_config` refuses to write a 17375 head while `false` (finding 2 — no thin
+    /// head can regress the true head from an unestablished floor), and `rollover` bails while
+    /// `false` (finding 1 — during defer the wallet is transiently-empty, so an empty rollover would
+    /// del-chain the real 7375 backups). Defaults `true` (a bare/test store publishes freely, same
+    /// posture as `read_established` in the test constructors); the boot path injects the deferred
+    /// latch so a fresh-box below-quorum boot cannot publish/rollover until establishment.
+    counter_established: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Nip60Store {
@@ -530,7 +540,22 @@ impl Nip60Store {
             read_timeout: Duration::from_secs(NIP60_READ_TIMEOUT_SECS),
             mint_allowlist,
             read_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Defaults TRUE; the boot path overwrites it with the shared counter latch via
+            // `set_counter_established` BEFORE any publish/rollover (all writes are gated below).
+            counter_established: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
+    }
+
+    /// Share the NUT-13 counter-establishment latch into this store (config-plane revision, findings
+    /// 1+2): the boot path passes [`crate::nip60_counter::Nip60CounterDb::established_handle`] so the
+    /// choke-point funnel (`publish_config`) and the rollover gate read the SAME establishment state
+    /// the derivation gate enforces. Called on the OWNED store at boot, before it is `Arc`-wrapped +
+    /// shared with the background flusher, so every later clone sees the shared latch.
+    pub fn set_counter_established(
+        &mut self,
+        latch: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.counter_established = latch;
     }
 
     /// Build a store over an arbitrary [`Nip60Transport`] — the seam the unit tests inject a mock
@@ -557,6 +582,9 @@ impl Nip60Store {
             // TRUE: existing tests that go straight to `rollover` without a prior reconcile don't
             // hit the R2 gate. R2 drill tests use `with_transport_and_read_k` + explicit reconcile.
             read_established: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            // TRUE by default (bare store publishes freely). The T11/T12 config-plane teeth flip it
+            // false directly to model a below-quorum defer.
+            counter_established: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -582,6 +610,9 @@ impl Nip60Store {
             mint_allowlist,
             // FALSE: the R2 drill tests start with a below-quorum boot and drive reconcile to flip.
             read_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // TRUE by default: the R2 token-plane drills don't exercise the counter latch (the
+            // config-plane teeth that do flip it explicitly).
+            counter_established: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -685,6 +716,28 @@ impl Nip60Store {
     /// (N5) to heal a slightly-stale counter from a mid-mint crash. Same ≥k durability gate as a
     /// token publish — a sub-quorum config write is NOT durable and errors.
     pub async fn publish_config(&self, config: &WalletConfigContent) -> anyhow::Result<EventId> {
+        // §finding-2 CHOKE-POINT FUNNEL GATE: `publish_config` is the ONLY `send_event(17375,..)`,
+        // so gating it here covers EVERY 17375 writer (boot step-5 + the graceful-teardown
+        // flush_estate estate publish + any future writer) — bypass-proof, matching the counter-gate
+        // pattern. Publish a 17375 HEAD only when the NUT-13 counter is ESTABLISHED (a real floor).
+        // While deferred (fresh-box below-quorum) the counter mirror is THIN/empty; publishing it
+        // would regress the true head on the reached relays and poison every future boot. Refuse
+        // with a clean Err — both call sites log-and-continue (best-effort), and the bounded retry
+        // re-publishes once establishment lands.
+        if !self
+            .counter_established
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::warn!(
+                "NIP-60 wallet-config publish REFUSED at the choke-point funnel: NUT-13 counter not \
+                 established (below-quorum fresh-box restore) — refusing to publish a potentially-thin \
+                 17375 head that would regress the true head (config-plane finding-2)"
+            );
+            anyhow::bail!(
+                "NIP-60 wallet-config publish refused: NUT-13 counter not established (config-plane \
+                 finding-2 funnel gate) — kept the existing head, published nothing"
+            );
+        }
         let ciphertext = self.crypto.encrypt_config(config)?;
         let outcome = self
             .transport
@@ -820,6 +873,30 @@ impl Nip60Store {
             );
             anyhow::bail!(
                 "rollover skipped: read not established (non-authoritative boot)"
+            );
+        }
+
+        // §finding-1 COUNTER-ESTABLISHMENT GATE: gate rollover on read_established AND
+        // counter_established. During a fresh-box below-quorum DEFER (counter NOT established) the
+        // restore-receive is blocked at the choke point → the wallet's unspent set is
+        // transiently-EMPTY, NOT genuinely-empty. Rolling over here would publish an EMPTY 7375 event
+        // then del-chain the REAL token backups (nip60 NIP-09 + del-chain supersede) → the durable
+        // backup LOST. counter_established=true ⟹ restore ran ⟹ the unspent set is real. Mirror the
+        // read_established bail: publish/prune NOTHING, keep the prior backup; the flusher's `?` +
+        // RearmOnDrop retries next tick (after the bounded retry establishes the counter).
+        if !self
+            .counter_established
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::warn!(
+                "rollover: counter not established (below-quorum fresh-box, restore deferred) — kept \
+                 prior backup, published/pruned nothing; the wallet is transiently-empty during \
+                 defer, so an empty rollover would del-chain the real 7375 backups (config-plane \
+                 finding-1); will retry once the bounded retry establishes the counter"
+            );
+            anyhow::bail!(
+                "rollover skipped: NUT-13 counter not established (restore deferred — config-plane \
+                 finding-1)"
             );
         }
 
@@ -2729,6 +2806,130 @@ mod tests {
         assert!(
             transport.any_delete_sent(),
             "D_b recovery: after read_established=true, rollover deletes the superseded event"
+        );
+    }
+
+    // ---- T11 (config-plane REVISION, finding-1): rollover BAILS during a counter DEFER even when
+    // the TOKEN read is established. During a fresh-box below-quorum defer the restore-receive is
+    // blocked at the choke point → the wallet is transiently-EMPTY; an empty rollover here would
+    // publish an empty 7375 event then DEL-CHAIN the real backups. Gating rollover on
+    // `read_established AND counter_established` prevents that: with read_established=true but
+    // counter_established=false, rollover must bail BEFORE publish_token (no send, no delete), so the
+    // real prior backup stays intact.
+    //
+    // RED-on-revert: remove the `!counter_established` gate in `rollover` → with read_established=true
+    // the empty rollover proceeds → publishes an empty event + del-chains the real backup →
+    // `any_delete_sent()` is true / the prior snapshot is pruned → RED.
+    #[tokio::test]
+    async fn t11_rollover_blocked_during_counter_defer() {
+        let crypto = test_crypto(0x6b);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        // Seed a REAL prior snapshot (with_transport: read_established=true, counter_established=true).
+        let store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+        let first_id = store
+            .rollover("https://m", "sat", vec![dummy_proof("live")], Vec::new())
+            .await
+            .expect("seed a real prior snapshot (all relays UP, counter established)");
+        assert!(transport.distinct_token_ids().contains(&first_id));
+
+        // Simulate a fresh-box below-quorum DEFER: the TOKEN read is established (quorum ok) but the
+        // NUT-13 COUNTER is NOT established (restore deferred) — isolates the finding-1 gate.
+        store
+            .counter_established
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            store.read_established.load(std::sync::atomic::Ordering::SeqCst),
+            "precondition: token read IS established (isolates the counter gate)"
+        );
+
+        // An EMPTY rollover (the transiently-empty-wallet flush) del-chaining the real backup.
+        let attempts_before = transport.attempts.lock().unwrap().len();
+        let result = store
+            .rollover("https://m", "sat", Vec::new(), vec![first_id.to_hex()])
+            .await;
+        assert!(result.is_err(), "rollover must BAIL during a counter defer");
+        assert!(
+            result.unwrap_err().to_string().contains("counter not established"),
+            "the bail names the counter-establishment gate (finding-1)"
+        );
+        assert_eq!(
+            transport.attempts.lock().unwrap().len(),
+            attempts_before,
+            "finding-1: zero sends attempted (the gate fires before publish_token)"
+        );
+        assert!(
+            !transport.any_delete_sent(),
+            "finding-1: no NIP-09 delete attempted — the real backup is NOT del-chained"
+        );
+        assert!(
+            transport.distinct_token_ids().contains(&first_id),
+            "finding-1: the REAL 7375 backup is intact (revert the counter gate → the empty rollover \
+             del-chains it → RED)"
+        );
+
+        // Recovery: establish the counter → the rollover proceeds as normal.
+        store
+            .counter_established
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        store
+            .rollover("https://m", "sat", vec![dummy_proof("new")], vec![first_id.to_hex()])
+            .await
+            .expect("rollover succeeds once the counter is established");
+        assert!(
+            transport.any_delete_sent(),
+            "recovery: after establishment, rollover publishes+prunes as normal"
+        );
+    }
+
+    // ---- T12 (config-plane REVISION, finding-2): EVERY 17375 writer is gated at the funnel. A
+    // below-established `publish_config` (the flush_estate estate-publish path, and any future
+    // writer) is REFUSED — no thin head is sent to the relays. Gating `publish_config` itself (the
+    // ONLY send_event(17375,..)) covers all call sites bypass-proof.
+    //
+    // RED-on-revert: remove the `!counter_established` gate in `publish_config` → the below-established
+    // publish reaches the transport (acks >= k) and returns Ok → `result.is_err()` fails AND a send
+    // was attempted → RED.
+    #[tokio::test]
+    async fn t12_publish_config_gated_at_funnel_when_not_established() {
+        let crypto = test_crypto(0x6c);
+        let transport = Arc::new(MultiRelayTransport::new(3, crypto.clone()));
+        let store = Nip60Store::with_transport(crypto.clone(), transport.clone(), 3, 2, allow_m());
+
+        // DEFER: the counter is NOT established (the flush_estate below-established publish path).
+        store
+            .counter_established
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let attempts_before = transport.attempts.lock().unwrap().len();
+        let result = store
+            .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+            .await;
+        assert!(
+            result.is_err(),
+            "finding-2: publish_config REFUSED at the funnel while the counter is not established"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("not established"),
+            "the refusal names the counter-establishment funnel gate (finding-2)"
+        );
+        assert_eq!(
+            transport.attempts.lock().unwrap().len(),
+            attempts_before,
+            "finding-2: NO 17375 send attempted (the funnel gate fires before send_event) — revert \
+             the gate → a thin head publishes → RED"
+        );
+
+        // Establish → the publish now reaches the transport.
+        store
+            .counter_established
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        store
+            .publish_wallet_config(std::collections::HashMap::new(), vec!["https://m".to_string()])
+            .await
+            .expect("publish_config succeeds once the counter is established");
+        assert!(
+            transport.attempts.lock().unwrap().len() > attempts_before,
+            "an established publish reaches the transport (the funnel opens on establishment)"
         );
     }
 
