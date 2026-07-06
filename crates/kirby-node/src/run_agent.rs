@@ -451,7 +451,12 @@ fn agent_boot_config(
     // needs (no new daemon act/rail/metering/nerve code — the two acts compose on orthogonal
     // seams).
     let (mut allow, brain, memory, agent) = match cfg.workload {
-        Workload::Capable => (
+        // The oracle workload reuses the capable grant verbatim: same brain/memory sentinels, the
+        // nostr.publish + nostr.dm_reply actuator tokens (it answers over DM), and the same
+        // brain/memory/agent cmdline blocks. Charge-issue is NOT allowlist-gated (Act::IssueCharge
+        // forks at the gateway before the allowlist step; it only needs a settlement provider,
+        // wired config-side from `[brain] settlement_method`), so oracle needs nothing beyond this.
+        Workload::Capable | Workload::Oracle => (
             // The capable loop is the both-acts workload PLUS the outward voice: the brain +
             // memory sentinels AND the nostr.publish actuator token in the allowlist, so
             // boot_and_observe builds the Completion rail, injects the Memory backend, AND attaches
@@ -478,7 +483,10 @@ fn agent_boot_config(
     // node identity key (pinned, so a note is signed by the agent's own npub, the F3 one-key
     // invariant) + a small fixed cost. None for every other workload, so they publish nothing.
     let social = match cfg.workload {
-        Workload::Capable => Some(crate::config::SocialConfig {
+        // The oracle answers over DM, so it MUST boot DM-enabled with the SAME SocialConfig as
+        // capable (relays, pinned voice key, dm_key_path, FROST/dm_under_q wiring). Without this it
+        // would be a deaf oracle — no inbound DM subscription, no reply voice.
+        Workload::Capable | Workload::Oracle => Some(crate::config::SocialConfig {
             relays: vec![cfg.relay.url.clone()],
             key_path: Some(NodeIdentity::resolve_key_path(
                 cfg.identity.key_path.as_deref(),
@@ -516,7 +524,7 @@ fn agent_boot_config(
     // infra endpoints (the fleet relay, the mint, the Routstr node) so egress can never reach them
     // even if a deploy allowlisted the host — belt-and-suspenders atop the SSRF floor (which already
     // blocks them by loopback/private IP when co-located).
-    let egress = if matches!(cfg.workload, Workload::Capable) && cfg.egress.enabled {
+    let egress = if matches!(cfg.workload, Workload::Capable | Workload::Oracle) && cfg.egress.enabled {
         allow.push(kirby_proto::ACTUATE_KIND_HTTP_FETCH.to_string());
         let mut refused = vec![crate::rail::host_of(&cfg.relay.url)];
         if !cfg.brain.mint_url.trim().is_empty() {
@@ -681,9 +689,11 @@ pub async fn run(mut run: RunAgentConfig) -> anyhow::Result<RunAgentOutcome> {
 /// on a DM-enabled agent, so it fails loud rather than silently omitting the binding.
 fn resolve_canonical_social_hex(config: &KirbyConfig) -> anyhow::Result<Option<String>> {
     use crate::config::Workload;
-    // Only the capable workload wires a DM identity (see `agent_boot_config`). Every other
-    // workload has no canonical social key.
-    if config.workload != Workload::Capable {
+    // Only the capable AND oracle workloads wire a DM identity (see `agent_boot_config`). Every
+    // other workload has no canonical social key. The oracle answers over DM, so it MUST advertise
+    // a canonical social hex in its 31000 binding — else discovery resolves it to a plain npub with
+    // no inbound DM subscription and its wraps never arrive (a deaf oracle).
+    if !matches!(config.workload, Workload::Capable | Workload::Oracle) {
         return Ok(None);
     }
     // BORN-UNIFIED (P1, dm_under_q): the canonical social identity IS the FROST key Q -- the SAME
@@ -1232,5 +1242,118 @@ mod tests {
             ..outcome
         };
         assert!(!no_restore.resume_passed());
+    }
+
+    // ==== (A) oracle-deployability: the capability grant + DM voice mirror capable ====
+
+    /// A co-located (no FROST keystore) cosign — cheap; `agent_boot_config` only needs the Arc
+    /// handle (the `_ => None` build arm does no I/O and starts no hub).
+    async fn colocated_cosign() -> std::sync::Arc<crate::relay_transport::AgentCosign> {
+        std::sync::Arc::new(
+            crate::relay_transport::AgentCosign::build(
+                None,
+                nostr_sdk::Keys::generate(),
+                "agent-0",
+                &[],
+                false,
+            )
+            .await
+            .expect("a co-located cosign builds with no keystore"),
+        )
+    }
+
+    /// A validated run for `workload`, with egress ON so the `http.fetch` grant arm is exercised.
+    /// The image dir (from `test_root`) gets the two files `ImagePaths::from_dir` checks for.
+    fn oracle_test_run(workload: Workload) -> RunAgentConfig {
+        let mut cfg = test_config(RunMode::Bootstrap);
+        cfg.workload = workload;
+        cfg.egress.enabled = true;
+        let run = RunAgentConfig::from_config(cfg).unwrap();
+        std::fs::write(run.image_dir.join("vmlinux"), b"").unwrap();
+        std::fs::write(run.image_dir.join("rootfs.squashfs"), b"").unwrap();
+        run
+    }
+
+    /// Tooth 5 (DM-gate): a booted `workload = oracle` gets a `SocialConfig` (DM-ENABLED, `Some`)
+    /// with the SAME fields as capable, AND a NON-`None` canonical social hex — so it answers over
+    /// DM and its 31000 binding advertises a real inbox. RED-on-revert: drop `Workload::Oracle`
+    /// from the `social` match arm (~485) OR from the `resolve_canonical_social_hex` guard (~696)
+    /// and oracle goes deaf (social `None` / hex `None`) → these assertions fail.
+    #[tokio::test]
+    async fn oracle_boots_dm_enabled_like_capable() {
+        let cosign = colocated_cosign().await;
+        let oracle_run = oracle_test_run(Workload::Oracle);
+        let capable_run = oracle_test_run(Workload::Capable);
+        let oracle_boot = agent_boot_config(&oracle_run, None, &cosign).unwrap();
+        let capable_boot = agent_boot_config(&capable_run, None, &cosign).unwrap();
+
+        let osoc = oracle_boot
+            .social
+            .as_ref()
+            .expect("oracle MUST boot DM-enabled (social Some) — a deaf oracle never answers");
+        let csoc = capable_boot.social.as_ref().expect("capable social");
+        assert_eq!(osoc.relays, csoc.relays, "oracle DM relays match capable");
+        assert_eq!(osoc.cost_sats, csoc.cost_sats, "oracle post cost matches capable");
+        assert!(osoc.dm_key_path.is_some(), "oracle has a DM identity keyfile (not deaf)");
+        assert_eq!(osoc.dm_backfill_secs, csoc.dm_backfill_secs);
+        assert_eq!(osoc.dm_under_q, csoc.dm_under_q);
+
+        // The 31000 canonical social binding: non-None for oracle (a discoverable DM inbox), equal
+        // to what capable resolves (both take the plain dm.key path here, dm_under_q=false).
+        let hex = resolve_canonical_social_hex(&oracle_run.config)
+            .expect("resolve must not error")
+            .expect("oracle MUST advertise a canonical social hex (non-None) or its wraps never arrive");
+        assert!(!hex.is_empty());
+    }
+
+    /// Tooth 6 (settlement, config-driven not Capable-gated): the oracle's boot config carries the
+    /// SAME `[brain]` (which holds `settlement_method`) as capable — so `settlement_method =
+    /// "lightning"` rides into boot and a settlement provider attaches (`Act::IssueCharge` is gated
+    /// only by an attached provider, forked before the allowlist). The allowlist grant is also
+    /// field-equal (brain+memory sentinels, nostr.publish + nostr.dm_reply, http.fetch), and the
+    /// genome selects `oracle_loop` (`boot.workload == Some("oracle")`). RED-on-revert: drop
+    /// `Workload::Oracle` from the allowlist/brain match arm (~459) → oracle falls to the bare
+    /// `mint.test.local` grant (no brain, no charge/DM/egress path) → these assertions fail.
+    #[tokio::test]
+    async fn oracle_grant_and_settlement_wiring_mirror_capable() {
+        let cosign = colocated_cosign().await;
+        let mut oracle_run = oracle_test_run(Workload::Oracle);
+        let mut capable_run = oracle_test_run(Workload::Capable);
+        // Post-validate mutation (bypasses the routstr-required-fields load guard): set the SAME
+        // settlement selector on both so we prove it flows into boot identically for oracle.
+        for run in [&mut oracle_run, &mut capable_run] {
+            run.config.brain.backend = crate::config::BrainBackendKind::Routstr;
+            run.config.brain.settlement_method = Some(crate::config::SettlementMethod::Lightning);
+        }
+        let oracle_boot = agent_boot_config(&oracle_run, None, &cosign).unwrap();
+        let capable_boot = agent_boot_config(&capable_run, None, &cosign).unwrap();
+
+        // The brain (carrying settlement_method) is passed through identically → provider attaches.
+        assert_eq!(oracle_boot.brain, capable_boot.brain, "oracle brain wiring == capable");
+        assert_eq!(
+            oracle_boot.brain.as_ref().unwrap().settlement_method,
+            Some(crate::config::SettlementMethod::Lightning),
+            "the lightning settlement selector rides into the oracle's boot config (provider attaches)"
+        );
+        // The capability grant (allowlist) is field-equal to capable — NOT the bare mint grant.
+        assert_eq!(oracle_boot.allow, capable_boot.allow, "oracle allowlist grant == capable");
+        assert!(
+            oracle_boot
+                .allow
+                .iter()
+                .any(|a| a.as_str() == kirby_proto::ACTUATE_KIND_NOSTR_DM_REPLY),
+            "oracle can answer DMs (nostr.dm_reply granted)"
+        );
+        // The genome selects oracle_loop (the deployed selection proof at the boot layer).
+        assert_eq!(oracle_boot.workload.as_deref(), Some("oracle"));
+        // Egress: oracle fetches prices — the http.fetch token + policy are granted like capable.
+        assert!(oracle_boot.egress.is_some(), "oracle egress policy built (price fetch)");
+        assert!(
+            oracle_boot
+                .allow
+                .iter()
+                .any(|a| a.as_str() == kirby_proto::ACTUATE_KIND_HTTP_FETCH),
+            "oracle granted http.fetch"
+        );
     }
 }

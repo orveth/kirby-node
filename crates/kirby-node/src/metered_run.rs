@@ -227,7 +227,7 @@ fn diarist_halt_floor(boot: &BootConfig) -> u64 {
 /// SAME death floor as the diarist). Every other workload gets `0` (disabled) and keeps relying on
 /// synthetic rent for its halt, unchanged.
 fn halt_floor_for(workload: Option<&str>, brain_max_cost_sats: Option<u64>) -> u64 {
-    if matches!(workload, Some("diarist") | Some("capable")) {
+    if matches!(workload, Some("diarist") | Some("capable") | Some("oracle")) {
         brain_max_cost_sats.unwrap_or(0)
     } else {
         0
@@ -641,6 +641,11 @@ mod tests {
         assert_eq!(halt_floor_for(Some("diarist"), Some(64)), 64, "the diarist floors at brain.max_cost_sats");
         // FIX-5: capable is routable + think-gated + zero-rent, so it floors at its per-think cap too.
         assert_eq!(halt_floor_for(Some("capable"), Some(64)), 64, "the capable loop floors at brain.max_cost_sats");
+        // (A) oracle-deployability: the oracle loop is think-gated + zero-rent like capable, so it
+        // MUST floor at its per-think cap too — else a deployed oracle is a DEATHLESS ZOMBIE (floor
+        // 0 = never earn-or-die halted). This matches the genome STRING, which the config enum edits
+        // do NOT cover, so it is a distinct, load-bearing money-safety tooth.
+        assert_eq!(halt_floor_for(Some("oracle"), Some(64)), 64, "the oracle loop floors at brain.max_cost_sats (money-safety)");
         // Every other workload keeps a 0 floor (disabled): synthetic rent drives their halt.
         assert_eq!(halt_floor_for(Some("brain"), Some(64)), 0);
         assert_eq!(halt_floor_for(Some("memory"), Some(64)), 0);
@@ -649,6 +654,33 @@ mod tests {
         // A think-gated workload with no brain (validate() forbids it) floors at 0, no panic.
         assert_eq!(halt_floor_for(Some("diarist"), None), 0);
         assert_eq!(halt_floor_for(Some("capable"), None), 0);
+        assert_eq!(halt_floor_for(Some("oracle"), None), 0);
+    }
+
+    /// Tooth 4 (headline, money-safety): the END-TO-END proof that a DEPLOYED `workload = oracle`
+    /// is subject to the earn-or-die floor-halt. The chain the deploy actually travels is: the
+    /// config enum `Workload::Oracle` → `genome_workload()` STRING → `boot.workload = Some(<that
+    /// string>)` → `halt_floor_for`. This asserts the STRING the deploy emits (`"oracle"`) arms the
+    /// SAME non-zero floor as capable — closing the gap that the config.rs enum edits do NOT touch
+    /// the `metered_run` string match. RED-on-revert: drop `Some("oracle")` from `halt_floor_for`
+    /// and the deployed oracle gets floor 0 (never halts = deathless zombie) and this fails.
+    #[test]
+    fn deployed_oracle_string_arms_the_same_floor_as_capable() {
+        use crate::config::Workload;
+        // The exact string a deployed oracle stamps into `boot.workload`.
+        let oracle_str = Workload::Oracle.genome_workload();
+        assert_eq!(oracle_str, "oracle", "the deployed oracle boot string");
+        let cap_str = Workload::Capable.genome_workload();
+        let cap = Some(64);
+        assert_eq!(
+            halt_floor_for(Some(oracle_str), cap),
+            halt_floor_for(Some(cap_str), cap),
+            "a deployed oracle is armed with the SAME earn-or-die floor as capable"
+        );
+        assert!(
+            halt_floor_for(Some(oracle_str), cap) > 0,
+            "the deployed oracle floor is NON-zero (armed), not a deathless zombie"
+        );
     }
 
     #[test]
