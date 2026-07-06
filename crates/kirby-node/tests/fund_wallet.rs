@@ -643,3 +643,208 @@ async fn multiple_paid_unissued_quotes_refuse_cross_quote_aggregate() {
 
     mint.shutdown().await;
 }
+
+// --------------------------------------------------------------------------------------------
+// TOOTH 9 (rev-3, ★#1 ISSUED-WITH-LOCAL-PROOFS → SUCCEEDS — the crux): a quote the mint reports
+// ISSUED while the wallet HOLDS unspent proofs for it (the state a completed-during-re-check saga
+// leaves: `check_mint_quote_status` completes a crashed issue saga, LANDS proofs, THEN returns
+// Issued) must make the drain SUCCEED — report the HELD sum as the fund and resume the EXACT quote,
+// NEVER bail on `state == Issued`. This is the invariant: FUNDED iff proofs are HELD; `Issued` alone
+// never decides funded-vs-not.
+//
+// Construction (mirrors the phantom-credit tooth 7, but KEEPS the proofs): fund a quote normally
+// (proofs land locally, quote ISSUED at the mint, an Incoming Transaction{quote_id, ys} recorded),
+// then reset ONLY the LOCAL quote record to unissued (amount_issued = 0) so it re-enters the
+// get_unissued list — but do NOT remove the proofs. A re-run's drain re-checks it (mint says Issued),
+// sums the HELD unspent proofs (> 0), and SUCCEEDS reporting the held amount, issuing NO new invoice.
+//
+// RED-on-revert: revert the ISSUED arm to the old unconditional `bail!` (decide on state, not held
+// proofs) → the re-run false-bails on a genuinely-funded quote → the `.expect(..)` panics → RED.
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn issued_at_mint_with_local_proofs_succeeds_never_false_bail() {
+    use cdk::cdk_database::WalletDatabase as _;
+    use cdk::nuts::MintQuoteState;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const AMOUNT: u64 = 4_096;
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let work = TempDir::new("kirby-fund-wallet-t9");
+    let db_path = work.path().join("wallet.sqlite");
+    let (wallet, counter_db) = open_boot_way(&mint.url(), &db_path).await;
+
+    // 1) Fund a quote normally — proofs land locally, the quote is ISSUED at the mint, an Incoming
+    //    Transaction{quote_id, ys} is recorded.
+    let funded = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        AMOUNT,
+        "t9-fund",
+        Duration::from_millis(150),
+        Duration::from_secs(25),
+        |_| {},
+    )
+    .await
+    .expect("the fresh fund mints proofs");
+    assert_eq!(funded.minted_sats, AMOUNT, "the initial fund minted the requested amount");
+    assert_eq!(
+        wallet.total_balance().await.map(u64::from).unwrap_or(0),
+        AMOUNT,
+        "the wallet holds the funded proofs before the reset"
+    );
+
+    // 2) Re-enter the quote into the unissued list WITHOUT removing its proofs: the state a
+    //    completed-during-re-check saga leaves (mint ISSUED, proofs HELD locally, quote back in the
+    //    unissued scan). Reset ONLY amount_issued (→ 0, so get_unissued includes it); KEEP the proofs.
+    let mut q = counter_db
+        .get_mint_quote(&funded.quote_id)
+        .await
+        .expect("read the funded quote")
+        .expect("the funded quote is stored");
+    q.amount_issued = cdk::Amount::ZERO;
+    q.state = MintQuoteState::Paid; // back in the unissued list; the mint re-check will flip it Issued
+    counter_db.add_mint_quote(q).await.expect("re-insert the quote as unissued (proofs kept)");
+    assert_eq!(
+        wallet.total_balance().await.map(u64::from).unwrap_or(0),
+        AMOUNT,
+        "precondition: the wallet STILL HOLDS the proofs (only the local quote record was reset)"
+    );
+
+    // 3) A re-run's drain must SUCCEED on the HELD proofs — resume the EXACT quote, report the held
+    //    sum, issue NO new invoice (the closure must NOT fire).
+    let invoices = Arc::new(AtomicUsize::new(0));
+    let inv = invoices.clone();
+    let resumed = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        AMOUNT,
+        "t9-rerun",
+        Duration::from_millis(50),
+        Duration::from_secs(25),
+        move |_| {
+            inv.fetch_add(1, Ordering::SeqCst);
+        },
+    )
+    .await
+    .expect(
+        "★ #1: an ISSUED-at-mint quote that HOLDS unspent proofs must SUCCEED (report the held sum) \
+         — revert the ISSUED arm to bail-on-state → false-bail on a funded quote → RED",
+    );
+    assert_eq!(
+        resumed.minted_sats, AMOUNT,
+        "the resumed fund reports the HELD proofs (not amount_issued / not the mint's claim)"
+    );
+    assert_eq!(
+        resumed.quote_id, funded.quote_id,
+        "it resumed the EXACT stranded quote id (no fresh quote)"
+    );
+    assert_eq!(
+        invoices.load(Ordering::SeqCst),
+        0,
+        "★ NO new invoice was issued — the held-proofs resume path ran, not the fresh-quote path"
+    );
+    assert_eq!(
+        wallet.total_balance().await.map(u64::from).unwrap_or(0),
+        AMOUNT,
+        "no double-mint: the wallet still holds exactly the original proofs"
+    );
+
+    mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// TOOTH 10 (rev-3, ★#2 SAGA RECOVERY runs at drain START, before the get_unissued scan): the drain
+// MUST call `recover_incomplete_sagas()` before scanning, so a crash-gap quote (CDK's `mint()` writes
+// `amount_issued` BEFORE proofs → a crash leaves an issued-but-proofless quote INVISIBLE to
+// get_unissued, since it filters `amount_issued = 0`) has its in-flight issue saga completed and its
+// proofs LANDED first — closing the double-pay hole.
+//
+// ★INFEASIBILITY NOTE (why this is an execution+ordering proof, not a full e2e crash-gap tooth): the
+// full e2e (partial mint → crash mid-saga → recover lands proofs → no fresh invoice) requires a REAL
+// incomplete Issue saga carrying mint-SIGNED blinded messages. The fakewallet mint completes `mint()`
+// atomically and CDK 0.17.1 exposes no public seam to inject a half-signed issue saga (a fabricated
+// `IssueSagaState::SecretsPrepared` saga with `blinded_messages: None` is COMPENSATED — rolled back —
+// not recovered-with-proofs; see cdk recovery.rs::test_recover_issue_secrets_prepared). So we prove
+// the load-bearing fact deterministically via recovery's OTHER observable effect:
+// `recover_incomplete_sagas()` first runs `cleanup_orphaned_quote_reservations()`, which RELEASES a
+// mint quote reserved by an operation whose saga does not exist (sets `used_by_operation = None`).
+// We seed exactly that orphaned reservation, then assert the drain RELEASED it — proving the recovery
+// call executes as part of the drain. Ordering (BEFORE the scan) is guaranteed by source placement:
+// the `recover_incomplete_sagas()` call is the first fallible step after the establishment guard and
+// precedes `get_unissued_mint_quotes()` with no branch between (see mint_rig.rs).
+//
+// RED-on-revert: remove the `recover_incomplete_sagas()` call from the drain → the orphaned
+// reservation is NOT released → the `used_by_operation.is_none()` assertion goes false → RED.
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn recover_incomplete_sagas_runs_at_drain_start() {
+    use cdk::cdk_database::WalletDatabase as _;
+    use cdk::nuts::PaymentMethod;
+    const AMOUNT: u64 = 1_500;
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let work = TempDir::new("kirby-fund-wallet-t10");
+    let db_path = work.path().join("wallet.sqlite");
+    let (wallet, counter_db) = open_boot_way(&mint.url(), &db_path).await;
+
+    // Seed an ORPHANED mint-quote reservation: a quote reserved by an operation whose saga does not
+    // exist (exactly what a crash between reserving a quote and persisting its saga leaves). Recovery's
+    // `cleanup_orphaned_quote_reservations()` releases these — the observable proof recovery ran.
+    let quote = wallet
+        .mint_quote(PaymentMethod::BOLT11, Some(cdk::Amount::from(AMOUNT)), Some("t10-orphan".to_string()), None)
+        .await
+        .expect("quote a bolt11 mint");
+    // A valid UUID string for which no saga exists (an orphaned reservation). A literal avoids a
+    // dependency on uuid's `v4` feature; cleanup only `parse_str`s it then looks up a (missing) saga.
+    let orphan_op = "d1e2f3a4-b5c6-4d7e-8f90-1a2b3c4d5e6f".to_string();
+    let mut stored = counter_db
+        .get_mint_quote(&quote.id)
+        .await
+        .expect("read the quote")
+        .expect("the quote is stored");
+    stored.used_by_operation = Some(orphan_op.clone());
+    counter_db.add_mint_quote(stored).await.expect("mark the quote reserved by an orphaned operation");
+
+    // Precondition: the quote IS reserved by the orphaned operation.
+    let before = counter_db
+        .get_mint_quote(&quote.id)
+        .await
+        .expect("read the quote")
+        .expect("stored");
+    assert_eq!(
+        before.used_by_operation.as_deref(),
+        Some(orphan_op.as_str()),
+        "precondition: the quote is reserved by an orphaned operation (no saga)"
+    );
+
+    // Run the drain. Its FIRST fallible step is `recover_incomplete_sagas()`, which releases the
+    // orphaned reservation. (The fakewallet auto-pays the quote ~1-3s, but this run uses a tiny
+    // timeout: whatever the drain does after recovery, recovery already RAN.)
+    let _ = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        AMOUNT,
+        "t10-run",
+        Duration::from_millis(10),
+        Duration::from_millis(1), // time out fast; we only care that recovery ran first
+        |_| {},
+    )
+    .await;
+
+    // ★ Recovery ran as part of the drain: the orphaned reservation was released.
+    let after = counter_db
+        .get_mint_quote(&quote.id)
+        .await
+        .expect("read the quote")
+        .expect("stored");
+    assert!(
+        after.used_by_operation.is_none(),
+        "★ #2: recover_incomplete_sagas() ran at drain start and RELEASED the orphaned reservation \
+         — remove the recover call → the reservation stays Some(..) → RED. (was: {:?})",
+        after.used_by_operation
+    );
+
+    mint.shutdown().await;
+}

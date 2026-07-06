@@ -479,6 +479,62 @@ fn ensure_minted_matches_requested(
     Ok(())
 }
 
+/// ★THE FUND INVARIANT READ (the 1a rail mechanism, [`crate::rail::LightningSettlement::held_unspent_for_quote`],
+/// applied verbatim to the fund drain): sum the sats the wallet ACTUALLY HOLDS (unspent) for a
+/// specific mint `quote_id`, and report whether ANY wallet [`Transaction`](cdk::wallet::types::Transaction)
+/// records that quote.
+///
+/// This is the ONLY sanctioned signal for a funded-vs-not / amount decision in the drain — NEVER
+/// the quote STATE (`Paid`/`Issued`/…), NEVER `amount_issued`, NEVER any mint-CLAIMED amount. The
+/// wallet writes a durable Incoming `Transaction{quote_id, ys}` ONLY after the minted proofs
+/// persist, so the record's PRESENCE ⇒ proofs were stored and its `ys` name them; we read those
+/// proofs back and sum only the still-`Unspent` ones. Summing held-Unspent (not the claim) is
+/// deterministic + idempotent: a second drain re-sums the same live set → the same number, and a
+/// proof later spent drops out. Returns `(held_sats, found_transaction)`; `(0, true)` (tx exists
+/// but every proof spent/removed) and `(0, false)` (no tx — the true lost-response) both mean
+/// "the wallet holds NOTHING for this quote" to the caller.
+async fn held_unspent_for_quote(wallet: &Wallet, quote_id: &str) -> anyhow::Result<(u64, bool)> {
+    use cdk::nuts::State;
+    use cdk::wallet::types::TransactionDirection;
+
+    // The wallet writes an Incoming (mint) Transaction only AFTER the proofs persist. `get_transaction`
+    // takes a TransactionId (a hash of the ys), NOT a quote_id, so we list Incoming txs + filter by quote.
+    let txs = wallet
+        .localstore
+        .list_transactions(
+            Some(wallet.mint_url.clone()),
+            Some(TransactionDirection::Incoming),
+            Some(wallet.unit.clone()),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("fund-wallet: list wallet transactions for quote {quote_id}: {e}"))?;
+
+    // The ys of every Incoming tx naming this quote (normally exactly one).
+    let ys: Vec<cdk::nuts::PublicKey> = txs
+        .iter()
+        .filter(|t| t.quote_id.as_deref() == Some(quote_id))
+        .flat_map(|t| t.ys.iter().copied())
+        .collect();
+    let found_transaction = !ys.is_empty();
+    if !found_transaction {
+        // No durable record that proofs for this quote ever persisted ⇒ the TRUE lost-response.
+        return Ok((0, false));
+    }
+
+    // Read those proofs back and sum ONLY the still-Unspent ones (the deterministic held set).
+    let proofs = wallet
+        .localstore
+        .get_proofs_by_ys(ys)
+        .await
+        .map_err(|e| anyhow::anyhow!("fund-wallet: read proofs for quote {quote_id}: {e}"))?;
+    let held: u64 = proofs
+        .iter()
+        .filter(|p| p.state == State::Unspent)
+        .map(|p| u64::from(p.proof.amount))
+        .sum();
+    Ok((held, found_transaction))
+}
+
 /// Mint `amount_sats` of ecash into an ALREADY-OPENED persistent wallet via an OPERATOR-PAID
 /// BOLT11 mint quote. This is the `fund-wallet` CLI's money dance: it mirrors the rail's
 /// settlement flow ([`crate::rail::LightningSettlement`]: `mint_quote` → check-status → `mint`)
@@ -509,6 +565,42 @@ fn ensure_minted_matches_requested(
 /// The wallet + counter_db MUST be the pair returned by [`open_persistent_wallet`] opened the
 /// SAME way the boot path opens them (seed via the [`WalletKey`] seam), so the minted proofs land
 /// in the store a subsequent boot reads and are derived under the boot-path seed (else unspendable).
+///
+/// # ★THE INVARIANT (rev-3 comprehensive closure — audited, not asserted)
+/// A mint quote is FUNDED **iff the wallet HOLDS unspent proofs for it**; the funded/credited/minted
+/// amount is the **SUM OF HELD UNSPENT PROOFS** for that quote id ([`held_unspent_for_quote`]) —
+/// NEVER the quote STATE (`Paid`/`Issued`/…), NEVER `amount_issued`, NEVER any mint-CLAIMED amount.
+/// This is the 1a rail invariant (credit == proofs actually held) applied to the fund drain. Every
+/// funded-vs-not decision branch and every reported/asserted amount below is enumerated and each
+/// decides on held-unspent-proofs (or is enumeration/refusal/identity that credits nothing):
+///
+/// | Branch / path | What it decides | Signal it decides on | held-proofs? |
+/// |---|---|---|---|
+/// | (a) NUT-13 establishment guard | refuse to mint (derivation gated) | counter established? (pre-req) | N/A — gates derivation, credits nothing |
+/// | (b) `recover_incomplete_sagas()` @ drain START | land in-flight/crashed issue-saga proofs BEFORE the scan | — (makes the held reads truthful) | ✓ its landed proofs feed every held check below |
+/// | (c) `get_unissued_mint_quotes()` + per-quote `check_mint_quote_status` | which pending quotes to classify | mint re-check | N/A — enumeration only, credits nothing |
+/// | (d) loop arm `Paid` → `NeedsMint` | eligible-to-mint (drain) | state `Paid` gates minting; the CREDIT is the post-mint HELD sum (branch h) | ✓ funded amount is held/minted proofs, not state |
+/// | (e) loop arm `Issued` → held>0 SUCCEED / held==0 BAIL (#1) | funded? + amount | **HELD unspent proofs for the quote** | ✓ — the crux; `Issued` alone NEVER funds |
+/// | (f) loop arm `Unpaid` (explicit, exhaustive — no `_` catch-all) | not a candidate | `Unpaid` ⇒ never paid ⇒ holds nothing | ✓ Unpaid ⇒ 0 held by definition; compile-exhaustive over the 3-variant enum |
+/// | (g) misattribution guard (`candidates.len() > 1`) | refuse (ambiguous attribution) | count of ALREADY-held-decided candidates | N/A — refusal; each candidate already held-decided |
+/// | (h) resolve `NeedsMint` → `wallet.mint()`; drained==0 → BAIL | funded amount | proofs `mint()` PERSISTED (held, unspent) — never `amount_issued` | ✓ |
+/// | (i) resolve `AlreadyHeld` → report `held_sats` | funded amount | **HELD unspent proofs sum** | ✓ |
+/// | (j) `ensure_minted_matches_requested(funded, requested)` | accept/refuse the fund | the HELD/minted funded amount vs requested | ✓ asserts on held, never on claim |
+/// | (k) fresh-mint `wallet.mint()` → `minted_sats` | funded amount | proofs `mint()` PERSISTED (held, unspent) | ✓ |
+/// | (l) post-fresh-mint `minted_sats == 0` → BAIL | refuse silent-success-on-0 | held/minted proofs total | ✓ |
+/// | (m) `FundWalletOutcome.minted_sats` | reported credit | = the held/minted funded amount (b–l) | ✓ |
+/// | (n) `FundWalletOutcome.balance_sats` | reported total balance | `wallet.total_balance()` (all held proofs) | ✓ |
+/// | (o) `FundWalletOutcome.quote_id` / `bolt11` | identity only | quote id / request string | N/A — no funding decision |
+///
+/// **Quote-visibility hiding paths** (every way a paid-but-proofless quote can hide from the scan)
+/// and their closure:
+/// - `get_unissued_mint_quotes()` EXCLUDES bolt11 quotes once `amount_issued != 0`, and CDK's
+///   `mint()` writes `amount_issued` BEFORE proofs ⇒ a crash in that gap leaves an issued-but-proofless
+///   quote invisible → closed by (b): `recover_incomplete_sagas()` completes the saga and LANDS its
+///   proofs BEFORE the scan, so the held reads see them.
+/// - in-flight / crashed issue sagas → closed by (b).
+/// - `Issued`-state quote still in the unissued list → closed by (e): decided on HELD proofs.
+/// - partially-minted → (e)/(h)/(i) sum only the still-Unspent held proofs.
 pub async fn mint_into_wallet_operator_pays(
     wallet: &Wallet,
     counter_db: &crate::nip60_counter::Nip60CounterDb,
@@ -539,31 +631,68 @@ pub async fn mint_into_wallet_operator_pays(
         );
     }
 
-    // 2) ★DRAIN-FIRST (money-safety: timeout double-pay + phantom-credit guards) — EXPLICIT per-quote.
-    //    If an operator paid the printed bolt11 AFTER this tool timed out, its quote sits Paid-but-
-    //    unissued in the store; a naive re-run would issue a FRESH invoice (double payment) and strand
-    //    the already-paid quote. We do NOT reuse `mint_unissued_quotes()`'s blind batch return: that
-    //    aggregate is computed from `amount_issued` DELTAS (the mint's book), so a quote that refreshed
-    //    to `Issued` WITHOUT landing local proofs (a lost mint-response) would INFLATE it — reporting a
-    //    PHANTOM fund the wallet never received. The 1a money-invariant applies: credit ONLY proofs we
-    //    ACTUALLY hold, NEVER the mint's claimed `amount_issued`. So we walk each pending quote by hand,
-    //    re-check its state WITH THE MINT, and classify it:
-    //      - Paid   → `wallet.mint(id)` EXPLICITLY and count the `Proofs.total_amount()` ACTUALLY
-    //                 minted into the LOCAL store (the only sanctioned credit source).
-    //      - Issued → the mint claims issued, yet the quote is STILL in our unissued list (no proofs
-    //                 landed locally = lost mint-response / recovery failure): BAIL loudly — a human
-    //                 resolves the stranded quote; we never paper over it with a new invoice or a
-    //                 phantom success on the mint's amount_issued.
-    //      - Unpaid → a prior UNPAID quote, not a drain candidate; leave it.
-    //    A check error means we cannot prove a pending quote is NOT paid, so we fail closed (a fresh
-    //    invoice over a stranded PAID quote would double-pay). MORE THAN ONE paid-unissued quote cannot
-    //    be unambiguously attributed to one quote id → BAIL (refuse a blind cross-quote aggregate).
+    // 2) ★SAGA RECOVERY FIRST (#2 — crash-gap closure). `get_unissued_mint_quotes()` EXCLUDES a
+    //    bolt11 quote once its LOCAL `amount_issued != 0`, and CDK's `mint()` writes `amount_issued`
+    //    BEFORE the proofs persist — so a crash in that gap leaves an ISSUED-but-proofless quote
+    //    INVISIBLE to the scan below, and a naive re-run would issue a FRESH invoice (double-pay)
+    //    while its already-paid proofs are recoverable. We run the SAME boot-time recovery
+    //    (rail `EcashProvider::recover_incomplete_sagas`, CDK `Wallet::recover_incomplete_sagas`;
+    //    boot.rs calls it too) BEFORE the scan so any in-flight / crashed issue saga is completed
+    //    and its proofs LAND FIRST; the per-quote held-proofs check then covers whatever recovery
+    //    landed. Fail CLOSED on a recovery error: if we cannot recover, we cannot prove a stranded
+    //    quote is not paid, and issuing a fresh invoice over it would double-pay.
+    wallet.recover_incomplete_sagas().await.map_err(|e| {
+        anyhow::anyhow!(
+            "fund-wallet: recovering incomplete mint sagas before the drain scan failed ({e}) — \
+             refusing to issue a new invoice while a crash-gap issued-but-proofless quote may be \
+             recoverable (a fresh invoice over it would double-pay). Resolve mint reachability and \
+             re-run."
+        )
+    })?;
+
+    // 3) ★DRAIN-FIRST (money-safety: timeout double-pay + phantom-credit guards) — EXPLICIT per-quote,
+    //    every decision on HELD unspent proofs (see the invariant table above). If an operator paid
+    //    the printed bolt11 AFTER this tool timed out, its quote sits Paid-but-unissued in the store;
+    //    a naive re-run would issue a FRESH invoice (double payment) and strand the already-paid quote.
+    //    We do NOT reuse `mint_unissued_quotes()`'s blind batch return (an `amount_issued` DELTA — the
+    //    mint's book, which a lost mint-response inflates into a PHANTOM fund). We walk each pending
+    //    quote by hand, re-check its state WITH THE MINT, and classify it into a funded CANDIDATE
+    //    decided on HELD proofs:
+    //      - Paid   → `NeedsMint`: mint EXPLICITLY below and count the proofs `mint()` PERSISTED into
+    //                 the LOCAL store (held, unspent) — NEVER `amount_issued`.
+    //      - Issued → decide on HELD proofs (#1): `check_mint_quote_status` can COMPLETE a crashed
+    //                 issue saga and LAND proofs, THEN return `Issued`, so `Issued` alone must NOT bail.
+    //                 held > 0 ⇒ `AlreadyHeld` (already funded; report the held sum, mint nothing more);
+    //                 held == 0 ⇒ BAIL (genuine lost-response / stranded — we hold NOTHING, never a
+    //                 phantom credit on the mint's `amount_issued`, never a fresh invoice).
+    //      - Unpaid → not a drain candidate; leave it and fall through to a fresh quote. (The match is
+    //                 EXHAUSTIVE over cdk 0.17.1's 3-variant `MintQuoteState` — NO `_` catch-all that
+    //                 could silently drop a funded quote; a new CDK variant would fail to compile here,
+    //                 forcing a re-audit.) Unpaid ⇒ never paid ⇒ holds nothing, so dropping it is correct.
+    //    A check error means we cannot prove a pending quote is NOT paid, so we fail closed. MORE THAN
+    //    ONE funded candidate cannot be unambiguously attributed to one quote id → BAIL.
+    enum DrainCandidate {
+        /// Paid at the mint, proofs NOT yet minted locally → mint (drain) then count the HELD sum.
+        NeedsMint(cdk::wallet::MintQuote),
+        /// Issued at the mint AND holds unspent proofs locally (a saga completed during the re-check
+        /// landed them) → already funded; report the HELD sum, mint nothing more.
+        AlreadyHeld { quote: cdk::wallet::MintQuote, held_sats: u64 },
+    }
+    impl DrainCandidate {
+        fn quote_id(&self) -> &str {
+            match self {
+                DrainCandidate::NeedsMint(q) => &q.id,
+                DrainCandidate::AlreadyHeld { quote, .. } => &quote.id,
+            }
+        }
+    }
+
     let pending_before = wallet
         .get_unissued_mint_quotes()
         .await
         .map_err(|e| anyhow::anyhow!("fund-wallet: list unissued mint quotes (drain-first): {e}"))?;
 
-    let mut paid_pending: Vec<cdk::wallet::MintQuote> = Vec::new();
+    let mut candidates: Vec<DrainCandidate> = Vec::new();
     for q in &pending_before {
         let fresh = wallet.check_mint_quote_status(&q.id).await.map_err(|e| {
             anyhow::anyhow!(
@@ -575,69 +704,88 @@ pub async fn mint_into_wallet_operator_pays(
             )
         })?;
         match fresh.state {
-            MintQuoteState::Paid => paid_pending.push(fresh),
+            MintQuoteState::Paid => candidates.push(DrainCandidate::NeedsMint(fresh)),
             MintQuoteState::Issued => {
-                // ★PHANTOM-CREDIT GUARD (the 1a invariant, mirror of the rail's issued-but-not-held
-                // recovery): the mint says this quote is ISSUED, yet it is STILL in our UNISSUED list
-                // — its proofs never landed in the LOCAL store (a lost mint-response). The blind batch
-                // drain would count the mint's `amount_issued` here and report a fund we never actually
-                // received. We hold NOTHING for it, so we BAIL rather than credit phantom sats or paper
-                // over it with a fresh invoice; a human resolves the genuinely-stranded quote.
-                anyhow::bail!(
-                    "fund-wallet: pending mint quote {} is ISSUED at the mint but no proofs landed in \
-                     the LOCAL wallet (a lost mint-response / recovery failure). Refusing to report a \
-                     PHANTOM fund on the mint's claimed amount_issued — we credit ONLY proofs actually \
-                     held — and refusing to issue a new invoice. Resolve this stranded quote out of band.",
-                    fresh.id
-                );
+                // ★#1 — decide on HELD proofs, NEVER on `state == Issued`. `check_mint_quote_status`
+                // (above) can complete a crashed issue saga and LAND proofs into the LOCAL store,
+                // then return `Issued`; bailing on the state alone would false-bail a genuinely-funded
+                // quote. Sum the HELD unspent proofs for THIS quote id (the 1a rail mechanism):
+                //   held > 0 ⇒ already funded — resume this EXACT quote, report the held sum.
+                //   held == 0 ⇒ genuine lost-response / stranded (mint claims Issued, we hold NOTHING):
+                //              BAIL — never a phantom credit on `amount_issued`, never a fresh invoice.
+                let (held, _found) = held_unspent_for_quote(wallet, &fresh.id).await?;
+                if held > 0 {
+                    candidates.push(DrainCandidate::AlreadyHeld { quote: fresh, held_sats: held });
+                } else {
+                    anyhow::bail!(
+                        "fund-wallet: pending mint quote {} is ISSUED at the mint but the wallet HOLDS \
+                         NO unspent proofs for it (a lost mint-response / recovery failure — recovery \
+                         ran and still landed nothing). Refusing to report a PHANTOM fund on the mint's \
+                         claimed amount_issued — we credit ONLY proofs actually held — and refusing to \
+                         issue a new invoice. Resolve this stranded quote out of band.",
+                        fresh.id
+                    );
+                }
             }
-            // Unpaid: a prior unpaid quote, not a drain candidate — leave it and fall through to a
-            // fresh quote below.
-            _ => {}
+            // Unpaid ⇒ never paid ⇒ holds nothing: not a drain candidate. Fall through to a fresh
+            // quote below. (Exhaustive over the 3-variant enum — no catch-all silent drop.)
+            MintQuoteState::Unpaid => {}
         }
     }
 
-    if paid_pending.len() > 1 {
-        // ★MISATTRIBUTION GUARD: more than one Paid-but-unissued quote is pending, so a drained fund
-        // cannot be attributed to ONE quote id — and a blind aggregate could satisfy `== requested`
-        // across UNRELATED quotes. Refuse rather than guess (find-by-amount / first()).
-        let ids: Vec<&str> = paid_pending.iter().map(|q| q.id.as_str()).collect();
+    if candidates.len() > 1 {
+        // ★MISATTRIBUTION GUARD: more than one funded candidate (each already decided on held proofs)
+        // is pending, so a drained fund cannot be attributed to ONE quote id — and a blind aggregate
+        // could satisfy `== requested` across UNRELATED quotes. Refuse rather than guess (first()).
+        let ids: Vec<&str> = candidates.iter().map(|c| c.quote_id()).collect();
         anyhow::bail!(
             "fund-wallet: {} paid-but-unissued mint quotes are pending ({ids:?}) — cannot unambiguously \
              attribute a fund to a single quote, and refusing to blindly aggregate-drain across \
              unrelated quotes (misattribution guard). Mint/resolve the stray quotes out of band, then \
              re-run.",
-            paid_pending.len()
+            candidates.len()
         );
     }
 
-    if let Some(quote) = paid_pending.into_iter().next() {
-        // Exactly ONE paid-but-unissued quote: DRAIN it EXPLICITLY. Mint into the LOCAL store and count
-        // the proofs ACTUALLY minted (`Proofs.total_amount()`), NEVER the mint's `amount_issued`.
-        let proofs = wallet
-            .mint(&quote.id, SplitTarget::default(), None)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("fund-wallet: drain (mint) the paid-but-unissued quote {}: {e}", quote.id)
-            })?;
-        let drained_sats: u64 = proofs
-            .total_amount()
-            .map_err(|e| anyhow::anyhow!("fund-wallet: total the drained proofs for {}: {e}", quote.id))?
-            .into();
+    if let Some(candidate) = candidates.into_iter().next() {
+        // Exactly ONE funded candidate: resolve it, computing the credited amount from HELD proofs.
+        let (quote, funded_sats) = match candidate {
+            DrainCandidate::NeedsMint(quote) => {
+                // Paid → DRAIN it EXPLICITLY. `wallet.mint()` returns the proofs it PERSISTED into the
+                // LOCAL store (held, unspent) — count those, NEVER the mint's `amount_issued`.
+                let proofs = wallet
+                    .mint(&quote.id, SplitTarget::default(), None)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("fund-wallet: drain (mint) the paid-but-unissued quote {}: {e}", quote.id)
+                    })?;
+                let drained_sats: u64 = proofs
+                    .total_amount()
+                    .map_err(|e| anyhow::anyhow!("fund-wallet: total the drained proofs for {}: {e}", quote.id))?
+                    .into();
 
-        // ★PHANTOM-CREDIT SECOND GUARD (defence in depth): a PAID quote that yielded ZERO local proofs
-        // means nothing actually landed — never report a fund the wallet did not receive.
-        if drained_sats == 0 {
-            anyhow::bail!(
-                "fund-wallet: draining the paid quote {} yielded ZERO local proofs — refusing to \
-                 report a fund the wallet did not receive (phantom credit).",
-                quote.id
-            );
-        }
+                // ★PHANTOM-CREDIT SECOND GUARD (defence in depth): a PAID quote that yielded ZERO
+                // local proofs means nothing actually landed — never report a fund not received.
+                if drained_sats == 0 {
+                    anyhow::bail!(
+                        "fund-wallet: draining the paid quote {} yielded ZERO local proofs — refusing to \
+                         report a fund the wallet did not receive (phantom credit).",
+                        quote.id
+                    );
+                }
+                (quote, drained_sats)
+            }
+            DrainCandidate::AlreadyHeld { quote, held_sats } => {
+                // Issued AND proofs already landed (saga completed during the re-check): the credit is
+                // the HELD sum computed above — mint NOTHING more (re-minting an Issued quote is a no-op
+                // / error). This is the #1 fix: an Issued-with-held-proofs quote SUCCEEDS, not bails.
+                (quote, held_sats)
+            }
+        };
 
-        // FIX 3: a BOLT11 quote mints its FULL amount (LN fees are payer-side), so a drained amount
+        // FIX 3: a BOLT11 quote mints its FULL amount (LN fees are payer-side), so a funded amount
         // != requested is a mismatch we refuse rather than silently under/over-report the fund.
-        ensure_minted_matches_requested(drained_sats, amount_sats, &quote.id)?;
+        ensure_minted_matches_requested(funded_sats, amount_sats, &quote.id)?;
 
         let balance_sats: u64 = wallet
             .total_balance()
@@ -646,14 +794,14 @@ pub async fn mint_into_wallet_operator_pays(
             .into();
         tracing::info!(
             quote_id = %quote.id,
-            drained_sats,
-            "fund-wallet: DRAINED a prior paid-but-unissued quote (minted to LOCAL proofs, resumed \
-             its EXACT quote id) — issued NO new invoice"
+            funded_sats,
+            "fund-wallet: RESUMED a prior paid-but-unissued quote from HELD proofs (its EXACT quote id) \
+             — issued NO new invoice"
         );
         return Ok(FundWalletOutcome {
             bolt11: quote.request,
             quote_id: quote.id,
-            minted_sats: drained_sats,
+            minted_sats: funded_sats,
             balance_sats,
         });
     }
