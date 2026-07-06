@@ -690,6 +690,9 @@ impl kirby_node::rail::SettlementProvider for StubSettlement {
     async fn verify_settlement(&self, _charge_id: &str, _evidence: &str) -> anyhow::Result<u64> {
         anyhow::bail!("verify_settlement not called in the E1 gate")
     }
+    fn method(&self) -> kirby_proto::ChargeMethod {
+        kirby_proto::ChargeMethod::Cashu
+    }
 }
 
 /// E1 (earn-loop gate): `IssueCharge` through the gateway leaves the treasury balance

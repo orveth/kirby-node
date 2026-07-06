@@ -252,6 +252,16 @@ impl GatewayService {
         self
     }
 
+    /// Attach a settlement provider we ALREADY hold behind `Arc<dyn SettlementProvider>` (the boot
+    /// path builds the provider next to the wallet and threads it as a trait object). Same effect
+    /// as [`Self::with_settlement_provider`]; the generic form stays for tests that pass a concrete
+    /// type. Boot wires exactly one provider (Cashu OR Lightning) selected by `[brain]
+    /// settlement_method`; `None` (the default) attaches nothing and IssueCharge fails closed.
+    pub fn with_settlement_provider_dyn(mut self, s: Arc<dyn SettlementProvider>) -> Self {
+        self.settlement = Some(s);
+        self
+    }
+
     /// TEST-ONLY: does `settle_locks` currently hold an entry for `charge_id`? Lets a tooth
     /// assert the per-charge map entry is cleaned up even when a settle is cancelled/panics.
     #[cfg(test)]
@@ -557,6 +567,12 @@ impl GatewayService {
         // either side (an old pre-R2-4 row, or a non-memory act) => skip (back-compat).
         let request_hash: Vec<u8> = match act {
             Act::Memory(m) => memory_request_hash(m),
+            // Inc 1b (Fix 4): extend the R2-4 content-aware dedupe to IssueCharge. A resume re-issue
+            // MUST return the SAME ChargeIssued, but a re-issue of the same key with DIVERGENT terms
+            // (amount/memo/method) is a client bug — refuse rather than hand back a charge that no
+            // longer matches the request. Prior (pre-1b) IssueCharge rows persisted an EMPTY hash, so
+            // the comparison below skips them (`!prior.request_hash.is_empty()`) — back-compat holds.
+            Act::IssueCharge(ic) => issue_charge_request_hash(ic),
             _ => Vec::new(),
         };
         if let Some(prior) = self.treasury.lookup(&req.idempotency_key)? {
@@ -1065,6 +1081,22 @@ impl GatewayService {
             return Ok(denied(Outcome::UpstreamFailed, self.balance()?));
         };
 
+        // METHOD GUARD (D2, ★SHARP TOOTH, money-safety): boot wires exactly ONE settlement rail.
+        // A charge whose requested `method` does not match the wired provider's rail must be
+        // REJECTED (fail-closed, debit 0) BEFORE `settlement.issue` — never settle a Cashu charge
+        // on a Lightning provider (or vice-versa). The genome-supplied `ic.method` is an i32; the
+        // wired provider names its rail via `settlement.method()`.
+        let wired_method = settlement.method() as i32;
+        if ic.method != wired_method {
+            tracing::error!(
+                requested_method = ic.method,
+                wired_method,
+                "IssueCharge method does NOT match the wired settlement rail; rejecting fail-closed \
+                 (debit 0) — never settle a charge on the wrong rail"
+            );
+            return Ok(denied(Outcome::UpstreamFailed, self.balance()?));
+        }
+
         let issued: ChargeIssuedData = match settlement.issue(ic.amount_sats, &ic.memo).await {
             Ok(d) => d,
             Err(e) => {
@@ -1087,13 +1119,16 @@ impl GatewayService {
 
         // Record with cost=0: issuing a charge costs the genome nothing. The ledger row
         // dedupes resume re-issues at STEP1 (a Duplicate returns the same ChargeIssued).
+        // Inc 1b (Fix 4): persist the effective-request hash (over amount/memo/method) so a future
+        // same-key re-issue with DIVERGENT terms is refused at STEP-1 — mirrors the Memory (R2-4)
+        // persist. A same-key SAME-terms resume still matches the hash and returns the same charge.
         match self.treasury.debit_and_record(
             &req.idempotency_key,
             0,
             proof.clone(),
             Vec::new(),
             Vec::new(),
-            Vec::new(),
+            issue_charge_request_hash(ic),
         )? {
             DebitOutcome::Debited { remaining, .. } => Ok(CapabilityReceipt {
                 schema_version: kirby_proto::SCHEMA_VERSION,
@@ -1656,6 +1691,21 @@ fn memory_request_hash(m: &Memory) -> Vec<u8> {
     h.finalize().to_vec()
 }
 
+/// A deterministic hash over an IssueCharge's EFFECTIVE request (`amount_sats`, `memo`, `method`)
+/// for the R2-4-style content-aware dedupe (Inc 1b Fix 4). A resume re-issue of the same
+/// idempotency key with the SAME terms hashes identically (returns the stored ChargeIssued); a
+/// re-issue with DIVERGENT terms hashes differently and is refused at STEP-1. Mirrors
+/// [`memory_request_hash`]'s length-prefixed encoding so no two distinct requests collide.
+fn issue_charge_request_hash(ic: &kirby_proto::IssueCharge) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(ic.amount_sats.to_be_bytes());
+    h.update((ic.memo.len() as u64).to_be_bytes());
+    h.update(ic.memo.as_bytes());
+    h.update((ic.method as u32).to_be_bytes());
+    h.finalize().to_vec()
+}
+
 /// Map a host-side treasury fault to a gRPC internal error. Genome-driven
 /// outcomes are receipts, not errors; only storage and encoding faults reach
 /// here.
@@ -1701,6 +1751,9 @@ mod tests {
             // Never resolves: park forever so the caller can cancel us mid-await.
             std::future::pending::<()>().await;
             unreachable!("pending future never resolves")
+        }
+        fn method(&self) -> kirby_proto::ChargeMethod {
+            kirby_proto::ChargeMethod::Cashu
         }
     }
 

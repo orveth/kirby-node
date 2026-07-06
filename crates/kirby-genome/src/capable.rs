@@ -783,6 +783,7 @@ pub(super) trait Gateway {
         amount_sats: u64,
         memo: &str,
         idempotency_key: &str,
+        method: ChargeMethod,
     ) -> Result<CapabilityReceipt, tonic::Status>;
     /// Fetch a FRESH [`SessionContext`] via `GetSessionContext` (B2). The daemon composes the
     /// `economics` percept LIVE per call, so the returned books are CURRENT (never a boot cache).
@@ -808,6 +809,7 @@ impl Gateway for NodeGatewayClient<tonic::transport::Channel> {
         amount_sats: u64,
         memo: &str,
         idempotency_key: &str,
+        method: ChargeMethod,
     ) -> Result<CapabilityReceipt, tonic::Status> {
         let req = CapabilityRequest {
             schema_version: kirby_proto::SCHEMA_VERSION,
@@ -815,7 +817,7 @@ impl Gateway for NodeGatewayClient<tonic::transport::Channel> {
             act: Some(Act::IssueCharge(IssueCharge {
                 amount_sats,
                 memo: memo.to_string(),
-                method: ChargeMethod::Cashu as i32,
+                method: method as i32,
             })),
             budget_sats: 0,
         };
@@ -2417,7 +2419,10 @@ pub(super) async fn earn_loop_tick<G: Gateway>(
 
     // ISSUE CHARGE: daemon-side, zero cost to the genome (IssueCharge is free).
     let charge_key = format!("earn-charge-{seq}");
-    let charge_receipt = match gw.issue_charge(amount_sats, &job.text, &charge_key).await {
+    let charge_receipt = match gw
+        .issue_charge(amount_sats, &job.text, &charge_key, ChargeMethod::Cashu)
+        .await
+    {
         Ok(r) => r,
         Err(status) => {
             boot_log(&format!("earn_loop seq={seq}: issue_charge errored ({status}); transient"));
@@ -3321,7 +3326,12 @@ pub(super) async fn oracle_tick<G: Gateway>(
                     ))
                 );
                 let charge_receipt = match gw
-                    .issue_charge(amount_sats, &format!("oracle: {text}"), &charge_key)
+                    .issue_charge(
+                        amount_sats,
+                        &format!("oracle: {text}"),
+                        &charge_key,
+                        ChargeMethod::Lightning,
+                    )
                     .await
                 {
                     Ok(r) => r,
@@ -3795,15 +3805,16 @@ mod tests {
             amount_sats: u64,
             memo: &str,
             idempotency_key: &str,
+            method: ChargeMethod,
         ) -> Result<CapabilityReceipt, tonic::Status> {
-            // Record the request so a test can assert the amount + idempotency key.
+            // Record the request so a test can assert the amount + idempotency key + method.
             self.requests.push(CapabilityRequest {
                 schema_version: kirby_proto::SCHEMA_VERSION,
                 idempotency_key: idempotency_key.to_string(),
                 act: Some(Act::IssueCharge(IssueCharge {
                     amount_sats,
                     memo: memo.to_string(),
-                    method: ChargeMethod::Cashu as i32,
+                    method: method as i32,
                 })),
                 budget_sats: 0,
             });
@@ -3825,7 +3836,7 @@ mod tests {
                     charge_id: format!("mock-charge-{idempotency_key}"),
                     invoice_or_request: format!("cashu:charge:{idempotency_key}:{returned_amount}"),
                     amount_sats: returned_amount,
-                    method: ChargeMethod::Cashu as i32,
+                    method: method as i32,
                 }),
                 ..Default::default()
             })
