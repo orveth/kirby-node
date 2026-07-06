@@ -421,6 +421,41 @@ fn pin_diarist_memory_key(
     pinned
 }
 
+/// The base capability allowlist granted to a workload's gateway (the SINGLE source of truth for
+/// the per-workload grant), BEFORE the conditional egress `http.fetch` token that
+/// [`agent_boot_config`] adds only when `[egress] enabled`. A destination ABSENT here is
+/// `DeniedNotAllowlisted` at the gateway's STEP 2 (fail-closed, checked BEFORE the Memory/Actuate/
+/// IssueCharge forks).
+///
+/// - `Capable`: the both-acts workload PLUS the outward PUBLIC voice — the brain + memory sentinels,
+///   the `nostr.publish` token, and the `nostr.dm_reply` token.
+/// - `Oracle`: the price-quote EARN workload. It THINKS (brain completion), ISSUES CHARGES
+///   (`ISSUE_CHARGE_DESTINATION` — charge-issue IS allowlist-gated at STEP 2, the destination is
+///   checked BEFORE the IssueCharge fork, so this token is REQUIRED or every charge is
+///   `DeniedNotAllowlisted` and the earn path is structurally dead), and answers over DM
+///   (`nostr.dm_reply`); its price fetch rides the egress `http.fetch` token added conditionally in
+///   `agent_boot_config`. It is LEAST-PRIVILEGE: NO `nostr.publish` (it never posts a public note)
+///   and NO memory sentinel (it does no durable memory write) — the emitted-act ⊆ grant invariant
+///   is proven by the genome tooth `oracle_emits_only_minimal_capabilities`.
+/// - Every OTHER workload keeps the bare test-mint grant.
+pub(crate) fn workload_allowlist(workload: crate::config::Workload) -> Vec<String> {
+    use crate::config::Workload;
+    match workload {
+        Workload::Capable => vec![
+            crate::rail::BRAIN_COMPLETION_DESTINATION.to_string(),
+            crate::rail::MEMORY_DESTINATION.to_string(),
+            kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH.to_string(),
+            kirby_proto::ACTUATE_KIND_NOSTR_DM_REPLY.to_string(),
+        ],
+        Workload::Oracle => vec![
+            crate::rail::BRAIN_COMPLETION_DESTINATION.to_string(),
+            crate::rail::ISSUE_CHARGE_DESTINATION.to_string(),
+            kirby_proto::ACTUATE_KIND_NOSTR_DM_REPLY.to_string(),
+        ],
+        _ => vec!["mint.test.local".to_string()],
+    }
+}
+
 /// The genome [`BootConfig`] for the v0 agent, shared by bootstrap and resume.
 /// `workload` is the real genome workload from `kirby.toml`; `restore_checkpoint`
 /// is set for resume.
@@ -450,33 +485,26 @@ fn agent_boot_config(
     // and all three cmdline blocks travel. This is the only config-wiring the capable agent
     // needs (no new daemon act/rail/metering/nerve code — the two acts compose on orthogonal
     // seams).
-    let (mut allow, brain, memory, agent) = match cfg.workload {
-        // The oracle workload reuses the capable grant verbatim: same brain/memory sentinels, the
-        // nostr.publish + nostr.dm_reply actuator tokens (it answers over DM), and the same
-        // brain/memory/agent cmdline blocks. Charge-issue is NOT allowlist-gated (Act::IssueCharge
-        // forks at the gateway before the allowlist step; it only needs a settlement provider,
-        // wired config-side from `[brain] settlement_method`), so oracle needs nothing beyond this.
+    // The capability allowlist is workload-scoped — the SINGLE source of truth is
+    // `workload_allowlist`. Charge-issue IS allowlist-gated: the gateway checks
+    // `allowlist.contains(rail::destination(act))` at STEP 2 BEFORE the IssueCharge fork, and
+    // `destination(Act::IssueCharge) == ISSUE_CHARGE_DESTINATION` — so the ORACLE grant MUST carry
+    // that token or every charge is DENIED_NOT_ALLOWLISTED and the earn path is structurally dead.
+    // The oracle grant is otherwise LEAST-PRIVILEGE (no nostr.publish, no memory sentinel); see
+    // `workload_allowlist`.
+    let mut allow = workload_allowlist(cfg.workload);
+    // The brain/memory/agent cmdline blocks ride only for the both-acts workloads (capable +
+    // oracle), so `boot_and_observe` builds the Completion rail, injects the Memory backend, and
+    // attaches the NostrActuator on ONE gateway. Every other workload carries none (the plain
+    // MockRail, no brain/memory/agent params). Keys are pinned to the node identity by construction
+    // (self-encrypted facts, node-npub-signed notes: the F3 one-key invariant).
+    let (brain, memory, agent) = match cfg.workload {
         Workload::Capable | Workload::Oracle => (
-            // The capable loop is the both-acts workload PLUS the outward voice: the brain +
-            // memory sentinels AND the nostr.publish actuator token in the allowlist, so
-            // boot_and_observe builds the Completion rail, injects the Memory backend, AND attaches
-            // the NostrActuator on ONE gateway. The actuator/EngramStore keys are pinned to the
-            // node identity by construction (capable facts are self-encrypted to the node, and a
-            // published note is signed by the node npub: the F3 one-key invariant). Per-kind
-            // gating: ONLY because nostr.publish is on this allowlist can a capable agent publish.
-            vec![
-                crate::rail::BRAIN_COMPLETION_DESTINATION.to_string(),
-                crate::rail::MEMORY_DESTINATION.to_string(),
-                kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH.to_string(),
-                // The PRIVATE voice token (task #12): only because nostr.dm_reply is on this
-                // allowlist can a capable agent answer a DM (per-kind gating, like nostr.publish).
-                kirby_proto::ACTUATE_KIND_NOSTR_DM_REPLY.to_string(),
-            ],
             Some(cfg.brain.clone()),
             Some(pin_diarist_memory_key(&cfg.memory, &cfg.identity)),
             Some(cfg.agent),
         ),
-        _ => (vec!["mint.test.local".to_string()], None, None, None),
+        _ => (None, None, None),
     };
     // The outward actuator config (the agent's voice): ONLY the capable workload publishes (the
     // first outward voice). Derived, not a toml section (MVP): the node's presence relay + the
@@ -1262,12 +1290,20 @@ mod tests {
         )
     }
 
-    /// A validated run for `workload`, with egress ON so the `http.fetch` grant arm is exercised.
-    /// The image dir (from `test_root`) gets the two files `ImagePaths::from_dir` checks for.
+    /// A validated run for `workload`, with egress ON so the `http.fetch` grant arm is exercised,
+    /// and a DEPLOYABLE earn path (routstr backend + lightning settlement) so `workload = oracle`
+    /// clears the earn-or-refuse-boot validation guard (config.rs). The image dir (from
+    /// `test_root`) gets the two files `ImagePaths::from_dir` checks for.
     fn oracle_test_run(workload: Workload) -> RunAgentConfig {
         let mut cfg = test_config(RunMode::Bootstrap);
         cfg.workload = workload;
         cfg.egress.enabled = true;
+        // The routstr + lightning earn path: required for a standalone oracle to validate, and the
+        // real shape a deployed oracle runs (a settlement provider attaches at boot).
+        cfg.brain.backend = crate::config::BrainBackendKind::Routstr;
+        cfg.brain.settlement_method = Some(crate::config::SettlementMethod::Lightning);
+        cfg.brain.node_url = "https://api.routstr.com".to_string();
+        cfg.brain.wallet_db_path = "/var/lib/kirby/brain-wallet.sqlite".to_string();
         let run = RunAgentConfig::from_config(cfg).unwrap();
         std::fs::write(run.image_dir.join("vmlinux"), b"").unwrap();
         std::fs::write(run.image_dir.join("rootfs.squashfs"), b"").unwrap();
@@ -1306,25 +1342,19 @@ mod tests {
         assert!(!hex.is_empty());
     }
 
-    /// Tooth 6 (settlement, config-driven not Capable-gated): the oracle's boot config carries the
-    /// SAME `[brain]` (which holds `settlement_method`) as capable — so `settlement_method =
-    /// "lightning"` rides into boot and a settlement provider attaches (`Act::IssueCharge` is gated
-    /// only by an attached provider, forked before the allowlist). The allowlist grant is also
-    /// field-equal (brain+memory sentinels, nostr.publish + nostr.dm_reply, http.fetch), and the
-    /// genome selects `oracle_loop` (`boot.workload == Some("oracle")`). RED-on-revert: drop
-    /// `Workload::Oracle` from the allowlist/brain match arm (~459) → oracle falls to the bare
-    /// `mint.test.local` grant (no brain, no charge/DM/egress path) → these assertions fail.
+    /// Tooth 6 (settlement + boot wiring, config-driven not Capable-gated): the oracle's boot config
+    /// carries the SAME `[brain]` (which holds `settlement_method`) as capable — so `settlement_method
+    /// = "lightning"` rides into boot and a settlement provider attaches. The genome selects
+    /// `oracle_loop` (`boot.workload == Some("oracle")`), and egress (the price-fetch `http.fetch`
+    /// token + policy) is granted like capable. RED-on-revert: drop `Workload::Oracle` from the
+    /// brain/social/egress arms → oracle falls to the bare grant (no brain, no charge/DM/egress path)
+    /// → these assertions fail. (The allowlist grant itself is checked by the two teeth below: it is
+    /// NOT field-equal to capable — the oracle is LEAST-PRIVILEGE.)
     #[tokio::test]
     async fn oracle_grant_and_settlement_wiring_mirror_capable() {
         let cosign = colocated_cosign().await;
-        let mut oracle_run = oracle_test_run(Workload::Oracle);
-        let mut capable_run = oracle_test_run(Workload::Capable);
-        // Post-validate mutation (bypasses the routstr-required-fields load guard): set the SAME
-        // settlement selector on both so we prove it flows into boot identically for oracle.
-        for run in [&mut oracle_run, &mut capable_run] {
-            run.config.brain.backend = crate::config::BrainBackendKind::Routstr;
-            run.config.brain.settlement_method = Some(crate::config::SettlementMethod::Lightning);
-        }
+        let oracle_run = oracle_test_run(Workload::Oracle);
+        let capable_run = oracle_test_run(Workload::Capable);
         let oracle_boot = agent_boot_config(&oracle_run, None, &cosign).unwrap();
         let capable_boot = agent_boot_config(&capable_run, None, &cosign).unwrap();
 
@@ -1335,8 +1365,6 @@ mod tests {
             Some(crate::config::SettlementMethod::Lightning),
             "the lightning settlement selector rides into the oracle's boot config (provider attaches)"
         );
-        // The capability grant (allowlist) is field-equal to capable — NOT the bare mint grant.
-        assert_eq!(oracle_boot.allow, capable_boot.allow, "oracle allowlist grant == capable");
         assert!(
             oracle_boot
                 .allow
@@ -1354,6 +1382,132 @@ mod tests {
                 .iter()
                 .any(|a| a.as_str() == kirby_proto::ACTUATE_KIND_HTTP_FETCH),
             "oracle granted http.fetch"
+        );
+    }
+
+    /// A Lightning settlement double: `issue` returns a canned payment request, `method()` reports
+    /// Lightning (matching the oracle genome's `ChargeMethod::Lightning`). Lets the charge-token
+    /// tooth drive a REAL `IssueCharge` through a gateway built with the oracle allowlist without a
+    /// live mint/relay. `verify_settlement` is unused by the tooth.
+    struct LightningTestSettlement;
+
+    #[async_trait::async_trait]
+    impl crate::rail::SettlementProvider for LightningTestSettlement {
+        async fn issue(
+            &self,
+            amount_sats: u64,
+            _memo: &str,
+        ) -> anyhow::Result<crate::rail::ChargeIssuedData> {
+            Ok(crate::rail::ChargeIssuedData {
+                charge_id: "oracle-test-charge".to_string(),
+                invoice_or_request: format!("lnbc{amount_sats}"),
+                amount_sats,
+            })
+        }
+        async fn verify_settlement(&self, _charge_id: &str, _evidence: &str) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+        fn method(&self) -> kirby_proto::ChargeMethod {
+            kirby_proto::ChargeMethod::Lightning
+        }
+    }
+
+    /// The charge-token deployable-path proof — a deployed oracle's IssueCharge must be authorized, not
+    /// denied at the allowlist. Charge-issue IS allowlist-gated: the gateway checks
+    /// `allowlist.contains(rail::destination(act))` at STEP 2 BEFORE the IssueCharge fork, and
+    /// `destination(Act::IssueCharge) == ISSUE_CHARGE_DESTINATION`. We build a real `GatewayService`
+    /// with the EXACT allowlist `agent_boot_config` produces for `Workload::Oracle`
+    /// (`workload_allowlist(Oracle)`) + a Lightning settlement provider, drive an `IssueCharge`, and
+    /// assert it is NOT `DeniedNotAllowlisted` (it reaches the fork and is authorized). Modeled on
+    /// the gateway test that allowlists `ISSUE_CHARGE_DESTINATION` for a MockRail.
+    ///
+    /// RED-on-revert: remove `ISSUE_CHARGE_DESTINATION` from the `Workload::Oracle` arm of
+    /// `workload_allowlist` → the destination is not on the oracle grant → the charge is
+    /// `DeniedNotAllowlisted` at STEP 2 (the earn path is structurally dead) → this fails.
+    #[tokio::test]
+    async fn oracle_allowlist_authorizes_issue_charge() {
+        use crate::gateway::{GatewayService, Session};
+        use crate::treasury::Treasury;
+        use kirby_proto::capability_request::Act;
+        use kirby_proto::{CapabilityRequest, ChargeMethod, IssueCharge, Outcome};
+        use std::sync::Arc;
+
+        let treasury = Treasury::open_temporary(1_000).expect("open temporary treasury");
+        let session = Session {
+            task_descriptor: "oracle-charge-token".into(),
+            budget_sats: 1_000,
+            // The EXACT grant the deployed oracle boots with — the invariant under test.
+            allowlisted_destinations: workload_allowlist(Workload::Oracle),
+            allowlisted_inbound_kinds: Vec::new(),
+        };
+        let svc = GatewayService::new(treasury, Arc::new(crate::rail::MockRail::new()), session)
+            .with_settlement_provider(LightningTestSettlement);
+
+        let req = CapabilityRequest {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            idempotency_key: "oracle-charge-1".into(),
+            act: Some(Act::IssueCharge(IssueCharge {
+                amount_sats: 10,
+                memo: "oracle: PRICE BTC/USD".into(),
+                method: ChargeMethod::Lightning as i32,
+            })),
+            budget_sats: 0,
+        };
+        let receipt = svc.authorize_capability(&req).await.expect("authorize IssueCharge");
+
+        assert_ne!(
+            receipt.outcome,
+            Outcome::DeniedNotAllowlisted as i32,
+            "the ORACLE allowlist MUST carry ISSUE_CHARGE_DESTINATION — a charge denied at the \
+             allowlist step is a structurally-dead earn path"
+        );
+        assert_eq!(
+            receipt.outcome,
+            Outcome::AuthorizedAndPerformed as i32,
+            "with the charge token granted + a settlement provider attached, IssueCharge is authorized"
+        );
+        assert_eq!(receipt.cost_sats, 0, "issuing a charge is zero-cost");
+        assert!(receipt.charge.is_some(), "an authorized IssueCharge returns a ChargeIssued");
+    }
+
+    /// Least-privilege — the ORACLE grant is the MINIMAL set: exactly the brain-completion
+    /// sentinel, the charge token, and the DM-reply token, and it EXCLUDES `nostr.publish` and the
+    /// memory sentinel that the Capable grant carries. `http.fetch` is NOT part of the base grant
+    /// (it is added conditionally by the egress arm), so it is absent here. Safe to drop the two
+    /// tokens because the genome tooth `oracle_emits_only_minimal_capabilities` proves the oracle's
+    /// emitted-act set never contains a publish or a memory write.
+    ///
+    /// RED-on-revert: re-add `MEMORY_DESTINATION` or `ACTUATE_KIND_NOSTR_PUBLISH` to the
+    /// `Workload::Oracle` arm of `workload_allowlist` (over-grant) → the set is no longer the minimal
+    /// three → this fails.
+    #[test]
+    fn oracle_allowlist_is_least_privilege() {
+        let oracle = workload_allowlist(Workload::Oracle);
+        let capable = workload_allowlist(Workload::Capable);
+
+        let mut expected = vec![
+            crate::rail::BRAIN_COMPLETION_DESTINATION.to_string(),
+            crate::rail::ISSUE_CHARGE_DESTINATION.to_string(),
+            kirby_proto::ACTUATE_KIND_NOSTR_DM_REPLY.to_string(),
+        ];
+        let mut got = oracle.clone();
+        expected.sort();
+        got.sort();
+        assert_eq!(got, expected, "the oracle grant is exactly the minimal earn+answer set");
+
+        // The two tokens the oracle drops (present on Capable) are ABSENT here (least-privilege).
+        assert!(
+            !oracle.iter().any(|a| a.as_str() == crate::rail::MEMORY_DESTINATION),
+            "the oracle does no durable memory write, so it is NOT granted the memory sentinel"
+        );
+        assert!(
+            !oracle.iter().any(|a| a.as_str() == kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH),
+            "the oracle answers over DM and never publishes, so it is NOT granted nostr.publish"
+        );
+        assert!(
+            capable.iter().any(|a| a.as_str() == crate::rail::MEMORY_DESTINATION)
+                && capable.iter().any(|a| a.as_str() == kirby_proto::ACTUATE_KIND_NOSTR_PUBLISH),
+            "sanity: Capable DOES carry both tokens the oracle drops (so the drop is meaningful)"
         );
     }
 }

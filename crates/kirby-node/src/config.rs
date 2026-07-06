@@ -2132,6 +2132,36 @@ impl KirbyConfig {
                 self.workload.genome_workload()
             );
         }
+        // ORACLE EARN-OR-REFUSE-BOOT (Milestone 2): a STANDALONE oracle structurally CANNOT earn
+        // unless it can issue a SETTLEABLE charge. The oracle genome emits `ChargeMethod::Lightning`
+        // UNCONDITIONALLY (capable.rs `oracle_tick`), and `IssueCharge` fails closed at the gateway
+        // (debit 0, no charge) unless a settlement provider is attached — which boot wires ONLY on
+        // the `routstr` backend with `settlement_method = Some(Lightning)` (`build_routstr_brain`).
+        // A stub / routstr_key backend, or `settlement_method` None / Cashu, boots an oracle that
+        // quotes prices it can never charge for = the zombie earn-loop this milestone forbids.
+        // Refuse the boot at LOAD with a clear message rather than ship a can't-earn oracle. Placed
+        // after the shared capable/oracle guards above so those (brain cap, memory cap, resume) still
+        // report their own errors first for a config that also trips them. (Standalone-only per the
+        // M5 seam: a money-less FleetHost never boots an oracle from its own top-level config.)
+        if role == ConfigRole::Standalone && self.workload == Workload::Oracle {
+            if self.brain.backend != BrainBackendKind::Routstr {
+                anyhow::bail!(
+                    "workload = \"oracle\" requires brain.backend = \"routstr\": a standalone oracle \
+                     issues Lightning charges and must attach a settlement provider, which boot wires \
+                     only on the routstr backend; got brain.backend = {:?} (an oracle on this backend \
+                     boots but can never earn)",
+                    self.brain.backend
+                );
+            }
+            if self.brain.settlement_method != Some(SettlementMethod::Lightning) {
+                anyhow::bail!(
+                    "workload = \"oracle\" requires brain.settlement_method = \"lightning\": the oracle \
+                     genome issues Lightning charges, so {:?} would boot an oracle that cannot settle \
+                     what it quotes (a can't-earn zombie)",
+                    self.brain.settlement_method
+                );
+            }
+        }
         // A pinned backend must match the host. `auto` resolves to the native one,
         // so it never trips this. This is a RUNTIME check (cfg!), not a compile-time
         // hard fail, so the crate builds on both platforms.
@@ -2581,6 +2611,9 @@ mod tests {
     /// (e.g. "capable") and the `genome_workload` assertion fails.
     #[test]
     fn oracle_workload_parses_and_maps_to_the_genome_string() {
+        // A DEPLOYABLE oracle (routstr backend + lightning settlement) so the earn-or-refuse-boot
+        // guard (`validate_for`) is satisfied — this tooth exercises parse + genome_workload mapping,
+        // not the earn-boot guard (that has its own `oracle_standalone_requires_routstr_lightning_earn_path`).
         let toml = r#"
             workload = "oracle"
             genome_image = { path = "/tmp/k/img" }
@@ -2591,6 +2624,10 @@ mod tests {
             [funding]
             initial_sats = 1000
             [brain]
+            backend = "routstr"
+            settlement_method = "lightning"
+            node_url = "https://api.routstr.com"
+            wallet_db_path = "/var/lib/kirby/brain-wallet.sqlite"
             max_cost_sats = 64
             [memory]
             max_cost_sats = 8
@@ -2691,8 +2728,10 @@ mod tests {
             "oracle must reject resume (bootstrap-only), got: {err}"
         );
 
-        // Negative control: the SAME oracle config with valid caps + bootstrap VALIDATES — proving
-        // the guards discriminate on the bad shapes, not on the oracle workload at large.
+        // Negative control: the SAME oracle config with valid caps + bootstrap + a DEPLOYABLE earn
+        // path (routstr backend + lightning settlement, required by the earn-or-refuse-boot guard)
+        // VALIDATES — proving the guards discriminate on the bad shapes, not on the oracle workload
+        // at large.
         let ok = r#"
             workload = "oracle"
             genome_image = { path = "/tmp/k/img" }
@@ -2703,6 +2742,10 @@ mod tests {
             [funding]
             initial_sats = 1000
             [brain]
+            backend = "routstr"
+            settlement_method = "lightning"
+            node_url = "https://api.routstr.com"
+            wallet_db_path = "/var/lib/kirby/brain-wallet.sqlite"
             max_cost_sats = 64
             [memory]
             max_cost_sats = 8
@@ -2710,6 +2753,82 @@ mod tests {
         let cfg = KirbyConfig::from_toml_str(ok).expect("a valid oracle bootstrap config must validate");
         assert_eq!(cfg.workload, Workload::Oracle);
         assert_eq!(cfg.mode, RunMode::Bootstrap);
+    }
+
+    /// Oracle earn-or-refuse-boot: a standalone `workload = "oracle"` is REFUSED at load
+    /// unless it can attach a Lightning settlement provider — it must run `brain.backend = "routstr"`
+    /// AND `brain.settlement_method = "lightning"`. Otherwise `IssueCharge` fails closed at runtime
+    /// and the oracle quotes prices it can never charge for (the can't-earn zombie). Each bad shape
+    /// below is otherwise valid (routstr required-fields satisfied), so ONLY the earn-boot guard can
+    /// be the failing check.
+    ///
+    /// RED-on-revert: delete the `workload == Oracle` guard block in `validate_for` and each of
+    /// these configs validates (the oracle boots but can never earn) → every `expect_err` fails.
+    #[test]
+    fn oracle_standalone_requires_routstr_lightning_earn_path() {
+        // The routstr required fields, shared by every case so only the earn-boot guard varies.
+        let routstr = r#"
+            node_url = "https://api.routstr.com"
+            wallet_db_path = "/var/lib/kirby/brain-wallet.sqlite"
+            max_cost_sats = 64
+        "#;
+        let cfg_toml = |brain_extra: &str| {
+            format!(
+                r#"
+            workload = "oracle"
+            genome_image = {{ path = "/tmp/k/img" }}
+            [identity]
+            key_path = "/tmp/k/node.key"
+            [relay]
+            url = "ws://127.0.0.1:7777"
+            [funding]
+            initial_sats = 1000
+            [brain]
+            {brain_extra}
+            [memory]
+            max_cost_sats = 8
+        "#
+            )
+        };
+
+        // (a) STUB backend (no earn path at all): refused for the backend requirement. A stub oracle
+        // would boot fine before this guard existed, so this is the case the guard newly catches.
+        let stub = cfg_toml("max_cost_sats = 64");
+        let err = KirbyConfig::from_toml_str(&stub)
+            .expect_err("a stub-backend oracle cannot earn and must be refused");
+        assert!(
+            err.to_string().contains("requires brain.backend = \"routstr\""),
+            "expected the routstr-backend requirement, got: {err}"
+        );
+
+        // (b) routstr backend but settlement_method OMITTED (None): no provider wires, so IssueCharge
+        // fails closed — refused for the lightning requirement.
+        let no_settle = cfg_toml(&format!("backend = \"routstr\"\n{routstr}"));
+        let err = KirbyConfig::from_toml_str(&no_settle)
+            .expect_err("a routstr oracle with no settlement_method cannot earn and must be refused");
+        assert!(
+            err.to_string().contains("requires brain.settlement_method = \"lightning\""),
+            "expected the lightning-settlement requirement (None), got: {err}"
+        );
+
+        // (c) routstr backend but settlement_method = "cashu" (wrong rail — the genome quotes
+        // Lightning): refused for the lightning requirement. (backend IS routstr, so the generic
+        // non-routstr settlement guard does NOT preempt this — only the oracle earn-boot guard bites.)
+        let cashu = cfg_toml(&format!("backend = \"routstr\"\nsettlement_method = \"cashu\"\n{routstr}"));
+        let err = KirbyConfig::from_toml_str(&cashu)
+            .expect_err("a routstr oracle settling on cashu cannot serve its lightning quotes");
+        assert!(
+            err.to_string().contains("requires brain.settlement_method = \"lightning\""),
+            "expected the lightning-settlement requirement (cashu), got: {err}"
+        );
+
+        // Negative control: the deployable earn path (routstr + lightning) VALIDATES.
+        let ok = cfg_toml(&format!("backend = \"routstr\"\nsettlement_method = \"lightning\"\n{routstr}"));
+        let cfg = KirbyConfig::from_toml_str(&ok)
+            .expect("a routstr + lightning oracle is deployable and must validate");
+        assert_eq!(cfg.workload, Workload::Oracle);
+        assert_eq!(cfg.brain.backend, BrainBackendKind::Routstr);
+        assert_eq!(cfg.brain.settlement_method, Some(SettlementMethod::Lightning));
     }
 
     // ---- brain-routstr: the `backend = "routstr"` validation guards (the real-mode
