@@ -14,9 +14,13 @@
 //!     credit through the settle path .. `unpaid_quote_settle_credits_nothing`
 //!     (the DETERMINISTIC gate tooth lives in rail.rs `lightning_settlement_gate_tests`)
 //!   - TOOTH 3 (orphaned-proofs recovery + IDEMPOTENT): a crash between `mint()` and the credit
-//!     recovers on the settle RETRY via the ISSUED branch — treasury credited exactly the summed
-//!     HELD-UNSPENT amount (NOT the mint-claimed amount_issued), mint() ran exactly once, no proof
-//!     loss, AND a second settle credits nothing more .. `issued_quote_recovers_the_orphaned_mint`
+//!     recovers on the settle RETRY via the ISSUED branch — treasury credited EXACTLY the summed
+//!     HELD-UNSPENT amount, mint() ran exactly once, no proof loss, AND a second settle credits
+//!     nothing more .. `issued_quote_recovers_the_orphaned_mint`. COVERAGE BOUNDARY: this scenario
+//!     has held == amount_issued == 300, so it does NOT distinguish crediting-held from
+//!     crediting-the-mint-claimed-amount_issued — the phantom-credit distinction is TOOTH (ii)'s
+//!     job (below). Tooth 3 guards {exact-held credit, exactly-once mint, no proof loss,
+//!     idempotency}; do NOT weaken Tooth (ii) assuming Tooth 3 backstops the phantom bug.
 //!   - TOOTH (ii) (★PHANTOM-GUARD): an ISSUED quote whose mint-claimed `amount_issued` diverges
 //!     from the ZERO sats actually held FAILS CLEAN (credits nothing, records a stranded quote),
 //!     never crediting the phantom `amount_issued`
@@ -294,16 +298,22 @@ async fn paid_quote_settle_mints_and_credits_the_verified_amount() {
 // `verify_settlement` does, and it flips the quote to ISSUED at the mint) WITHOUT crediting —
 // modelling a daemon that died after `wallet.mint` but before `credit_verified`. Then drive
 // the settle RETRY (`settle_charge`), which re-enters `verify_settlement`, sees the quote is
-// ISSUED, takes the recovery branch (returns `amount_issued`, does NOT re-mint), and lets the
-// idempotent credit proceed.
+// ISSUED, takes the recovery branch (sums the still-Unspent proofs HELD for the quote and returns
+// THAT — here == amount_issued == 300, so the two are indistinguishable in this scenario — does
+// NOT re-mint), and lets the idempotent credit proceed.
 //
 // Asserts:
-//   (a) the treasury ends credited EXACTLY the minted amount;
+//   (a) the treasury ends credited EXACTLY the minted (held) amount;
 //   (b) mint() ran EXACTLY once — proven two ways: the pre-settle direct mint is the only mint
 //       (the wallet balance does not rise across the settle), AND a would-be second
 //       `wallet.mint(charge_id)` on an already-ISSUED quote ERRORS (so had the retry re-minted,
 //       it would have failed, not credited);
 //   (c) no proof loss — the wallet balance equals the minted amount throughout.
+//
+// COVERAGE BOUNDARY: because held == amount_issued == 300 here, this tooth does NOT bite on the
+// held-vs-amount_issued PHANTOM distinction (an amount_issued revert stays green — the numbers are
+// equal). That distinction is TOOTH (ii)'s job, where held == 0 ≠ amount_issued == 300. Tooth 3
+// guards exact-held credit + exactly-once mint + no proof loss + idempotency.
 //
 // RECOVERY MECHANISM PINNED: this is the ISSUED-branch credit — sum the still-Unspent proofs the
 // wallet holds for the quote (via its durable Incoming Transaction) and credit THAT, NEVER the
