@@ -848,3 +848,117 @@ async fn recover_incomplete_sagas_runs_at_drain_start() {
 
     mint.shutdown().await;
 }
+
+// --------------------------------------------------------------------------------------------
+// TOOTH 11 (rev-4, ★FIX #1 — the ALL-QUOTES proofless-issued scan, the definitive recovery-half
+// close): a quote the mint ISSUED against (amount_issued > 0) while the wallet HOLDS NO unspent
+// proofs for it (a crash-gap / compensated / failed-recovery / lost mint-response) is INVISIBLE to
+// `get_unissued_mint_quotes()` (which excludes amount_issued != 0), so the get_unissued drain scan
+// never sees it — a fresh invoice would DOUBLE-PAY the already-paid quote. The all-quotes scan
+// (`wallet.localstore.get_mint_quotes()`) enumerates EVERY quote and BAILS on any that is
+// issued-against yet holds zero proofs, deciding purely on HELD proofs (report-independent).
+//
+// Construction (a faithful proofless-issued quote INVISIBLE to get_unissued — the key difference
+// from the phantom-credit tooth 7, which resets amount_issued=0 to make the quote VISIBLE to
+// get_unissued): fund a quote normally (proofs land, amount_issued = AMOUNT, quote ISSUED at the
+// mint → EXCLUDED from get_unissued), then REMOVE the local proofs but KEEP amount_issued > 0. The
+// quote is now stranded-paid + proofless AND hidden from the get_unissued drain scan; only the
+// all-quotes scan catches it.
+//
+// RED-on-revert: remove the all-quotes proofless-issued scan from `mint_into_wallet_operator_pays`
+// → the invisible quote is not caught → the drain falls through to the fresh-quote path → it quotes
+// + prints a NEW invoice (the `panic!` closure fires = double-pay) → RED.
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn all_quotes_scan_bails_on_a_proofless_issued_quote_invisible_to_get_unissued() {
+    use cdk::cdk_database::WalletDatabase as _;
+    const AMOUNT: u64 = 3_333;
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let work = TempDir::new("kirby-fund-wallet-t11");
+    let db_path = work.path().join("wallet.sqlite");
+    let (wallet, counter_db) = open_boot_way(&mint.url(), &db_path).await;
+
+    // 1) Fund a quote normally — proofs land locally, amount_issued = AMOUNT, quote ISSUED at the mint
+    //    (so it is EXCLUDED from get_unissued).
+    let funded = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        AMOUNT,
+        "t11-fund",
+        Duration::from_millis(150),
+        Duration::from_secs(25),
+        |_| {},
+    )
+    .await
+    .expect("the fresh fund mints proofs");
+    assert_eq!(funded.minted_sats, AMOUNT, "the initial fund minted the requested amount");
+
+    // Precondition (the crux): the quote has amount_issued > 0 (so get_unissued excludes it) — it is
+    // INVISIBLE to the drain scan below.
+    let stored = counter_db
+        .get_mint_quote(&funded.quote_id)
+        .await
+        .expect("read the funded quote")
+        .expect("the funded quote is stored");
+    assert!(
+        u64::from(stored.amount_issued) > 0,
+        "precondition: the funded quote is ISSUED against (amount_issued > 0)"
+    );
+    let unissued = wallet.get_unissued_mint_quotes().await.expect("list unissued");
+    assert!(
+        !unissued.iter().any(|q| q.id == funded.quote_id),
+        "precondition: the issued-against quote is INVISIBLE to get_unissued (the drain scan cannot see it)"
+    );
+
+    // 2) Remove the local proofs but KEEP amount_issued > 0: a stranded PAID-but-proofless quote
+    //    hidden from get_unissued (crash-gap / compensated / lost mint-response).
+    let held = counter_db
+        .get_proofs(None, None, None, None)
+        .await
+        .expect("read local proofs");
+    let ys: Vec<_> = held.iter().map(|p| p.y).collect();
+    counter_db
+        .update_proofs(vec![], ys)
+        .await
+        .expect("remove the local proofs (stranded proofless-issued quote)");
+    assert_eq!(
+        wallet.total_balance().await.map(u64::from).unwrap_or(0),
+        0,
+        "precondition: the wallet holds NO proofs, yet the quote stays amount_issued > 0 (invisible to get_unissued)"
+    );
+
+    // 3) A re-run must BAIL via the ALL-QUOTES scan, issuing NO fresh invoice (the panic closure must
+    //    NOT fire — a fresh invoice would double-pay the already-paid quote).
+    let res = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        AMOUNT,
+        "t11-rerun",
+        Duration::from_millis(50),
+        Duration::from_secs(25),
+        |_| panic!(
+            "double-pay: a proofless-issued quote invisible to get_unissued must BAIL via the \
+             all-quotes scan BEFORE quoting a fresh invoice"
+        ),
+    )
+    .await;
+    assert!(
+        res.is_err(),
+        "★ FIX #1: a proofless-issued quote INVISIBLE to get_unissued must make the drain BAIL — \
+         remove the all-quotes scan → it falls through to a fresh invoice (double-pay) → RED"
+    );
+    let msg = format!("{:#}", res.unwrap_err());
+    assert!(
+        msg.contains("proofless") || msg.contains("double-pay") || msg.contains("stranded"),
+        "the bail names the proofless-issued / double-pay cause: {msg}"
+    );
+    assert_eq!(
+        wallet.total_balance().await.map(u64::from).unwrap_or(0),
+        0,
+        "the wallet still holds NOTHING — no fresh invoice, no double-pay"
+    );
+
+    mint.shutdown().await;
+}

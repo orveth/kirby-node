@@ -521,18 +521,61 @@ async fn held_unspent_for_quote(wallet: &Wallet, quote_id: &str) -> anyhow::Resu
         return Ok((0, false));
     }
 
-    // Read those proofs back and sum ONLY the still-Unspent ones (the deterministic held set).
+    // Read those proofs back and sum ONLY the still-Unspent ones (the deterministic held set). The
+    // sum is CHECKED (task #59): a raw u64 sum would WRAP on overflow and mis-report the held amount.
     let proofs = wallet
         .localstore
         .get_proofs_by_ys(ys)
         .await
         .map_err(|e| anyhow::anyhow!("fund-wallet: read proofs for quote {quote_id}: {e}"))?;
-    let held: u64 = proofs
-        .iter()
-        .filter(|p| p.state == State::Unspent)
-        .map(|p| u64::from(p.proof.amount))
-        .sum();
+    let held = checked_held_sum(
+        proofs
+            .iter()
+            .filter(|p| p.state == State::Unspent)
+            .map(|p| p.proof.amount),
+    )
+    .map_err(|e| anyhow::anyhow!("fund-wallet: held-proofs sum for quote {quote_id}: {e}"))?;
     Ok((held, found_transaction))
+}
+
+/// Sum a set of held unspent proof amounts, CHECKED (closes tracked follow-up task #59).
+///
+/// A raw `iter.map(u64::from).sum::<u64>()` WRAPS on overflow in a RELEASE build (Rust panics on
+/// arithmetic overflow only in debug), silently reporting a WRONG (small, wrapped) held amount — and a
+/// wrapped total could even satisfy an `== requested` check on garbage. [`cdk::Amount::try_sum`] folds
+/// with `checked_add` and returns `Err` on overflow instead, so an overflowing held set FAILS CLOSED
+/// (refused) rather than being mis-credited. Pure over the amounts so the overflow tooth drives it
+/// directly (no wallet/store needed).
+fn checked_held_sum(amounts: impl IntoIterator<Item = Amount>) -> anyhow::Result<u64> {
+    let total = Amount::try_sum(amounts).map_err(|e| {
+        anyhow::anyhow!(
+            "summing held unspent proofs overflowed the u64 amount space ({e}) — refusing to report \
+             a WRAPPED (wrong, small) held amount (task #59: checked held-sum, fail-closed)"
+        )
+    })?;
+    Ok(u64::from(total))
+}
+
+/// Refuse to fresh-quote unless saga recovery CLEANLY completed (FIX #1 report-capture half).
+/// [`cdk::wallet::Wallet::recover_incomplete_sagas`] returns `Ok(report)` even when it left work
+/// UNDONE: `failed > 0` (a saga that could NOT be recovered) or `skipped > 0` (a saga still pending —
+/// mint unreachable / payment pending) can each leave a paid-but-proofless quote that a fresh invoice
+/// would DOUBLE-PAY. So an incomplete recovery is a hard STOP before the drain scan: we cannot prove
+/// no stranded paid quote exists. (`recovered` / `compensated` are clean terminal outcomes — a
+/// compensated saga released its resources — and do NOT block; the all-quotes proofless-issued scan
+/// below is the report-INDEPENDENT backstop that also catches a compensated-but-still-issued quote.)
+fn check_recovery_report(report: &cdk::wallet::RecoveryReport) -> anyhow::Result<()> {
+    if report.failed > 0 || report.skipped > 0 {
+        anyhow::bail!(
+            "fund-wallet: saga recovery did not cleanly complete before the drain scan ({} failed, {} \
+             skipped) — refusing to issue a new invoice while an unrecovered/pending issue saga may \
+             leave a paid-but-proofless quote (a fresh invoice over it would double-pay). Resolve mint \
+             reachability and re-run.",
+            report.failed,
+            report.skipped
+        );
+    }
+    Ok(())
 }
 
 /// Mint `amount_sats` of ecash into an ALREADY-OPENED persistent wallet via an OPERATOR-PAID
@@ -566,18 +609,23 @@ async fn held_unspent_for_quote(wallet: &Wallet, quote_id: &str) -> anyhow::Resu
 /// SAME way the boot path opens them (seed via the [`WalletKey`] seam), so the minted proofs land
 /// in the store a subsequent boot reads and are derived under the boot-path seed (else unspendable).
 ///
-/// # ★THE INVARIANT (rev-3 comprehensive closure — audited, not asserted)
+/// # ★THE INVARIANT (rev-4 comprehensive closure — audited, not asserted)
 /// A mint quote is FUNDED **iff the wallet HOLDS unspent proofs for it**; the funded/credited/minted
 /// amount is the **SUM OF HELD UNSPENT PROOFS** for that quote id ([`held_unspent_for_quote`]) —
 /// NEVER the quote STATE (`Paid`/`Issued`/…), NEVER `amount_issued`, NEVER any mint-CLAIMED amount.
-/// This is the 1a rail invariant (credit == proofs actually held) applied to the fund drain. Every
-/// funded-vs-not decision branch and every reported/asserted amount below is enumerated and each
-/// decides on held-unspent-proofs (or is enumeration/refusal/identity that credits nothing):
+/// This is the 1a rail invariant (credit == proofs actually held) applied to the fund drain. The
+/// table below is EXHAUSTIVE over EVERY branch of this fn — the drain scan, the post-drain fresh-quote
+/// poll loop, and the guards/outcome. Each row is either a funded-vs-not / amount decision that decides
+/// on held-unspent-proofs, or an eligibility / refusal / identity branch that credits NOTHING (any
+/// branch found in the code is on this list):
 ///
 /// | Branch / path | What it decides | Signal it decides on | held-proofs? |
 /// |---|---|---|---|
+/// | (z) `amount_sats == 0` guard (pre-flight) | refuse (nothing to mint) | requested amount == 0 | N/A — input guard, credits nothing |
 /// | (a) NUT-13 establishment guard | refuse to mint (derivation gated) | counter established? (pre-req) | N/A — gates derivation, credits nothing |
-/// | (b) `recover_incomplete_sagas()` @ drain START | land in-flight/crashed issue-saga proofs BEFORE the scan | — (makes the held reads truthful) | ✓ its landed proofs feed every held check below |
+/// | (b) `recover_incomplete_sagas()` @ drain START | land in-flight/crashed issue-saga proofs BEFORE the scans | — (makes the held reads truthful); hard `Err` bails | ✓ its landed proofs feed every held check below |
+/// | (b′) `check_recovery_report(report)` — FIX #1(a) | refuse to fresh-quote on an unclean recovery | `report.failed > 0 \|\| skipped > 0` | N/A — refusal; a stranded paid quote may remain, do not double-pay |
+/// | (b″) ★ALL-QUOTES proofless-issued scan — FIX #1(b) | BAIL on a stranded paid-but-proofless quote INVISIBLE to get_unissued | for every quote with `amount_issued > 0`: **HELD unspent proofs == 0** | ✓ — decides purely on held proofs, report-independent; the definitive recovery-half close |
 /// | (c) `get_unissued_mint_quotes()` + per-quote `check_mint_quote_status` | which pending quotes to classify | mint re-check | N/A — enumeration only, credits nothing |
 /// | (d) loop arm `Paid` → `NeedsMint` | eligible-to-mint (drain) | state `Paid` gates minting; the CREDIT is the post-mint HELD sum (branch h) | ✓ funded amount is held/minted proofs, not state |
 /// | (e) loop arm `Issued` → held>0 SUCCEED / held==0 BAIL (#1) | funded? + amount | **HELD unspent proofs for the quote** | ✓ — the crux; `Issued` alone NEVER funds |
@@ -585,22 +633,31 @@ async fn held_unspent_for_quote(wallet: &Wallet, quote_id: &str) -> anyhow::Resu
 /// | (g) misattribution guard (`candidates.len() > 1`) | refuse (ambiguous attribution) | count of ALREADY-held-decided candidates | N/A — refusal; each candidate already held-decided |
 /// | (h) resolve `NeedsMint` → `wallet.mint()`; drained==0 → BAIL | funded amount | proofs `mint()` PERSISTED (held, unspent) — never `amount_issued` | ✓ |
 /// | (i) resolve `AlreadyHeld` → report `held_sats` | funded amount | **HELD unspent proofs sum** | ✓ |
-/// | (j) `ensure_minted_matches_requested(funded, requested)` | accept/refuse the fund | the HELD/minted funded amount vs requested | ✓ asserts on held, never on claim |
+/// | (j) `ensure_minted_matches_requested(funded, requested)` (resume path) | accept/refuse the fund | the HELD/minted funded amount vs requested | ✓ asserts on held, never on claim |
+/// | (p) fresh `mint_quote()` (+ its failure → bail) | request a new bolt11 (no drain candidate) | — (creates the quote; failure bails, credits nothing) | N/A — no funding decision |
+/// | (q) poll arm `Ok(Paid)` → `break` | eligible-to-mint (fresh) | state `Paid` gates minting; CREDIT is the post-mint HELD sum (branch k) | ✓ funded amount is minted proofs, not state |
+/// | (r) poll arm `Ok(Issued)` → BAIL | refuse (minted elsewhere; nothing to mint) | state `Issued` on a fresh quote we never minted | N/A — refusal; credits nothing |
+/// | (s) poll arm `Ok(_)` (Unpaid/pending) → continue | keep waiting | state not yet `Paid` | N/A — no decision; loops |
+/// | (t) poll arm `Err(_)` → warn + retry | transient; keep waiting to the deadline | mint check error | N/A — no decision; loops |
+/// | (u) poll timeout (`>= deadline`) → BAIL | refuse (not paid in time) | wall-clock deadline | N/A — refusal; credits nothing (quote persisted for a drain-resume) |
 /// | (k) fresh-mint `wallet.mint()` → `minted_sats` | funded amount | proofs `mint()` PERSISTED (held, unspent) | ✓ |
+/// | (j2) `ensure_minted_matches_requested(minted, requested)` (fresh path) | accept/refuse the fund | minted proofs vs requested | ✓ asserts on minted proofs, never on claim |
 /// | (l) post-fresh-mint `minted_sats == 0` → BAIL | refuse silent-success-on-0 | held/minted proofs total | ✓ |
 /// | (m) `FundWalletOutcome.minted_sats` | reported credit | = the held/minted funded amount (b–l) | ✓ |
 /// | (n) `FundWalletOutcome.balance_sats` | reported total balance | `wallet.total_balance()` (all held proofs) | ✓ |
 /// | (o) `FundWalletOutcome.quote_id` / `bolt11` | identity only | quote id / request string | N/A — no funding decision |
 ///
-/// **Quote-visibility hiding paths** (every way a paid-but-proofless quote can hide from the scan)
-/// and their closure:
+/// **Quote-visibility hiding paths** (every way a paid-but-proofless quote can hide) and their closure
+/// — after rev-4 the closure is REPORT-INDEPENDENT: the all-quotes scan (b″) decides on held proofs
+/// over EVERY quote regardless of the get_unissued filter or recovery completeness:
 /// - `get_unissued_mint_quotes()` EXCLUDES bolt11 quotes once `amount_issued != 0`, and CDK's
 ///   `mint()` writes `amount_issued` BEFORE proofs ⇒ a crash in that gap leaves an issued-but-proofless
-///   quote invisible → closed by (b): `recover_incomplete_sagas()` completes the saga and LANDS its
-///   proofs BEFORE the scan, so the held reads see them.
-/// - in-flight / crashed issue sagas → closed by (b).
+///   quote invisible to (c) → CLOSED by (b″): the all-quotes scan sees it (`amount_issued > 0`, held==0)
+///   and bails; (b) also tries to land its proofs first, and (b′) refuses to proceed on an unclean recovery.
+/// - in-flight / crashed issue sagas → (b) lands their proofs; (b′) bails if recovery is unclean; (b″) is the backstop.
+/// - a COMPENSATED (rolled-back) saga that stays `amount_issued > 0` with no proofs → CLOSED by (b″).
 /// - `Issued`-state quote still in the unissued list → closed by (e): decided on HELD proofs.
-/// - partially-minted → (e)/(h)/(i) sum only the still-Unspent held proofs.
+/// - partially-minted → (b″)/(e)/(h)/(i) sum only the still-Unspent held proofs (checked-sum, FIX #2).
 pub async fn mint_into_wallet_operator_pays(
     wallet: &Wallet,
     counter_db: &crate::nip60_counter::Nip60CounterDb,
@@ -641,7 +698,7 @@ pub async fn mint_into_wallet_operator_pays(
     //    and its proofs LAND FIRST; the per-quote held-proofs check then covers whatever recovery
     //    landed. Fail CLOSED on a recovery error: if we cannot recover, we cannot prove a stranded
     //    quote is not paid, and issuing a fresh invoice over it would double-pay.
-    wallet.recover_incomplete_sagas().await.map_err(|e| {
+    let recovery_report = wallet.recover_incomplete_sagas().await.map_err(|e| {
         anyhow::anyhow!(
             "fund-wallet: recovering incomplete mint sagas before the drain scan failed ({e}) — \
              refusing to issue a new invoice while a crash-gap issued-but-proofless quote may be \
@@ -649,6 +706,52 @@ pub async fn mint_into_wallet_operator_pays(
              re-run."
         )
     })?;
+    // ★FIX #1 (a) CAPTURE the report — a hard `Err` is not the only failure. CDK returns `Ok(report)`
+    //    even when `report.failed > 0` (unrecoverable) or `report.skipped > 0` (still pending). Refuse
+    //    to fresh-quote unless recovery CLEANLY completed (see `check_recovery_report`).
+    check_recovery_report(&recovery_report)?;
+
+    // 2b) ★FIX #1 (b) THE DEFINITIVE, REPORT-INDEPENDENT CLOSE — an ALL-QUOTES proofless-issued scan
+    //    BEFORE issuing any fresh quote. This is the RECOVERY half of the invariant, closed the SAME
+    //    way the credit half was: a scan over EVERY mint quote deciding on HELD PROOFS — never on the
+    //    `get_unissued` filter (which EXCLUDES `amount_issued != 0`) nor on recovery completeness.
+    //    `get_unissued_mint_quotes()` (the drain scan below) cannot see a quote once `amount_issued != 0`
+    //    (a crash-gap / compensated / failed-recovery / lost-response leaves exactly that), so a fresh
+    //    invoice would DOUBLE-PAY over it. We enumerate ALL quotes for THIS wallet and BAIL on any that
+    //    is ISSUED-against (`amount_issued > 0`) yet holds ZERO unspent proofs — a stranded paid quote.
+    //    This single scan covers every hiding place at once, independent of the recovery report.
+    let all_quotes = wallet.localstore.get_mint_quotes().await.map_err(|e| {
+        anyhow::anyhow!(
+            "fund-wallet: list ALL mint quotes for the proofless-issued scan ({e}) — refusing to \
+             issue a new invoice while a stranded paid-but-proofless quote may be invisible to the \
+             get_unissued drain scan (a fresh invoice over it would double-pay)."
+        )
+    })?;
+    for q in &all_quotes {
+        // Scope to THIS wallet (mint + unit), mirroring get_unissued's own filter.
+        if q.mint_url != wallet.mint_url || q.unit != wallet.unit {
+            continue;
+        }
+        // Only a quote the mint has ISSUED against (`amount_issued > 0`) can be a proofless-issued
+        // stranded quote that hides from get_unissued; `amount_issued == 0` quotes are handled by the
+        // get_unissued drain scan below (decided there on held proofs too).
+        if u64::from(q.amount_issued) == 0 {
+            continue;
+        }
+        // The 1a rail mechanism (checked-sum, FIX #2): held unspent proofs for THIS quote id.
+        let (held, _found) = held_unspent_for_quote(wallet, &q.id).await?;
+        if held == 0 {
+            anyhow::bail!(
+                "fund-wallet: mint quote {} is ISSUED against (amount_issued={}) but the wallet HOLDS \
+                 NO unspent proofs for it — a stranded PAID-but-proofless quote INVISIBLE to the \
+                 get_unissued drain scan (crash-gap / compensated / failed-recovery / lost \
+                 mint-response). Refusing to issue a fresh invoice: it would DOUBLE-PAY the already-paid \
+                 quote. Resolve this stranded quote out of band, then re-run.",
+                q.id,
+                u64::from(q.amount_issued)
+            );
+        }
+    }
 
     // 3) ★DRAIN-FIRST (money-safety: timeout double-pay + phantom-credit guards) — EXPLICIT per-quote,
     //    every decision on HELD unspent proofs (see the invariant table above). If an operator paid
@@ -1343,6 +1446,47 @@ mod tests {
             ensure_minted_matches_requested(5_001, 5_000, "q-over").is_err(),
             "minted > requested is an anomaly → bail"
         );
+    }
+
+    // ---- FIX #2 (task #59): checked_held_sum FAILS CLOSED on u64 overflow, never wraps. ----------
+    // A raw `iter.map(u64::from).sum::<u64>()` WRAPS in release (reporting a wrong, small held amount);
+    // the checked sum returns Err instead. RED-on-revert: replace the `Amount::try_sum` body with a raw
+    // `amounts.into_iter().map(u64::from).sum::<u64>()` → the overflowing set wraps to a small value and
+    // returns Ok(that) instead of Err → this `is_err()` assert goes false → RED.
+    #[test]
+    fn fix2_checked_held_sum_fails_closed_on_overflow() {
+        // A normal held set sums exactly (no false bail).
+        let ok = checked_held_sum([Amount::from(1_000u64), Amount::from(2_048u64)])
+            .expect("a normal held set does not overflow");
+        assert_eq!(ok, 3_048, "the checked sum totals a normal held set exactly");
+
+        // An overflowing set (u64::MAX + 1) MUST fail closed (Err), never wrap to a small value.
+        let overflow = checked_held_sum([Amount::from(u64::MAX), Amount::from(1u64)]);
+        assert!(
+            overflow.is_err(),
+            "★ an overflowing held set MUST fail closed (Err) — revert to a raw u64 `.sum()` → it WRAPS \
+             to a small value and returns Ok → RED (task #59: checked held-sum)"
+        );
+    }
+
+    // ---- FIX #1(a): check_recovery_report BAILS on an unclean recovery (failed/skipped > 0). ------
+    // CDK returns Ok(report) even when it left work undone; the drain must refuse to fresh-quote then.
+    // RED-on-revert: make check_recovery_report always return Ok (drop the failed/skipped bail) → the
+    // failed/skipped cases below no longer error → their `is_err()` asserts go false → RED.
+    #[test]
+    fn fix1a_check_recovery_report_bails_on_failed_or_skipped() {
+        use cdk::wallet::RecoveryReport;
+        // A clean recovery (recovered/compensated only) does NOT block the drain.
+        let clean = RecoveryReport { recovered: 3, compensated: 1, skipped: 0, failed: 0 };
+        assert!(check_recovery_report(&clean).is_ok(), "a clean recovery proceeds (recovered/compensated ok)");
+        assert!(check_recovery_report(&RecoveryReport::default()).is_ok(), "an empty recovery is clean");
+
+        // failed > 0 → BAIL (a saga could not be recovered; a stranded paid quote may remain).
+        let failed = RecoveryReport { recovered: 0, compensated: 0, skipped: 0, failed: 1 };
+        assert!(check_recovery_report(&failed).is_err(), "★ failed > 0 must bail — revert → Ok → RED");
+        // skipped > 0 → BAIL (a saga still pending; cannot prove no stranded paid quote exists).
+        let skipped = RecoveryReport { recovered: 0, compensated: 0, skipped: 2, failed: 0 };
+        assert!(check_recovery_report(&skipped).is_err(), "★ skipped > 0 must bail — revert → Ok → RED");
     }
 
     // ---- union_max_counters unit coverage (the pure merge under T1/T2). --------------------------
