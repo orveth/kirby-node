@@ -28,8 +28,10 @@ directly. Examples below write `kirby-node`; substitute `cargo run -p kirby-node
 
 ## Every command speaks JSON + stable exit codes
 
-Pass `--json` (the default) and read stdout as one JSON object. The exit code is the machine
-signal — branch on it, don't parse prose:
+Pass `--json` (the default) and read stdout as JSON. Most commands print a single JSON object, but
+the LN-invoice blocking flows (`provision` and `topup --amount-sats`) print the `bolt11` as an
+early `{"status":"invoice-created",...}` line and THEN a final result line — i.e. JSONL. Act on the
+FINAL line plus the exit code; the exit code is the machine signal — branch on it, don't parse prose:
 
 - `0` funded · `2` unpaid-timeout · `3` expired · `4` failed-payment · `5` network-failure ·
   `6` auth-failure · `7` insufficient-balance · `8` key-write-failure · `9` usage-error
@@ -87,12 +89,14 @@ token in the request body, while create puts it in the URL (a bearer-in-logs exp
 # human-gated) — same pay-then-confirm shape as create→poll, not an instant grow:
 kirby-node fund-key topup --key-path ./agent.key --amount-sats <N>   # → prints bolt11, then blocks
 
-# ecash: synchronous, no invoice, no blocking (token in the request body — no URL exposure):
+# ecash: no invoice + no human pay step (token in the request body — no URL exposure), but it
+# STILL blocks until the node confirms the balance rose (bounded by --timeout-secs):
 kirby-node fund-key topup --key-path ./agent.key --from-token <cashu>
 ```
 
 Surface the LN `bolt11` for the user to pay, exactly as with `create`; do not treat LN topup as
-instant or it will hang until `--timeout-secs`. `--from-token` returns right away.
+instant or it will hang until `--timeout-secs`. The `--from-token` path skips the invoice and the
+human pay step but is not instant either — it blocks until the balance-rise is confirmed.
 
 **Inspect a key — `balance`:**
 
