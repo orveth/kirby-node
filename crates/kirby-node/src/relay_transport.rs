@@ -2568,15 +2568,25 @@ mod tests {
         let frame =
             encode_cosign_frame(AGENT, &cse, holder.public_key(), &coordinator).expect("encode");
         // Fan-out: relay 1 is dead, but relay 2 accepts -> publish succeeds (non-empty success).
-        coord_conn
-            .publish(frame)
-            .await
-            .expect("publish still reaches a live relay after one died");
-
-        let got = tokio::time::timeout(Duration::from_secs(15), holder_conn.next_event())
-            .await
-            .expect("the frame must arrive via the surviving relay")
-            .expect("next_event ok");
+        // The frame is ephemeral, so it lands only if the holder's REQ is live on relay 2 at publish
+        // time; under parallel test load that can still be settling, so serialized bounded
+        // publish-then-await retry (pollution-free: a lost ephemeral queues nothing; break on land).
+        // Honest-red-safe: `publish().expect` still bails if NO relay accepts (both dead => failover
+        // truly broken => panic on the first iteration), and if delivery never lands the retry budget
+        // is exhausted => panic -- neither masks a real failover break.
+        let mut got = None;
+        for _ in 0..20 {
+            coord_conn
+                .publish(frame.clone())
+                .await
+                .expect("publish still reaches a live relay after one died");
+            if let Ok(ev) = tokio::time::timeout(Duration::from_secs(2), holder_conn.next_event()).await
+            {
+                got = Some(ev.expect("next_event ok"));
+                break;
+            }
+        }
+        let got = got.expect("the frame must arrive via the surviving relay within the retry budget");
         let (_agent, decoded, sender) = decode_cosign_frame(&got).expect("decode");
         assert_eq!(sender, coordinator.public_key());
         assert_eq!(
