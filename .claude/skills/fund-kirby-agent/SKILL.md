@@ -31,8 +31,11 @@ directly. Examples below write `kirby-node`; substitute `cargo run -p kirby-node
 Pass `--json` (the default) and read stdout as one JSON object. The exit code is the machine
 signal — branch on it, don't parse prose:
 
-- `0` funded/success · `2` unpaid-timeout · `3` invoice-expired · `4` failed-payment ·
-  `5` network · `6` auth · `7` insufficient-balance · `8` key-write · `9` usage-error
+- `0` funded · `2` unpaid-timeout · `3` expired · `4` failed-payment · `5` network-failure ·
+  `6` auth-failure · `7` insufficient-balance · `8` key-write-failure · `9` usage-error
+
+  (these are the exact `status` tags the CLI emits in its JSON; branch on the exit code, and the
+  tag corroborates it.)
 
 The minted `sk-` is bearer money. The CLI writes it `0600` to your `--key-out` path and never prints
 it. **Never** echo a key, put it in logs, commit it, or pass it on a command line where it lands in
@@ -77,11 +80,24 @@ kirby-node fund-key create --from-token <cashu...> --key-out ./agent.key   # →
 Prefer `topup --from-token` over `create --from-token` when a key already exists — topup sends the
 token in the request body, while create puts it in the URL (a bearer-in-logs exposure).
 
-**Grow / inspect an existing key:**
+**Grow an existing key — `topup` (two sources, same shapes as `create`):**
 
 ```sh
-kirby-node fund-key topup   --key-path ./agent.key --amount-sats <N>   # or --from-token <cashu>
-kirby-node fund-key balance --key-path ./agent.key                     # → probed balance_sats
+# LN: mints a topup invoice, emits the bolt11 early, then BLOCKS until it is paid (real sats,
+# human-gated) — same pay-then-confirm shape as create→poll, not an instant grow:
+kirby-node fund-key topup --key-path ./agent.key --amount-sats <N>   # → prints bolt11, then blocks
+
+# ecash: synchronous, no invoice, no blocking (token in the request body — no URL exposure):
+kirby-node fund-key topup --key-path ./agent.key --from-token <cashu>
+```
+
+Surface the LN `bolt11` for the user to pay, exactly as with `create`; do not treat LN topup as
+instant or it will hang until `--timeout-secs`. `--from-token` returns right away.
+
+**Inspect a key — `balance`:**
+
+```sh
+kirby-node fund-key balance --key-path ./agent.key   # → {balance_sats} (probed from the bound node)
 ```
 
 ## Refusals are guardrails, not bugs

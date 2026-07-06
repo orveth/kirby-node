@@ -39,6 +39,16 @@ cargo run -p kirby-node -- fund-key poll --key-out ./agent.key
 On exit `0`, `./agent.key` holds the funded `sk-` (0600). The agent branches on the exit code, not
 the prose.
 
+## Turn the funded key into a runnable config
+
+`create`/`poll` produce only the funded **key** — they do NOT write a config. To get a runnable
+`./kirby.toml`, either:
+- use `provision --emit-config ./kirby.toml` instead of `create`+`poll` (the one-shot variant below
+  writes the key AND a correct minimal config in one call) — the simplest path, or
+- build a config from `kirby.toml.example` + `docs/config.md`, pointing `[brain] api_key_path` at
+  `./agent.key`. The [`run-kirby-node`](../run-kirby-node/SKILL.md) skill walks this. (Don't
+  hand-assemble the routstr_key keys from memory — `--emit-config` writes the authoritative shape.)
+
 ## One-shot variant (human pays a QR)
 
 `provision` collapses create+poll and can emit a runnable config in one call:
