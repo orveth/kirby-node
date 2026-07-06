@@ -2873,11 +2873,22 @@ mod tests {
         };
         let bframe =
             encode_cosign_frame(AGENT, &baseline, holder.public_key(), &coordinator).expect("encode");
-        coord_conn.publish(bframe).await.expect("publish the baseline frame via the forwarder");
-        let got = tokio::time::timeout(Duration::from_secs(10), holder_conn.next_event())
-            .await
-            .expect("the baseline frame must arrive through the forwarder")
-            .expect("next_event ok");
+        // Same ephemeral publish-race as the other real-relay teeth: serialized bounded retry so a
+        // publish before the holder's REQ is live at the relay doesn't strand the baseline (pollution-
+        // free -- a lost ephemeral frame queues nothing, and we break on the first delivery).
+        let mut got = None;
+        for _ in 0..20 {
+            coord_conn
+                .publish(bframe.clone())
+                .await
+                .expect("publish the baseline frame via the forwarder");
+            if let Ok(ev) = tokio::time::timeout(Duration::from_secs(2), holder_conn.next_event()).await
+            {
+                got = Some(ev.expect("next_event ok"));
+                break;
+            }
+        }
+        let got = got.expect("the baseline frame must arrive through the forwarder within the retry budget");
         assert_eq!(
             decode_cosign_frame(&got).expect("decode baseline").1.payload,
             baseline.payload,
