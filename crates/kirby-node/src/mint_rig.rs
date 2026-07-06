@@ -490,10 +490,14 @@ fn ensure_minted_matches_requested(
 ///      NUT-13 derivation at the choke point ([`crate::nip60_counter::Nip60CounterDb`]), so
 ///      `wallet.mint` would silently yield ZERO proofs (nip60.rs choke-point tooth). We REFUSE to
 ///      proceed when the counter is not established — never mint-quote, never report success on 0.
-///   2. ★DRAIN-FIRST (timeout double-pay guard): BEFORE issuing a new quote, `mint_unissued_quotes`
-///      drains any paid-but-unissued quote a prior timed-out run left behind (safe-to-call-blindly:
-///      it mints only when `amount_mintable()>0`, a no-op on an already-issued quote). If it drained
-///      anything, we RETURN that (issuing no new invoice) — resuming the stranded quote.
+///   2. ★DRAIN-FIRST (timeout double-pay + phantom-credit guards): BEFORE issuing a new quote, walk
+///      each paid-but-unissued quote a prior timed-out run left behind EXPLICITLY — re-check its
+///      state with the mint, mint a PAID one with `wallet.mint(id)`, and count the proofs ACTUALLY
+///      minted to the LOCAL store (NEVER `mint_unissued_quotes`'s `amount_issued` aggregate, which a
+///      lost mint-response can inflate into a phantom credit). If a paid quote resolved cleanly we
+///      RETURN it (issuing no new invoice) — resuming that EXACT stranded quote. A quote the mint
+///      calls Issued while it is still unissued locally (no proofs landed) BAILS loudly; more than
+///      one paid-unissued quote (ambiguous attribution) BAILS too.
 ///   3. `mint_quote(BOLT11, amount, memo)` → hand the bolt11 (`quote.request`) to `on_bolt11` for
 ///      an operator to pay (the CLI prints it to stdout); the quote id is persisted + logged to resume.
 ///   4. POLL `check_mint_quote_status` until `Paid` (bounded by `timeout`, `poll_interval` apart).
@@ -535,50 +539,120 @@ pub async fn mint_into_wallet_operator_pays(
         );
     }
 
-    // 2) ★DRAIN-FIRST (money-safety: the timeout double-pay / stranded-funds guard). Before issuing
-    //    a NEW mint quote, drain any paid-but-unissued quote a PRIOR timed-out run left behind. If
-    //    an operator paid the printed bolt11 AFTER this tool timed out, its quote sits Paid-but-
-    //    unissued in the store; a naive re-run would issue a FRESH invoice (double payment) and
-    //    strand the already-paid quote. `mint_unissued_quotes` reads those (get_unissued_mint_quotes),
-    //    RE-CHECKS each one's state with the mint, and mints ONLY when `amount_mintable() > 0` — an
-    //    already-ISSUED quote reports 0 mintable (bolt11 is all-or-nothing, Paid→Issued), so this is
-    //    SAFE TO CALL BLINDLY: never a double-issue, a no-op when there is nothing paid to drain.
-    //    Capture the pending quote(s) FIRST so a drained fund can report/resume the same quote id.
+    // 2) ★DRAIN-FIRST (money-safety: timeout double-pay + phantom-credit guards) — EXPLICIT per-quote.
+    //    If an operator paid the printed bolt11 AFTER this tool timed out, its quote sits Paid-but-
+    //    unissued in the store; a naive re-run would issue a FRESH invoice (double payment) and strand
+    //    the already-paid quote. We do NOT reuse `mint_unissued_quotes()`'s blind batch return: that
+    //    aggregate is computed from `amount_issued` DELTAS (the mint's book), so a quote that refreshed
+    //    to `Issued` WITHOUT landing local proofs (a lost mint-response) would INFLATE it — reporting a
+    //    PHANTOM fund the wallet never received. The 1a money-invariant applies: credit ONLY proofs we
+    //    ACTUALLY hold, NEVER the mint's claimed `amount_issued`. So we walk each pending quote by hand,
+    //    re-check its state WITH THE MINT, and classify it:
+    //      - Paid   → `wallet.mint(id)` EXPLICITLY and count the `Proofs.total_amount()` ACTUALLY
+    //                 minted into the LOCAL store (the only sanctioned credit source).
+    //      - Issued → the mint claims issued, yet the quote is STILL in our unissued list (no proofs
+    //                 landed locally = lost mint-response / recovery failure): BAIL loudly — a human
+    //                 resolves the stranded quote; we never paper over it with a new invoice or a
+    //                 phantom success on the mint's amount_issued.
+    //      - Unpaid → a prior UNPAID quote, not a drain candidate; leave it.
+    //    A check error means we cannot prove a pending quote is NOT paid, so we fail closed (a fresh
+    //    invoice over a stranded PAID quote would double-pay). MORE THAN ONE paid-unissued quote cannot
+    //    be unambiguously attributed to one quote id → BAIL (refuse a blind cross-quote aggregate).
     let pending_before = wallet
         .get_unissued_mint_quotes()
         .await
         .map_err(|e| anyhow::anyhow!("fund-wallet: list unissued mint quotes (drain-first): {e}"))?;
-    let drained_sats: u64 = wallet
-        .mint_unissued_quotes()
-        .await
-        .map_err(|e| anyhow::anyhow!("fund-wallet: drain paid-but-unissued mint quotes: {e}"))?
-        .into();
-    if drained_sats > 0 {
-        // A prior run's PAID quote was just drained (minted). Issue NO new invoice — that would be
-        // the double-pay this guard prevents. The drained amount must equal what was requested
-        // (FIX 3 invariant): a BOLT11 quote mints its FULL amount, so a drained amount != requested
-        // is a mismatch we refuse rather than silently under/over-report the fund.
-        ensure_minted_matches_requested(drained_sats, amount_sats, "resumed paid-but-unissued quote")?;
-        let resumed = pending_before
-            .iter()
-            .find(|q| q.amount == Some(Amount::from(amount_sats)))
-            .or_else(|| pending_before.first());
-        let (bolt11, quote_id) = resumed
-            .map(|q| (q.request.clone(), q.id.clone()))
-            .unwrap_or_default();
+
+    let mut paid_pending: Vec<cdk::wallet::MintQuote> = Vec::new();
+    for q in &pending_before {
+        let fresh = wallet.check_mint_quote_status(&q.id).await.map_err(|e| {
+            anyhow::anyhow!(
+                "fund-wallet: re-checking pending mint quote {} with the mint failed ({e}) — refusing \
+                 to issue a new invoice while a prior quote's paid state is unknown (a fresh invoice \
+                 over a stranded PAID quote would double-pay). Pay/resolve the printed invoice and \
+                 re-run.",
+                q.id
+            )
+        })?;
+        match fresh.state {
+            MintQuoteState::Paid => paid_pending.push(fresh),
+            MintQuoteState::Issued => {
+                // ★PHANTOM-CREDIT GUARD (the 1a invariant, mirror of the rail's issued-but-not-held
+                // recovery): the mint says this quote is ISSUED, yet it is STILL in our UNISSUED list
+                // — its proofs never landed in the LOCAL store (a lost mint-response). The blind batch
+                // drain would count the mint's `amount_issued` here and report a fund we never actually
+                // received. We hold NOTHING for it, so we BAIL rather than credit phantom sats or paper
+                // over it with a fresh invoice; a human resolves the genuinely-stranded quote.
+                anyhow::bail!(
+                    "fund-wallet: pending mint quote {} is ISSUED at the mint but no proofs landed in \
+                     the LOCAL wallet (a lost mint-response / recovery failure). Refusing to report a \
+                     PHANTOM fund on the mint's claimed amount_issued — we credit ONLY proofs actually \
+                     held — and refusing to issue a new invoice. Resolve this stranded quote out of band.",
+                    fresh.id
+                );
+            }
+            // Unpaid: a prior unpaid quote, not a drain candidate — leave it and fall through to a
+            // fresh quote below.
+            _ => {}
+        }
+    }
+
+    if paid_pending.len() > 1 {
+        // ★MISATTRIBUTION GUARD: more than one Paid-but-unissued quote is pending, so a drained fund
+        // cannot be attributed to ONE quote id — and a blind aggregate could satisfy `== requested`
+        // across UNRELATED quotes. Refuse rather than guess (find-by-amount / first()).
+        let ids: Vec<&str> = paid_pending.iter().map(|q| q.id.as_str()).collect();
+        anyhow::bail!(
+            "fund-wallet: {} paid-but-unissued mint quotes are pending ({ids:?}) — cannot unambiguously \
+             attribute a fund to a single quote, and refusing to blindly aggregate-drain across \
+             unrelated quotes (misattribution guard). Mint/resolve the stray quotes out of band, then \
+             re-run.",
+            paid_pending.len()
+        );
+    }
+
+    if let Some(quote) = paid_pending.into_iter().next() {
+        // Exactly ONE paid-but-unissued quote: DRAIN it EXPLICITLY. Mint into the LOCAL store and count
+        // the proofs ACTUALLY minted (`Proofs.total_amount()`), NEVER the mint's `amount_issued`.
+        let proofs = wallet
+            .mint(&quote.id, SplitTarget::default(), None)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("fund-wallet: drain (mint) the paid-but-unissued quote {}: {e}", quote.id)
+            })?;
+        let drained_sats: u64 = proofs
+            .total_amount()
+            .map_err(|e| anyhow::anyhow!("fund-wallet: total the drained proofs for {}: {e}", quote.id))?
+            .into();
+
+        // ★PHANTOM-CREDIT SECOND GUARD (defence in depth): a PAID quote that yielded ZERO local proofs
+        // means nothing actually landed — never report a fund the wallet did not receive.
+        if drained_sats == 0 {
+            anyhow::bail!(
+                "fund-wallet: draining the paid quote {} yielded ZERO local proofs — refusing to \
+                 report a fund the wallet did not receive (phantom credit).",
+                quote.id
+            );
+        }
+
+        // FIX 3: a BOLT11 quote mints its FULL amount (LN fees are payer-side), so a drained amount
+        // != requested is a mismatch we refuse rather than silently under/over-report the fund.
+        ensure_minted_matches_requested(drained_sats, amount_sats, &quote.id)?;
+
         let balance_sats: u64 = wallet
             .total_balance()
             .await
             .map_err(|e| anyhow::anyhow!("fund-wallet: read the wallet balance after draining: {e}"))?
             .into();
         tracing::info!(
-            quote_id = %quote_id,
+            quote_id = %quote.id,
             drained_sats,
-            "fund-wallet: DRAINED a prior paid-but-unissued quote (resumed) — issued NO new invoice"
+            "fund-wallet: DRAINED a prior paid-but-unissued quote (minted to LOCAL proofs, resumed \
+             its EXACT quote id) — issued NO new invoice"
         );
         return Ok(FundWalletOutcome {
-            bolt11,
-            quote_id,
+            bolt11: quote.request,
+            quote_id: quote.id,
             minted_sats: drained_sats,
             balance_sats,
         });

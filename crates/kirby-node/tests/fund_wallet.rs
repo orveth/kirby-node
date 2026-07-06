@@ -441,3 +441,205 @@ async fn drained_amount_below_requested_bails_never_silent_under_fund() {
 
     mint.shutdown().await;
 }
+
+/// Wait (bounded) until AT LEAST `n` of the wallet's unissued mint quotes are PAID at the mint (the
+/// fakewallet auto-pays each ~1-3s after quoting). Polls exactly as an operator re-run's drain would.
+async fn wait_until_n_quotes_paid(wallet: &cdk::Wallet, n: usize, timeout: Duration) {
+    use cdk::nuts::MintQuoteState;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let pending = wallet
+            .get_unissued_mint_quotes()
+            .await
+            .expect("list unissued mint quotes");
+        let mut paid = 0usize;
+        for q in &pending {
+            if let Ok(s) = wallet.check_mint_quote_status(&q.id).await {
+                if s.state == MintQuoteState::Paid {
+                    paid += 1;
+                }
+            }
+        }
+        if paid >= n {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only {paid}/{n} unissued quotes became PAID within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+// --------------------------------------------------------------------------------------------
+// TOOTH 7 (rev-2, ★PHANTOM-CREDIT — the crux): a quote the mint reports ISSUED while it is STILL
+// unissued locally (no proofs landed = a lost mint-response / recovery failure) must make the drain
+// BAIL LOUDLY. The mint's claimed `amount_issued` is NOT a fund — the wallet holds nothing — so the
+// tool must never report a success (phantom credit) nor issue a fresh invoice. Mirrors the rail's
+// issued-but-proofs-not-held fail-clean (1a Tooth ii): credit ONLY proofs actually held.
+//
+// Construction (faithful lost-response): fund a quote normally (proofs land, quote ISSUED at the
+// mint), then reset its LOCAL record to unissued (amount_issued = 0) and REMOVE the local proofs —
+// exactly the state a lost mint-response leaves: mint says ISSUED, wallet holds nothing, quote back
+// in the unissued list. A re-run's drain must detect this and bail.
+//
+// RED-on-revert: change the drain's ISSUED arm from a bail to counting the mint's `amount_issued`
+// as "drained" (the old blind `mint_unissued_quotes` aggregate) → it returns Ok reporting a funded
+// AMOUNT while the wallet balance is 0 (phantom credit) → the `is_err()` assertion below goes false
+// → RED. This proves credit == proofs-actually-held, NEVER amount_issued.
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn issued_at_mint_without_local_proofs_bails_never_phantom_credit() {
+    use cdk::cdk_database::WalletDatabase as _;
+    use cdk::nuts::MintQuoteState;
+    const AMOUNT: u64 = 4_096;
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let work = TempDir::new("kirby-fund-wallet-t7");
+    let db_path = work.path().join("wallet.sqlite");
+    let (wallet, counter_db) = open_boot_way(&mint.url(), &db_path).await;
+
+    // 1) Fund a quote normally — proofs land locally, the quote is ISSUED at the mint.
+    let funded = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        AMOUNT,
+        "t7-fund",
+        Duration::from_millis(150),
+        Duration::from_secs(25),
+        |_| {},
+    )
+    .await
+    .expect("the fresh fund mints proofs");
+    assert_eq!(funded.minted_sats, AMOUNT, "the initial fund minted the requested amount");
+    let pre_balance: u64 = wallet.total_balance().await.map(u64::from).unwrap_or(0);
+    assert_eq!(pre_balance, AMOUNT, "the wallet holds the funded proofs before the reset");
+
+    // 2) Simulate the lost mint-response: reset the LOCAL quote to unissued (amount_issued = 0) so it
+    //    re-enters the unissued list, and REMOVE the local proofs so the wallet holds nothing. The
+    //    mint still remembers the quote as ISSUED.
+    let mut q = counter_db
+        .get_mint_quote(&funded.quote_id)
+        .await
+        .expect("read the funded quote")
+        .expect("the funded quote is stored");
+    q.amount_issued = cdk::Amount::ZERO;
+    q.state = MintQuoteState::Paid; // back in the unissued list; the mint re-check will flip it Issued
+    q.used_by_operation = None; // no saga-resume path — a genuinely lost response
+    counter_db.add_mint_quote(q).await.expect("re-insert the quote as unissued");
+
+    let held = counter_db
+        .get_proofs(None, None, None, None)
+        .await
+        .expect("read local proofs");
+    let ys: Vec<_> = held.iter().map(|p| p.y).collect();
+    counter_db
+        .update_proofs(vec![], ys)
+        .await
+        .expect("remove the local proofs (lost-response: nothing landed)");
+    let after_reset: u64 = wallet.total_balance().await.map(u64::from).unwrap_or(0);
+    assert_eq!(after_reset, 0, "precondition: the wallet holds NO proofs (lost mint-response)");
+
+    // 3) A re-run's drain must BAIL — the mint says ISSUED but we hold nothing; never phantom-credit,
+    //    never a fresh invoice (the closure must not fire).
+    let res = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        AMOUNT,
+        "t7-rerun",
+        Duration::from_millis(50),
+        Duration::from_secs(25),
+        |_| panic!("phantom-credit: an ISSUED-without-local-proofs quote must bail BEFORE quoting a new invoice"),
+    )
+    .await;
+    assert!(
+        res.is_err(),
+        "★ PHANTOM-CREDIT: an ISSUED-at-mint quote with NO local proofs must BAIL — revert the ISSUED \
+         arm to count amount_issued → Ok on 0 held proofs (phantom fund) → RED"
+    );
+    let msg = format!("{:#}", res.unwrap_err());
+    assert!(
+        msg.contains("PHANTOM") || msg.contains("ISSUED") || msg.contains("lost mint-response"),
+        "the bail names the phantom-credit / lost-response cause: {msg}"
+    );
+    let final_balance: u64 = wallet.total_balance().await.map(u64::from).unwrap_or(0);
+    assert_eq!(final_balance, 0, "the wallet still holds NOTHING — no phantom fund was credited");
+
+    mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// TOOTH 8 (rev-2, ★MISATTRIBUTION): more than one paid-but-unissued quote is pending. The drain
+// cannot unambiguously attribute a fund to ONE quote id, and a blind aggregate could satisfy
+// `== requested` across UNRELATED quotes. The tool must BAIL rather than guess (find-by-amount /
+// first()) and cross-quote-aggregate.
+//
+// Construction: create TWO unrelated 1000-sat quotes, wait until BOTH are paid, then re-run asking
+// for 2000 (== the sum of the two unrelated quotes). The blind aggregate would drain both = 2000 and
+// (mis)report success attributing to a guessed quote id.
+//
+// RED-on-revert: replace the `paid_pending.len() > 1` bail + explicit single-quote drain with the old
+// blind `mint_unissued_quotes()` aggregate + find-by-amount/first() guess → run 2 drains BOTH quotes
+// (2000 == requested) and returns Ok on a guessed/cross-quote attribution → the `is_err()` below goes
+// false → RED.
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn multiple_paid_unissued_quotes_refuse_cross_quote_aggregate() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use cdk::nuts::PaymentMethod;
+    const EACH: u64 = 1_000;
+    const REQUESTED: u64 = 2_000; // == the SUM of the two unrelated quotes (the aggregate trap)
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let work = TempDir::new("kirby-fund-wallet-t8");
+    let db_path = work.path().join("wallet.sqlite");
+    let (wallet, counter_db) = open_boot_way(&mint.url(), &db_path).await;
+
+    // Two UNRELATED paid-but-unissued quotes (quote them directly; the fakewallet auto-pays each).
+    let _q1 = wallet
+        .mint_quote(PaymentMethod::BOLT11, Some(cdk::Amount::from(EACH)), Some("t8-q1".to_string()), None)
+        .await
+        .expect("quote 1");
+    let _q2 = wallet
+        .mint_quote(PaymentMethod::BOLT11, Some(cdk::Amount::from(EACH)), Some("t8-q2".to_string()), None)
+        .await
+        .expect("quote 2");
+    wait_until_n_quotes_paid(&wallet, 2, Duration::from_secs(20)).await;
+
+    // A re-run for 2000 (the SUM). With two paid-unissued quotes pending, the drain must refuse to
+    // attribute — never a blind cross-quote aggregate, never a fresh invoice.
+    let invoices = Arc::new(AtomicUsize::new(0));
+    let inv = invoices.clone();
+    let res = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        REQUESTED,
+        "t8-rerun",
+        Duration::from_millis(50),
+        Duration::from_secs(25),
+        move |_| {
+            inv.fetch_add(1, Ordering::SeqCst);
+        },
+    )
+    .await;
+    assert!(
+        res.is_err(),
+        "★ MISATTRIBUTION: two paid-but-unissued quotes must make the drain BAIL — revert to the blind \
+         aggregate + guess → it drains both (2000 == requested) and reports a guessed attribution → RED"
+    );
+    let msg = format!("{:#}", res.unwrap_err());
+    assert!(
+        msg.contains("attribute") || msg.contains("paid-but-unissued") || msg.contains("unambiguously"),
+        "the bail names the ambiguous-attribution cause: {msg}"
+    );
+    // No fresh invoice was issued (the ambiguity bailed before quoting anew).
+    assert_eq!(
+        invoices.load(Ordering::SeqCst),
+        0,
+        "the ambiguity refusal issued NO new invoice"
+    );
+
+    mint.shutdown().await;
+}
