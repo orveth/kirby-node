@@ -625,7 +625,7 @@ fn check_recovery_report(report: &cdk::wallet::RecoveryReport) -> anyhow::Result
 /// | (a) NUT-13 establishment guard | refuse to mint (derivation gated) | counter established? (pre-req) | N/A — gates derivation, credits nothing |
 /// | (b) `recover_incomplete_sagas()` @ drain START | land in-flight/crashed issue-saga proofs BEFORE the scans | — (makes the held reads truthful); hard `Err` bails | ✓ its landed proofs feed every held check below |
 /// | (b′) `check_recovery_report(report)` — FIX #1(a) | refuse to fresh-quote on an unclean recovery | `report.failed > 0 \|\| skipped > 0` | N/A — refusal; a stranded paid quote may remain, do not double-pay |
-/// | (b″) ★ALL-QUOTES proofless-issued scan — FIX #1(b) | BAIL on a stranded paid-but-proofless quote INVISIBLE to get_unissued | for every quote with `amount_issued > 0`: **HELD unspent proofs == 0** | ✓ — decides purely on held proofs, report-independent; the definitive recovery-half close |
+/// | (b″) ★ALL-QUOTES proofless-issued scan — FIX #1(b) | BAIL on a TRUE-stranded paid-but-proofless quote INVISIBLE to get_unissued (a SPENT quote — tx exists — PROCEEDS) | for every quote with `amount_issued > 0`: **HELD unspent proofs == 0 AND no Incoming tx (proofs never landed)** | ✓ — decides purely on held proofs + tx-existence, report-independent; the definitive recovery-half close |
 /// | (c) `get_unissued_mint_quotes()` + per-quote `check_mint_quote_status` | which pending quotes to classify | mint re-check | N/A — enumeration only, credits nothing |
 /// | (d) loop arm `Paid` → `NeedsMint` | eligible-to-mint (drain) | state `Paid` gates minting; the CREDIT is the post-mint HELD sum (branch h) | ✓ funded amount is held/minted proofs, not state |
 /// | (e) loop arm `Issued` → held>0 SUCCEED / held==0 BAIL (#1) | funded? + amount | **HELD unspent proofs for the quote** | ✓ — the crux; `Issued` alone NEVER funds |
@@ -652,8 +652,10 @@ fn check_recovery_report(report: &cdk::wallet::RecoveryReport) -> anyhow::Result
 /// over EVERY quote regardless of the get_unissued filter or recovery completeness:
 /// - `get_unissued_mint_quotes()` EXCLUDES bolt11 quotes once `amount_issued != 0`, and CDK's
 ///   `mint()` writes `amount_issued` BEFORE proofs ⇒ a crash in that gap leaves an issued-but-proofless
-///   quote invisible to (c) → CLOSED by (b″): the all-quotes scan sees it (`amount_issued > 0`, held==0)
-///   and bails; (b) also tries to land its proofs first, and (b′) refuses to proceed on an unclean recovery.
+///   quote invisible to (c) → CLOSED by (b″): the all-quotes scan sees it (`amount_issued > 0`, held==0,
+///   AND no Incoming tx — proofs never landed) and bails; (b) also tries to land its proofs first, and
+///   (b′) refuses to proceed on an unclean recovery. (A SPENT quote — held==0 WITH an Incoming tx — is
+///   legitimately used, not stranded, so (b″) PROCEEDS past it: the per-request wallet is spent by design.)
 /// - in-flight / crashed issue sagas → (b) lands their proofs; (b′) bails if recovery is unclean; (b″) is the backstop.
 /// - a COMPENSATED (rolled-back) saga that stays `amount_issued > 0` with no proofs → CLOSED by (b″).
 /// - `Issued`-state quote still in the unissued list → closed by (e): decided on HELD proofs.
@@ -738,15 +740,26 @@ pub async fn mint_into_wallet_operator_pays(
         if u64::from(q.amount_issued) == 0 {
             continue;
         }
-        // The 1a rail mechanism (checked-sum, FIX #2): held unspent proofs for THIS quote id.
-        let (held, _found) = held_unspent_for_quote(wallet, &q.id).await?;
-        if held == 0 {
+        // The 1a rail mechanism (checked-sum, FIX #2): held unspent proofs for THIS quote id, AND
+        // whether ANY Incoming tx records it. The DISCRIMINATOR between stranded and spent (both
+        // held==0) is that tx: `held_unspent_for_quote` writes an Incoming tx ONLY after proofs
+        // persist, so
+        //   held==0 && NO tx (found_transaction==false) ⇒ proofs NEVER landed = the TRUE stranded /
+        //     lost-response ⇒ BAIL (a fresh invoice over it would double-pay the already-paid quote).
+        //   held==0 && a tx EXISTS (found_transaction==true) ⇒ proofs landed then were SPENT ⇒ the
+        //     quote was legitimately used ⇒ PROCEED (skip; NOT stranded). The per-request wallet is
+        //     spent by design, so a fully-spent quote MUST NOT brick a repeat fund.
+        //   held>0 ⇒ funded/unspent ⇒ PROCEED (not a stranded-bail candidate).
+        let (held, found_transaction) = held_unspent_for_quote(wallet, &q.id).await?;
+        if held == 0 && !found_transaction {
             anyhow::bail!(
                 "fund-wallet: mint quote {} is ISSUED against (amount_issued={}) but the wallet HOLDS \
-                 NO unspent proofs for it — a stranded PAID-but-proofless quote INVISIBLE to the \
-                 get_unissued drain scan (crash-gap / compensated / failed-recovery / lost \
-                 mint-response). Refusing to issue a fresh invoice: it would DOUBLE-PAY the already-paid \
-                 quote. Resolve this stranded quote out of band, then re-run.",
+                 NO unspent proofs for it AND records NO Incoming transaction for it — its proofs NEVER \
+                 landed = a stranded PAID-but-proofless quote INVISIBLE to the get_unissued drain scan \
+                 (crash-gap / compensated / failed-recovery / lost mint-response). Refusing to issue a \
+                 fresh invoice: it would DOUBLE-PAY the already-paid quote. (A quote whose proofs landed \
+                 then were SPENT — held==0 with an Incoming tx — is NOT stranded and proceeds.) Resolve \
+                 this stranded quote out of band, then re-run.",
                 q.id,
                 u64::from(q.amount_issued)
             );

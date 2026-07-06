@@ -861,9 +861,11 @@ async fn recover_incomplete_sagas_runs_at_drain_start() {
 // Construction (a faithful proofless-issued quote INVISIBLE to get_unissued — the key difference
 // from the phantom-credit tooth 7, which resets amount_issued=0 to make the quote VISIBLE to
 // get_unissued): fund a quote normally (proofs land, amount_issued = AMOUNT, quote ISSUED at the
-// mint → EXCLUDED from get_unissued), then REMOVE the local proofs but KEEP amount_issued > 0. The
-// quote is now stranded-paid + proofless AND hidden from the get_unissued drain scan; only the
-// all-quotes scan catches it.
+// mint → EXCLUDED from get_unissued), then REMOVE the local proofs AND the Incoming tx naming the
+// quote but KEEP amount_issued > 0 — the TRUE lost-response (`held == 0 && !found_transaction`: a
+// crash-gap quote whose proofs NEVER landed also has no tx). The quote is now stranded-paid +
+// proofless AND hidden from the get_unissued drain scan; only the all-quotes scan catches it.
+// (A SPENT quote — tx REMAINS, proofs spent — is NOT stranded and PROCEEDS; that is tooth 12.)
 //
 // RED-on-revert: remove the all-quotes proofless-issued scan from `mint_into_wallet_operator_pays`
 // → the invisible quote is not caught → the drain falls through to the fresh-quote path → it quotes
@@ -912,8 +914,13 @@ async fn all_quotes_scan_bails_on_a_proofless_issued_quote_invisible_to_get_unis
         "precondition: the issued-against quote is INVISIBLE to get_unissued (the drain scan cannot see it)"
     );
 
-    // 2) Remove the local proofs but KEEP amount_issued > 0: a stranded PAID-but-proofless quote
-    //    hidden from get_unissued (crash-gap / compensated / lost mint-response).
+    // 2) Remove the local proofs AND the Incoming transaction that names the quote, but KEEP
+    //    amount_issued > 0: the TRUE stranded PAID-but-proofless quote hidden from get_unissued
+    //    (crash-gap / compensated / lost mint-response). This is FAITHFUL to a real crash-gap: CDK's
+    //    issue saga writes the Incoming Transaction ONLY after proofs persist, so a quote whose proofs
+    //    NEVER landed also has NO transaction — `held == 0 && !found_transaction`. (Contrast tooth 12,
+    //    the SPENT case, where the tx REMAINS and the scan must PROCEED.)
+    use cdk::wallet::types::TransactionDirection;
     let held = counter_db
         .get_proofs(None, None, None, None)
         .await
@@ -923,6 +930,18 @@ async fn all_quotes_scan_bails_on_a_proofless_issued_quote_invisible_to_get_unis
         .update_proofs(vec![], ys)
         .await
         .expect("remove the local proofs (stranded proofless-issued quote)");
+    // Remove the Incoming tx(s) naming this quote so there is NO durable record proofs ever landed
+    // (found_transaction == false = the true lost-response). Without this the quote would look SPENT.
+    let txs = counter_db
+        .list_transactions(Some(wallet.mint_url.clone()), Some(TransactionDirection::Incoming), Some(wallet.unit.clone()))
+        .await
+        .expect("list incoming transactions");
+    for t in txs.iter().filter(|t| t.quote_id.as_deref() == Some(funded.quote_id.as_str())) {
+        counter_db
+            .remove_transaction(t.id())
+            .await
+            .expect("remove the Incoming tx (proofs never landed = true stranded)");
+    }
     assert_eq!(
         wallet.total_balance().await.map(u64::from).unwrap_or(0),
         0,
@@ -958,6 +977,118 @@ async fn all_quotes_scan_bails_on_a_proofless_issued_quote_invisible_to_get_unis
         wallet.total_balance().await.map(u64::from).unwrap_or(0),
         0,
         "the wallet still holds NOTHING — no fresh invoice, no double-pay"
+    );
+
+    mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// TOOTH 12 (rev-4.1, ★FIX #1(b) DISCRIMINATOR — the spent-vs-stranded split in the ALL-QUOTES
+// scan): a quote the mint ISSUED against (amount_issued > 0) whose proofs LANDED and were then
+// SPENT holds ZERO unspent proofs (held == 0) — the SAME held signal as the stranded case (tooth
+// 11) — but it is NOT stranded: an Incoming Transaction still records that its proofs once landed
+// (`found_transaction == true`). The per-request wallet is SPENT BY DESIGN, so a fully-spent quote
+// MUST NOT brick a repeat fund. The all-quotes scan bails ONLY on the TRUE lost-response
+// (`held == 0 && !found_transaction`); a spent quote (tx exists) PROCEEDS to a fresh fund.
+//
+// Construction (the SPENT state, contrast tooth 11's no-tx stranded state): fund a quote normally
+// (proofs land, the Incoming tx persists, amount_issued = AMOUNT), then mark its proofs SPENT
+// (State::Spent) so held == 0 while the Incoming tx REMAINS (found_transaction == true).
+//
+// RED-on-revert: revert the discriminator to `held == 0` alone (drop `&& !found_transaction`) → the
+// spent quote FALSE-BAILS at the all-quotes scan → the re-run errors instead of funding → RED.
+// This proves the fix does not merely fail-safe (never double-pay) but keeps the tool USABLE for
+// the by-design repeat-spend wallet.
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn all_quotes_scan_proceeds_on_a_spent_quote_never_false_bails() {
+    use cdk::cdk_database::WalletDatabase as _;
+    use cdk::nuts::State;
+    use cdk::wallet::types::TransactionDirection;
+    const AMOUNT: u64 = 4_444;
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let work = TempDir::new("kirby-fund-wallet-t12");
+    let db_path = work.path().join("wallet.sqlite");
+    let (wallet, counter_db) = open_boot_way(&mint.url(), &db_path).await;
+
+    // 1) Fund a quote normally — proofs land locally, the Incoming tx persists, amount_issued = AMOUNT,
+    //    quote ISSUED at the mint (EXCLUDED from get_unissued).
+    let funded = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        AMOUNT,
+        "t12-fund",
+        Duration::from_millis(150),
+        Duration::from_secs(25),
+        |_| {},
+    )
+    .await
+    .expect("the fresh fund mints proofs");
+    assert_eq!(funded.minted_sats, AMOUNT, "the initial fund minted the requested amount");
+
+    // 2) SPEND the proofs (mark them State::Spent) — held drops to 0, but the Incoming tx REMAINS.
+    let held = counter_db
+        .get_proofs(None, None, None, None)
+        .await
+        .expect("read local proofs");
+    let ys: Vec<_> = held.iter().map(|p| p.y).collect();
+    counter_db
+        .update_proofs_state(ys, State::Spent)
+        .await
+        .expect("mark the proofs SPENT (held drops to 0, the Incoming tx remains)");
+    assert_eq!(
+        wallet.total_balance().await.map(u64::from).unwrap_or(0),
+        0,
+        "precondition: the wallet holds NO unspent proofs (the quote was fully SPENT)"
+    );
+    // Precondition (the discriminator crux): the Incoming tx naming the spent quote STILL EXISTS
+    // (found_transaction == true), and the quote stays amount_issued > 0 (invisible to get_unissued).
+    let txs = counter_db
+        .list_transactions(Some(wallet.mint_url.clone()), Some(TransactionDirection::Incoming), Some(wallet.unit.clone()))
+        .await
+        .expect("list incoming transactions");
+    assert!(
+        txs.iter().any(|t| t.quote_id.as_deref() == Some(funded.quote_id.as_str())),
+        "precondition: an Incoming tx still records the SPENT quote (found_transaction == true) — the \
+         discriminator that separates a spent quote from a true stranded one"
+    );
+    let stored = counter_db
+        .get_mint_quote(&funded.quote_id)
+        .await
+        .expect("read the spent quote")
+        .expect("the spent quote is stored");
+    assert!(
+        u64::from(stored.amount_issued) > 0,
+        "precondition: the spent quote stays ISSUED against (amount_issued > 0, invisible to get_unissued)"
+    );
+
+    // 3) A re-run must PROCEED past the all-quotes scan (the spent quote is NOT stranded), reach the
+    //    fresh-quote path, and successfully mint a NEW fund. (on_bolt11 does NOT panic here — a fresh
+    //    invoice is LEGITIMATE: the prior quote was genuinely spent, not stranded.)
+    let refund = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        AMOUNT,
+        "t12-rerun",
+        Duration::from_millis(150),
+        Duration::from_secs(25),
+        |_| {},
+    )
+    .await
+    .expect(
+        "★ FIX #1(b) discriminator: a SPENT quote (held==0 but an Incoming tx exists) must NOT \
+         false-bail the all-quotes scan — revert the discriminator to `held == 0` alone → the spent \
+         quote false-bails → the re-run errors → RED",
+    );
+    assert_eq!(
+        refund.minted_sats, AMOUNT,
+        "the re-run funds afresh (proceeds past the spent quote), minting the requested amount"
+    );
+    assert_ne!(
+        refund.quote_id, funded.quote_id,
+        "the re-run minted a FRESH quote (it proceeded past the spent one, did not resume it)"
     );
 
     mint.shutdown().await;
