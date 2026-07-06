@@ -73,6 +73,9 @@ cargo run -p kirby-node -- fund-key create --from-token <cashu...> --key-out ./a
 
 ## 4. Run the funded agent
 
+This step assumes you produced `./kirby.toml` in "Turn the funded key into a runnable config" above
+(either the `provision --emit-config` one-shot, or a hand-built config). With that in hand:
+
 ```sh
 cargo run -p kirby-node -- agent --config ./kirby.toml
 ```
@@ -82,6 +85,7 @@ cargo run -p kirby-node -- agent --config ./kirby.toml
 ## What the skill reports back
 
 > Minted a 21-sat funding invoice and (after you paid) a funded key at `./agent.key`; the node
-> probed a balance of 21 sats. Wrote a runnable config to `./kirby.toml`. The agent is booting —
+> probed a balance of 21 sats. Emitted a runnable config to `./kirby.toml` (via `provision
+--emit-config`). The agent is booting —
 > `born=true` confirmed. Money is play-money ecash; `./agent.key` is a bearer credential, keep it
 > secret.

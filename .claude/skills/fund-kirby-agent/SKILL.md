@@ -33,11 +33,13 @@ the LN-invoice blocking flows (`provision` and `topup --amount-sats`) print the 
 early `{"status":"invoice-created",...}` line and THEN a final result line — i.e. JSONL. Act on the
 FINAL line plus the exit code; the exit code is the machine signal — branch on it, don't parse prose:
 
-- `0` funded · `2` unpaid-timeout · `3` expired · `4` failed-payment · `5` network-failure ·
+- `0` success · `2` unpaid-timeout · `3` expired · `4` failed-payment · `5` network-failure ·
   `6` auth-failure · `7` insufficient-balance · `8` key-write-failure · `9` usage-error
 
-  (these are the exact `status` tags the CLI emits in its JSON; branch on the exit code, and the
-  tag corroborates it.)
+  `2`–`9` are the exact failure `status` tags the CLI emits in its JSON. Exit `0` is success, but
+  its `status` varies by command: `invoice-created` (`create --amount-sats`), `funded`
+  (`poll`/`provision`/`topup`/`create --from-token`), `ok` (`balance`). Branch on the exit code
+  first; the `status` tag tells you which success shape you got.
 
 The minted `sk-` is bearer money. The CLI writes it `0600` to your `--key-out` path and never prints
 it. **Never** echo a key, put it in logs, commit it, or pass it on a command line where it lands in

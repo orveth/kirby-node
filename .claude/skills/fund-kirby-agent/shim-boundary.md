@@ -15,7 +15,8 @@ down the boundary so it stays thin as funding policy evolves.
 - The default Routstr node URL and node binding.
 - Per-key caps / `balance_limit` semantics (the capped child-key concept).
 - Authentication (Bearer key auth on topup/balance) and any faucet behavior.
-- The stable JSON output shape and the exit-code contract (0 funded; 2–9 distinct failures).
+- The stable JSON output shape and the exit-code contract (exit 0 = success — status
+  `invoice-created`/`funded`/`ok` by command; 2–9 = distinct failure tags).
 - Secret handling: `sk-` written `0600`, never printed/logged; the `0600` pending-invoice sidecar.
 
 **Skill owns:** which subcommand fits the user's intent, threading the user's `--amount-sats` /
