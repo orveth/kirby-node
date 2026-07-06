@@ -4025,6 +4025,150 @@ mod tests {
         assert_eq!(ack, 2, "the settlement was consumed");
     }
 
+    /// Least-privilege subset property: across the oracle loop's realistic percept range, the
+    /// oracle's EMITTED capability-act set is a SUBSET of its minimal host grant — it emits ONLY
+    /// `Completion` (think), `IssueCharge` (charge), `nostr.dm_reply` (answer/invoice/books), and
+    /// `http.fetch` (price fetch), and NEVER a `nostr.publish` or a `Memory` act. This is the
+    /// genome-side half of the least-privilege pair: it justifies dropping `nostr.publish` + the
+    /// memory sentinel from the host Oracle allowlist (`run_agent::workload_allowlist`), whose
+    /// host-side half is `oracle_allowlist_is_least_privilege`.
+    ///
+    /// A subset tooth that drives only the happy path is false-green — an
+    /// unexercised percept that emits a publish/memory would slip through and we'd drop a token the
+    /// deployed loop needs. So this drives EVERY act-emitting arm of `oracle_tick` (enumerated from
+    /// its match): the PRICE happy path (think+charge+invoice, then full-settle answer via http.fetch),
+    /// a STATUS/BOOKS free-report DM, plus the NON-emitting arms (idle/empty, an UNSUPPORTED DM, an
+    /// UNDERPAID settle, an UNMATCHED settle) to prove they add no forbidden act. `fetch_session_context`
+    /// (the STATUS percept read) is a distinct Gateway method, NOT an allowlist-gated `call`, so it never
+    /// appears in the recorded act stream (only Completion/Memory/Actuate via `call` + IssueCharge do).
+    ///
+    /// RED-on-revert: make any `oracle_tick` arm emit a publish (e.g. call `build_post_request`) or a
+    /// Memory SET → a forbidden act appears in the recorded set → the `classify` panic arms fire.
+    #[tokio::test]
+    async fn oracle_emits_only_minimal_capabilities() {
+        use std::collections::BTreeSet;
+
+        // Scan a driven gateway's recorded act stream: collect the allowlist-gated act "kinds" the
+        // oracle emitted, and fail LOUDLY on any act the least-privilege oracle is NOT granted (a
+        // Memory write or a nostr.publish) — the two tokens the Oracle grant omits. If ANY percept ever emits
+        // one, the drop would break the deployed loop, so this panics rather than passes.
+        fn classify(gw: &MockGateway) -> BTreeSet<&'static str> {
+            let mut emitted: BTreeSet<&'static str> = BTreeSet::new();
+            for r in &gw.requests {
+                match r.act.as_ref().expect("every recorded request carries an act") {
+                    Act::Completion(_) => {
+                        emitted.insert("completion");
+                    }
+                    Act::IssueCharge(_) => {
+                        emitted.insert("issue_charge");
+                    }
+                    Act::Memory(_) => panic!(
+                        "oracle emitted a Memory act — the oracle does NO durable write and is NOT \
+                         granted MEMORY_DESTINATION; dropping it would break this: {r:?}"
+                    ),
+                    Act::Actuate(a) => {
+                        assert_ne!(
+                            a.kind, ACTUATE_KIND_NOSTR_PUBLISH,
+                            "oracle emitted a nostr.publish — the oracle answers over DM and is NOT \
+                             granted the publish token; dropping it would break this"
+                        );
+                        if a.kind == ACTUATE_KIND_NOSTR_DM_REPLY {
+                            emitted.insert("dm_reply");
+                        } else if a.kind == ACTUATE_KIND_HTTP_FETCH {
+                            emitted.insert("http.fetch");
+                        } else {
+                            panic!("oracle emitted an unexpected actuate kind: {}", a.kind);
+                        }
+                    }
+                    other => panic!("oracle emitted an unexpected act variant: {other:?}"),
+                }
+            }
+            emitted
+        }
+
+        let params = test_params();
+        let mut all: BTreeSet<&'static str> = BTreeSet::new();
+
+        // PERCEPT 1 — the earning HAPPY PATH: a PRICE DM (think + issue charge + invoice dm_reply)
+        // then a FULL PAYMENT_SETTLED (build the answer via http.fetch feeds + answer dm_reply).
+        // Exercises every act the oracle can emit on the money spine.
+        {
+            let sender = dm_sender_hex(1);
+            let mut gw = MockGateway::thinking("CHARGE:10").with_dm(1, &sender, "PRICE BTC/USD");
+            let mut ack: u64 = 0;
+            let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+            oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+            gw = gw.with_payment_settled(2, &oracle_charge_id(&sender), 10);
+            oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+            all.extend(classify(&gw));
+        }
+
+        // PERCEPT 2 — IDLE tick (inbox empty): the oracle emits NO act at all.
+        {
+            let mut gw = MockGateway::thinking("unused");
+            let mut ack: u64 = 0;
+            let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+            oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+            all.extend(classify(&gw));
+        }
+
+        // PERCEPT 3 — an UNSUPPORTED DM (neither PRICE nor STATUS): consumed with a note, no act.
+        {
+            let sender = dm_sender_hex(2);
+            let mut gw = MockGateway::thinking("unused").with_dm(1, &sender, "hello oracle");
+            let mut ack: u64 = 0;
+            let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+            oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+            all.extend(classify(&gw));
+        }
+
+        // PERCEPT 4 — a STATUS/BOOKS DM: a FREE self-report. `fetch_session_context` is a percept
+        // READ (a distinct Gateway method, not an allowlist-gated `call`), delivered over the SAME
+        // dm_reply door — no publish, no memory, no charge.
+        {
+            let sender = dm_sender_hex(3);
+            let mut gw = MockGateway::thinking("unused").with_dm(1, &sender, "STATUS");
+            let mut ack: u64 = 0;
+            let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+            oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+            all.extend(classify(&gw));
+        }
+
+        // PERCEPT 5 — an UNDERPAID settlement (verified < quoted): the honest-failure arm drops the
+        // job with no answer. Tick 1 emits think+charge+invoice; tick 2 (underpaid) emits nothing new.
+        {
+            let sender = dm_sender_hex(4);
+            let mut gw = MockGateway::thinking("CHARGE:10").with_dm(1, &sender, "PRICE BTC/USD");
+            let mut ack: u64 = 0;
+            let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+            oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+            gw = gw.with_payment_settled(2, &oracle_charge_id(&sender), 5); // 5 < quoted 10
+            oracle_tick(&mut gw, 2, &mut ack, &mut pending, &params, 1_000, 5).await;
+            all.extend(classify(&gw));
+        }
+
+        // PERCEPT 6 — an UNMATCHED settlement (a PAYMENT_SETTLED with no pending job): consumed with
+        // a note, no act (already-answered / TTL-aged / reboot-lost path).
+        {
+            let mut gw =
+                MockGateway::thinking("unused").with_payment_settled(1, "no-such-charge", 10);
+            let mut ack: u64 = 0;
+            let mut pending: HashMap<String, PendingCharge> = HashMap::new();
+            oracle_tick(&mut gw, 1, &mut ack, &mut pending, &params, 1_000, 0).await;
+            all.extend(classify(&gw));
+        }
+
+        // Positive control: the driven percept range actually exercised the FULL earning path (so
+        // the "never publish / never memory" claim is over REAL runs across the loop's realistic
+        // percepts, not an empty request set).
+        for want in ["completion", "issue_charge", "dm_reply", "http.fetch"] {
+            assert!(
+                all.contains(want),
+                "the driven percepts must collectively emit a {want} act; emitted = {all:?}"
+            );
+        }
+    }
+
     /// TOOTH T3 (B2 surface 1): a STATUS/BOOKS DM gets a FREE reply — the oracle issues NO charge
     /// (`issue_charge` is never called), DMs the KIRBY BOOKS report formatted from the daemon's
     /// LIVE economics percept, and consumes the event (no pending job opened).
