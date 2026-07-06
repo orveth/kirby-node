@@ -445,6 +445,151 @@ fn load_or_create_wallet_seed(seed_path: &Path) -> anyhow::Result<[u8; 64]> {
     Ok(seed)
 }
 
+/// The result of an operator-pays funding mint ([`mint_into_wallet_operator_pays`]).
+#[derive(Debug, Clone)]
+pub struct FundWalletOutcome {
+    /// The BOLT11 invoice (the mint quote's `request`) an operator paid to fund the wallet.
+    pub bolt11: String,
+    /// The mint quote id (the daemon-side handle the mint was looked up + minted by).
+    pub quote_id: String,
+    /// The mint-VERIFIED sats minted into the wallet (the summed proofs, NEVER the requested
+    /// amount): the only sanctioned source for a credit (money-MUST), mirrored from the rail.
+    pub minted_sats: u64,
+    /// The wallet's total spendable balance AFTER the mint.
+    pub balance_sats: u64,
+}
+
+/// Mint `amount_sats` of ecash into an ALREADY-OPENED persistent wallet via an OPERATOR-PAID
+/// BOLT11 mint quote. This is the `fund-wallet` CLI's money dance: it mirrors the rail's
+/// settlement flow ([`crate::rail::LightningSettlement`]: `mint_quote` → check-status → `mint`)
+/// but WITHOUT the fakewallet auto-pay of [`fund_wallet`] — an operator pays the printed bolt11
+/// out of band, so this POLLS the mint until the quote flips to `Paid` before minting.
+///
+/// The flow (the money-safety ordering is load-bearing):
+///   1. ★NUT-13 ESTABLISHMENT GUARD (bail-loudly-never-silent-0): a DEFERRED counter blocks every
+///      NUT-13 derivation at the choke point ([`crate::nip60_counter::Nip60CounterDb`]), so
+///      `wallet.mint` would silently yield ZERO proofs (nip60.rs choke-point tooth). We REFUSE to
+///      proceed when the counter is not established — never mint-quote, never report success on 0.
+///   2. `mint_quote(BOLT11, amount, memo)` → hand the bolt11 (`quote.request`) to `on_bolt11` for
+///      an operator to pay (the CLI prints it to stdout).
+///   3. POLL `check_mint_quote_status` until `Paid` (bounded by `timeout`, `poll_interval` apart).
+///   4. `mint` the ecash into the wallet; the summed proofs are the mint-VERIFIED amount.
+///   5. A SECOND establishment/derivation guard: assert the mint yielded NON-ZERO proofs — a 0-proof
+///      mint means the derivation was silently gated, and we bail rather than claim success.
+///
+/// The wallet + counter_db MUST be the pair returned by [`open_persistent_wallet`] opened the
+/// SAME way the boot path opens them (seed via the [`WalletKey`] seam), so the minted proofs land
+/// in the store a subsequent boot reads and are derived under the boot-path seed (else unspendable).
+pub async fn mint_into_wallet_operator_pays(
+    wallet: &Wallet,
+    counter_db: &crate::nip60_counter::Nip60CounterDb,
+    amount_sats: u64,
+    memo: &str,
+    poll_interval: std::time::Duration,
+    timeout: std::time::Duration,
+    on_bolt11: impl FnOnce(&str),
+) -> anyhow::Result<FundWalletOutcome> {
+    use cdk::nuts::nut00::ProofsMethods as _;
+    use cdk::nuts::MintQuoteState;
+
+    if amount_sats == 0 {
+        anyhow::bail!("fund-wallet: --amount-sats must be > 0 (nothing to mint)");
+    }
+
+    // 1) ★NUT-13 ESTABLISHMENT GUARD. A deferred counter gates every derivation at the choke point,
+    //    so a mint would silently yield ZERO proofs. Refuse loudly BEFORE quoting — never report
+    //    success on a wallet that cannot derive (the "silent-success-on-0" money bug this guards).
+    if !counter_db.is_established() {
+        anyhow::bail!(
+            "fund-wallet: the NUT-13 counter is DEFERRED (not established) — every wallet \
+             derivation is blocked at the choke point, so a mint would silently yield ZERO \
+             proofs. This happens when NIP-60 is configured but the config read is below \
+             read-quorum (a fresh-box restore that cannot safely establish the counter floor). \
+             Run fund-wallet with NIP-60 OFF (empty `[nip60] relays`) so the counter establishes \
+             immediately, or wait for a >=k config read. Refusing to mint into a deferred wallet."
+        );
+    }
+
+    // 2) A NUT-04 BOLT11 mint quote: the mint returns a bolt11 an operator pays with any Lightning
+    //    wallet. The quote id is the handle we poll + mint by (mirrors the rail's `issue`).
+    let quote = wallet
+        .mint_quote(
+            PaymentMethod::BOLT11,
+            Some(Amount::from(amount_sats)),
+            Some(memo.to_string()),
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("fund-wallet: request a bolt11 mint quote: {e}"))?;
+
+    on_bolt11(&quote.request);
+
+    // 3) Poll the MINT for the quote's state until PAID (an operator pays the bolt11 out of band).
+    //    Bounded by `timeout`; a check error is transient (retry until the deadline), a terminal
+    //    Issued state is a hard error (already minted elsewhere).
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match wallet.check_mint_quote_status(&quote.id).await {
+            Ok(q) if q.state == MintQuoteState::Paid => break,
+            Ok(q) if q.state == MintQuoteState::Issued => anyhow::bail!(
+                "fund-wallet: mint quote {} is already ISSUED (its proofs were minted elsewhere) \
+                 — nothing left to mint",
+                quote.id
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                quote_id = %quote.id,
+                error = %e,
+                "fund-wallet: transient error checking the mint quote status; retrying"
+            ),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "fund-wallet: timed out after {:?} waiting for the bolt11 mint quote {} to be \
+                 PAID. Pay the printed invoice and re-run, or raise the timeout.",
+                timeout,
+                quote.id
+            );
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    // 4) PAID: mint the ecash into the wallet. The summed proofs are the mint-VERIFIED amount (the
+    //    ONLY sanctioned source, mirroring the rail — never the requested `amount_sats`).
+    let proofs = wallet
+        .mint(&quote.id, SplitTarget::default(), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("fund-wallet: mint the bolt11-settled ecash for {}: {e}", quote.id))?;
+    let minted_sats: u64 = proofs
+        .total_amount()
+        .map_err(|e| anyhow::anyhow!("fund-wallet: total the minted proofs: {e}"))?
+        .into();
+
+    // 5) SECOND guard (defence in depth): the establishment check above should make this
+    //    unreachable, but a 0-proof mint means derivation was silently gated — bail rather than
+    //    claim success on a wallet that gained nothing.
+    if minted_sats == 0 {
+        anyhow::bail!(
+            "fund-wallet: the mint yielded ZERO proofs for a PAID quote ({}) — the NUT-13 \
+             derivation was gated. Refusing to report a successful fund on 0 minted sats.",
+            quote.id
+        );
+    }
+
+    let balance_sats: u64 = wallet
+        .total_balance()
+        .await
+        .map_err(|e| anyhow::anyhow!("fund-wallet: read the wallet balance after minting: {e}"))?
+        .into();
+
+    Ok(FundWalletOutcome {
+        bolt11: quote.request,
+        quote_id: quote.id,
+        minted_sats,
+        balance_sats,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     //! #115 Cut B teeth: the 17375 counter-mirror COMPLETENESS + no-regress at wallet open.
