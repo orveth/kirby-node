@@ -261,3 +261,183 @@ async fn deferred_counter_bails_loudly_never_silent_success_on_zero() {
 
     mint.shutdown().await;
 }
+
+/// Wait (bounded) until the wallet holds at least one PAID-but-unissued mint quote — i.e. the
+/// fakewallet has auto-marked a stranded quote paid (the "operator pays AFTER the timeout" event).
+/// Polls `check_mint_quote_status` exactly as an operator's re-run would; returns once one is Paid.
+async fn wait_until_a_stranded_quote_is_paid(wallet: &cdk::Wallet, timeout: Duration) {
+    use cdk::nuts::MintQuoteState;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let pending = wallet
+            .get_unissued_mint_quotes()
+            .await
+            .expect("list unissued mint quotes");
+        for q in &pending {
+            if let Ok(s) = wallet.check_mint_quote_status(&q.id).await {
+                if s.state == MintQuoteState::Paid {
+                    return;
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the fakewallet did not mark the stranded quote PAID within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+// --------------------------------------------------------------------------------------------
+// TOOTH 5 (FIX 2) — ★DRAIN-FIRST (the money-critical timeout double-pay guard): the operator pays
+// the printed bolt11 AFTER the tool timed out. A re-run must DRAIN the already-paid quote (mint the
+// existing proofs) and issue NO new invoice — never a second payment / stranded funds.
+//
+// This proves `mint_unissued_quotes` is safe-to-call-blindly: it re-checks each unissued quote with
+// the mint and mints ONLY when `amount_mintable() > 0`, so the paid quote is drained (minted) and an
+// already-issued quote would be a no-op.
+//
+// RED-on-revert: remove the drain-first step in `mint_into_wallet_operator_pays` → run 2 goes
+// straight to the fresh path → it quotes + prints a NEW invoice (invoice count → 2) and mints a
+// SECOND quote (double payment) → the `invoices == 1` assertion goes false → RED.
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn pay_after_timeout_drains_the_paid_quote_and_issues_no_new_invoice() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const AMOUNT: u64 = 2_048;
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let work = TempDir::new("kirby-fund-wallet-t5");
+    let db_path = work.path().join("wallet.sqlite");
+    let (wallet, counter_db) = open_boot_way(&mint.url(), &db_path).await;
+
+    // A shared invoice counter across BOTH runs: each printed bolt11 == one issued invoice.
+    let invoices = Arc::new(AtomicUsize::new(0));
+
+    // RUN 1: a tiny timeout so it gives up BEFORE the fakewallet auto-pays (~1-3s). It quotes +
+    // PRINTS one bolt11 (count → 1), then times out, leaving a persisted unissued quote behind.
+    let inv1 = invoices.clone();
+    let run1 = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        AMOUNT,
+        "t5-run1",
+        Duration::from_millis(10),
+        Duration::from_millis(1), // time out ~immediately (before any auto-pay)
+        move |_bolt11| {
+            inv1.fetch_add(1, Ordering::SeqCst);
+        },
+    )
+    .await;
+    assert!(run1.is_err(), "run 1 times out (the operator has not paid yet)");
+    assert_eq!(invoices.load(Ordering::SeqCst), 1, "run 1 printed exactly one invoice");
+
+    // The operator pays that invoice AFTER the timeout: the fakewallet auto-marks the quote PAID.
+    wait_until_a_stranded_quote_is_paid(&wallet, Duration::from_secs(20)).await;
+
+    // RUN 2: a re-run with the SAME amount. DRAIN-FIRST mints the already-paid quote and issues NO
+    // new invoice — the closure must NOT fire again (count stays 1).
+    let inv2 = invoices.clone();
+    let outcome = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        AMOUNT,
+        "t5-run2",
+        Duration::from_millis(50),
+        Duration::from_secs(25),
+        move |_bolt11| {
+            inv2.fetch_add(1, Ordering::SeqCst);
+        },
+    )
+    .await
+    .expect("★ run 2 DRAINS the stranded paid quote (no new invoice)");
+
+    assert_eq!(
+        invoices.load(Ordering::SeqCst),
+        1,
+        "★ DRAIN-FIRST: run 2 issued NO new invoice (still 1 total) — revert the drain → run 2 \
+         quotes a fresh invoice (count 2) + double-mints → RED"
+    );
+    assert_eq!(
+        outcome.minted_sats, AMOUNT,
+        "the drained quote minted exactly the requested amount"
+    );
+    let balance: u64 = wallet.total_balance().await.map(u64::from).unwrap_or(0);
+    assert_eq!(
+        balance, AMOUNT,
+        "the wallet holds exactly the drained amount — no double-mint (a second minted quote would show 2x)"
+    );
+
+    mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// TOOTH 6 (FIX 3) — ★minted==requested (silent under-funding guard), driven against the fakewallet:
+// a prior run left a PAID-but-unissued quote for 1000 sats; a re-run that asks for MORE (2000) drains
+// only the 1000 actually paid. The handler must BAIL (minted 1000 != requested 2000) rather than
+// silently report a 2000-sat fund when only 1000 landed.
+//
+// RED-on-revert: drop the `ensure_minted_matches_requested` assert (make it always Ok) → run 2
+// returns Ok reporting a mismatched/under-fund → the `is_err()` assertion goes false → RED.
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn drained_amount_below_requested_bails_never_silent_under_fund() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const PAID: u64 = 1_000; // what the prior run quoted + the operator paid
+    const REQUESTED_AGAIN: u64 = 2_000; // the re-run asks for MORE than the stranded quote
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let work = TempDir::new("kirby-fund-wallet-t6");
+    let db_path = work.path().join("wallet.sqlite");
+    let (wallet, counter_db) = open_boot_way(&mint.url(), &db_path).await;
+
+    // Run 1: quote PAID sats, time out (leave a paid-but-unissued quote for the operator to pay).
+    let run1 = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        PAID,
+        "t6-run1",
+        Duration::from_millis(10),
+        Duration::from_millis(1),
+        |_| {},
+    )
+    .await;
+    assert!(run1.is_err(), "run 1 times out");
+    wait_until_a_stranded_quote_is_paid(&wallet, Duration::from_secs(20)).await;
+
+    // Run 2: ask for MORE than the stranded quote. Drain mints the paid 1000, which != the requested
+    // 2000 → BAIL. It must NOT issue a fresh invoice (the drain path ran, then bailed on the mismatch).
+    let invoices = Arc::new(AtomicUsize::new(0));
+    let inv = invoices.clone();
+    let res = mint_into_wallet_operator_pays(
+        &wallet,
+        &counter_db,
+        REQUESTED_AGAIN,
+        "t6-run2",
+        Duration::from_millis(50),
+        Duration::from_secs(25),
+        move |_| {
+            inv.fetch_add(1, Ordering::SeqCst);
+        },
+    )
+    .await;
+    assert!(
+        res.is_err(),
+        "★ FIX 3: a drained amount ({PAID}) below the requested ({REQUESTED_AGAIN}) MUST bail — \
+         revert the minted==requested assert → silent under-fund success → RED"
+    );
+    let msg = format!("{:#}", res.unwrap_err());
+    assert!(
+        msg.contains("under-funded") || msg.contains("requested"),
+        "the bail names the amount mismatch: {msg}"
+    );
+    assert_eq!(
+        invoices.load(Ordering::SeqCst),
+        0,
+        "no fresh invoice was issued on the drain path (the mismatch bailed after draining)"
+    );
+
+    mint.shutdown().await;
+}

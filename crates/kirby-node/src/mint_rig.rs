@@ -459,6 +459,26 @@ pub struct FundWalletOutcome {
     pub balance_sats: u64,
 }
 
+/// ★FIX 3 (silent under-funding guard): a NUT-04 BOLT11 mint quote issues its FULL requested
+/// amount — LN routing fees are the PAYER's, never deducted from the minted proofs — so the minted
+/// sats MUST equal the requested sats. A shortfall means the wallet is under-funded (a mint that
+/// yielded less than asked), and any mismatch is refused rather than reported as a success. Shared
+/// by BOTH the fresh-mint path and the drain-first resume path so the invariant has ONE home.
+fn ensure_minted_matches_requested(
+    minted_sats: u64,
+    requested_sats: u64,
+    quote_id: &str,
+) -> anyhow::Result<()> {
+    if minted_sats != requested_sats {
+        anyhow::bail!(
+            "fund-wallet: minted {minted_sats} sats but {requested_sats} were requested (quote {quote_id}) \
+             — a BOLT11 mint issues the FULL quote amount (LN fees are payer-side), so a mismatch means \
+             the wallet is under-funded. Refusing to report success on a partial/mismatched fund."
+        );
+    }
+    Ok(())
+}
+
 /// Mint `amount_sats` of ecash into an ALREADY-OPENED persistent wallet via an OPERATOR-PAID
 /// BOLT11 mint quote. This is the `fund-wallet` CLI's money dance: it mirrors the rail's
 /// settlement flow ([`crate::rail::LightningSettlement`]: `mint_quote` → check-status → `mint`)
@@ -470,11 +490,16 @@ pub struct FundWalletOutcome {
 ///      NUT-13 derivation at the choke point ([`crate::nip60_counter::Nip60CounterDb`]), so
 ///      `wallet.mint` would silently yield ZERO proofs (nip60.rs choke-point tooth). We REFUSE to
 ///      proceed when the counter is not established — never mint-quote, never report success on 0.
-///   2. `mint_quote(BOLT11, amount, memo)` → hand the bolt11 (`quote.request`) to `on_bolt11` for
-///      an operator to pay (the CLI prints it to stdout).
-///   3. POLL `check_mint_quote_status` until `Paid` (bounded by `timeout`, `poll_interval` apart).
-///   4. `mint` the ecash into the wallet; the summed proofs are the mint-VERIFIED amount.
-///   5. A SECOND establishment/derivation guard: assert the mint yielded NON-ZERO proofs — a 0-proof
+///   2. ★DRAIN-FIRST (timeout double-pay guard): BEFORE issuing a new quote, `mint_unissued_quotes`
+///      drains any paid-but-unissued quote a prior timed-out run left behind (safe-to-call-blindly:
+///      it mints only when `amount_mintable()>0`, a no-op on an already-issued quote). If it drained
+///      anything, we RETURN that (issuing no new invoice) — resuming the stranded quote.
+///   3. `mint_quote(BOLT11, amount, memo)` → hand the bolt11 (`quote.request`) to `on_bolt11` for
+///      an operator to pay (the CLI prints it to stdout); the quote id is persisted + logged to resume.
+///   4. POLL `check_mint_quote_status` until `Paid` (bounded by `timeout`, `poll_interval` apart).
+///   5. `mint` the ecash; the summed proofs are the mint-VERIFIED amount, which MUST equal the
+///      requested amount (FIX 3 — a BOLT11 quote mints its full amount; a mismatch is an under-fund).
+///   6. A SECOND establishment/derivation guard: assert the mint yielded NON-ZERO proofs — a 0-proof
 ///      mint means the derivation was silently gated, and we bail rather than claim success.
 ///
 /// The wallet + counter_db MUST be the pair returned by [`open_persistent_wallet`] opened the
@@ -510,7 +535,56 @@ pub async fn mint_into_wallet_operator_pays(
         );
     }
 
-    // 2) A NUT-04 BOLT11 mint quote: the mint returns a bolt11 an operator pays with any Lightning
+    // 2) ★DRAIN-FIRST (money-safety: the timeout double-pay / stranded-funds guard). Before issuing
+    //    a NEW mint quote, drain any paid-but-unissued quote a PRIOR timed-out run left behind. If
+    //    an operator paid the printed bolt11 AFTER this tool timed out, its quote sits Paid-but-
+    //    unissued in the store; a naive re-run would issue a FRESH invoice (double payment) and
+    //    strand the already-paid quote. `mint_unissued_quotes` reads those (get_unissued_mint_quotes),
+    //    RE-CHECKS each one's state with the mint, and mints ONLY when `amount_mintable() > 0` — an
+    //    already-ISSUED quote reports 0 mintable (bolt11 is all-or-nothing, Paid→Issued), so this is
+    //    SAFE TO CALL BLINDLY: never a double-issue, a no-op when there is nothing paid to drain.
+    //    Capture the pending quote(s) FIRST so a drained fund can report/resume the same quote id.
+    let pending_before = wallet
+        .get_unissued_mint_quotes()
+        .await
+        .map_err(|e| anyhow::anyhow!("fund-wallet: list unissued mint quotes (drain-first): {e}"))?;
+    let drained_sats: u64 = wallet
+        .mint_unissued_quotes()
+        .await
+        .map_err(|e| anyhow::anyhow!("fund-wallet: drain paid-but-unissued mint quotes: {e}"))?
+        .into();
+    if drained_sats > 0 {
+        // A prior run's PAID quote was just drained (minted). Issue NO new invoice — that would be
+        // the double-pay this guard prevents. The drained amount must equal what was requested
+        // (FIX 3 invariant): a BOLT11 quote mints its FULL amount, so a drained amount != requested
+        // is a mismatch we refuse rather than silently under/over-report the fund.
+        ensure_minted_matches_requested(drained_sats, amount_sats, "resumed paid-but-unissued quote")?;
+        let resumed = pending_before
+            .iter()
+            .find(|q| q.amount == Some(Amount::from(amount_sats)))
+            .or_else(|| pending_before.first());
+        let (bolt11, quote_id) = resumed
+            .map(|q| (q.request.clone(), q.id.clone()))
+            .unwrap_or_default();
+        let balance_sats: u64 = wallet
+            .total_balance()
+            .await
+            .map_err(|e| anyhow::anyhow!("fund-wallet: read the wallet balance after draining: {e}"))?
+            .into();
+        tracing::info!(
+            quote_id = %quote_id,
+            drained_sats,
+            "fund-wallet: DRAINED a prior paid-but-unissued quote (resumed) — issued NO new invoice"
+        );
+        return Ok(FundWalletOutcome {
+            bolt11,
+            quote_id,
+            minted_sats: drained_sats,
+            balance_sats,
+        });
+    }
+
+    // 3) A NUT-04 BOLT11 mint quote: the mint returns a bolt11 an operator pays with any Lightning
     //    wallet. The quote id is the handle we poll + mint by (mirrors the rail's `issue`).
     let quote = wallet
         .mint_quote(
@@ -522,9 +596,18 @@ pub async fn mint_into_wallet_operator_pays(
         .await
         .map_err(|e| anyhow::anyhow!("fund-wallet: request a bolt11 mint quote: {e}"))?;
 
+    // PERSIST + PRINT the quote id: it is already persisted in the wallet store by `mint_quote`;
+    // logging it (and naming it in the timeout bail below) lets an operator RESUME this exact quote
+    // via the drain-first step on a re-run instead of paying a fresh invoice.
+    tracing::info!(
+        quote_id = %quote.id,
+        amount_sats,
+        "fund-wallet: created bolt11 mint quote (persisted); a re-run resumes it via drain-first"
+    );
+
     on_bolt11(&quote.request);
 
-    // 3) Poll the MINT for the quote's state until PAID (an operator pays the bolt11 out of band).
+    // 4) Poll the MINT for the quote's state until PAID (an operator pays the bolt11 out of band).
     //    Bounded by `timeout`; a check error is transient (retry until the deadline), a terminal
     //    Issued state is a hard error (already minted elsewhere).
     let deadline = tokio::time::Instant::now() + timeout;
@@ -554,7 +637,7 @@ pub async fn mint_into_wallet_operator_pays(
         tokio::time::sleep(poll_interval).await;
     }
 
-    // 4) PAID: mint the ecash into the wallet. The summed proofs are the mint-VERIFIED amount (the
+    // 5) PAID: mint the ecash into the wallet. The summed proofs are the mint-VERIFIED amount (the
     //    ONLY sanctioned source, mirroring the rail — never the requested `amount_sats`).
     let proofs = wallet
         .mint(&quote.id, SplitTarget::default(), None)
@@ -565,7 +648,13 @@ pub async fn mint_into_wallet_operator_pays(
         .map_err(|e| anyhow::anyhow!("fund-wallet: total the minted proofs: {e}"))?
         .into();
 
-    // 5) SECOND guard (defence in depth): the establishment check above should make this
+    // ★FIX 3: minted MUST equal requested. A NUT-04 BOLT11 mint quote issues the FULL quote amount
+    //    (LN routing fees are payer-side, never minted-side), so `minted < requested` is a SILENT
+    //    under-fund and `minted > requested` an anomaly — either way we bail rather than report a
+    //    fund that does not match what was asked for.
+    ensure_minted_matches_requested(minted_sats, amount_sats, &quote.id)?;
+
+    // 6) SECOND guard (defence in depth): the establishment check above should make this
     //    unreachable, but a 0-proof mint means derivation was silently gated — bail rather than
     //    claim success on a wallet that gained nothing.
     if minted_sats == 0 {
@@ -1000,6 +1089,37 @@ mod tests {
         assert!(
             counter_db.increment_keyset_counter(&k, 1).await.is_err(),
             "a deferred fresh box blocks derivations at the choke point"
+        );
+    }
+
+    // ---- FIX 3 (silent under-funding guard): minted MUST equal requested. -----------------------
+    // The shared invariant called by BOTH the fresh-mint path and the drain-first resume path. A
+    // BOLT11 mint issues the FULL quote amount, so minted < requested is a silent under-fund and
+    // any mismatch is refused.
+    //
+    // RED-on-revert: make `ensure_minted_matches_requested` always return `Ok(())` (drop the assert)
+    // → the `minted < requested` case below no longer errors → `is_err()` goes false → RED.
+    #[test]
+    fn fix3_minted_must_equal_requested_or_it_bails() {
+        // Exact match → Ok (the happy path, no false bail).
+        assert!(
+            ensure_minted_matches_requested(5_000, 5_000, "q-ok").is_ok(),
+            "minted == requested is the correct fund → Ok"
+        );
+        // Under-fund (minted < requested) → BAIL (the silent under-funding this guards).
+        let under = ensure_minted_matches_requested(4_999, 5_000, "q-under");
+        assert!(
+            under.is_err(),
+            "★ minted < requested (under-fund) MUST bail — revert the assert → this is Ok → RED"
+        );
+        assert!(
+            format!("{:#}", under.unwrap_err()).contains("under-funded"),
+            "the bail names the under-fund cause"
+        );
+        // Over-mint (minted > requested) → also bail (an anomaly, never silently accepted).
+        assert!(
+            ensure_minted_matches_requested(5_001, 5_000, "q-over").is_err(),
+            "minted > requested is an anomaly → bail"
         );
     }
 

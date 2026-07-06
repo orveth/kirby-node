@@ -664,6 +664,68 @@ async fn run_agent_cmd(
     }
 }
 
+/// `fund-wallet`'s money-path PREFLIGHT: validate the loaded config BEFORE opening or minting into
+/// any wallet. Split out of [`run_fund_wallet_cmd`] so it is unit-testable without a running mint.
+/// It enforces three guards the generic [`KirbyConfig::validate`] does NOT cover for this command:
+///
+///  - **backend = routstr** (codex-positive, kept): only the routstr backend holds a per-request
+///    treasury wallet; a stub backend has none and a `routstr_key` bearer key is funded by
+///    `fund-key`. Refuse anything else rather than opening a store the boot path never reads.
+///  - **FIX 4 — config hole**: Standalone validation only enforces `brain.mint_url` /
+///    `brain.wallet_db_path` when `workload = "capable"`, but fund-wallet uses them
+///    UNCONDITIONALLY (any workload). A routstr config with a non-capable workload passes
+///    `validate()` with an EMPTY `wallet_db_path`, then misbehaves here — so require them explicitly.
+///  - **FIX 1 — NIP-60 seam**: fund-wallet opens the wallet NIP-60-OFF (empty-floor establishment
+///    args). But boot loads the remote counter/token floor from `[nip60].relays` BEFORE opening the
+///    wallet, so minting here against the NIP-60-off counter would use a state a NIP-60-ON boot would
+///    not — a NUT-13 counter-seam mismatch (index-reuse hazard). REFUSE when `[nip60].relays` is
+///    non-empty; fund-wallet is NIP-60-off-only.
+fn validate_fund_wallet_config(config: &kirby_node::config::KirbyConfig) -> anyhow::Result<()> {
+    use kirby_node::config::BrainBackendKind;
+    let brain = &config.brain;
+
+    if brain.backend != BrainBackendKind::Routstr {
+        anyhow::bail!(
+            "fund-wallet funds the per-request treasury wallet, which only the routstr backend \
+             holds (brain.backend = \"routstr\"); this config's backend is {:?}. For a prepaid \
+             routstr_key bearer key use `kirby-node fund-key` instead.",
+            brain.backend
+        );
+    }
+
+    // FIX 4: these are used unconditionally by fund-wallet, but Standalone validate only enforces
+    // them under workload=capable — so a non-capable routstr config reaches here with them empty.
+    if brain.mint_url.trim().is_empty() {
+        anyhow::bail!(
+            "fund-wallet: brain.mint_url must be set (the treasury wallet's mint) — fund-wallet \
+             opens and mints into the wallet unconditionally, regardless of workload. Standalone \
+             validation only enforces this under workload=\"capable\", so set it explicitly."
+        );
+    }
+    if brain.wallet_db_path.trim().is_empty() {
+        anyhow::bail!(
+            "fund-wallet: brain.wallet_db_path must be set (the persistent wallet store) — \
+             fund-wallet mints into this store regardless of workload. Standalone validation only \
+             enforces this under workload=\"capable\", so set it explicitly."
+        );
+    }
+
+    // FIX 1: fund-wallet is NIP-60-OFF-only (its NIP-60-off open would use a counter state a
+    // NIP-60-ON boot would not → seam mismatch / NUT-13 index-reuse hazard).
+    if !config.nip60.relays.is_empty() {
+        anyhow::bail!(
+            "fund-wallet is NIP-60-OFF-only: this config declares {} [nip60].relays, but \
+             fund-wallet opens the wallet with the NIP-60-off (empty-floor) establishment args, \
+             which use a counter state a NIP-60-ON boot would NOT — minting here would risk a \
+             NUT-13 counter-seam mismatch (index reuse). Run fund-wallet against a config with an \
+             empty `[nip60] relays` (NIP-60 off).",
+            config.nip60.relays.len()
+        );
+    }
+
+    Ok(())
+}
+
 /// The `fund-wallet` keystone: mint real ecash into the per-request (backend="routstr") treasury
 /// wallet via an operator-paid bolt11 mint quote, so a subsequent `kirby-node agent` boot clears
 /// the solvency floor (`assert_wallet_backs_counter`). A THIN SHIM: it reuses the boot path's
@@ -679,26 +741,18 @@ async fn run_fund_wallet_cmd(
     use std::path::Path;
     use std::time::Duration;
 
-    use kirby_node::config::{BrainBackendKind, ConfigRole, KirbyConfig};
+    use kirby_node::config::{ConfigRole, KirbyConfig};
     use kirby_node::mint_rig::{self, WalletKey};
 
     // Validate as Standalone (the full brain money-path battery) — the same role `agent` boots
     // under, so a config that fund-wallet accepts is one `agent` can boot.
     let config = KirbyConfig::load_or_default(config_path.as_deref(), ConfigRole::Standalone)?;
-    let brain = &config.brain;
     tracing::info!(config = ?config_path, "loaded kirby config for fund-wallet");
 
-    // fund-wallet is the PER-REQUEST (X-Cashu) wallet's funding path. The prepaid bearer key
-    // (routstr_key) is funded by `fund-key`; a stub backend holds no wallet. Refuse anything else
-    // loudly rather than opening a store the boot path would not read.
-    if brain.backend != BrainBackendKind::Routstr {
-        anyhow::bail!(
-            "fund-wallet funds the per-request treasury wallet, which only the routstr backend \
-             holds (brain.backend = \"routstr\"); this config's backend is {:?}. For a prepaid \
-             routstr_key bearer key use `kirby-node fund-key` instead.",
-            brain.backend
-        );
-    }
+    // fund-wallet's own money-path preflight (backend + FIX 4 field presence + FIX 1 NIP-60-off).
+    // Split out (not inlined) so it is unit-testable without a running mint.
+    validate_fund_wallet_config(&config)?;
+    let brain = &config.brain;
 
     let db_path = Path::new(&brain.wallet_db_path);
 
@@ -2661,5 +2715,99 @@ mod fund_wallet_cli_tests {
         // --amount-sats is required (no default); omitting it is a parse error.
         let res = Cli::try_parse_from(["kirby-node", "fund-wallet", "--config", "/tmp/kirby.toml"]);
         assert!(res.is_err(), "fund-wallet without --amount-sats must fail to parse");
+    }
+}
+
+#[cfg(test)]
+mod fund_wallet_config_tests {
+    //! Preflight teeth for [`super::validate_fund_wallet_config`] (increment C revision): FIX 1
+    //! (NIP-60-off-only), FIX 4 (config hole — mint_url/wallet_db_path required), and the kept
+    //! codex-positive (non-routstr backend refused). These drive the pure preflight directly, so
+    //! they need no running mint. Each builds a config that WOULD otherwise reach the money path.
+    use super::validate_fund_wallet_config;
+    use kirby_node::config::{BrainBackendKind, KirbyConfig};
+
+    /// A baseline routstr config that PASSES the preflight: routstr backend, mint_url + wallet_db_path
+    /// set, NIP-60 off (empty relays). Each tooth mutates ONE field to trip its guard.
+    fn ok_routstr_config() -> KirbyConfig {
+        let mut cfg = KirbyConfig::default();
+        cfg.brain.backend = BrainBackendKind::Routstr;
+        cfg.brain.mint_url = "https://mint.example.com".to_string();
+        cfg.brain.wallet_db_path = "/tmp/kirby-fund-wallet-test/wallet.sqlite".to_string();
+        cfg.nip60.relays = Vec::new();
+        cfg
+    }
+
+    #[test]
+    fn baseline_routstr_nip60_off_passes_preflight() {
+        assert!(
+            validate_fund_wallet_config(&ok_routstr_config()).is_ok(),
+            "a routstr config with mint_url + wallet_db_path set and NIP-60 off must pass (no false refusal)"
+        );
+    }
+
+    // ---- KEEP codex-positive: a NON-routstr backend is refused. -----------------------------------
+    // RED-on-revert: drop the backend check → a stub-backend config is accepted → fund-wallet opens a
+    // store the boot path never reads → this `is_err()` goes false → RED.
+    #[test]
+    fn non_routstr_backend_is_refused() {
+        let mut cfg = ok_routstr_config();
+        cfg.brain.backend = BrainBackendKind::Stub;
+        let err = validate_fund_wallet_config(&cfg)
+            .expect_err("a non-routstr backend must be refused");
+        assert!(
+            format!("{err:#}").contains("routstr"),
+            "the refusal names the routstr requirement: {err:#}"
+        );
+    }
+
+    // ---- FIX 4 (config hole): mint_url / wallet_db_path required regardless of workload. ----------
+    // The config below has backend=routstr with a NON-capable (default) workload and an EMPTY
+    // wallet_db_path — exactly the shape Standalone validate() lets through (the routstr money-path
+    // checks are gated on workload=capable), then fund-wallet misbehaves on the empty store path.
+    //
+    // RED-on-revert: drop the wallet_db_path/mint_url presence checks → this hole config is accepted
+    // → fund-wallet proceeds against an empty store path (misbehaves) → `is_err()` goes false → RED.
+    #[test]
+    fn fix4_empty_wallet_db_path_is_refused() {
+        let mut cfg = ok_routstr_config();
+        cfg.brain.wallet_db_path = String::new(); // the hole Standalone validate() misses
+        let err = validate_fund_wallet_config(&cfg)
+            .expect_err("★ FIX 4: an empty wallet_db_path must be refused (config-hole guard)");
+        assert!(
+            format!("{err:#}").contains("wallet_db_path"),
+            "the refusal names wallet_db_path: {err:#}"
+        );
+    }
+
+    #[test]
+    fn fix4_empty_mint_url_is_refused() {
+        let mut cfg = ok_routstr_config();
+        cfg.brain.mint_url = String::new();
+        let err = validate_fund_wallet_config(&cfg)
+            .expect_err("★ FIX 4: an empty mint_url must be refused");
+        assert!(
+            format!("{err:#}").contains("mint_url"),
+            "the refusal names mint_url: {err:#}"
+        );
+    }
+
+    // ---- FIX 1 (NIP-60 seam): a non-empty [nip60].relays is refused. -----------------------------
+    // fund-wallet opens NIP-60-off; a config with relays set means boot would load a counter floor
+    // fund-wallet's NIP-60-off open would NOT → seam mismatch / index-reuse hazard.
+    //
+    // RED-on-revert: drop the nip60.relays guard → the config is accepted → fund-wallet opens
+    // NIP-60-off against a counter state boot wouldn't use → `is_err()` goes false → RED.
+    #[test]
+    fn fix1_non_empty_nip60_relays_is_refused() {
+        let mut cfg = ok_routstr_config();
+        cfg.nip60.relays = vec!["wss://relay.example.com".to_string()];
+        let err = validate_fund_wallet_config(&cfg)
+            .expect_err("★ FIX 1: a config with [nip60].relays must be refused (NIP-60-off-only)");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("NIP-60") && msg.contains("relays"),
+            "the refusal names the NIP-60 seam: {msg}"
+        );
     }
 }
