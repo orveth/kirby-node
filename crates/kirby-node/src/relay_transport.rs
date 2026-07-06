@@ -2392,13 +2392,26 @@ mod tests {
         };
         let frame =
             encode_cosign_frame(AGENT, &cse, holder.public_key(), &coordinator).expect("encode");
-        coord_conn.publish(frame).await.expect("publish the frame over the real relay");
 
-        // The holder receives it over the wire (bounded so a routing bug fails fast, not hangs).
-        let got = tokio::time::timeout(Duration::from_secs(10), holder_conn.next_event())
-            .await
-            .expect("the frame must arrive at the #p-addressed holder within the timeout")
-            .expect("next_event ok");
+        // KIND_KIRBY_COSIGN is ephemeral (a real relay does not store it), so it lands ONLY if the
+        // holder's subscribe REQ is already live at publish time. Under parallel test load that REQ
+        // can still be settling, so we publish-then-await in a SERIALIZED bounded retry rather than
+        // racing a single send. A lost ephemeral publish queues nothing (no matching subscriber), and
+        // we break on the first delivery -- so exactly one frame is received (routing/opacity proof
+        // unchanged; a broken `#p=me` binding still routes NOTHING => every retry times out => red).
+        let mut got = None;
+        for _ in 0..20 {
+            coord_conn
+                .publish(frame.clone())
+                .await
+                .expect("publish the frame over the real relay");
+            if let Ok(ev) = tokio::time::timeout(Duration::from_secs(2), holder_conn.next_event()).await
+            {
+                got = Some(ev.expect("next_event ok"));
+                break;
+            }
+        }
+        let got = got.expect("the frame must arrive at the #p-addressed holder within the retry budget");
 
         let (agent, decoded, sender) =
             decode_cosign_frame(&got).expect("decode the delivered frame");
@@ -2747,11 +2760,27 @@ mod tests {
         };
         let bframe =
             encode_cosign_frame(AGENT, &baseline, holder.public_key(), &coordinator).expect("encode");
-        coord_conn.publish(bframe).await.expect("publish the baseline frame");
-        let got = tokio::time::timeout(Duration::from_secs(10), holder_conn.next_event())
-            .await
-            .expect("the baseline frame must arrive over the live relay")
-            .expect("next_event ok");
+        // The frame is ephemeral (KIND_KIRBY_COSIGN, not stored), so it lands ONLY if the holder's
+        // subscribe REQ is already live at the relay when the coordinator publishes. Under parallel
+        // test load that REQ can still be settling, so we publish-then-await in a SERIALIZED bounded
+        // retry (publish one frame, wait briefly, break on delivery) rather than racing a single send.
+        // Serialized -- NOT a background publisher -- so we never over-publish: a lost ephemeral frame
+        // queues nothing at the holder (the relay drops it with no matching subscriber), and once the
+        // REQ is live exactly one frame lands and we break, so no duplicate baseline frame can leak
+        // into the post-drop receive below.
+        let mut got = None;
+        for _ in 0..20 {
+            coord_conn
+                .publish(bframe.clone())
+                .await
+                .expect("publish the baseline frame");
+            if let Ok(ev) = tokio::time::timeout(Duration::from_secs(2), holder_conn.next_event()).await
+            {
+                got = Some(ev.expect("next_event ok"));
+                break;
+            }
+        }
+        let got = got.expect("the baseline frame must arrive over the live relay within the retry budget");
         assert_eq!(
             decode_cosign_frame(&got).expect("decode baseline").1.payload,
             baseline.payload,
