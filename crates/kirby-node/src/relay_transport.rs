@@ -2360,7 +2360,7 @@ mod tests {
     // ---- NostrRelayConn: the production transport, proven over a REAL (hermetic, in-process) ----
     // ---- nostr relay. These are ADDITIVE: the InMemoryConn tests above stay the fast golden.  ----
 
-    use nostr_relay_builder::MockRelay;
+    use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 
     /// FRAME ROUND-TRIP over a REAL relay: a `#p`-addressed CoSignEvent frame published by the
     /// coordinator's [`NostrRelayConn`] arrives at the holder's [`NostrRelayConn`] over a hermetic
@@ -2392,13 +2392,26 @@ mod tests {
         };
         let frame =
             encode_cosign_frame(AGENT, &cse, holder.public_key(), &coordinator).expect("encode");
-        coord_conn.publish(frame).await.expect("publish the frame over the real relay");
 
-        // The holder receives it over the wire (bounded so a routing bug fails fast, not hangs).
-        let got = tokio::time::timeout(Duration::from_secs(10), holder_conn.next_event())
-            .await
-            .expect("the frame must arrive at the #p-addressed holder within the timeout")
-            .expect("next_event ok");
+        // KIND_KIRBY_COSIGN is ephemeral (a real relay does not store it), so it lands ONLY if the
+        // holder's subscribe REQ is already live at publish time. Under parallel test load that REQ
+        // can still be settling, so we publish-then-await in a SERIALIZED bounded retry rather than
+        // racing a single send. A lost ephemeral publish queues nothing (no matching subscriber), and
+        // we break on the first delivery -- so exactly one frame is received (routing/opacity proof
+        // unchanged; a broken `#p=me` binding still routes NOTHING => every retry times out => red).
+        let mut got = None;
+        for _ in 0..20 {
+            coord_conn
+                .publish(frame.clone())
+                .await
+                .expect("publish the frame over the real relay");
+            if let Ok(ev) = tokio::time::timeout(Duration::from_secs(2), holder_conn.next_event()).await
+            {
+                got = Some(ev.expect("next_event ok"));
+                break;
+            }
+        }
+        let got = got.expect("the frame must arrive at the #p-addressed holder within the retry budget");
 
         let (agent, decoded, sender) =
             decode_cosign_frame(&got).expect("decode the delivered frame");
@@ -2555,15 +2568,25 @@ mod tests {
         let frame =
             encode_cosign_frame(AGENT, &cse, holder.public_key(), &coordinator).expect("encode");
         // Fan-out: relay 1 is dead, but relay 2 accepts -> publish succeeds (non-empty success).
-        coord_conn
-            .publish(frame)
-            .await
-            .expect("publish still reaches a live relay after one died");
-
-        let got = tokio::time::timeout(Duration::from_secs(15), holder_conn.next_event())
-            .await
-            .expect("the frame must arrive via the surviving relay")
-            .expect("next_event ok");
+        // The frame is ephemeral, so it lands only if the holder's REQ is live on relay 2 at publish
+        // time; under parallel test load that can still be settling, so serialized bounded
+        // publish-then-await retry (pollution-free: a lost ephemeral queues nothing; break on land).
+        // Honest-red-safe: `publish().expect` still bails if NO relay accepts (both dead => failover
+        // truly broken => panic on the first iteration), and if delivery never lands the retry budget
+        // is exhausted => panic -- neither masks a real failover break.
+        let mut got = None;
+        for _ in 0..20 {
+            coord_conn
+                .publish(frame.clone())
+                .await
+                .expect("publish still reaches a live relay after one died");
+            if let Ok(ev) = tokio::time::timeout(Duration::from_secs(2), holder_conn.next_event()).await
+            {
+                got = Some(ev.expect("next_event ok"));
+                break;
+            }
+        }
+        let got = got.expect("the frame must arrive via the surviving relay within the retry budget");
         let (_agent, decoded, sender) = decode_cosign_frame(&got).expect("decode");
         assert_eq!(sender, coordinator.public_key());
         assert_eq!(
@@ -2571,5 +2594,354 @@ mod tests {
             "the frame survived one relay dying, delivered via the other"
         );
         println!("RELAYCONN-FAILOVER PASS: with 2 relays and one killed mid-run, the #p-addressed frame still landed via the survivor");
+    }
+
+    // ---- #48: half-open RECONNECT proof. The failover tooth above proves multi-relay REDUNDANCY --
+    // ---- (kill 1 of 2). These two prove the SINGLE-relay self-heal the #103 lesson demands: a  ----
+    // ---- socket dies, the pool detects it, reconnects to the SAME url, and AUTO-RESUBSCRIBES    ----
+    // ---- (InnerRelay::resubscribe) the stable-id REQ, so a frame published AFTER the drop still ----
+    // ---- lands -- with NO manual re-subscribe. Tooth A is the clean-close case (fast, CI); B is ----
+    // ---- the TRUE half-open (silently-dead socket, only the keepalive ping can surface it).     ----
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Parse the port out of a relay url like `ws://127.0.0.1:54321` (a trailing `/` is tolerated).
+    /// We take the port from a live `MockRelay`'s own url rather than reserving one ourselves --
+    /// `MockRelay::run` binds a guaranteed-free port (no bind-then-rebind TOCTOU race).
+    fn port_of(relay_url: &str) -> u16 {
+        relay_url
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("could not parse a port out of relay url {relay_url}"))
+    }
+
+    /// Run an in-process nostr relay on a FIXED port (so a shutdown+restart reuses the SAME url and
+    /// a same-url reconnect can succeed). `MockRelay::run` picks a random port; it is a thin `Deref`
+    /// over `LocalRelay`, so we build the `LocalRelay` directly with `RelayBuilder::port`. Retries
+    /// the bind: a just-shutdown relay can hold the port briefly (listener teardown / lingering
+    /// client sockets), so a fixed-port restart may need a few attempts.
+    async fn run_fixed_port_relay(port: u16) -> LocalRelay {
+        let mut last_err = None;
+        for _ in 0..25 {
+            let relay = LocalRelay::new(RelayBuilder::default().port(port));
+            match relay.run().await {
+                Ok(()) => return relay,
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+        panic!("could not bind a fixed-port relay on {port}: {last_err:?}");
+    }
+
+    /// A tiny in-process TCP forwarder for the TRUE half-open test (Tooth B). It listens on a
+    /// localhost port and, per accepted client connection, dials `upstream` and copies bytes both
+    /// directions. `blackhole()` FREEZES every connection open AT THAT MOMENT -- the copy loop stops
+    /// moving bytes but HOLDS all four socket halves open (never drops them), so the client still
+    /// believes its socket is live: a genuine half-open (NOT a close -- a close is Tooth A's case).
+    /// Connections accepted AFTER `blackhole()` (i.e. the pool's reconnect) forward normally, so the
+    /// client can recover by reconnecting to the SAME url. This works because a `broadcast` send
+    /// reaches only receivers that were subscribed at send time; a post-freeze connection subscribes
+    /// later and so never receives the freeze signal.
+    struct TcpBlackholeForwarder {
+        local_port: u16,
+        freeze_tx: tokio::sync::broadcast::Sender<()>,
+        accept_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TcpBlackholeForwarder {
+        async fn start(upstream_port: u16) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the forwarder listener");
+            let local_port =
+                listener.local_addr().expect("forwarder local addr").port();
+            let (freeze_tx, _rx0) = tokio::sync::broadcast::channel::<()>(8);
+            let accept_freeze = freeze_tx.clone();
+            let accept_task = tokio::spawn(async move {
+                loop {
+                    let client = match listener.accept().await {
+                        Ok((sock, _peer)) => sock,
+                        Err(_) => break,
+                    };
+                    // Subscribe at ACCEPT time: a freeze sent before this connection existed is not
+                    // delivered to it, so a reconnect (a fresh accept post-freeze) forwards normally.
+                    let freeze_rx = accept_freeze.subscribe();
+                    tokio::spawn(async move {
+                        if let Ok(server) =
+                            tokio::net::TcpStream::connect(("127.0.0.1", upstream_port)).await
+                        {
+                            pump_until_frozen(client, server, freeze_rx).await;
+                        }
+                    });
+                }
+            });
+            Self { local_port, freeze_tx, accept_task }
+        }
+
+        fn url(&self) -> String {
+            format!("ws://127.0.0.1:{}", self.local_port)
+        }
+
+        /// Freeze every currently-open connection into a half-open state: bytes stop, but the
+        /// sockets stay OPEN so the client still sees a live socket.
+        fn blackhole(&self) {
+            let _ = self.freeze_tx.send(());
+        }
+    }
+
+    impl Drop for TcpBlackholeForwarder {
+        fn drop(&mut self) {
+            self.accept_task.abort();
+        }
+    }
+
+    /// Copy bytes both ways between `client` and `server` until either side closes OR a freeze
+    /// signal arrives. On freeze we PARK holding all four socket halves (they stay owned by this
+    /// frame and are never dropped) -- that is the true half-open: the sockets remain OPEN but no
+    /// byte moves, so only the peer's keepalive ping can ever surface the death.
+    async fn pump_until_frozen(
+        client: tokio::net::TcpStream,
+        server: tokio::net::TcpStream,
+        mut freeze_rx: tokio::sync::broadcast::Receiver<()>,
+    ) {
+        let (mut cr, mut cw) = client.into_split();
+        let (mut sr, mut sw) = server.into_split();
+        let mut cbuf = vec![0u8; 8192];
+        let mut sbuf = vec![0u8; 8192];
+        loop {
+            tokio::select! {
+                _ = freeze_rx.recv() => {
+                    // HALF-OPEN: hold cr/cw/sr/sw open, move no bytes, park until the forwarder is
+                    // torn down at test end. The peer's socket stays ESTABLISHED but silent.
+                    std::future::pending::<()>().await;
+                    return;
+                }
+                r = cr.read(&mut cbuf) => match r {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if sw.write_all(&cbuf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                },
+                r = sr.read(&mut sbuf) => match r {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if cw.write_all(&sbuf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    /// TOOTH A (fast, CI-default): CLEAN-DROP + SAME-PORT RESTART -> reconnect + auto-resubscribe.
+    /// A frame round-trips over a fixed-port relay; the relay is cleanly shut down and a NEW relay
+    /// is started on the SAME port; a frame published AFTER the drop still lands at the holder. It
+    /// lands ONLY because the pool reconnected to the same url AND auto-re-REQ'd the stable-id
+    /// subscription (we never manually re-subscribe). This is the committed regression guard for
+    /// the reconnect + resubscribe path; if either breaks, this test times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn relayconn_reconnects_and_resubscribes_after_clean_drop_same_port() {
+        let relay = MockRelay::run().await.expect("boot the in-process relay");
+        let url = relay.url().await.to_string();
+        let port = port_of(&url);
+
+        let coordinator = Keys::generate();
+        let holder = Keys::generate();
+        let coord_conn = Arc::new(
+            NostrRelayConn::new(coordinator.public_key(), vec![url.clone()]).expect("coord conn"),
+        );
+        let holder_conn =
+            NostrRelayConn::new(holder.public_key(), vec![url.clone()]).expect("holder conn");
+        coord_conn.ensure_connected().await.expect("coordinator subscribes");
+        holder_conn.ensure_connected().await.expect("holder subscribes");
+
+        // Baseline: one frame round-trips over the live relay (the setup carries frames).
+        let baseline = CoSignEvent {
+            session_id: 1,
+            from: GuardianId::try_from(1u16).unwrap(),
+            round: kirby_custody::seam::ROUND_SHARE,
+            payload: vec![0x01],
+        };
+        let bframe =
+            encode_cosign_frame(AGENT, &baseline, holder.public_key(), &coordinator).expect("encode");
+        // The frame is ephemeral (KIND_KIRBY_COSIGN, not stored), so it lands ONLY if the holder's
+        // subscribe REQ is already live at the relay when the coordinator publishes. Under parallel
+        // test load that REQ can still be settling, so we publish-then-await in a SERIALIZED bounded
+        // retry (publish one frame, wait briefly, break on delivery) rather than racing a single send.
+        // Serialized -- NOT a background publisher -- so we never over-publish: a lost ephemeral frame
+        // queues nothing at the holder (the relay drops it with no matching subscriber), and once the
+        // REQ is live exactly one frame lands and we break, so no duplicate baseline frame can leak
+        // into the post-drop receive below.
+        let mut got = None;
+        for _ in 0..20 {
+            coord_conn
+                .publish(bframe.clone())
+                .await
+                .expect("publish the baseline frame");
+            if let Ok(ev) = tokio::time::timeout(Duration::from_secs(2), holder_conn.next_event()).await
+            {
+                got = Some(ev.expect("next_event ok"));
+                break;
+            }
+        }
+        let got = got.expect("the baseline frame must arrive over the live relay within the retry budget");
+        assert_eq!(
+            decode_cosign_frame(&got).expect("decode baseline").1.payload,
+            baseline.payload,
+            "baseline frame round-trips before the drop"
+        );
+
+        // DROP: clean-close the relay (the client detects the close at once), then restart a NEW
+        // relay on the SAME port so the same-url reconnect has a live socket to reach.
+        relay.shutdown();
+        let relay2 = run_fixed_port_relay(port).await;
+        assert_eq!(
+            relay2.url().await.to_string(),
+            url,
+            "the restarted relay must reuse the same url so reconnect targets it"
+        );
+
+        // POST-DROP frame. KIND_KIRBY_COSIGN is ephemeral (not stored), so it lands only if the
+        // holder is subscribed at publish time -- i.e. AFTER it has reconnected + auto-resubscribed.
+        // The publisher retries in the background (each attempt rides the current socket; publishes
+        // before the holder resubscribes are simply lost) while we await the delivery once. The
+        // default retry_interval is 10s, so allow several reconnect cycles under a 60s ceiling.
+        let after = CoSignEvent {
+            session_id: 2,
+            from: GuardianId::try_from(2u16).unwrap(),
+            round: kirby_custody::seam::ROUND_SHARE,
+            payload: vec![0x02, 0x03],
+        };
+        let aframe =
+            encode_cosign_frame(AGENT, &after, holder.public_key(), &coordinator).expect("encode");
+        let pub_conn = Arc::clone(&coord_conn);
+        let publisher = tokio::spawn(async move {
+            loop {
+                let _ = pub_conn.publish(aframe.clone()).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+        let got2 = tokio::time::timeout(Duration::from_secs(60), holder_conn.next_event())
+            .await
+            .expect(
+                "the post-drop frame must land after the pool reconnects + auto-resubscribes within 60s",
+            )
+            .expect("next_event ok");
+        publisher.abort();
+        assert_eq!(
+            decode_cosign_frame(&got2).expect("decode post-drop").1.payload,
+            after.payload,
+            "the post-drop frame arrived only via reconnect + auto-resubscribe (no manual re-sub)"
+        );
+        // Keep the restarted relay alive until the assertion completes.
+        drop(relay2);
+        println!("RELAYCONN-RECONNECT PASS: after a clean drop + same-port restart, a post-drop #p-addressed frame landed via reconnect + auto-resubscribe (no manual re-subscribe)");
+    }
+
+    /// TOOTH B (the TRUE half-open, `#[ignore]`d -- ~110s wall floor, not fast CI). An in-process
+    /// TCP forwarder sits between the clients and a fixed-port relay. Mid-run we BLACKHOLE it: both
+    /// live connections freeze with their sockets held OPEN (a genuine half-open -- the client still
+    /// thinks the socket is live). A clean close would be detected at once (that is Tooth A); a
+    /// silently-dead socket is surfaced ONLY by the keepalive ping. So the post-blackhole frame
+    /// lands ONLY because: the 55s ping went unanswered -> the NEXT ping tick returned
+    /// `NotRepliedToPing` (hence a ~2x55s ~= 110s detection floor) -> the pool reconnected (a fresh
+    /// TCP conn the forwarder forwards normally) -> it auto-re-REQ'd the stable-id subscription.
+    /// This is the ONLY tooth that bites the keepalive-ping flag specifically.
+    ///
+    /// Run it explicitly (it is not in fast CI):
+    ///   nix develop -c cargo test -p kirby-node relay_transport -- --ignored
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "true half-open detection has a ~110s wall floor (2x the hard-coded 55s PING_INTERVAL); run with -- --ignored"]
+    async fn relayconn_half_open_surfaced_by_keepalive_ping_reconnects_and_resubscribes() {
+        let relay = MockRelay::run().await.expect("boot the in-process relay");
+        let relay_port = port_of(&relay.url().await.to_string());
+        let forwarder = TcpBlackholeForwarder::start(relay_port).await;
+        let url = forwarder.url();
+
+        let coordinator = Keys::generate();
+        let holder = Keys::generate();
+        let coord_conn = Arc::new(
+            NostrRelayConn::new(coordinator.public_key(), vec![url.clone()]).expect("coord conn"),
+        );
+        let holder_conn =
+            NostrRelayConn::new(holder.public_key(), vec![url.clone()]).expect("holder conn");
+        coord_conn.ensure_connected().await.expect("coordinator subscribes via the forwarder");
+        holder_conn.ensure_connected().await.expect("holder subscribes via the forwarder");
+
+        // Baseline: a frame round-trips THROUGH the forwarder (the forwarder path carries frames).
+        let baseline = CoSignEvent {
+            session_id: 10,
+            from: GuardianId::try_from(1u16).unwrap(),
+            round: kirby_custody::seam::ROUND_SHARE,
+            payload: vec![0x10],
+        };
+        let bframe =
+            encode_cosign_frame(AGENT, &baseline, holder.public_key(), &coordinator).expect("encode");
+        // Same ephemeral publish-race as the other real-relay teeth: serialized bounded retry so a
+        // publish before the holder's REQ is live at the relay doesn't strand the baseline (pollution-
+        // free -- a lost ephemeral frame queues nothing, and we break on the first delivery).
+        let mut got = None;
+        for _ in 0..20 {
+            coord_conn
+                .publish(bframe.clone())
+                .await
+                .expect("publish the baseline frame via the forwarder");
+            if let Ok(ev) = tokio::time::timeout(Duration::from_secs(2), holder_conn.next_event()).await
+            {
+                got = Some(ev.expect("next_event ok"));
+                break;
+            }
+        }
+        let got = got.expect("the baseline frame must arrive through the forwarder within the retry budget");
+        assert_eq!(
+            decode_cosign_frame(&got).expect("decode baseline").1.payload,
+            baseline.payload,
+            "baseline frame round-trips through the forwarder before the blackhole"
+        );
+
+        // BLACKHOLE: freeze both live connections into a half-open (sockets held OPEN, bytes stopped).
+        // The client cannot tell the socket died; only the 55s keepalive ping will surface it.
+        forwarder.blackhole();
+
+        // POST-BLACKHOLE frame. It lands ONLY if the ping surfaced the half-open (~110s), the pool
+        // reconnected (a fresh conn the forwarder forwards), and it auto-resubscribed. Retry publish
+        // in the background; await the delivery once under a 180s ceiling (< the 300s idle_timeout).
+        let after = CoSignEvent {
+            session_id: 11,
+            from: GuardianId::try_from(2u16).unwrap(),
+            round: kirby_custody::seam::ROUND_SHARE,
+            payload: vec![0x11, 0x12],
+        };
+        let aframe =
+            encode_cosign_frame(AGENT, &after, holder.public_key(), &coordinator).expect("encode");
+        let pub_conn = Arc::clone(&coord_conn);
+        let publisher = tokio::spawn(async move {
+            loop {
+                let _ = pub_conn.publish(aframe.clone()).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        });
+        let got2 = tokio::time::timeout(Duration::from_secs(180), holder_conn.next_event())
+            .await
+            .expect(
+                "the post-blackhole frame must land after the keepalive ping surfaces the half-open (~110s) + reconnect + resubscribe within 180s",
+            )
+            .expect("next_event ok");
+        publisher.abort();
+        assert_eq!(
+            decode_cosign_frame(&got2).expect("decode post-blackhole").1.payload,
+            after.payload,
+            "the post-blackhole frame arrived only via ping-driven reconnect + auto-resubscribe"
+        );
+        // Keep the relay + forwarder alive until the assertion completes.
+        drop(forwarder);
+        drop(relay);
+        println!("RELAYCONN-HALFOPEN PASS: a blackholed (sockets-held-open) half-open socket was surfaced by the 55s keepalive ping; the pool reconnected + auto-resubscribed and a post-blackhole frame landed");
     }
 }
