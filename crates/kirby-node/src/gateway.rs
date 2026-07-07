@@ -580,11 +580,41 @@ impl GatewayService {
                 && !prior.request_hash.is_empty()
                 && request_hash != prior.request_hash
             {
-                tracing::error!(
-                    key = %req.idempotency_key,
-                    "idempotency key reused with a DIFFERENT memory request (wseq desync / stale checkpoint); refusing, debit 0 (R2-4)"
-                );
-                return Ok(denied(Outcome::Unspecified, self.balance()?));
+                // A DIVERGENT content hash under an already-performed key means the key was reused
+                // for different content. The correct handling SPLITS by act:
+                //
+                //  - Act::Memory: the hash covers a DETERMINISTIC (op+slug+value) request, so a
+                //    divergence is a real wseq-desync / stale-checkpoint collision (the F1 class).
+                //    REFUSE rather than silently serve the stale result (R2-7-backed).
+                //
+                //  - Act::IssueCharge: the "content" is the amount_sats, which for an oracle quote
+                //    is a NONDETERMINISTIC LLM re-quote, NOT a client invariant. An IssueCharge key
+                //    is idempotent BY DESIGN -- the FIRST quote is authoritative. Refusing here
+                //    handed the genome charge=None, which its loop turned into a same-seq Transient
+                //    that HEAD-OF-LINE-WEDGED the whole DM inbox (the live 1c re-fire hang). So a
+                //    divergent re-quote must RETURN the first ChargeIssued (fall through below),
+                //    never break idempotency by refusing. Loud-log the collision so a recurrence of
+                //    the (still-undetermined) two-distinct-events-one-key case is diagnosable.
+                //
+                // `request_hash` is non-empty ONLY for Memory and IssueCharge (see the match above,
+                // `_ => Vec::new()`), so the `_` arm here is IssueCharge (and any future
+                // content-hashed act defaults to the safe idempotent-return, never a silent refuse).
+                match act {
+                    Act::Memory(_) => {
+                        tracing::error!(
+                            key = %req.idempotency_key,
+                            "idempotency key reused with a DIFFERENT memory request (wseq desync / stale checkpoint); refusing, debit 0 (R2-4)"
+                        );
+                        return Ok(denied(Outcome::Unspecified, self.balance()?));
+                    }
+                    _ => {
+                        tracing::warn!(
+                            key = %req.idempotency_key,
+                            prior_cost_sats = prior.cost_sats,
+                            "IssueCharge idempotency key re-presented with a DIVERGENT amount hash (nondeterministic re-quote); returning the FIRST authoritative charge, idempotent (R2-4 IssueCharge split; collision-why diagnostic)"
+                        );
+                    }
+                }
             }
             // For an IssueCharge resume the genome MUST get the same ChargeIssued (same
             // charge_id!) it received the first time. The first issue stored the prost-
@@ -2156,5 +2186,127 @@ mod tests {
             firecracker_vsock_listen_path(Path::new("/tmp/x.sock"), 17),
             Path::new("/tmp/x.sock_17")
         );
+    }
+
+    // ===== Row A tooth (dmloop-fix): the IssueCharge idempotency SPLIT =====
+
+    /// A settlement double that issues a charge whose id ENCODES the amount, so "returned the FIRST
+    /// charge" is distinguishable from "freshly re-issued at the new amount". Never settles.
+    struct EchoSettlement;
+    #[async_trait::async_trait]
+    impl SettlementProvider for EchoSettlement {
+        async fn issue(&self, amount_sats: u64, _memo: &str) -> anyhow::Result<ChargeIssuedData> {
+            Ok(ChargeIssuedData {
+                charge_id: format!("charge-{amount_sats}"),
+                invoice_or_request: format!("cashu:charge:{amount_sats}"),
+                amount_sats,
+            })
+        }
+        async fn verify_settlement(&self, _c: &str, _e: &str) -> anyhow::Result<u64> {
+            unreachable!("this tooth issues, never settles")
+        }
+        fn method(&self) -> kirby_proto::ChargeMethod {
+            kirby_proto::ChargeMethod::Cashu
+        }
+    }
+
+    fn issuing_gateway() -> GatewayService {
+        let treasury = Treasury::open_temporary(1_000).expect("open temporary treasury");
+        let session = Session {
+            task_descriptor: "dmloop-rowA".into(),
+            budget_sats: 1_000,
+            allowlisted_destinations: vec![ISSUE_CHARGE_DESTINATION.to_string()],
+            allowlisted_inbound_kinds: Vec::new(),
+        };
+        GatewayService::new(treasury, Arc::new(MockRail::new()), session)
+            .with_settlement_provider(EchoSettlement)
+    }
+
+    fn issue_charge_req(key: &str, amount: u64) -> kirby_proto::CapabilityRequest {
+        kirby_proto::CapabilityRequest {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            idempotency_key: key.to_string(),
+            act: Some(kirby_proto::capability_request::Act::IssueCharge(kirby_proto::IssueCharge {
+                amount_sats: amount,
+                memo: "oracle: PRICE BTC/USD".to_string(),
+                method: kirby_proto::ChargeMethod::Cashu as i32,
+            })),
+            budget_sats: 0,
+        }
+    }
+
+    /// TOOTH 2 (Row A, money-idempotency): re-presenting an IssueCharge idempotency key with a
+    /// DIVERGENT amount (a nondeterministic LLM re-quote) must return the FIRST authoritative
+    /// ChargeIssued (DuplicateIgnored), NOT refuse with charge=None (which head-of-line-WEDGED the
+    /// genome inbox live). RED on reverting Row A: the divergent re-present returns
+    /// denied(Unspecified) / charge=None instead of the first charge.
+    #[tokio::test]
+    async fn issue_charge_divergent_requote_returns_first_charge() {
+        let svc = issuing_gateway();
+        let key = "oracle-charge-v3-abc";
+
+        // A1: first quote at 10 sats -> issued + stored.
+        let r1 = svc.authorize_capability(&issue_charge_req(key, 10)).await.unwrap();
+        assert_eq!(r1.outcome, kirby_proto::Outcome::AuthorizedAndPerformed as i32);
+        let c1 = r1.charge.expect("first issue mints a charge");
+        assert_eq!(c1.amount_sats, 10);
+        assert_eq!(c1.charge_id, "charge-10");
+
+        // A2: SAME key, DIVERGENT amount (20) -> must return the FIRST charge, idempotent.
+        let r2 = svc.authorize_capability(&issue_charge_req(key, 20)).await.unwrap();
+        assert_eq!(
+            r2.outcome,
+            kirby_proto::Outcome::DuplicateIgnored as i32,
+            "a divergent re-quote is idempotent, NOT refused"
+        );
+        let c2 = r2.charge.expect("the divergent re-present returns the FIRST charge, not None");
+        assert_eq!(c2.charge_id, "charge-10", "returns the FIRST charge id, not a fresh charge-20");
+        assert_eq!(c2.amount_sats, 10, "the FIRST authoritative amount, not the re-quoted 20");
+    }
+
+    /// TOOTH 2b (Row A twin / control): the split is ACT-SPECIFIC -- a DIVERGENT Memory re-present
+    /// under the same key MUST still REFUSE (the F1 wseq-desync class it was built for). GREEN in
+    /// both fix and revert: proves Row A narrowed ONLY IssueCharge, never loosened Memory.
+    #[tokio::test]
+    async fn divergent_memory_represent_still_refuses() {
+        let svc = issuing_gateway();
+        let key = "mem-slug-key";
+        // Seed a prior Memory row (value "A"): its stored request_hash is a real memory-write hash.
+        let mem_a = kirby_proto::Memory {
+            op: kirby_proto::MemoryOp::Set as i32,
+            slug: "core".to_string(),
+            value: b"A".to_vec(),
+            max_cost_sats: 10,
+        };
+        svc.treasury
+            .debit_and_record(
+                key,
+                1,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                super::memory_request_hash(&mem_a),
+            )
+            .unwrap();
+
+        // Re-present the SAME key with a DIVERGENT Memory value ("B") -> must REFUSE at STEP-1.
+        let req_b = kirby_proto::CapabilityRequest {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            idempotency_key: key.to_string(),
+            act: Some(kirby_proto::capability_request::Act::Memory(kirby_proto::Memory {
+                op: kirby_proto::MemoryOp::Set as i32,
+                slug: "core".to_string(),
+                value: b"B".to_vec(),
+                max_cost_sats: 10,
+            })),
+            budget_sats: 0,
+        };
+        let r = svc.authorize_capability(&req_b).await.unwrap();
+        assert_eq!(
+            r.outcome,
+            kirby_proto::Outcome::Unspecified as i32,
+            "a divergent Memory re-present is still REFUSED (act-specific split preserved)"
+        );
+        assert!(r.charge.is_none(), "a refused Memory yields no charge");
     }
 }
