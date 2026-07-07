@@ -210,6 +210,11 @@ pub struct ServeGuard {
     /// `[nip60]` is configured (the SAME opt-in gate as `nip60_flusher`); `None` for a bare /
     /// non-nip60 host → no counter estate publish, unchanged behavior.
     nip60_counter_estate: Option<Nip60CounterEstate>,
+    /// #62 (earn-loop deployability): the settlement-poller task handle, aborted in `Drop` exactly
+    /// like `handle` (the serve task) so the poller shuts down cleanly with the daemon. `Some` only
+    /// when settlement is wired (an earn agent); `None` for every non-earn agent, whose boot spawns
+    /// NO poller and is byte-identical.
+    settle_poller: Option<tokio::task::AbortHandle>,
 }
 
 /// The handles a graceful teardown needs to re-publish the current kind:17375 counter mirror
@@ -287,6 +292,7 @@ impl ServeGuard {
             _nip60_shutdown: None,
             nip60_flusher: Some(nip60_flusher),
             nip60_counter_estate: None,
+            settle_poller: None,
         }
     }
 
@@ -303,6 +309,7 @@ impl ServeGuard {
             _nip60_shutdown: None,
             nip60_flusher: None,
             nip60_counter_estate: Some(estate),
+            settle_poller: None,
         }
     }
 }
@@ -310,11 +317,127 @@ impl ServeGuard {
 impl Drop for ServeGuard {
     fn drop(&mut self) {
         self.handle.abort();
+        // #62: abort the settlement poller alongside the serve task so it stops polling the mint
+        // the instant the run tears down (no orphaned task pinning the wallet/treasury).
+        if let Some(poller) = &self.settle_poller {
+            poller.abort();
+        }
         // `_dm_shutdown` drops with the struct -> the DM inbound task's shutdown arm fires.
         // `_nip60_shutdown` drops with the struct -> the ABRUPT-death fallback flush fires (a
         // detached task). On the graceful path `flush_estate` already ran + consumed `dirty`, so
         // that fallback no-ops (`!dirty`); it exists only for a panic/kill that skipped it.
     }
+}
+
+/// Spawn the #62 SETTLEMENT POLLER task and return its [`tokio::task::AbortHandle`] (bound onto the
+/// [`ServeGuard`] so it aborts cleanly at teardown). Every `interval` it runs ONE
+/// [`GatewayService::pending_settlement_sweep`] cycle on `service`: enumerate the DAEMON's durable
+/// ISSUED-but-uncredited charge set ([`crate::treasury::Treasury::issued_uncredited_charge_ids`])
+/// and `settle_charge(&id, "")` each — the mint poll → mint → treasury credit → `PaymentSettled`
+/// enqueue the genome waits on. Per-charge errors are CLASSIFIED inside the sweep (a still-UNPAID
+/// quote logs at DEBUG and continues; a real mint/store/treasury fault logs at WARN), so the loop
+/// never dies. Shared by boot (below, gated on a wired settlement) AND the deployable-path teeth,
+/// so both drive the SAME production trigger — not a bespoke test path.
+///
+/// WHY THIS EXISTS — the earn-loop deployability GAP this closes:
+/// [`GatewayService::settle_charge`] is the ONLY code that polls the mint (`check_mint_quote_status`),
+/// mints, credits the treasury (`credit_verified`), and enqueues the `PaymentSettled` inbox event the
+/// genome's oracle_tick settlement branch waits for. Before this task it had NO production caller
+/// (every caller was a test), so a deployed daemon never settled a paid charge: the customer paid,
+/// the mint was never polled → no credit → no answer. This task is the missing production trigger.
+///
+/// ── PART-A CLASS-CLOSURE TABLE (#62; ships in the diff — kirby's gate audits it row-by-row) ──────
+/// Method: for every pub/pub(crate) fn that mutates money/treasury/wallet/charge/lifecycle state,
+/// grepped all callers, classified test vs prod, traced transitive prod-reachability. The
+/// "settle_charge shape" is EXACTLY ONE prod-dead subtree; no other money/lifecycle fn is
+/// test-only-driven.
+///
+/// | fn (file:line)                             | callers                          | prod path? | disposition |
+/// |--------------------------------------------|----------------------------------|------------|-------------|
+/// | GatewayService::settle_charge (gateway.rs) | driven by pending_settlement_sweep ← poller | **GAP** (pre-#62) | **WIRED** (this poller, via the treasury issued-charge index) |
+/// | Treasury::issued_uncredited_charge_ids (treasury.rs) | pending_settlement_sweep ← poller | REACHABLE | the durable poll source — the dedicated `issued_charges` tree (#62 ruling) |
+/// | GatewayService::settle_inner (gateway.rs)  | only settle_charge               | GAP (transitive) | closed by wiring settle_charge |
+/// | Treasury::credit_verified (treasury.rs)    | prod = ONLY settle_inner; 7 test | GAP (transitive) | closed by wiring settle_charge |
+/// | SettlementProvider::verify_settlement      | prod = ONLY settle_inner         | GAP (transitive) | closed by wiring settle_charge |
+/// | push_typed(PaymentSettled) (gateway.rs)    | that kind ONLY in settle_inner   | **GAP** (that kind) | closed by wiring settle_charge |
+/// | SettlementProvider::issue                  | authorize_issue_charge ← RPC     | REACHABLE  | not a gap |
+/// | authorize_issue_charge (gateway.rs)        | dispatch ← RPC                   | REACHABLE  | not a gap |
+/// | Treasury::debit_and_record / debit_metered / reconcile_to_observed | prod authorize/meter/boot-G4 | REACHABLE | not a gap |
+/// | EcashProvider::mint_send_token             | prod actuator + nip60 delegate   | REACHABLE  | not a gap |
+/// | mint_rig::mint_into_wallet_operator_pays   | prod fund-wallet CLI             | REACHABLE  | not a gap (separate FUND path) |
+///
+/// CLOSURE CONCLUSION: wiring a single production trigger for `settle_charge` closes the ENTIRE
+/// class — `credit_verified` and `verify_settlement` become prod-reachable transitively.
+///
+/// ── PART-B MULTI-WRITE-SEAM CLASS SWEEP (#62 follow-up; ships in the diff — audited row-by-row) ──
+/// Method: enumerated EVERY place in the touched money paths (treasury.rs, gateway.rs, boot.rs)
+/// where two-or-more writes must land TOGETHER for correctness, then classified each: WRAPPED in one
+/// sled tx, already-atomic, or deferred-with-reason. Motivation: a two-write ISSUE seam
+/// (`debit_and_record` + a separate `record_issued_charge`) had a crash window that stranded a
+/// payable charge unindexed (took-money-never-answered). This sweep proves no sibling seam hides the
+/// SAME shape one write over.
+///
+/// | seam (path)                         | the writes                                   | atomic?         | disposition |
+/// |-------------------------------------|----------------------------------------------|-----------------|-------------|
+/// | ISSUE (gateway authorize_issue_charge → treasury) | ledger row + `issued_charges` poll-index | **WAS 2 writes** | **WRAPPED** — `Treasury::record_charge_atomic` commits both in ONE tx over (balance, ledger, issued_charges). THIS cut. |
+/// | DEBIT generic act (treasury debit_and_record)     | balance − cost  + ledger row             | YES (one tx)    | already-atomic — one `.transaction((balance, ledger))`. Unchanged (a non-charge act must NOT write `issued_charges`). |
+/// | METER tick (treasury debit_metered)               | balance − burn (NO ledger row)           | N/A (single write) | not a seam — one balance write, no paired write (rent leaves no ledger row). |
+/// | CREDIT / settle (treasury credit_verified)        | balance + amount + `credit_ledger` row   | YES (one tx)    | already-atomic — one `.transaction((balance, credit_ledger))` (incl. the terminal-overflow marker branch). |
+/// | RECONCILE (treasury reconcile_to_observed)        | balance := observed (single tx set)      | YES (one tx)    | already-atomic — single balance set. |
+/// | SETTLE deliver (gateway settle_inner)             | `credit_verified` (sled) + PaymentSettled ENQUEUE | **NO — and correctly so** | NOT wrappable: PaymentSettled is an IN-MEMORY inbox push, not a 2nd sled write, so it cannot join a sled tx. The credit-durable / push-in-memory crash window (credited-but-unanswered) = **TASK #50** (durable dead-letter store; gates unattended-live). Deferred, out of this cut. |
+/// | INDEX-only (treasury record_issued_charge)        | `issued_charges` insert (single write)   | N/A (single write) | not a seam standalone; the ISSUE seam above now writes the index INSIDE the ledger tx. Kept pub for the direct-index unit tooth; no prod caller pairs it with a second write anymore. |
+///
+/// PART-B CONCLUSION: every multi-write seam in the touched paths is either ONE sled tx (ISSUE now
+/// wrapped; DEBIT / CREDIT / RECONCILE already were) or a documented deferral (SETTLE's in-memory
+/// PaymentSettled push → #50). No un-wrapped, un-justified two-sled-write seam remains.
+///
+/// ── FINAL DESIGN + CLASS-CLOSURE DISPOSITIONS (kirby's ruling — the dedicated issued-charge index)
+/// The poll source is the DAEMON's dedicated, durable `issued_charges` sled tree
+/// ([`crate::treasury::Treasury::issued_uncredited_charge_ids`]) — charge_id -> a plain method-tag
+/// byte, written ONLY by `authorize_issue_charge` (the single IssueCharge act) via
+/// `record_issued_charge`, minus `credit_ledger`, filtered to the Lightning rail. It is NOT a scan
+/// of the `ledger`'s `proof` field. A cold cross-model review found the `ledger` `proof` is
+/// POLYMORPHIC — non-charge acts write it too (gateway.rs generic/brain, memory, capability rows;
+/// only the IssueCharge path writes a `ChargeIssued` proof) — so a ledger scan had to HEURISTICALLY
+/// (decode + round-trip guard) tell a charge proof from a colliding non-charge proof, and a false
+/// positive would FALSELY CREDIT a non-charge act. The dedicated tree removes the heuristic: a
+/// non-charge act simply has no key in `issued_charges`, so it is excluded by construction.
+///
+/// The five poll-source / settlement issues the review enumerated, and their dispositions:
+///   #2 FALSE-CREDIT via the polymorphic `ledger` `proof` — CLOSED HERE, structurally: a non-charge
+///      act is never written to `issued_charges`, so it can never be polled or credited. No heuristic.
+///   #4 CASHU-WRONG-RAIL (a Cashu charge polled on the Lightning `settle_charge(id, "")` path) —
+///      CLOSED HERE: the charge's rail is stored in the index and the poller filters to Lightning
+///      (a Cashu charge is settled by token evidence, never a mint-quote poll).
+///   #1 CREDITED-BUT-UNANSWERED (the credit is durable but the `PaymentSettled` push is in-memory,
+///      so a crash after credit / before delivery drops the genome's answer) — deferred to the
+///      existing TASK #50 (a durable pending-charge / dead-letter store; gates unattended-live).
+///   #3 CRASH-MINTED PROOFS SPENDABLE before the Issued-recovery credit wins — follow-up TASK #73.
+///   #5 UNBOUNDED unpaid-charge POLL GROWTH (an unpaid charge is retained and re-polled forever) —
+///      follow-up TASK #74 (expiry / backoff / cap on the poll set).
+///
+/// The crash-window RE-POLL that makes an already-paid charge recoverable still holds: an ISSUED-
+/// but-uncredited charge KEEPS its `issued_charges` key (no `credit_ledger` row) until it is
+/// credited, so the poller re-polls it and `settle_charge` credits the HELD proofs via
+/// `verify_settlement`'s Issued-recovery branch (no re-mint). BACK-COMPAT: a charge issued by a
+/// PRIOR binary (before the `issued_charges` tree existed) has no key here, so it is not polled —
+/// acceptable, a re-fire issues a fresh (indexed) charge. Idempotency: `credit_verified` is
+/// idempotent on charge_id and the mint is idempotent per quote, so the poller never double-credits.
+pub fn spawn_settlement_poller(
+    service: GatewayService,
+    interval: Duration,
+) -> tokio::task::AbortHandle {
+    let handle = tokio::spawn(async move {
+        // `tokio::time::interval` fires the FIRST tick IMMEDIATELY, so a charge already paid when
+        // the daemon comes up (e.g. paid while it was down) settles on the first cycle rather than
+        // after a full interval elapses.
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            service.pending_settlement_sweep().await;
+        }
+    });
+    handle.abort_handle()
 }
 
 /// The outcome of a boot demonstration (the G1 evidence).
@@ -1937,6 +2060,28 @@ pub async fn boot_and_observe_with_rail(
             tracing::error!(error = %e, "gateway serve loop ended with error");
         }
     });
+    // #62 (earn-loop deployability): spawn the SETTLEMENT POLLER right after the serve task, and
+    // ONLY when settlement is wired (the SAME `settlement_wired` gate the inbox/allowlist use above,
+    // boot.rs — additive discipline: a non-earn agent spawns NOTHING here and boots byte-identically).
+    // This is the missing production trigger for `settle_charge` — see `spawn_settlement_poller`'s
+    // doc (with the Part-A closure table). The cadence is the optional `[brain] settle_poll_secs`
+    // knob (default 10s), clamped to >= 1s; when no `[brain]` block exists we fall back to the
+    // default (settlement is only ever wired on the Routstr path, which always has a `[brain]`).
+    let settle_poller = if settlement_wired {
+        let poll_secs = config
+            .brain
+            .as_ref()
+            .map(|b| b.settle_poll_secs)
+            .unwrap_or_else(crate::config::default_brain_settle_poll_secs)
+            .max(1);
+        tracing::info!(
+            settle_poll_secs = poll_secs,
+            "settlement wired — spawning the #62 settlement poller (mint-poll → mint → credit → PaymentSettled)"
+        );
+        Some(spawn_settlement_poller(service.clone(), Duration::from_secs(poll_secs)))
+    } else {
+        None
+    };
     // Spawn the NIP-17 DM inbound subscription (task #12) when DMs are enabled: publish the agent's
     // kind:10050 inbox-relay list (best-effort -- a relay hiccup must not fail boot), then run the
     // producer that feeds the gateway's inbox queue. The task is torn down with the run via the
@@ -2061,6 +2206,8 @@ pub async fn boot_and_observe_with_rail(
         // Cut B (#115): the current-counter-mirror re-publish at graceful death, awaited inside the
         // SAME `flush_estate` after the proof flush.
         nip60_counter_estate,
+        // #62: the settlement poller handle (Some only when settlement is wired), aborted in Drop.
+        settle_poller,
     };
 
     // Wait for the genome's boot hello event (session=<task>). This is the G1

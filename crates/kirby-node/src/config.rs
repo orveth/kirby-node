@@ -838,6 +838,14 @@ pub struct BrainConfig {
     /// guard then rejects any charge whose method does not match the wired rail.
     #[serde(default)]
     pub settlement_method: Option<SettlementMethod>,
+    /// (#62) The settlement-poller CADENCE in seconds: how often the boot-time poller re-polls the
+    /// mint for each outstanding bolt11 charge and settles the paid ones (mint → credit →
+    /// `PaymentSettled`). This is the production trigger for `settle_charge`. OPTIONAL: omitted
+    /// configs get [`default_brain_settle_poll_secs`] (10s), so existing configs are byte-identical.
+    /// ONLY the earn path (a wired settlement provider) spawns the poller; tune this to stay under a
+    /// mint's rate limit without a rebuild. Clamped to >= 1s at spawn.
+    #[serde(default = "default_brain_settle_poll_secs")]
+    pub settle_poll_secs: u64,
 }
 
 /// Which settlement RAIL the daemon wires for the earn-loop (Inc 1b/D2). Selects ONE provider at
@@ -886,6 +894,12 @@ fn default_brain_fee_headroom_sats() -> u64 {
 fn default_brain_max_tokens() -> u32 {
     1024
 }
+/// (#62) The settlement-poller cadence default (seconds). `pub` so the boot poller falls back to it
+/// when a `[brain]` block is absent. 10s: brisk enough that a stranger's paid charge settles within
+/// seconds, gentle on the mint's rate limit (and operator-tunable via `[brain] settle_poll_secs`).
+pub fn default_brain_settle_poll_secs() -> u64 {
+    10
+}
 
 impl BrainConfig {
     /// The effective NIP-60 mint-allowlist: the wallet's own `mint_url` (always trusted, first)
@@ -924,6 +938,7 @@ impl Default for BrainConfig {
             recovery_timeout_secs: default_brain_recovery_timeout_secs(),
             fee_headroom_sats: default_brain_fee_headroom_sats(),
             settlement_method: None,
+            settle_poll_secs: default_brain_settle_poll_secs(),
         }
     }
 }

@@ -1117,30 +1117,53 @@ impl GatewayService {
         // idempotency key, so the customer-correlation holds across a resume).
         let proof = charge.encode_to_vec();
 
-        // Record with cost=0: issuing a charge costs the genome nothing. The ledger row
-        // dedupes resume re-issues at STEP1 (a Duplicate returns the same ChargeIssued).
+        // (#62) Map the wired rail (proto ChargeMethod) to the treasury's PROTO-FREE method tag so
+        // the charge can be indexed in the durable `issued_charges` tree below. The D2 method guard
+        // above already proved `ic.method == settlement.method()`, so the wired rail IS this
+        // charge's rail. Any non-Lightning rail maps to Cashu (fail-safe: never Lightning-polled).
+        let method_tag = match settlement.method() {
+            kirby_proto::ChargeMethod::Lightning => crate::treasury::ChargeMethodTag::Lightning,
+            _ => crate::treasury::ChargeMethodTag::Cashu,
+        };
+        // Clone the charge_id before `charge` is moved into the receipt, so the index write in the
+        // Debited arm can reference it.
+        let charge_id = charge.charge_id.clone();
+
+        // Record with cost=0 ATOMICALLY: the cost=0 ledger row (STEP-1 dedupe — a Duplicate returns
+        // the same ChargeIssued on a resume re-issue) AND the durable `issued_charges` poll-index
+        // entry commit in ONE sled multi-tree transaction (#62 money-safety). This closes the
+        // took-money-never-answered gap the old TWO-write sequence (`debit_and_record` then a
+        // separate `record_issued_charge`) left: a crash BETWEEN them stranded a payable charge with
+        // a ledger row but no poll-index entry, so the settlement poller (sourced from
+        // `issued_charges`) never settled it. `issued_charges` is the poller's poll SOURCE; STRUCTURAL
+        // money-safety (#2): only genuine IssueCharge acts land there, so a non-charge `ledger` proof
+        // can never be polled or credited. On a Duplicate (resume-replay OR a concurrent same-key
+        // re-issue that minted its own loser charge_id) the atomic call writes NEITHER a second
+        // ledger row NOR an index entry, so the loser id never becomes an index-without-ledger
+        // orphan; only the fresh winner is indexed, atomically with its ledger row.
         // Inc 1b (Fix 4): persist the effective-request hash (over amount/memo/method) so a future
         // same-key re-issue with DIVERGENT terms is refused at STEP-1 — mirrors the Memory (R2-4)
         // persist. A same-key SAME-terms resume still matches the hash and returns the same charge.
-        match self.treasury.debit_and_record(
+        match self.treasury.record_charge_atomic(
             &req.idempotency_key,
-            0,
+            &charge_id,
+            method_tag,
             proof.clone(),
-            Vec::new(),
-            Vec::new(),
             issue_charge_request_hash(ic),
         )? {
-            DebitOutcome::Debited { remaining, .. } => Ok(CapabilityReceipt {
-                schema_version: kirby_proto::SCHEMA_VERSION,
-                outcome: Outcome::AuthorizedAndPerformed as i32,
-                cost_sats: 0,
-                treasury_remaining: remaining,
-                proof,
-                completion: Vec::new(),
-                memory: None,
-                charge: Some(charge),
-                http_response: None,
-            }),
+            DebitOutcome::Debited { remaining, .. } => {
+                Ok(CapabilityReceipt {
+                    schema_version: kirby_proto::SCHEMA_VERSION,
+                    outcome: Outcome::AuthorizedAndPerformed as i32,
+                    cost_sats: 0,
+                    treasury_remaining: remaining,
+                    proof,
+                    completion: Vec::new(),
+                    memory: None,
+                    charge: Some(charge),
+                    http_response: None,
+                })
+            }
             // Concurrent same-key: the stored ChargeIssued is in proof.
             DebitOutcome::Duplicate(prior) => Ok(CapabilityReceipt {
                 schema_version: kirby_proto::SCHEMA_VERSION,
@@ -1336,6 +1359,76 @@ impl GatewayService {
         }
 
         Ok(outcome)
+    }
+
+    /// ONE settlement-poller cycle (#62): enumerate the DAEMON's own durable ISSUED-but-uncredited
+    /// charge set ([`Treasury::issued_uncredited_charge_ids`]) and attempt `settle_charge(&id, "")`
+    /// for each. This is the production trigger the boot-time poller task calls every cadence —
+    /// `settle_charge` (which polls the mint, mints, credits the treasury, and enqueues
+    /// `PaymentSettled`) otherwise has NO live caller, so a deployed daemon would never settle a
+    /// paid charge.
+    ///
+    /// POLL SOURCE = THE TREASURY, NOT THE WALLET (ruling B, the money-safety core of #62): the
+    /// source is the treasury's durable issued-charge index, NOT the wallet's
+    /// `get_unissued_mint_quotes()` view. That view leaks three ways — a crash-window charge that
+    /// flipped ISSUED drops out of it (paid charge stranded), a NIP-60-ON drain-minted quote is
+    /// invisible to it (#72), and it exposes NON-charge wallet quotes the poller could falsely
+    /// credit. Sourcing from the durable issued-charge set (which RETAINS an ISSUED-but-uncredited
+    /// charge until it is credited, and contains ONLY real IssueCharge rows) closes all three.
+    ///
+    /// PER-CHARGE ERRORS ARE CLASSIFIED, never silently loop-swallowed (#4): a
+    /// [`crate::rail::SettleNotReady`] (the still-UNPAID quote — the NORMAL steady state) is logged
+    /// at DEBUG and skipped; ANY OTHER error (a mint/store/treasury I/O fault) is a PERSISTENT
+    /// failure logged at WARN with the charge_id + error, so a genuine fault surfaces instead of
+    /// hiding behind routine UNPAID noise. Either way the sweep continues to the next id and the
+    /// poller loop never dies. A no-op when no settlement provider is attached (a non-earn agent),
+    /// so the sweep is safe to call on any gateway.
+    pub async fn pending_settlement_sweep(&self) {
+        if self.settlement.is_none() {
+            // No settlement wired (a non-earn agent): nothing to poll (settle_charge would bail).
+            return;
+        }
+        let ids = match self.treasury.issued_uncredited_charge_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                // Enumerating the durable issued-charge index failed — a real treasury/storage
+                // fault (not routine UNPAID noise), so WARN. Retry next cycle; never abort the loop.
+                tracing::warn!(
+                    error = %e,
+                    "settlement poller: enumerating the issued-uncredited charge set failed; retrying next cycle"
+                );
+                return;
+            }
+        };
+        for id in ids {
+            match self.settle_charge(&id, "").await {
+                Ok(outcome) => {
+                    tracing::info!(
+                        charge_id = %id,
+                        credited = matches!(outcome, CreditOutcome::Credited { .. }),
+                        "settlement poller: settle_charge resolved a pending charge"
+                    );
+                }
+                Err(e) if e.downcast_ref::<crate::rail::SettleNotReady>().is_some() => {
+                    // The COMMON case: the quote is still UNPAID (the customer has not paid yet).
+                    // The NORMAL steady state — log at DEBUG and CONTINUE to the next charge.
+                    tracing::debug!(
+                        charge_id = %id,
+                        error = %e,
+                        "settlement poller: charge not yet payable (UNPAID); continuing"
+                    );
+                }
+                Err(e) => {
+                    // A PERSISTENT failure (mint/store/treasury I/O). Surface it at WARN so a real
+                    // fault is never swallowed as routine UNPAID noise; retry next cycle regardless.
+                    tracing::warn!(
+                        charge_id = %id,
+                        error = %e,
+                        "settlement poller: PERSISTENT settle failure (not UNPAID); will retry next cycle"
+                    );
+                }
+            }
+        }
     }
 
     fn balance(&self) -> Result<u64, TreasuryError> {

@@ -956,8 +956,10 @@ impl NostrActuator {
         }
         let client = Client::builder().signer(keys.clone()).build();
         for url in relays {
-            client
-                .add_relay(url)
+            // #62 (secondary): use the ping-DISABLED add so a transient stall across one 55s
+            // keepalive window does not self-kill the actuator's relay connection (a self-killed
+            // actuator drops the answer-send). `reconnect` still recovers genuine drops.
+            crate::nerve::add_relay_no_ping(&client, url)
                 .await
                 .with_context(|| format!("add actuator relay {url}"))?;
         }
@@ -1012,8 +1014,10 @@ impl NostrActuator {
         // pre-built owned `Event` via `send_event` does not need a client signer.
         let client = Client::builder().build();
         for url in relays {
-            client
-                .add_relay(url)
+            // #62 (secondary): ping-DISABLED add (see the single-key path) so the FROST actuator's
+            // relay connection does not self-kill on a laggy keepalive window; reconnect still
+            // recovers genuine drops.
+            crate::nerve::add_relay_no_ping(&client, url)
                 .await
                 .with_context(|| format!("add actuator relay {url}"))?;
         }
@@ -3808,6 +3812,25 @@ impl StrandedQuoteSink for SledStrandedSink {
     }
 }
 
+/// (#62) A settlement attempt that failed because the charge is NOT-YET-PAYABLE — the NORMAL
+/// steady state (the customer has not paid the invoice yet). The settlement poller sweeps every
+/// outstanding charge each cycle and MOST attempts bail here, so this must be distinguishable from
+/// a PERSISTENT failure (a mint/store/treasury I/O fault): the poller logs this at DEBUG and
+/// continues, but logs a real error at WARN so a genuine fault is never silently swallowed as
+/// routine UNPAID noise. Carried as a typed error so `pending_settlement_sweep` can classify via
+/// `anyhow`'s `downcast_ref` (the `?` chain from `verify_settlement` preserves it — no `.context`
+/// wraps it).
+#[derive(Debug, thiserror::Error)]
+pub enum SettleNotReady {
+    /// The bolt11 mint quote is still UNPAID: the customer's Lightning payment has not reached the
+    /// mint. No mint, no credit (fail-closed) — retry next cycle.
+    #[error(
+        "bolt11 mint quote is UNPAID — the customer's Lightning payment has not reached the mint; \
+         refusing to mint or credit (fail-closed)"
+    )]
+    Unpaid,
+}
+
 /// The money-tooth gate: a bolt11 mint quote is only mintable once the mint reports it PAID.
 ///
 /// cdk 0.17.1's [`cdk::nuts::MintQuoteState`] (= `nut23::QuoteState`) has exactly THREE
@@ -3829,10 +3852,11 @@ fn ensure_quote_paid(state: cdk::nuts::MintQuoteState) -> anyhow::Result<()> {
     use cdk::nuts::MintQuoteState;
     match state {
         MintQuoteState::Paid => Ok(()),
-        MintQuoteState::Unpaid => anyhow::bail!(
-            "bolt11 mint quote is UNPAID — the customer's Lightning payment has not reached \
-             the mint; refusing to mint or credit (fail-closed)"
-        ),
+        // TYPED (#4): the UNPAID bail is the poller's NORMAL steady state — return the typed
+        // `SettleNotReady::Unpaid` (not a bare `anyhow::bail!`) so `pending_settlement_sweep` can
+        // `downcast_ref` it and log at DEBUG, while a real mint/store/treasury fault stays an
+        // untyped error the sweep logs at WARN. The `?` chain preserves the concrete type.
+        MintQuoteState::Unpaid => Err(SettleNotReady::Unpaid.into()),
         MintQuoteState::Issued => anyhow::bail!(
             "bolt11 mint quote is already ISSUED — the freshly-mintable gate must not be \
              reached on an already-minted quote (the Issued recovery branch handles it \
