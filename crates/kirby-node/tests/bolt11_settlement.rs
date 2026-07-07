@@ -148,6 +148,44 @@ async fn await_quote_state(wallet: &Arc<cdk::Wallet>, quote_id: &str, want: Mint
     }
 }
 
+/// Issue a bolt11 charge THROUGH THE GATEWAY (the real `authorize_capability` IssueCharge path), so
+/// the charge is recorded in the daemon's durable `issued_charges` index — the settlement poller's
+/// poll source (#62 ruling). Returns the daemon-assigned charge_id (== the bolt11 mint quote id).
+/// This is how a real deployed daemon records a charge; the poller enumerates that index via
+/// `Treasury::issued_uncredited_charge_ids`, NEVER the wallet's quote view.
+async fn issue_charge_through_gateway(
+    svc: &GatewayService,
+    key: &str,
+    amount_sats: u64,
+    memo: &str,
+) -> String {
+    use kirby_proto::capability_request::Act;
+    use kirby_proto::{CapabilityRequest, ChargeMethod, IssueCharge, Outcome};
+    let req = CapabilityRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        idempotency_key: key.to_string(),
+        act: Some(Act::IssueCharge(IssueCharge {
+            amount_sats,
+            memo: memo.to_string(),
+            method: ChargeMethod::Lightning as i32,
+        })),
+        budget_sats: 0,
+    };
+    let receipt = svc
+        .authorize_capability(&req)
+        .await
+        .expect("authorize IssueCharge through the gateway");
+    assert_eq!(
+        receipt.outcome,
+        Outcome::AuthorizedAndPerformed as i32,
+        "the gateway must authorize the Lightning IssueCharge (records the durable ChargeIssued row)"
+    );
+    receipt
+        .charge
+        .expect("gateway returns a ChargeIssued")
+        .charge_id
+}
+
 // --------------------------------------------------------------------------------------------
 // TOOTH 1 — issue → bolt11: `issue()` returns a real, parseable bolt11 invoice.
 //
@@ -1040,6 +1078,629 @@ async fn issue_charge_replay_with_divergent_terms_is_refused() {
         r3.charge.expect("resume returns a charge").charge_id,
         charge1.charge_id,
         "the resume returns the SAME charge_id (customer correlation preserved)"
+    );
+
+    mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// #62 DEPLOYABLE-PATH TOOTH — the DAEMON's OWN settlement poller settles a paid charge end-to-end.
+//
+// The earn-loop deployability proof. `GatewayService::settle_charge` (mint-poll → mint → treasury
+// credit → PaymentSettled enqueue) had NO production caller before #62 — every caller was a test —
+// so a DEPLOYED daemon never settled a paid charge (customer pays, mint never polled, no credit, no
+// answer). This tooth builds the earn-shape gateway (a wired Lightning settlement over the daemon
+// wallet + an inbox queue, exactly what boot attaches when settlement is wired), issues a charge
+// THROUGH THE GATEWAY (so it is recorded in the durable `issued_charges` index — the poller's
+// source), lets the fakewallet mark it PAID, then spawns the REAL PRODUCTION POLLER
+// (`kirby_node::boot::spawn_settlement_poller` — the SAME task boot spawns, NOT a direct
+// `settle_charge` call from the test body) and asserts that WITHIN A BOUNDED WAIT the poller's own
+// trigger:
+//   (a) credits the treasury the MINT-VERIFIED amount, and
+//   (b) makes a PaymentSettled event deliverable via the gateway's `poll_inbox` (the genome's
+//       settled signal), correlated to the charge_id.
+//
+// RED-on-revert (asserts the mutation LANDED — the poller mechanism, not a direct settle): neuter
+// the poller by removing the `service.pending_settlement_sweep().await` call (or the `tokio::spawn`)
+// inside `boot::spawn_settlement_poller`. The daemon's trigger then never fires: the treasury stays
+// 0 and no PaymentSettled is ever enqueued, so the bounded wait below times out on the credit
+// assertion → RED. (Verified during the build: with the sweep call commented out this test times
+// out and FAILS; restored → GREEN.)
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn settlement_poller_settles_a_paid_charge_end_to_end() {
+    use kirby_proto::node_gateway_server::NodeGateway;
+    use kirby_proto::PaymentSettled;
+    use prost::Message as _;
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    let wallet = build_wallet(&mint.url()).await.expect("build daemon wallet");
+
+    // The earn-shape gateway: a wired Lightning settlement over the wallet + an inbox queue —
+    // exactly what boot attaches when settlement is wired. Treasury starts EMPTY (unsettled).
+    let (svc, _queue) = lightning_gateway(0, wallet.clone());
+
+    // Issue the charge THROUGH THE GATEWAY so the durable `issued_charges` index entry exists (the
+    // poller's source). This is the real deployed path; the test never calls settle_charge.
+    let charge_id = issue_charge_through_gateway(&svc, "poller-e2e-1", 220, "poller-e2e").await;
+
+    // The stranger pays: the fakewallet flips the quote to PAID.
+    await_quote_state(&wallet, &charge_id, MintQuoteState::Paid).await;
+
+    assert_eq!(svc.treasury_remaining().unwrap(), 0, "treasury starts empty (charge unsettled)");
+
+    // SPAWN THE REAL PRODUCTION POLLER — the SAME task boot spawns (the settle_charge trigger),
+    // over a CLONE of the gateway. A short interval keeps the tooth fast; the first tick fires
+    // immediately. Nothing in the test body calls settle_charge — the daemon's own trigger must.
+    let poller =
+        kirby_node::boot::spawn_settlement_poller(svc.clone(), Duration::from_millis(200));
+
+    // Assert the DAEMON's poller (not the test) credits the treasury within a bounded wait.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if svc.treasury_remaining().unwrap() == 220 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the settlement poller did not credit the treasury within the deadline (remaining = {})",
+            svc.treasury_remaining().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // (a) treasury credited the MINT-VERIFIED amount by the poller's own settle.
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        220,
+        "the poller settled the paid charge and credited the mint-verified amount"
+    );
+
+    // (b) a PaymentSettled event (the genome's settled signal) is deliverable via poll_inbox,
+    // correlated to the charge_id — enqueued by the poller's settle, not the test.
+    let resp = svc
+        .poll_inbox(tonic::Request::new(kirby_proto::InboxRequest {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            want_kinds: vec![InboundKind::PaymentSettled as i32],
+            ack_seq: 0,
+            wait_ms: 0,
+        }))
+        .await
+        .expect("poll_inbox");
+    let settled: Vec<PaymentSettled> = resp
+        .into_inner()
+        .events
+        .into_iter()
+        .filter(|e| e.kind == InboundKind::PaymentSettled as i32)
+        .map(|e| PaymentSettled::decode(e.payload.as_slice()).expect("decode PaymentSettled"))
+        .collect();
+    assert_eq!(
+        settled.len(),
+        1,
+        "the poller's settle enqueued exactly one PaymentSettled for the genome"
+    );
+    assert_eq!(
+        settled[0].charge_id, charge_id,
+        "the PaymentSettled correlates to the settled charge"
+    );
+    assert_eq!(
+        settled[0].verified_sats, 220,
+        "the PaymentSettled carries the mint-verified amount"
+    );
+
+    // Clean shutdown of the poller (as the ServeGuard's Drop does at run-end).
+    poller.abort();
+    mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// #62 TOOTH (b) — CRASH-WINDOW RECOVERY: the poller RE-POLLS an ISSUED-but-uncredited charge.
+//
+// The #1 leak the durable poll source closes. A charge that crashed BETWEEN `wallet.mint()` and
+// `credit_verified` is now ISSUED at the mint (`amount_issued != 0`) — so it has DROPPED from the
+// wallet's `get_unissued_mint_quotes()` view. Under the old wallet-sourced poller it would be
+// INVISIBLE and the paid charge stranded forever. Under ruling B the poll source is the treasury's
+// durable ISSUED-CHARGE index (`Treasury::issued_uncredited_charge_ids`), which RETAINS the charge
+// (its `ChargeIssued` ledger row has no credit_ledger row) until it is credited. So the poller
+// re-polls it and `settle_charge` credits the HELD proofs via `verify_settlement`'s Issued-recovery
+// branch (no re-mint). This tooth drives the REAL poller and asserts the charge is recovered, not
+// dropped.
+//
+// RED-on-revert (asserts the mutation LANDED — the durable poll source): neuter
+// `Treasury::issued_uncredited_charge_ids` to `return Ok(Vec::new());` at the top (treasury.rs).
+// This EXACTLY models the old wallet-sourced enumeration for this scenario: `get_unissued_mint_quotes()`
+// returns [] for a fully-ISSUED quote, so the charge is invisible to the poller. The poller then
+// never re-polls it → the treasury stays 0 → the bounded wait below times out on the credit
+// assertion → RED. (Verified during the build: with the method stubbed to Ok(Vec::new()) this test
+// times out and FAILS; restored → GREEN.)
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn settlement_poller_recovers_a_crash_window_issued_charge() {
+    use kirby_proto::node_gateway_server::NodeGateway;
+    use kirby_proto::PaymentSettled;
+    use prost::Message as _;
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    let wallet = build_wallet(&mint.url()).await.expect("build daemon wallet");
+    let (svc, _queue) = lightning_gateway(0, wallet.clone());
+
+    // Issue THROUGH the gateway so the durable `issued_charges` index entry exists (the poll source).
+    let charge_id = issue_charge_through_gateway(&svc, "crash-window-1", 300, "crash-window").await;
+
+    // The stranger pays.
+    await_quote_state(&wallet, &charge_id, MintQuoteState::Paid).await;
+
+    // CRASH WINDOW: mint the proofs directly (what a settle would do), WITHOUT crediting the
+    // treasury — the daemon "died" after wallet.mint() but before credit_verified. The quote is
+    // now ISSUED at the mint (amount_issued != 0), so it has DROPPED from get_unissued_mint_quotes().
+    let minted_proofs = wallet
+        .mint(&charge_id, SplitTarget::default(), None)
+        .await
+        .expect("mint the settled ecash (the pre-crash mint)");
+    let minted: u64 = minted_proofs.total_amount().expect("total the minted proofs").into();
+    assert_eq!(minted, 300, "the pre-crash mint produced the full amount");
+    assert_eq!(
+        wallet.check_mint_quote_status(&charge_id).await.expect("check quote").state,
+        MintQuoteState::Issued,
+        "after mint() the quote is ISSUED at the mint — invisible to the wallet's unissued view"
+    );
+    assert_eq!(svc.treasury_remaining().unwrap(), 0, "treasury uncredited (the crash window)");
+
+    // SPAWN THE REAL PRODUCTION POLLER. Its source is the treasury's durable issued-charge index,
+    // which still lists this ISSUED-but-uncredited charge, so it re-polls + recovers it.
+    let poller = kirby_node::boot::spawn_settlement_poller(svc.clone(), Duration::from_millis(200));
+
+    // Assert the poller credits the treasury the HELD amount within a bounded wait (recovery, not
+    // re-mint). If the charge were dropped (old wallet source) this would time out.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if svc.treasury_remaining().unwrap() == 300 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the poller did not recover the crash-window ISSUED charge within the deadline \
+             (remaining = {}) — it was DROPPED, not re-polled",
+            svc.treasury_remaining().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The recovery credited exactly the held amount and did NOT re-mint (wallet balance unchanged).
+    assert_eq!(svc.treasury_remaining().unwrap(), 300, "recovered charge credited the held amount");
+    let wallet_balance: u64 = wallet.total_balance().await.expect("balance").into();
+    assert_eq!(wallet_balance, 300, "no re-mint — the wallet still holds exactly the minted 300");
+
+    // A PaymentSettled correlated to the charge is deliverable (the genome's settled signal).
+    let resp = svc
+        .poll_inbox(tonic::Request::new(kirby_proto::InboxRequest {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            want_kinds: vec![InboundKind::PaymentSettled as i32],
+            ack_seq: 0,
+            wait_ms: 0,
+        }))
+        .await
+        .expect("poll_inbox");
+    let settled: Vec<PaymentSettled> = resp
+        .into_inner()
+        .events
+        .into_iter()
+        .filter(|e| e.kind == InboundKind::PaymentSettled as i32)
+        .map(|e| PaymentSettled::decode(e.payload.as_slice()).expect("decode PaymentSettled"))
+        .collect();
+    assert_eq!(settled.len(), 1, "the recovery settle enqueued exactly one PaymentSettled");
+    assert_eq!(settled[0].charge_id, charge_id, "the PaymentSettled correlates to the recovered charge");
+
+    poller.abort();
+    mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// #62 TOOTH (c) — FALSE-CREDIT REFUTE (the #2 KILL): a NON-CHARGE act's polymorphic `ledger`
+// `proof` is NEVER polled or credited by the settlement poller.
+//
+// The money-safety core of #62. The treasury `ledger` `proof` field is POLYMORPHIC — non-charge
+// acts write it too (generic/brain, memory, capability rows), not only the one IssueCharge act. A
+// poll source that SCANNED the ledger and decoded each `proof` as a `ChargeIssued` had to
+// HEURISTICALLY (decode + round-trip guard) tell a real charge proof from a colliding non-charge
+// proof; a false positive would FALSELY CREDIT a non-charge act. kirby's ruling replaces the scan
+// with a DEDICATED `issued_charges` tree that ONLY `authorize_issue_charge` writes, so a non-charge
+// act is excluded by construction (no key there — no heuristic).
+//
+// This tooth constructs the exact collision: a NON-CHARGE ledger row whose `proof` IS a valid,
+// round-tripping `ChargeIssued` pointing at a REAL PAID mint quote (models gateway.rs writing a
+// polymorphic proof that collides with canonical `ChargeIssued` bytes) — written directly to the
+// treasury `ledger`, and crucially NEVER recorded in `issued_charges`. Alongside it, a real charge
+// issued through the gateway. It asserts the poller settles ONLY the real charge and NEVER the
+// colliding non-charge row (no false credit, no bogus PaymentSettled).
+//
+// RED-on-revert (asserts the mutation LANDED — the dedicated-tree poll source): revert
+// `Treasury::issued_uncredited_charge_ids` to the OLD ledger-scan that decodes each `ledger` row's
+// `proof` as a `ChargeIssued` (the pre-ruling body). The colliding non-charge row then decodes to a
+// `ChargeIssued{charge_id = <the paid bogus quote>}`, round-trips, and is included → the poller
+// calls `settle_charge(bogus_id, "")` → it mints+credits the bogus 999 and emits a PaymentSettled
+// for it → the treasury over-credits, so the "credited ONLY the real charge" / "no bogus
+// PaymentSettled" assertions below FAIL (RED). Restore the dedicated-tree source → GREEN.
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn settlement_poller_never_credits_a_non_charge_ledger_proof() {
+    use kirby_proto::node_gateway_server::NodeGateway;
+    use kirby_proto::{ChargeIssued, ChargeMethod, PaymentSettled};
+    use prost::Message as _;
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    let wallet = build_wallet(&mint.url()).await.expect("build daemon wallet");
+
+    // Build the earn-shape gateway EXPLICITLY so the test holds a `Treasury` clone (to inject the
+    // non-charge ledger row below). Same shape as `lightning_gateway`: a wired Lightning settlement
+    // over the daemon wallet + an inbox queue. Treasury starts EMPTY.
+    let treasury = Treasury::open_temporary(0).expect("open temporary treasury");
+    let session = Session {
+        task_descriptor: "bolt11-settlement-1a".into(),
+        budget_sats: 0,
+        allowlisted_destinations: vec![ISSUE_CHARGE_DESTINATION.to_string()],
+        allowlisted_inbound_kinds: vec![InboundKind::PaymentSettled],
+    };
+    let queue = InboundQueue::new();
+    let svc = GatewayService::new(treasury.clone(), Arc::new(MockRail::new()), session)
+        .with_settlement_provider(LightningSettlement::new(wallet.clone()))
+        .with_inbound_queue(queue.clone());
+
+    // A REAL charge through the gateway: records an `issued_charges` index entry (the poll source)
+    // AND a `ledger` row.
+    let real_id = issue_charge_through_gateway(&svc, "real-charge-1", 150, "real job").await;
+
+    // A NON-CHARGE quote created DIRECTLY on the wallet — no IssueCharge, so NO `issued_charges`
+    // entry. Paid by the stranger, so IF it were ever polled it WOULD mint+credit 999.
+    let bogus = wallet
+        .mint_quote(
+            cdk::nuts::PaymentMethod::BOLT11,
+            Some(cdk::Amount::from(999u64)),
+            Some("not-a-charge (fund quote)".to_string()),
+            None,
+        )
+        .await
+        .expect("create a non-charge wallet mint quote");
+    let bogus_id = bogus.id.clone();
+    assert_ne!(bogus_id, real_id, "the bogus quote is a distinct quote id");
+
+    // THE #2 COLLISION: write a NON-CHARGE `ledger` row whose `proof` is a VALID, round-tripping
+    // `ChargeIssued` pointing at the PAID bogus quote — under a non-charge idempotency key, and
+    // NEVER recorded in `issued_charges`. This is exactly the polymorphic-proof case the dedicated
+    // tree must exclude: a ledger scan would decode+round-trip it as a charge; the tree source will
+    // not, because it was never issued through `authorize_issue_charge`.
+    let colliding = ChargeIssued {
+        charge_id: bogus_id.clone(),
+        invoice_or_request: String::new(),
+        amount_sats: 999,
+        method: ChargeMethod::Lightning as i32,
+    };
+    let colliding_proof = colliding.encode_to_vec();
+    treasury
+        .debit_and_record(
+            "non-charge-act-key",
+            0,
+            colliding_proof,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("write the non-charge ledger row (models a polymorphic-proof collision)");
+
+    // Both quotes are PAID by the stranger.
+    await_quote_state(&wallet, &real_id, MintQuoteState::Paid).await;
+    await_quote_state(&wallet, &bogus_id, MintQuoteState::Paid).await;
+
+    // SPAWN THE REAL POLLER. Its source is the dedicated `issued_charges` tree, so only the real
+    // charge is in the poll set — the colliding non-charge ledger row is excluded by construction.
+    let poller = kirby_node::boot::spawn_settlement_poller(svc.clone(), Duration::from_millis(200));
+
+    // Wait for the REAL charge to settle (proves the poller is alive and doing its job).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if svc.treasury_remaining().unwrap() == 150 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the poller did not settle the real charge in time (remaining = {})",
+            svc.treasury_remaining().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Give several more poll cycles so a (wrongly) enumerated non-charge row would have settled.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // MONEY-SAFETY INVARIANT: credited EXACTLY the real charge — never the colliding bogus 999.
+    assert_eq!(
+        svc.treasury_remaining().unwrap(),
+        150,
+        "the treasury is credited ONLY the real issued charge — the non-charge proof is never credited"
+    );
+
+    // The bogus quote was NEVER minted: still PAID (not ISSUED), and the wallet holds only 150.
+    assert_eq!(
+        wallet.check_mint_quote_status(&bogus_id).await.expect("check bogus quote").state,
+        MintQuoteState::Paid,
+        "the non-charge quote was never minted by the poller (still PAID, not ISSUED)"
+    );
+    let wallet_balance: u64 = wallet.total_balance().await.expect("balance").into();
+    assert_eq!(wallet_balance, 150, "only the real charge minted into the wallet — the bogus 999 did not");
+
+    // And NO PaymentSettled was emitted for the bogus quote (exactly one, for the real charge).
+    let resp = svc
+        .poll_inbox(tonic::Request::new(kirby_proto::InboxRequest {
+            schema_version: kirby_proto::SCHEMA_VERSION,
+            want_kinds: vec![InboundKind::PaymentSettled as i32],
+            ack_seq: 0,
+            wait_ms: 0,
+        }))
+        .await
+        .expect("poll_inbox");
+    let settled: Vec<PaymentSettled> = resp
+        .into_inner()
+        .events
+        .into_iter()
+        .filter(|e| e.kind == InboundKind::PaymentSettled as i32)
+        .map(|e| PaymentSettled::decode(e.payload.as_slice()).expect("decode PaymentSettled"))
+        .collect();
+    assert_eq!(settled.len(), 1, "exactly one PaymentSettled — for the real charge only");
+    assert_eq!(settled[0].charge_id, real_id, "the settled event is the real charge");
+    assert!(
+        !settled.iter().any(|s| s.charge_id == bogus_id),
+        "NO PaymentSettled was emitted for the non-charge proof (no false credit)"
+    );
+
+    poller.abort();
+    mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// #62 TOOTH (d) — PERSISTENT-ERROR SURFACING: a still-UNPAID settle is classified as the transient
+// `SettleNotReady`, while a real (persistent) settle failure is NOT — so the poller can log UNPAID
+// at DEBUG and a genuine fault at WARN, never silently loop-swallowing a real error (#4).
+//
+// This exercises the real classification `pending_settlement_sweep` uses (an `anyhow` downcast to
+// `kirby_node::rail::SettleNotReady`) end-to-end over the LIVE mint:
+//   - UNPAID: settle a charge whose invoice has NOT been paid → `verify_settlement` bails via
+//     `ensure_quote_paid(Unpaid)` → the error MUST downcast to `SettleNotReady` (transient).
+//   - PERSISTENT: settle a charge_id the mint does not know → `check_mint_quote_status` errors →
+//     the error MUST NOT downcast to `SettleNotReady` (a real fault the poller surfaces at WARN).
+//
+// RED-on-revert (asserts the mutation LANDED — the typed error): revert `ensure_quote_paid`'s
+// `MintQuoteState::Unpaid` arm from `Err(SettleNotReady::Unpaid.into())` back to a bare
+// `anyhow::bail!(...)` (rail.rs). The UNPAID settle's error then no longer downcasts to
+// `SettleNotReady`, so the first assertion (UNPAID is classified transient) FAILS (RED) — the
+// poller would misclassify the normal UNPAID steady state as a persistent WARN. (Verified during
+// the build by reverting the arm to `anyhow::bail!`; the downcast returned None and this test
+// FAILED; restored the typed error → GREEN.)
+// --------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn unpaid_settle_is_classified_transient_persistent_error_is_not() {
+    use kirby_node::rail::SettleNotReady;
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+
+    let wallet = build_wallet(&mint.url()).await.expect("build daemon wallet");
+    let (svc, _queue) = lightning_gateway(0, wallet.clone());
+
+    // UNPAID: issue a real charge but do NOT pay it. settle_charge bails via ensure_quote_paid.
+    // (CreditOutcome is not Debug, so match the Err out rather than expect_err.)
+    let unpaid_id = issue_charge_through_gateway(&svc, "unpaid-1", 100, "unpaid job").await;
+    let unpaid_err = match svc.settle_charge(&unpaid_id, "").await {
+        Ok(_) => panic!("an UNPAID charge must not settle"),
+        Err(e) => e,
+    };
+    assert!(
+        unpaid_err.downcast_ref::<SettleNotReady>().is_some(),
+        "an UNPAID settle must be classified as the TRANSIENT SettleNotReady (poller logs at DEBUG), \
+         got: {unpaid_err:#}"
+    );
+
+    // PERSISTENT: settle a charge_id the mint has never heard of. check_mint_quote_status errors —
+    // a real fault, NOT the normal UNPAID steady state.
+    let persistent_err = match svc
+        .settle_charge("this-quote-id-does-not-exist-at-the-mint", "")
+        .await
+    {
+        Ok(_) => panic!("an unknown quote id must error at the mint"),
+        Err(e) => e,
+    };
+    assert!(
+        persistent_err.downcast_ref::<SettleNotReady>().is_none(),
+        "a PERSISTENT settle failure (unknown quote → mint error) must NOT be classified as UNPAID \
+         (the poller surfaces it at WARN), got: {persistent_err:#}"
+    );
+
+    mint.shutdown().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// #62 TOOTH (d) — METHOD FILTER: a Cashu charge recorded in the durable issued-charge index is NOT
+// in the LIGHTNING poll set, so it is never settled via the Lightning `settle_charge(id, "")`
+// mint-quote poll (#4 — a Cashu charge is settled by TOKEN EVIDENCE, not a quote poll). The
+// Lightning poller only ever calls `settle_charge` on ids returned by
+// `Treasury::issued_uncredited_charge_ids`, so excluding the Cashu id from that set is exactly what
+// keeps it off the Lightning path.
+//
+// RED-on-revert (asserts the mutation LANDED — the rail filter): drop the
+// `if tag != ChargeMethodTag::Lightning { continue; }` filter in `issued_uncredited_charge_ids`
+// (treasury.rs). The Cashu charge_id then enters the returned poll set, so the `!ids.contains`
+// (Cashu) and `ids.len() == 1` assertions below FAIL (RED). Restore the filter → GREEN.
+// --------------------------------------------------------------------------------------------
+#[test]
+fn cashu_charge_is_excluded_from_the_lightning_poll_set() {
+    use kirby_node::treasury::ChargeMethodTag;
+
+    let treasury = Treasury::open_temporary(0).expect("open temporary treasury");
+    // Record one Lightning and one Cashu charge in the durable issued-charge index (the poller's
+    // poll source) — both UNCREDITED (no credit_ledger row).
+    treasury
+        .record_issued_charge("lightning-charge-1", ChargeMethodTag::Lightning)
+        .expect("record the Lightning charge");
+    treasury
+        .record_issued_charge("cashu-charge-1", ChargeMethodTag::Cashu)
+        .expect("record the Cashu charge");
+
+    let ids = treasury
+        .issued_uncredited_charge_ids()
+        .expect("enumerate the lightning poll set");
+
+    assert!(
+        ids.contains(&"lightning-charge-1".to_string()),
+        "the Lightning charge IS in the lightning poll set"
+    );
+    assert!(
+        !ids.contains(&"cashu-charge-1".to_string()),
+        "MONEY-SAFETY (#4): a Cashu charge is NEVER in the lightning settle_charge(id, \"\") poll set"
+    );
+    assert_eq!(ids.len(), 1, "exactly the one Lightning charge is enumerated");
+}
+
+// --------------------------------------------------------------------------------------------
+// #62 ROUND-5 FINDING-1 (★DEPLOYABLE-PATH TOOTH) — a CONCURRENT same-idempotency-key IssueCharge,
+// driven THROUGH THE REAL GATEWAY PATH (authorize_capability → STEP-1 dedupe → authorize_issue_charge
+// → record_charge_atomic), must leave EXACTLY ONE charge_id in the durable poll index — the
+// CANONICAL winner that holds the ledger row — with NO index-without-ledger orphan.
+//
+// WHY A DEPLOYABLE TOOTH (the round-5 methodology finding): the pre-round-5 unit tooth called
+// `record_charge_atomic` DIRECTLY and replayed the SAME charge_id, so it never exercised the
+// loser-id insert and PASSED the buggy code. The defect only manifests on the REAL path: two
+// concurrent same-key issues each mint a DISTINCT charge_id at the mint, both pass STEP-1 (no ledger
+// row yet), then race into `record_charge_atomic`; the loser hits the in-tx ledger dedupe. With the
+// pre-fix unconditional-first insert, the loser's charge_id was indexed anyway → an
+// index-without-ledger orphan the poller would (double-)settle. (A sequential REPLAY can't trigger
+// it: STEP-1 short-circuits before issue/record even run — the third leg below proves that.)
+//
+// RED-on-revert (mutation-landed): move the `issued_charges.insert(...)` in `record_charge_atomic`
+// back to unconditional-FIRST (before the ledger dedupe). The loser id is then indexed too, so
+// `issued_uncredited_charge_ids()` returns TWO ids (winner + orphan loser) → the `len == 1`
+// assertion goes RED. With the fix, only the winner is indexed → GREEN.
+#[tokio::test]
+async fn concurrent_same_key_issue_indexes_only_the_canonical_winner_no_orphan() {
+    use kirby_proto::capability_request::Act;
+    use kirby_proto::{CapabilityRequest, ChargeIssued, ChargeMethod, IssueCharge, Outcome};
+    use prost::Message as _;
+
+    let port = common::free_port().await;
+    let mint = FakeMint::start(port).await.expect("boot local fakewallet mint");
+    let wallet = build_wallet(&mint.url()).await.expect("build daemon wallet");
+
+    // Build the earn-shape gateway BUT keep an independent Treasury handle (same sled db via the
+    // shared Arc) so the test can read the durable poll index the poller sources from — the exact
+    // set `pending_settlement_sweep` enumerates. Treasury starts EMPTY.
+    let treasury = Treasury::open_temporary(0).expect("open temporary treasury");
+    let session = Session {
+        task_descriptor: "bolt11-settlement-1a".into(),
+        budget_sats: 0,
+        allowlisted_destinations: vec![ISSUE_CHARGE_DESTINATION.to_string()],
+        allowlisted_inbound_kinds: vec![InboundKind::PaymentSettled],
+    };
+    let queue = InboundQueue::new();
+    let svc = GatewayService::new(treasury.clone(), Arc::new(MockRail::new()), session)
+        .with_settlement_provider(LightningSettlement::new(wallet.clone()))
+        .with_inbound_queue(queue);
+
+    // Two IDENTICAL IssueCharge requests under the SAME idempotency_key + SAME terms. Same terms so
+    // STEP-1's content-aware dedupe (Fix 4) does NOT refuse the replay; distinct mint quotes so each
+    // `issue()` mints a DISTINCT charge_id (the winner + a would-be loser).
+    let mk = || CapabilityRequest {
+        schema_version: kirby_proto::SCHEMA_VERSION,
+        idempotency_key: "concurrent-issue-key".to_string(),
+        act: Some(Act::IssueCharge(IssueCharge {
+            amount_sats: 210,
+            memo: "concurrent-issue".to_string(),
+            method: ChargeMethod::Lightning as i32,
+        })),
+        budget_sats: 0,
+    };
+    let (req_a, req_b) = (mk(), mk());
+
+    // Drive BOTH through the real gateway path CONCURRENTLY. `join!` polls each until it awaits at
+    // the mint's `issue()` network call — so BOTH pass STEP-1 (no ledger row yet) and BOTH mint a
+    // distinct charge_id before either writes the ledger row; they then race into
+    // `record_charge_atomic`, where the in-tx ledger dedupe picks one winner.
+    let (res_a, res_b) = tokio::join!(
+        svc.authorize_capability(&req_a),
+        svc.authorize_capability(&req_b),
+    );
+    let rec_a = res_a.expect("authorize A");
+    let rec_b = res_b.expect("authorize B");
+
+    // Exactly ONE call performed the fresh issue; the other collapsed to a Duplicate (the in-tx
+    // ledger dedupe). Order is nondeterministic, so assert the multiset.
+    let mut outcomes = [rec_a.outcome, rec_b.outcome];
+    outcomes.sort_unstable();
+    let mut want = [
+        Outcome::AuthorizedAndPerformed as i32,
+        Outcome::DuplicateIgnored as i32,
+    ];
+    want.sort_unstable();
+    assert_eq!(
+        outcomes, want,
+        "one concurrent issue performs, the other dedupes (STEP-1 / in-tx) — not two fresh issues"
+    );
+
+    // Both receipts hand the genome the SAME (canonical winner) charge_id: the winner returns its
+    // own minted id; the Duplicate arm returns the id decoded from the stored ledger proof.
+    let id_a = rec_a.charge.expect("A carries a ChargeIssued").charge_id;
+    let id_b = rec_b.charge.expect("B carries a ChargeIssued").charge_id;
+    assert_eq!(
+        id_a, id_b,
+        "a same-key concurrent issue must return ONE canonical charge_id to the genome"
+    );
+    let winner_id = id_a;
+
+    // The canonical winner is the id stored in the single ledger row under the idempotency key.
+    let ledger_row = treasury
+        .lookup("concurrent-issue-key")
+        .expect("lookup ledger row")
+        .expect("the winning issue wrote exactly one ledger row under the key");
+    let ledgered = ChargeIssued::decode(ledger_row.proof.as_slice())
+        .expect("decode the stored ChargeIssued")
+        .charge_id;
+    assert_eq!(ledgered, winner_id, "the ledger row holds the canonical winner's charge_id");
+
+    // ★THE ORPHAN ASSERTION: the durable poll index (the poller's ONLY source) holds EXACTLY the
+    // canonical winner — the loser id minted by the deduped call is NOT indexed. Pre-fix, the loser
+    // was indexed too (index-without-ledger orphan) and this is len 2 → RED.
+    let indexed = treasury
+        .issued_uncredited_charge_ids()
+        .expect("read the durable poll index");
+    assert_eq!(
+        indexed,
+        vec![winner_id.clone()],
+        "exactly ONE indexed charge — the canonical winner with a ledger row; NO loser orphan"
+    );
+
+    // A sequential REPLAY through STEP-1 (the resume-replay shape): dedupes at STEP-1 BEFORE issue()
+    // or record_charge_atomic run, returns the SAME canonical charge_id, and adds NO index entry.
+    let replay = svc.authorize_capability(&mk()).await.expect("replay authorize");
+    assert_eq!(
+        replay.outcome,
+        Outcome::DuplicateIgnored as i32,
+        "a same-key resume replay dedupes at STEP-1"
+    );
+    assert_eq!(
+        replay.charge.expect("replay carries a ChargeIssued").charge_id,
+        winner_id,
+        "the replay returns the canonical winner charge_id"
+    );
+    let indexed_after = treasury
+        .issued_uncredited_charge_ids()
+        .expect("read the durable poll index after replay");
+    assert_eq!(
+        indexed_after,
+        vec![winner_id],
+        "the replay leaves exactly one indexed charge — still no orphan"
     );
 
     mint.shutdown().await;

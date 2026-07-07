@@ -192,6 +192,17 @@ struct Inner {
     /// choosing a colliding `idempotency_key`), and keeps `lookup()` /
     /// `max_idempotency_seq` (which scan only `ledger`) blind to credits.
     credit_ledger: sled::Tree,
+    /// charge_id -> a single method-tag byte: the DURABLE, daemon-owned index of ISSUED charges
+    /// (#62). A THIRD tree, disjoint from both `ledger` and `credit_ledger` ON PURPOSE: it is the
+    /// settlement poller's poll SOURCE, and ONLY `authorize_issue_charge` (the one IssueCharge act)
+    /// writes it, via `record_issued_charge`. Sourcing the poll set structurally from THIS tree —
+    /// not from a scan of the polymorphic `ledger` `proof` field, which non-charge acts also write
+    /// (a generic/brain/memory/capability row) — means a non-charge proof can NEVER be mistaken for
+    /// a charge and falsely credited: it simply has no key here (money-safety, #2). The value byte
+    /// records the charge's settlement rail (see `ChargeMethodTag`) so the Lightning poller filters
+    /// to Lightning charges only (#4). PROTO-FREE: the gateway maps the proto `ChargeMethod` to the
+    /// plain tag byte before calling in, so the treasury core carries no `kirby_proto`/`prost` dep.
+    issued_charges: sled::Tree,
     /// Held so the database is flushed and dropped with the treasury.
     db: sled::Db,
     /// The cumulative metered VM-rent burned THIS RUN (Σ of the actual amounts `debit_metered`
@@ -239,6 +250,41 @@ pub fn margin_ratio(income_sats: u64, spent_sats: u64, rent_sats: u64) -> Option
     }
 }
 
+/// The settlement RAIL a charge was issued on, persisted as a single byte in the treasury's
+/// `issued_charges` index (#62). PROTO-FREE by design: the treasury core carries no
+/// `kirby_proto`/`prost` dependency, so the gateway (the proto-aware layer) maps the proto
+/// `ChargeMethod` to this plain tag before calling [`Treasury::record_issued_charge`]. The Lightning
+/// settlement poller filters the poll set to [`ChargeMethodTag::Lightning`] (a Cashu charge is
+/// settled by token evidence, never the `settle_charge(id, "")` mint-quote poll — #4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChargeMethodTag {
+    /// A bolt11 / mint-quote (Lightning) charge — the `settle_charge(id, "")` poll path.
+    Lightning,
+    /// A Cashu charge — settled by token evidence, NOT polled on the Lightning path.
+    Cashu,
+}
+
+impl ChargeMethodTag {
+    /// The single byte persisted in `issued_charges`. Non-zero so an absent/empty value can never
+    /// be silently read as a valid tag.
+    fn as_byte(self) -> u8 {
+        match self {
+            ChargeMethodTag::Lightning => 1,
+            ChargeMethodTag::Cashu => 2,
+        }
+    }
+
+    /// Decode a persisted tag byte; `None` for any unknown byte (a corrupt/foreign value is never
+    /// mistaken for a rail — the poller then skips that row rather than guessing).
+    fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(ChargeMethodTag::Lightning),
+            2 => Some(ChargeMethodTag::Cashu),
+            _ => None,
+        }
+    }
+}
+
 impl Treasury {
     /// Open (or create) a persisted treasury at `path`, seeding the balance to
     /// `initial_sats` ONLY if it does not already exist. On a resume from an
@@ -252,6 +298,7 @@ impl Treasury {
         let balance = db.open_tree("balance")?;
         let ledger = db.open_tree("ledger")?;
         let credit_ledger = db.open_tree("credit_ledger")?;
+        let issued_charges = db.open_tree("issued_charges")?;
 
         // Seed only on first creation. compare_and_swap with expected None makes
         // this idempotent across daemon restarts and resumes: the outer result
@@ -270,6 +317,7 @@ impl Treasury {
                 balance,
                 ledger,
                 credit_ledger,
+                issued_charges,
                 db,
                 rent_sats: AtomicU64::new(0),
                 runway_hint: AtomicU64::new(RUNWAY_HINT_UNKNOWN),
@@ -285,12 +333,14 @@ impl Treasury {
         let balance = db.open_tree("balance")?;
         let ledger = db.open_tree("ledger")?;
         let credit_ledger = db.open_tree("credit_ledger")?;
+        let issued_charges = db.open_tree("issued_charges")?;
         balance.insert(BALANCE_KEY, &initial_sats.to_be_bytes())?;
         Ok(Treasury {
             inner: Arc::new(Inner {
                 balance,
                 ledger,
                 credit_ledger,
+                issued_charges,
                 db,
                 rent_sats: AtomicU64::new(0),
                 runway_hint: AtomicU64::new(RUNWAY_HINT_UNKNOWN),
@@ -363,6 +413,93 @@ impl Treasury {
         } else {
             CreditOutcome::Duplicate(prior)
         }
+    }
+
+    /// (#62) Record `charge_id` in the DURABLE, daemon-owned `issued_charges` index with its
+    /// settlement `method` — called by `authorize_issue_charge` right after the charge's ledger
+    /// row lands. This index is the settlement poller's poll SOURCE
+    /// ([`Treasury::issued_uncredited_charge_ids`]); writing here (and ONLY here) is what makes an
+    /// issued charge visible to the poller. Idempotent: a re-issue of the same `charge_id`
+    /// overwrites with the same tag (a no-op in effect), so a resume replay is harmless.
+    ///
+    /// STRUCTURAL money-safety (#2): because ONLY this call — reached ONLY from the single
+    /// IssueCharge act — writes `issued_charges`, a non-charge act's polymorphic `ledger` `proof`
+    /// can never enter the poll set: it has no key here. No decode/round-trip heuristic guards a
+    /// non-charge proof out; it is excluded by construction.
+    pub fn record_issued_charge(
+        &self,
+        charge_id: &str,
+        method: ChargeMethodTag,
+    ) -> Result<(), TreasuryError> {
+        self.inner
+            .issued_charges
+            .insert(charge_id.as_bytes(), &[method.as_byte()])?;
+        // Durability: flush so a crash right after IssueCharge cannot lose the poll-source entry
+        // (mirrors debit_and_record's post-write flush — the ledger row and this index persist
+        // together across a crash).
+        self.inner.db.flush()?;
+        Ok(())
+    }
+
+    /// (#62 earn-loop deployability) The DURABLE, daemon-owned set of charge_ids that were ISSUED
+    /// but not yet CREDITED, filtered to the LIGHTNING rail — the settlement poller's poll source.
+    ///
+    /// SOURCE = THE DEDICATED `issued_charges` INDEX, NOT A LEDGER SCAN (the money-safety core of
+    /// #62, kirby's ruling). ONLY `authorize_issue_charge` writes `issued_charges` (via
+    /// `record_issued_charge`), so this set contains EXACTLY the real IssueCharge acts. It does NOT
+    /// scan the `ledger`'s `proof` field, which is POLYMORPHIC — non-charge acts (generic/brain,
+    /// memory, capability rows) write it too. A ledger scan had to HEURISTICALLY tell a charge proof
+    /// from a colliding non-charge proof (decode + round-trip guard); a false positive there would
+    /// FALSELY CREDIT a non-charge act (#2). Sourcing structurally from `issued_charges` removes the
+    /// heuristic entirely: a non-charge act simply has no key here, so it can never be polled.
+    ///
+    /// HOW IT FILTERS:
+    /// - Iterate `issued_charges` keys (each is a `charge_id`, plain UTF-8).
+    /// - INCLUDE a charge_id iff (i) its recorded rail is [`ChargeMethodTag::Lightning`] — a Cashu
+    ///   charge is settled by token evidence, never the `settle_charge(id, "")` mint-quote poll (#4)
+    ///   — AND (ii) `credit_lookup(charge_id)` is `None` (neither credited nor settled-dead
+    ///   terminal). A row in the SEPARATE `credit_ledger` means the charge is already resolved.
+    ///
+    /// BACK-COMPAT: a charge issued by a PRIOR binary (before `issued_charges` existed) has no key
+    /// here, so it is not polled — acceptable: a re-fire issues a fresh charge (which IS recorded).
+    ///
+    /// PERF: one O(rows) scan of the small per-agent `issued_charges` tree per poll cycle plus one
+    /// `credit_ledger` point-lookup per row. Cheap on the poll cadence; NOT for the hot path.
+    pub fn issued_uncredited_charge_ids(&self) -> Result<Vec<String>, TreasuryError> {
+        let mut out = Vec::new();
+        for item in self.inner.issued_charges.iter() {
+            let (key, val) = item?;
+            // The value is the single method-tag byte written by `record_issued_charge` /
+            // `record_charge_atomic`. An unknown/corrupt byte is skipped (never poll a row we
+            // cannot classify) — fail-CLOSED, but no longer SILENT: an unclassifiable index row is
+            // a real data anomaly (corruption / a foreign write) worth surfacing.
+            let Some(tag) = val.first().copied().and_then(ChargeMethodTag::from_byte) else {
+                tracing::warn!(
+                    charge_id = %String::from_utf8_lossy(&key),
+                    tag_byte = ?val.first().copied(),
+                    "issued_charges row has an unknown/empty method-tag byte; skipping it (never \
+                     poll a row we cannot classify) — possible index corruption"
+                );
+                continue;
+            };
+            // #4: only Lightning charges are settled on the settle_charge(id, "") poll path.
+            if tag != ChargeMethodTag::Lightning {
+                continue;
+            }
+            let Ok(charge_id) = std::str::from_utf8(&key) else {
+                tracing::warn!(
+                    charge_id_hex = %key.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    "issued_charges key is not valid UTF-8; skipping it (a charge_id is always \
+                     UTF-8) — possible index corruption"
+                );
+                continue;
+            };
+            // INCLUDE iff not yet resolved (no credited/terminal row under this charge_id).
+            if self.credit_lookup(charge_id)?.is_none() {
+                out.push(charge_id.to_string());
+            }
+        }
+        Ok(out)
     }
 
     /// The maximum numeric suffix among recorded ledger keys with `prefix` (e.g.
@@ -614,6 +751,121 @@ impl Treasury {
         };
 
         // Durability: flush so a crash after a debit cannot lose the record.
+        self.inner.db.flush()?;
+        Ok(outcome)
+    }
+
+    /// (#62 money-safety) Atomically record an ISSUED charge: the charge's cost=0 ledger row AND
+    /// its `issued_charges` poll-index entry commit in ONE sled MULTI-TREE TRANSACTION over
+    /// (balance, ledger, issued_charges). This is the charge-specific sibling of `debit_and_record`
+    /// (generic acts must NOT touch `issued_charges`, so THEY keep calling `debit_and_record`).
+    ///
+    /// WHY ATOMIC (the gap this closes): `authorize_issue_charge` used to do TWO separate sled
+    /// writes — `debit_and_record` (the ledger row) then `record_issued_charge` (the poll index).
+    /// A crash BETWEEN them stranded a real payable charge with a ledger row but NO index entry:
+    /// the settlement poller (sourced from `issued_charges`) never saw it, so a customer could pay
+    /// a charge that the daemon never settled — took-money-never-answered. Worse, a resume replay
+    /// hit the ledger-dedupe (`Duplicate`) and skipped the index write, so the charge stayed
+    /// unindexed FOREVER. Committing both writes in one transaction removes the window: after this
+    /// call there is NEVER a ledger-row-without-index (or index-without-ledger-row) state.
+    ///
+    /// IDEMPOTENCY (preserved INSIDE the txn, mirrors `debit_and_record`): if `idempotency_key`
+    /// already has a ledger row (a resume replay or a concurrent re-issue), NO second ledger row is
+    /// written and the balance is untouched — it returns `Duplicate` with the stored record, EXACTLY
+    /// as `debit_and_record` does. The `issued_charges` index entry is written ONLY on the fresh
+    /// ledger-write branch, in the SAME txn as the ledger row, so `issued_charges` holds a
+    /// `charge_id` IFF a ledger row exists for it (the canonical winner). A Duplicate/replay writes
+    /// neither ledger nor index — a concurrent same-key re-issue that mints a second (loser) id can
+    /// therefore never leave an index-without-ledger orphan in the poll set.
+    /// Net: a fresh issue writes both (atomically); a replay writes neither.
+    ///
+    /// Cost is 0 (issuing a charge costs the genome nothing), so the never-negative debit can never
+    /// go `Insufficient`; the guard is kept for parity with `debit_and_record`. Returns the same
+    /// `DebitOutcome` semantics the caller already maps.
+    pub fn record_charge_atomic(
+        &self,
+        idempotency_key: &str,
+        charge_id: &str,
+        method: ChargeMethodTag,
+        proof: Vec<u8>,
+        request_hash: Vec<u8>,
+    ) -> Result<DebitOutcome, TreasuryError> {
+        let key_bytes = idempotency_key.as_bytes();
+        let charge_id_bytes = charge_id.as_bytes();
+        let method_byte = method.as_byte();
+        // A charge is recorded with cost=0: a ledger row for STEP-1 dedupe, but no spend.
+        let cost_sats: u64 = 0;
+        let record_json = serde_json::to_vec(&PerformedRecord {
+            cost_sats,
+            // placeholder; the real post-debit balance is written inside the txn
+            treasury_remaining_after: 0,
+            proof: proof.clone(),
+            // A charge carries no assistant completion or memory result (those are Completion /
+            // Memory acts). Empty here, exactly as the gateway passed for the old two-write path.
+            completion: Vec::new(),
+            memory: Vec::new(),
+            // The effective-request hash (over amount/memo/method) so a same-key, DIVERGENT-terms
+            // re-issue is refused at STEP-1 (rides the re-decode below unchanged).
+            request_hash,
+        })
+        .map_err(|e| TreasuryError::Corrupt(format!("encode record: {e}")))?;
+
+        let outcome =
+            (&self.inner.balance, &self.inner.ledger, &self.inner.issued_charges).transaction(
+                move |(balance, ledger, issued_charges)| {
+                    // Idempotency (mirrors debit_and_record): a ledger row already under this key
+                    // means the charge was already issued (resume replay / concurrent re-issue), so
+                    // write NO second ledger row, make NO balance change, and index NOTHING. A
+                    // concurrent same-key re-issue mints its OWN (loser) charge_id; indexing it here
+                    // would strand an index-without-ledger orphan in the poll set (a charge_id the
+                    // poller can never correlate to a ledger row). Index only the winner, below.
+                    if let Some(existing) = ledger.get(key_bytes)? {
+                        let rec: PerformedRecord = serde_json::from_slice(&existing)
+                            .map_err(|e| abort(format!("ledger record: {e}")))?;
+                        return Ok(DebitOutcome::Duplicate(rec));
+                    }
+
+                    let current_raw = balance
+                        .get(BALANCE_KEY)?
+                        .ok_or_else(|| abort("balance key missing".into()))?;
+                    let current = decode_u64_tx(&current_raw)?;
+
+                    // Never-negative / never-overspend, kept for parity. cost=0 can never refuse.
+                    let Some(next) = current.checked_sub(cost_sats) else {
+                        return Ok(DebitOutcome::Insufficient { remaining: current });
+                    };
+
+                    balance.insert(BALANCE_KEY, &next.to_be_bytes())?;
+
+                    // Re-encode the record with the true post-debit balance so the stored receipt
+                    // matches what the genome was told (same shape debit_and_record writes).
+                    let mut rec: PerformedRecord = serde_json::from_slice(&record_json)
+                        .map_err(|e| abort(format!("decode record: {e}")))?;
+                    rec.treasury_remaining_after = next;
+                    let rec_bytes = serde_json::to_vec(&rec)
+                        .map_err(|e| abort(format!("re-encode record: {e}")))?;
+                    ledger.insert(key_bytes, rec_bytes)?;
+
+                    // ATOMIC PAIRING (index the WINNER only): the poll-index entry is written in the
+                    // SAME txn as the fresh ledger row, and ONLY on this fresh-write branch — so
+                    // `issued_charges` holds a charge_id IFF a ledger row exists for it (the
+                    // canonical winner). Ledger row and index commit together or not at all; the
+                    // Duplicate arm above indexes nothing, so no index-without-ledger orphan is
+                    // possible even under a concurrent same-idempotency-key re-issue.
+                    issued_charges.insert(charge_id_bytes, &[method_byte])?;
+
+                    Ok(DebitOutcome::Debited { cost_sats, remaining: next })
+                },
+            );
+
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(TransactionError::Abort(msg)) => return Err(TreasuryError::Corrupt(msg)),
+            Err(TransactionError::Storage(e)) => return Err(TreasuryError::Storage(e)),
+        };
+
+        // Durability: flush so a crash after the atomic write cannot lose the ledger row OR the
+        // poll-index entry — they persist together (mirrors debit_and_record's post-write flush).
         self.inner.db.flush()?;
         Ok(outcome)
     }
@@ -872,7 +1124,117 @@ fn decode_u64_tx(raw: &[u8]) -> Result<u64, ConflictableTransactionError<String>
 
 #[cfg(test)]
 mod tests {
-    use super::{is_lock_contention, ReconcileOutcome, Treasury, TreasuryError};
+    use super::{
+        is_lock_contention, ChargeMethodTag, DebitOutcome, ReconcileOutcome, Treasury,
+        TreasuryError,
+    };
+
+    // ---- #62 ATOMIC CHARGE WRITE (money-safety: no ledger-row-without-index) ----
+
+    /// TOOTH (#62): `record_charge_atomic` commits the charge's ledger row AND its `issued_charges`
+    /// poll-index entry TOGETHER — after the call there is NEVER a ledger-row-without-index state
+    /// (both exist, or neither). This is the invariant that makes an issued charge always settleable:
+    /// the settlement poller's source is `issued_uncredited_charge_ids` (the index), so a charge with
+    /// a ledger row but no index entry would be a payable charge the poller NEVER settles
+    /// (took-money-never-answered).
+    ///
+    /// RED-ON-REVERT (simulates the pre-fix crash between the two old writes): in
+    /// `record_charge_atomic`, revert the tx-wrap back to two separate writes AND skip the index —
+    /// i.e. replace the body with a plain `debit_and_record(...)` and DROP the
+    /// `issued_charges.insert(...)`. The ledger row then lands but the index does NOT, so the
+    /// `issued_uncredited_charge_ids` assertion below finds an EMPTY poll set → the charge is
+    /// unindexed → the poller would never settle it → RED. With the atomic write both land → the
+    /// charge is in the poll set → GREEN.
+    #[test]
+    fn record_charge_atomic_indexes_and_ledgers_together() {
+        let t = Treasury::open_temporary(1_000).unwrap();
+
+        // A fresh issue: both writes must land in one tx.
+        let out = t
+            .record_charge_atomic(
+                "issue-key-1",
+                "charge-abc",
+                ChargeMethodTag::Lightning,
+                b"charge-proof".to_vec(),
+                b"req-hash".to_vec(),
+            )
+            .unwrap();
+        assert!(
+            matches!(out, DebitOutcome::Debited { cost_sats: 0, .. }),
+            "a fresh charge issues at cost 0"
+        );
+
+        // (i) the LEDGER row exists (STEP-1 dedupe source) ...
+        assert!(
+            t.lookup("issue-key-1").unwrap().is_some(),
+            "the charge's ledger row must exist after record_charge_atomic"
+        );
+        // (ii) ... AND the INDEX entry exists — the charge is in the poller's poll set. This is the
+        // half the pre-fix crash window dropped; it is what goes RED if the index write is skipped.
+        assert_eq!(
+            t.issued_uncredited_charge_ids().unwrap(),
+            vec!["charge-abc".to_string()],
+            "the charge must be in the durable poll index (the poller's ONLY source)"
+        );
+
+        // Cost 0: a charge does not spend the treasury.
+        assert_eq!(t.remaining().unwrap(), 1_000, "issuing a charge costs the genome nothing");
+    }
+
+    /// TOOTH (#62, Round-5 finding-1): idempotency is PRESERVED inside the atomic tx AND the
+    /// Duplicate arm indexes NOTHING — so a same-key re-issue that mints a DIFFERENT (loser)
+    /// charge_id (the concurrent-issue shape) can NEVER leave an index-without-ledger orphan. The
+    /// first (winner) issue writes ledger row + index for its charge_id; a second call under the
+    /// SAME `idempotency_key` but a DIFFERENT charge_id returns `Duplicate` (no second ledger row)
+    /// and does NOT index the loser. Net: exactly ONE indexed charge_id, the canonical winner that
+    /// holds the ledger row.
+    ///
+    /// RED-ON-REVERT (finding-1): move the `issued_charges.insert(...)` back to unconditional-FIRST
+    /// (before the ledger dedupe). The Duplicate arm then indexes the loser id too, so the poll set
+    /// becomes `[charge-winner, charge-LOSER]` (len 2) — an index-without-ledger orphan — and the
+    /// `len == 1 / winner only` assertion below goes RED. (Note: the OLD unit tooth replayed the
+    /// SAME charge_id, so it could not catch this; the deployable gateway twin in
+    /// bolt11_settlement.rs drives the same defect through STEP1 under real concurrency.)
+    #[test]
+    fn record_charge_atomic_duplicate_key_does_not_index_a_loser_charge_id() {
+        let t = Treasury::open_temporary(1_000).unwrap();
+
+        let first = t
+            .record_charge_atomic(
+                "issue-key-2",
+                "charge-winner",
+                ChargeMethodTag::Lightning,
+                b"p".to_vec(),
+                b"h".to_vec(),
+            )
+            .unwrap();
+        assert!(matches!(first, DebitOutcome::Debited { .. }), "first issue debits (cost 0)");
+
+        // A same-key re-issue that minted a DIFFERENT (loser) charge_id — the concurrent-issue
+        // shape. Must NOT write a second ledger row, and must NOT index the loser id.
+        let replay = t
+            .record_charge_atomic(
+                "issue-key-2",
+                "charge-LOSER",
+                ChargeMethodTag::Lightning,
+                b"p".to_vec(),
+                b"h".to_vec(),
+            )
+            .unwrap();
+        assert!(
+            matches!(replay, DebitOutcome::Duplicate(_)),
+            "a same-key re-issue returns Duplicate (no second ledger row)"
+        );
+
+        // Exactly ONE indexed charge — the canonical winner. The loser id is NOT in the poll set
+        // (no index-without-ledger orphan), and there is no double-row.
+        assert_eq!(
+            t.issued_uncredited_charge_ids().unwrap(),
+            vec!["charge-winner".to_string()],
+            "only the winner is indexed; the loser charge_id must NOT be in the poll set (no orphan)"
+        );
+        assert_eq!(t.remaining().unwrap(), 1_000, "no balance movement on issue or replay");
+    }
 
     // ---- B1 economics snapshot (Milestone 2 axis-2: the agent keeps its own books) ----
 

@@ -85,6 +85,8 @@ These blocks are read only when `workload = "capable"` (the think/act loop). Wit
 | `recovery_timeout_secs` | u64 | `10` | (routstr) Cleanup / refund budget. |
 | `fee_headroom_sats` | u64 | `8` | (routstr) Wallet fee reserve. |
 | `bytes_per_sat` | u64 | `16` | (stub) Simulated cost knob. |
+| `settlement_method` | `cashu` \| `lightning` | unset | (routstr) The earn-loop settlement rail wired for `IssueCharge`. Unset = no provider (IssueCharge fails closed). `lightning` = a stranger pays a bolt11; required for `workload = "oracle"`. |
+| `settle_poll_secs` | u64 | `10` | (#62) Settlement-poller cadence (seconds): how often the daemon re-polls the mint for outstanding bolt11 charges and settles the paid ones (mint → credit → PaymentSettled). Optional; only the earn path (a wired `settlement_method`) runs the poller. Tune down for faster settlement, up to stay under a mint's rate limit. Clamped to `>= 1`. |
 
 ### `[memory]` -- the diarist / engram store
 
