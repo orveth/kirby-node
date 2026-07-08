@@ -993,22 +993,26 @@ async fn stranded_sink_write_failure_hard_fails_the_lightning_settlement() {
 }
 
 // --------------------------------------------------------------------------------------------
-// FIX 4 (MED) — the R2-4 content-aware dedupe now covers IssueCharge: a same-key re-issue with
-// DIVERGENT terms is REFUSED (debit 0) instead of returning a charge that no longer matches the
-// request. A same-key SAME-terms resume still returns the ORIGINAL ChargeIssued (dedupe intact).
+// ROW A (money-idempotency, integration-level) — a same-key IssueCharge re-presented with DIVERGENT
+// terms (a nondeterministic LLM re-quote) returns the FIRST authoritative ChargeIssued, idempotent
+// (DuplicateIgnored) — NOT a refusal. Refusing on a divergent IssueCharge head-of-line-WEDGED the
+// genome inbox live (gudnuf's attempt-2 re-quote); Row A split the R2-4 guard by act so IssueCharge
+// collapses to the first quote while Memory keeps the strict refuse (guarded by TOOTH 2b,
+// divergent_memory_represent_still_refuses). A same-key SAME-terms resume still returns the ORIGINAL
+// ChargeIssued (dedupe intact).
 //
 // The replay below keeps the SAME method (Lightning) and diverges only on `amount_sats` — so the
-// D2 method-guard is NOT the thing rejecting it; the request_hash comparison is. That isolates this
-// tooth to Fix 4.
+// D2 method-guard is NOT the thing acting; the request_hash comparison + the IssueCharge act-split
+// is. That isolates this tooth to Row A — the integration-level twin (real FakeMint +
+// lightning_gateway + wallet) of the gateway unit tooth issue_charge_divergent_requote_returns_first_charge.
 //
-// RED-on-revert: revert the `Act::IssueCharge(ic) => issue_charge_request_hash(ic)` STEP-1 arm to
-// `_ => Vec::new()` (or revert the persist of `issue_charge_request_hash(ic)` in
-// `authorize_issue_charge` back to `Vec::new()`). Either revert leaves the stored/compared hash
-// empty, so the divergent replay is NOT refused — it returns the prior charge as DuplicateIgnored,
-// and the `Outcome::Unspecified` assertion FAILS (RED).
+// RED-on-revert (guards the fix, not the bug): revert the `Act::IssueCharge(ic)` request_hash split
+// back to the Memory-style refuse arm, so the divergent replay is REFUSED again
+// (Outcome::Unspecified / charge=None) — the DuplicateIgnored + first-charge assertions below FAIL
+// (RED). The test reopens the wedge the instant Row A regresses.
 // --------------------------------------------------------------------------------------------
 #[tokio::test]
-async fn issue_charge_replay_with_divergent_terms_is_refused() {
+async fn issue_charge_replay_with_divergent_terms_returns_first_charge() {
     use kirby_proto::capability_request::Act;
     use kirby_proto::{CapabilityRequest, ChargeMethod, IssueCharge, Outcome};
 
@@ -1036,6 +1040,10 @@ async fn issue_charge_replay_with_divergent_terms_is_refused() {
         "the first issue is authorized"
     );
     let charge1 = r1.charge.clone().expect("the first issue returns a charge");
+    // LightningSettlement.issue echoes the REQUESTED amount into ChargeIssued.amount_sats verbatim
+    // (rail.rs) — pin it so the "returns the FIRST amount (100), not the re-quoted 200" assertion on
+    // the divergent replay below is a CHECKED fact, not an unverified echo assumption.
+    assert_eq!(charge1.amount_sats, 100, "the first issue echoes the requested 100 sats");
 
     // Same key, SAME method (so the method-guard is NOT what rejects), DIVERGENT amount (200 vs 100).
     let divergent = CapabilityRequest {
@@ -1051,11 +1059,21 @@ async fn issue_charge_replay_with_divergent_terms_is_refused() {
     let r2 = svc.authorize_capability(&divergent).await.expect("divergent replay");
     assert_eq!(
         r2.outcome,
-        Outcome::Unspecified as i32,
-        "a same-key IssueCharge replay with DIVERGENT terms (200 vs 100) must be REFUSED (debit 0); \
-         reverting the IssueCharge request_hash arm returns DuplicateIgnored here (RED-on-revert)"
+        Outcome::DuplicateIgnored as i32,
+        "a same-key IssueCharge replay with DIVERGENT terms (200 vs 100) returns the FIRST \
+         authoritative charge idempotently (Row A) — NOT refused; reverting the Act::IssueCharge \
+         request_hash split back to the refuse arm returns Outcome::Unspecified here (RED-on-revert, \
+         guards the fix not the bug)"
     );
-    assert!(r2.charge.is_none(), "a refused divergent replay carries no ChargeIssued");
+    let charge2 = r2.charge.clone().expect("the divergent replay returns the FIRST charge, not None");
+    assert_eq!(
+        charge2.charge_id, charge1.charge_id,
+        "returns the FIRST charge id (idempotent collapse to the first quote), not a fresh 200-charge"
+    );
+    assert_eq!(
+        charge2.amount_sats, charge1.amount_sats,
+        "the FIRST authoritative amount (100), not the re-quoted 200"
+    );
 
     // A same-key SAME-terms resume still dedupes to the ORIGINAL charge (the contract is preserved).
     let resume = CapabilityRequest {
