@@ -205,6 +205,11 @@ pub mod quorum_ecdh;
 // Pass it where a plain `&Keys` DM identity went; nostr's own audited NIP-59 does the
 // seal/wrap/unwrap, calling back for Q-ECDH (nip44) + membrane-gated Q-sign (the seal).
 pub mod qsigner;
+// #49 (failover step 2): the BOUNDED QUORUM-PROBE admission gate. Answers "can THIS node
+// assemble the agent's quorum right now?" (its own share + a bounded, authenticated liveness
+// probe of the other placement holders) so a DISTRIBUTED survivor with one local share can take
+// over -- the all-shares-local gate never could. Read-only + fail-closed; fences unchanged.
+pub mod quorum_probe;
 // S5/S6 (chunk 1): the RemoteHolder -- a `quorum_signer::Holder` whose FROST share lives
 // on ANOTHER machine. It exchanges OPAQUE CoSignEvents with a holder-side server; the
 // secret SigningNonces NEVER crosses the wire (each holder owns its nonce locally) and the

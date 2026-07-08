@@ -1387,11 +1387,22 @@ async fn run_spawn_control_plane(
                     let keystore_dir = keystore_dir_for(
                         &kirby_node::fleet::instance_id_for(&verdict.agent_id),
                     );
-                    let loadable = keystore_loadable_at(&keystore_dir);
+                    // Gate (a) readiness. CO-LOCATED (the ONLY live path today: distributed signing
+                    // defaults off and no placement.json ships in prod) -> the unchanged all-shares-
+                    // local check, byte-identical to before #49. The DISTRIBUTED quorum-probe path
+                    // (`kirby_node::quorum_probe::can_assemble_quorum`: this node's own share + a
+                    // bounded, authenticated liveness probe of the other placement holders) is wired
+                    // in HERE when the co-sign transport is wired into the fleet loop, co-gated with
+                    // distributed signing going live (see the #49 admission notes in `quorum_probe`).
+                    let readiness = if keystore_loadable_at(&keystore_dir) {
+                        kirby_node::quorum_probe::QuorumReadiness::CanSign
+                    } else {
+                        kirby_node::quorum_probe::QuorumReadiness::LocalNotLoadable
+                    };
                     match consumer
                         .admit_takeover(
                             &verdict.agent_id,
-                            loadable,
+                            readiness,
                             &node_image,
                             supervisor.tenant_count(),
                         )

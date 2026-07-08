@@ -68,6 +68,7 @@ use kirby_proto::KIND_KIRBY_SPAWN_REQUEST;
 use crate::config::{validate_agent_label, TenantConfig};
 use crate::fleet_supervisor::{FleetSupervisor, TenantRecord};
 use crate::lease::{LeaseNodeId, SpawnFenceView};
+use crate::quorum_probe::QuorumReadiness;
 
 /// The maximum byte length of a spawn request's relay-event content (the JSON
 /// [`SpawnRequest`]). A spawn request is small (an agent label, a brain/budget descriptor,
@@ -211,6 +212,15 @@ pub enum TakeoverSkip {
     /// a fresh spawn consults). Between the detector's snapshot and this admit a peer re-claimed
     /// (a heartbeat, or a competing survivor's takeover), so backing off here prevents a double-host.
     AlreadyClaimedElsewhere { holder: LeaseNodeId, term: u64 },
+    /// DISTRIBUTED keystore (#49): this node holds its own share, but the bounded quorum probe could
+    /// NOT prove >= MIN_SIGNERS live holders for the agent's Q within the deadline (holders
+    /// unreachable / ambiguous). Distinct from `KeystoreNotLoadable` (that is the co-located
+    /// all-shares-absent case): here the node COULD sign IF a second holder were reachable, but none
+    /// is, so it fails closed rather than claim a takeover it cannot complete.
+    QuorumUnreachable,
+    /// DISTRIBUTED keystore (#49): the local placement manifest is absent or malformed, so the holder
+    /// roster to probe cannot be trusted. Fail closed with a distinct reason (never guess a roster).
+    StalePlacement,
 }
 
 impl std::fmt::Display for TakeoverSkip {
@@ -226,6 +236,16 @@ impl std::fmt::Display for TakeoverSkip {
             TakeoverSkip::AlreadyClaimedElsewhere { holder, term } => {
                 write!(f, "another node ({holder}) holds a fresh lease at term {term}")
             }
+            TakeoverSkip::QuorumUnreachable => write!(
+                f,
+                "distributed keystore: could not prove a live quorum for the agent's Q within the \
+                 probe deadline (fail closed)"
+            ),
+            TakeoverSkip::StalePlacement => write!(
+                f,
+                "distributed keystore: the local placement manifest is absent or malformed (fail \
+                 closed)"
+            ),
         }
     }
 }
@@ -779,11 +799,15 @@ impl SpawnConsumer {
     /// (`SpawnFenceView`) — so a takeover (a NEW VM-launch + FROST-claim entry point) can never slip
     /// a tenant past a gate a `handle_event` spawn enforces. DEFAULT-DENY, gates checked in the
     /// REQUIRED order:
-    ///   (a) `keystore_loadable` — does THIS node hold the agent's FROST quorum? (the cross-machine
-    ///       boundary; the caller computes it via
-    ///       [`crate::keyset_provisioning::keystore_loadable_at`] and passes it so the consumer
-    ///       stays free of keystore-path knowledge). FIRST: a node that cannot sign as the agent
-    ///       must do nothing else.
+    ///   (a) `readiness` — can THIS node FROST-sign as the agent? The CALLER computes it (co-located:
+    ///       [`crate::keyset_provisioning::keystore_loadable_at`], the all-shares-local check;
+    ///       DISTRIBUTED: [`crate::quorum_probe::can_assemble_quorum`], this node's own share plus a
+    ///       bounded, authenticated liveness probe of the other placement holders) and passes the
+    ///       verdict so the consumer stays a pure decision free of keystore-path / relay knowledge.
+    ///       FIRST: a node that cannot sign as the agent must do nothing else. `CanSign` passes; each
+    ///       not-ready variant maps to its OWN distinct Skip reason. #49: a distributed survivor with
+    ///       ONE local share + a reachable quorum now passes here — the all-shares-local gate never
+    ///       could, which is why an identity had never moved machines.
     ///   (b) capacity — `tenant_count >= max_tenants` => skip (cannot host another).
     ///   (c) image — `node_image` (what a takeover relaunches on, the node's OWN configured image —
     ///       never attacker-supplied) must be in the pre-staged allowlist (default-deny).
@@ -801,15 +825,26 @@ impl SpawnConsumer {
     pub async fn admit_takeover(
         &self,
         agent_id: &str,
-        keystore_loadable: bool,
+        readiness: QuorumReadiness,
         node_image: &str,
         tenant_count: usize,
     ) -> TakeoverAdmission {
-        // (a) KEYSTORE-LOADABLE FIRST: a node that does not hold the agent's quorum cannot FROST-
-        //     sign its lease/voice, so it must take no further action (the cross-machine boundary,
-        //     finding G-2 — same-host works, cross-machine without distributed shares is skipped).
-        if !keystore_loadable {
-            return TakeoverAdmission::Skip(TakeoverSkip::KeystoreNotLoadable);
+        // (a) READINESS FIRST: a node that cannot FROST-sign as the agent takes no further action.
+        //     CO-LOCATED (all shares local) and DISTRIBUTED (own share + a probed live quorum, #49)
+        //     both surface as `CanSign`; each failure mode is its own distinct, fail-closed Skip. The
+        //     caller computed the verdict, so this stays a pure decision (no keystore/relay I/O here).
+        match readiness {
+            QuorumReadiness::CanSign => {}
+            QuorumReadiness::LocalNotLoadable => {
+                // The cross-machine boundary (finding G-2): a co-located node without all shares.
+                return TakeoverAdmission::Skip(TakeoverSkip::KeystoreNotLoadable);
+            }
+            QuorumReadiness::QuorumUnreachable => {
+                return TakeoverAdmission::Skip(TakeoverSkip::QuorumUnreachable);
+            }
+            QuorumReadiness::StalePlacement => {
+                return TakeoverAdmission::Skip(TakeoverSkip::StalePlacement);
+            }
         }
         // (b) CAPACITY: do not exceed the per-host ceiling (the SAME check `handle_event` step 7
         //     applies). Checked before the fence so an over-capacity node does no fence I/O.
@@ -1504,7 +1539,7 @@ mod tests {
     #[tokio::test]
     async fn takeover_admitted_when_all_gates_pass() {
         let consumer = takeover_consumer(16, Arc::new(MockFence::new(1)));
-        let a = consumer.admit_takeover("kirby-dead", true, "img", 0).await;
+        let a = consumer.admit_takeover("kirby-dead", QuorumReadiness::CanSign, "img", 0).await;
         assert_eq!(a, TakeoverAdmission::Admit, "all gates pass => admit, got {a:?}");
     }
 
@@ -1515,7 +1550,7 @@ mod tests {
     async fn takeover_suppressed_when_keystore_not_loadable() {
         let consumer = takeover_consumer(16, Arc::new(MockFence::new(1)));
         // loadable = false; capacity/image/fence are all otherwise-passing.
-        let a = consumer.admit_takeover("kirby-peer", false, "img", 0).await;
+        let a = consumer.admit_takeover("kirby-peer", QuorumReadiness::LocalNotLoadable, "img", 0).await;
         assert_eq!(
             a,
             TakeoverAdmission::Skip(TakeoverSkip::KeystoreNotLoadable),
@@ -1528,7 +1563,7 @@ mod tests {
     #[tokio::test]
     async fn takeover_suppressed_when_over_capacity() {
         let consumer = takeover_consumer(2, Arc::new(MockFence::new(1))); // ceiling = 2
-        let a = consumer.admit_takeover("kirby-dead", true, "img", 2).await; // already hosting 2
+        let a = consumer.admit_takeover("kirby-dead", QuorumReadiness::CanSign, "img", 2).await; // already hosting 2
         assert_eq!(
             a,
             TakeoverAdmission::Skip(TakeoverSkip::OverCapacity),
@@ -1542,14 +1577,14 @@ mod tests {
     #[tokio::test]
     async fn takeover_suppressed_when_image_not_allowlisted() {
         let consumer = takeover_consumer(16, Arc::new(MockFence::new(1)));
-        let a = consumer.admit_takeover("kirby-dead", true, "not-staged", 0).await;
+        let a = consumer.admit_takeover("kirby-dead", QuorumReadiness::CanSign, "not-staged", 0).await;
         assert_eq!(
             a,
             TakeoverAdmission::Skip(TakeoverSkip::UnknownImage("not-staged".to_string())),
             "an image not in the allowlist must suppress the takeover, got {a:?}"
         );
         // And the empty-image (image-incapable node: empty allowlist => "") case is also denied.
-        let a_empty = consumer.admit_takeover("kirby-dead", true, "", 0).await;
+        let a_empty = consumer.admit_takeover("kirby-dead", QuorumReadiness::CanSign, "", 0).await;
         assert!(
             matches!(a_empty, TakeoverAdmission::Skip(TakeoverSkip::UnknownImage(_))),
             "an empty node image (no staged image) must suppress, got {a_empty:?}"
@@ -1566,7 +1601,7 @@ mod tests {
         let fence = Arc::new(MockFence::new(1));
         fence.record("kirby-dead", ActiveLease { node_id: 2, term: 7 });
         let consumer = takeover_consumer(16, fence);
-        let a = consumer.admit_takeover("kirby-dead", true, "img", 0).await;
+        let a = consumer.admit_takeover("kirby-dead", QuorumReadiness::CanSign, "img", 0).await;
         assert_eq!(
             a,
             TakeoverAdmission::Skip(TakeoverSkip::AlreadyClaimedElsewhere { holder: 2, term: 7 }),
@@ -1577,7 +1612,7 @@ mod tests {
         let fence_self = Arc::new(MockFence::new(1));
         fence_self.record("kirby-dead", ActiveLease { node_id: 1, term: 7 });
         let consumer_self = takeover_consumer(16, fence_self);
-        let a_self = consumer_self.admit_takeover("kirby-dead", true, "img", 0).await;
+        let a_self = consumer_self.admit_takeover("kirby-dead", QuorumReadiness::CanSign, "img", 0).await;
         assert_eq!(a_self, TakeoverAdmission::Admit, "a same-node lease must not suppress, got {a_self:?}");
     }
 
@@ -1590,21 +1625,21 @@ mod tests {
     async fn each_gate_independently_flips_admit_to_skip() {
         // Baseline: all green => Admit (proves the failing inputs below are what cause each Skip).
         let base = takeover_consumer(16, Arc::new(MockFence::new(1)));
-        assert_eq!(base.admit_takeover("kirby-dead", true, "img", 0).await, TakeoverAdmission::Admit);
+        assert_eq!(base.admit_takeover("kirby-dead", QuorumReadiness::CanSign, "img", 0).await, TakeoverAdmission::Admit);
 
         // (a) only keystore flipped.
         assert!(matches!(
-            base.admit_takeover("kirby-dead", false, "img", 0).await,
+            base.admit_takeover("kirby-dead", QuorumReadiness::LocalNotLoadable, "img", 0).await,
             TakeoverAdmission::Skip(TakeoverSkip::KeystoreNotLoadable)
         ));
         // (b) only capacity flipped (ceiling 16, count 16).
         assert!(matches!(
-            base.admit_takeover("kirby-dead", true, "img", 16).await,
+            base.admit_takeover("kirby-dead", QuorumReadiness::CanSign, "img", 16).await,
             TakeoverAdmission::Skip(TakeoverSkip::OverCapacity)
         ));
         // (c) only image flipped.
         assert!(matches!(
-            base.admit_takeover("kirby-dead", true, "nope", 0).await,
+            base.admit_takeover("kirby-dead", QuorumReadiness::CanSign, "nope", 0).await,
             TakeoverAdmission::Skip(TakeoverSkip::UnknownImage(_))
         ));
         // (d) only the fence flipped (a fresh peer lease).
@@ -1614,8 +1649,109 @@ mod tests {
             takeover_consumer(16, f)
         };
         assert!(matches!(
-            fenced.admit_takeover("kirby-dead", true, "img", 0).await,
+            fenced.admit_takeover("kirby-dead", QuorumReadiness::CanSign, "img", 0).await,
             TakeoverAdmission::Skip(TakeoverSkip::AlreadyClaimedElsewhere { holder: 2, .. })
         ));
+    }
+
+    // ---- #49: the DISTRIBUTED (quorum-probe) admission path -------------------------------------
+
+    /// A trivial [`HolderQuorumProbe`] double: every holder answers `Live` (or all `Unreachable`),
+    /// so the readiness a probe would compute can be driven end-to-end into `admit_takeover`.
+    struct FixedProbe {
+        live: bool,
+    }
+    impl crate::quorum_probe::HolderQuorumProbe for FixedProbe {
+        fn probe(
+            &self,
+            _address: &str,
+            expected_identifier: u16,
+            _agent_id: &str,
+            _deadline: std::time::Duration,
+        ) -> impl std::future::Future<Output = crate::quorum_probe::ProbeOutcome> + Send {
+            let live = self.live;
+            async move {
+                if live {
+                    crate::quorum_probe::ProbeOutcome::Live { identifier: expected_identifier }
+                } else {
+                    crate::quorum_probe::ProbeOutcome::Unreachable
+                }
+            }
+        }
+    }
+
+    /// G-4 GATE (a), the #49 DISTRIBUTED skip reasons are DISTINCT from `KeystoreNotLoadable`: a
+    /// distributed keystore that cannot prove a live quorum, and one with a stale placement, each map
+    /// to their OWN fail-closed Skip (so an operator can tell "cross-machine boundary" from "holders
+    /// unreachable" from "bad placement").
+    #[tokio::test]
+    async fn takeover_distributed_skip_reasons_are_distinct() {
+        let consumer = takeover_consumer(16, Arc::new(MockFence::new(1)));
+        assert_eq!(
+            consumer
+                .admit_takeover("kirby-dead", QuorumReadiness::QuorumUnreachable, "img", 0)
+                .await,
+            TakeoverAdmission::Skip(TakeoverSkip::QuorumUnreachable),
+        );
+        assert_eq!(
+            consumer
+                .admit_takeover("kirby-dead", QuorumReadiness::StalePlacement, "img", 0)
+                .await,
+            TakeoverAdmission::Skip(TakeoverSkip::StalePlacement),
+        );
+    }
+
+    /// TOOTH 4 (the #49 fix, END-TO-END through both units): a node with ONLY its own share drives
+    /// the bounded quorum probe and, when a second holder is reachable, `admit_takeover` ADMITS the
+    /// takeover — the SAME node the all-shares-local gate would have SKIPPED (`KeystoreNotLoadable`).
+    /// With the quorum unreachable it fails closed. This is why an identity can now move machines.
+    #[tokio::test]
+    async fn tooth4_one_local_share_takeover_end_to_end() {
+        use crate::quorum_probe::{can_assemble_quorum, ProbeDeadlines};
+        use std::time::Duration;
+
+        let consumer = takeover_consumer(16, Arc::new(MockFence::new(1)));
+        // A 3-holder placement; THIS node holds identifier 1 (its own share only).
+        let roster: Vec<(u16, String)> =
+            vec![(1, "self".into()), (2, "h2".into()), (3, "h3".into())];
+        let deadlines =
+            ProbeDeadlines { per_holder: Duration::from_millis(500), overall: Duration::from_secs(2) };
+
+        // (a) REACHABLE quorum: self + a live holder -> CanSign -> ADMIT.
+        let readiness_ok =
+            can_assemble_quorum("kirby-dead", 1, true, &roster, deadlines, &FixedProbe { live: true })
+                .await;
+        assert_eq!(readiness_ok, QuorumReadiness::CanSign);
+        assert_eq!(
+            consumer.admit_takeover("kirby-dead", readiness_ok, "img", 0).await,
+            TakeoverAdmission::Admit,
+            "1 local share + a reachable quorum must ADMIT the takeover (the #49 fix)"
+        );
+
+        // The pre-#49 all-shares-local gate SKIPPED exactly this 1-share survivor.
+        assert_eq!(
+            consumer
+                .admit_takeover("kirby-dead", QuorumReadiness::LocalNotLoadable, "img", 0)
+                .await,
+            TakeoverAdmission::Skip(TakeoverSkip::KeystoreNotLoadable),
+            "the old gate skipped a distributed survivor with one local share"
+        );
+
+        // (b) UNREACHABLE quorum: self + no reachable holder -> QuorumUnreachable -> Skip.
+        let readiness_bad = can_assemble_quorum(
+            "kirby-dead",
+            1,
+            true,
+            &roster,
+            deadlines,
+            &FixedProbe { live: false },
+        )
+        .await;
+        assert_eq!(readiness_bad, QuorumReadiness::QuorumUnreachable);
+        assert_eq!(
+            consumer.admit_takeover("kirby-dead", readiness_bad, "img", 0).await,
+            TakeoverAdmission::Skip(TakeoverSkip::QuorumUnreachable),
+            "a survivor that cannot reach a second holder must fail closed"
+        );
     }
 }
