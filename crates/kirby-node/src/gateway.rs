@@ -1763,26 +1763,59 @@ fn denied(outcome: Outcome, treasury_remaining: u64) -> CapabilityReceipt {
     receipt(outcome, 0, treasury_remaining, Vec::new(), Vec::new(), None)
 }
 
-/// Decode a persisted IssueCharge `proof` back to `ChargeIssued`, FAIL-CLOSED. A stored
-/// charge proof should ALWAYS decode -- the daemon prost-encoded it itself -- so a decode
-/// failure means ledger corruption or a version skew. Surface that LOUDLY and return `None`
-/// (never a fabricated charge, never a panic); a silent `.ok()` would drop a money-bearing
-/// charge with no trace. This is the ONE place a stored charge proof is decoded: both the
-/// STEP1 resume-replay (`decode_charge`) and the concurrent same-key Duplicate arm route
-/// through it, so the loud-fail-closed contract holds for EVERY stored-proof decode (MED-1).
+/// Decode a persisted IssueCharge `proof` back to `ChargeIssued`, FAIL-CLOSED -- on BOTH an
+/// undecodable proof AND a decodable-but-structurally-invalid one. A stored charge proof should
+/// ALWAYS decode to a real charge (the daemon prost-encoded it itself from a `settlement.issue`
+/// result), so ANY deviation means ledger corruption, a version skew, or a foreign/empty proof.
+/// Two traps prost sets that a bare `.ok()` walks straight into: (a) EMPTY bytes decode to
+/// `Ok(ChargeIssued::default())` -- `Err` never fires -- and (b) a foreign/partial proto decodes
+/// to a garbage `Ok(..)`. Either would hand the genome a FABRICATED `Some { charge_id: "",
+/// amount_sats: 0, .. }`. So after a successful decode we ALSO reject a structurally-invalid
+/// charge: a real issued charge always has a non-empty mint-assigned `charge_id`, a non-empty
+/// `invoice_or_request` (Cashu's `cashu:charge:..` string / Lightning's bolt11 -- both providers
+/// set it unconditionally on a successful issue), and a WIRED rail `method` (Lightning/Cashu, never
+/// Unspecified -- the D2 method guard in `authorize_issue_charge` proved `ic.method == the wired
+/// rail` BEFORE the charge was ever stored). `amount_sats` is
+/// deliberately NOT checked: the oracle floors at `ORACLE_MIN_CHARGE_SATS`, but the earn loop's
+/// amount is job-derived and unclamped, so a real charge CAN be 0 sats -- rejecting on it would
+/// drop a legit charge. Every rejection is loud (`tracing::error`) and returns `None`; never a
+/// fabricated charge, never a panic. This is the ONE place a stored charge proof is decoded: both
+/// the STEP1 resume-replay (`decode_charge`) and the concurrent same-key Duplicate arm route
+/// through it, so the fail-closed contract holds for EVERY stored-proof decode (MED-1 class-closure).
 fn decode_issued_charge(proof: &[u8]) -> Option<ChargeIssued> {
-    match ChargeIssued::decode(proof) {
-        Ok(charge) => Some(charge),
+    let charge = match ChargeIssued::decode(proof) {
+        Ok(charge) => charge,
         Err(e) => {
             tracing::error!(
                 error = %e,
                 proof_len = proof.len(),
                 "stored IssueCharge proof failed to decode -- fail-closed to no-charge \
-                 (ledger corruption or version skew; was a silent `.ok()`)"
+                 (ledger corruption or version skew)"
             );
-            None
+            return None;
         }
+    };
+    // Decodable-but-garbage guard: empty bytes -> `ChargeIssued::default()` (empty charge_id +
+    // invoice, Unspecified method); a foreign/partial proto -> plausible-looking garbage. A real
+    // issued charge has none of these, so reject loudly rather than fabricate a Some. A real charge
+    // ALWAYS has a non-empty `invoice_or_request`: Cashu builds `cashu:charge:{id}:{amt}` (literal
+    // prefix -> never empty) and Lightning stores `quote.request` (the bolt11 invoice, the whole
+    // point of a mint quote). (amount_sats NOT checked: a real earn charge can be 0 -- see the doc.)
+    let method_is_wired_rail = charge.method == kirby_proto::ChargeMethod::Lightning as i32
+        || charge.method == kirby_proto::ChargeMethod::Cashu as i32;
+    if charge.charge_id.is_empty() || charge.invoice_or_request.is_empty() || !method_is_wired_rail {
+        tracing::error!(
+            proof_len = proof.len(),
+            charge_id_empty = charge.charge_id.is_empty(),
+            invoice_empty = charge.invoice_or_request.is_empty(),
+            method = charge.method,
+            "stored IssueCharge proof decoded to a STRUCTURALLY-INVALID charge (empty charge_id / \
+             empty invoice_or_request / non-rail method) -- fail-closed to no-charge (empty / \
+             foreign / partial proto; a silent `.ok()` would fabricate this Some)"
+        );
+        return None;
     }
+    Some(charge)
 }
 
 /// Decode a persisted `proof` field back to `ChargeIssued` for an IssueCharge STEP1
@@ -2333,16 +2366,17 @@ mod tests {
         assert!(r.charge.is_none(), "a refused Memory yields no charge");
     }
 
-    /// TOOTH MED-1 (fail-closed decode, class-closure): a STORED IssueCharge proof is decoded in
-    /// TWO places -- the STEP1 resume-replay (`decode_charge`) and the concurrent same-key
-    /// Duplicate arm (perform path, the `DuplicateIgnored` receipt). Both previously used a silent
-    /// `.ok()` that dropped a money-bearing charge with NO trace on a corrupt / version-skewed
-    /// proof. Both now route through the ONE shared helper `decode_issued_charge`, which
-    /// FAIL-CLOSES: a corrupt proof yields `None` (never a fabricated charge, never a panic) AND is
-    /// logged loudly. This asserts the shared contract BOTH sites depend on. (Log-only fix -> a
-    /// behavioral contract assertion, NOT a red-on-revert: reverting loud->silent leaves the `None`
-    /// identical, so there is no behavioral mutation to catch -- the value is the fail-closed
-    /// guarantee itself, exercised on the exact production helper both call sites now use.)
+    /// TOOTH MED-1 (fail-closed decode, class-closure -- covers DECODABLE-GARBAGE): a STORED
+    /// IssueCharge proof is decoded in TWO places -- the STEP1 resume-replay (`decode_charge`) and
+    /// the concurrent same-key Duplicate arm -- both routed through the ONE shared helper
+    /// `decode_issued_charge`. It FAILS CLOSED (loud `tracing::error` + None, never a fabricated
+    /// charge, never a panic) on BOTH an undecodable proof AND a DECODABLE-but-structurally-invalid
+    /// one. The subtle trap prost sets: EMPTY bytes decode to `Ok(ChargeIssued::default())` (Err
+    /// never fires) and a foreign proto partial-decodes to garbage -- a bare `.ok()` would hand the
+    /// genome a fabricated `Some { charge_id: "", .. }`. RED-ON-REVERTABLE now (stronger than the
+    /// old log-only assertion): reverting the structural-validation block makes empty/garbage return
+    /// `Some(default)` instead of `None`. Also guards AGAINST over-rejection: a valid charge (incl.
+    /// a legit 0-sat earn charge) still round-trips to `Some`.
     #[test]
     fn stored_charge_proof_decodes_fail_closed_not_silent() {
         use prost::Message;
@@ -2370,6 +2404,54 @@ mod tests {
             "a corrupt stored charge proof fails closed (no bogus charge, no panic)"
         );
 
+        // ★DECODABLE-GARBAGE (the codex/Fable gap): EMPTY bytes decode to Ok(ChargeIssued::default())
+        // -- Err NEVER fires -- so a bare `.ok()` would fabricate Some{charge_id:""}. Must FAIL CLOSED.
+        assert_eq!(
+            super::decode_issued_charge(&[]),
+            None,
+            "an EMPTY proof decodes to ChargeIssued::default() -> fail closed, NOT a fabricated Some"
+        );
+        // decodable but structurally invalid: empty charge_id (otherwise-plausible charge).
+        let empty_id = kirby_proto::ChargeIssued {
+            charge_id: String::new(),
+            invoice_or_request: "cashu:x".to_string(),
+            amount_sats: 5,
+            method: kirby_proto::ChargeMethod::Cashu as i32,
+        }
+        .encode_to_vec();
+        assert_eq!(super::decode_issued_charge(&empty_id), None, "empty charge_id -> fail closed");
+        // decodable but structurally invalid: Unspecified (non-rail) method -- never what D2 stores.
+        let bad_method = kirby_proto::ChargeIssued {
+            charge_id: "charge-9".to_string(),
+            invoice_or_request: "cashu:x".to_string(),
+            amount_sats: 9,
+            method: 0, // CHARGE_METHOD_UNSPECIFIED
+        }
+        .encode_to_vec();
+        assert_eq!(super::decode_issued_charge(&bad_method), None, "Unspecified method -> fail closed");
+        // decodable but structurally invalid: EMPTY invoice_or_request with valid id + method (the
+        // DISTINCT partial/foreign-decode vector -- charge_id+method alone would NOT catch this).
+        let empty_invoice = kirby_proto::ChargeIssued {
+            charge_id: "charge-8".to_string(),
+            invoice_or_request: String::new(),
+            amount_sats: 8,
+            method: kirby_proto::ChargeMethod::Cashu as i32,
+        }
+        .encode_to_vec();
+        assert_eq!(super::decode_issued_charge(&empty_invoice), None, "empty invoice_or_request -> fail closed");
+        // ★amount_sats == 0 is a LEGIT charge (earn is unclamped) -> must round-trip, NEVER rejected.
+        let zero_amt = kirby_proto::ChargeIssued {
+            charge_id: "charge-free".to_string(),
+            invoice_or_request: "cashu:0".to_string(),
+            amount_sats: 0,
+            method: kirby_proto::ChargeMethod::Cashu as i32,
+        };
+        assert_eq!(
+            super::decode_issued_charge(&zero_amt.encode_to_vec()),
+            Some(zero_amt),
+            "a 0-sat charge is legit (earn unclamped) -> decodes, never rejected on amount"
+        );
+
         // STEP1 wrapper: an IssueCharge act delegates to the fail-closed helper.
         let act = kirby_proto::capability_request::Act::IssueCharge(kirby_proto::IssueCharge {
             amount_sats: 10,
@@ -2377,6 +2459,7 @@ mod tests {
             method: kirby_proto::ChargeMethod::Cashu as i32,
         });
         assert_eq!(super::decode_charge(&corrupt, &act), None, "STEP1 corrupt -> fail-closed None");
+        assert_eq!(super::decode_charge(&[], &act), None, "STEP1 empty proof -> fail-closed None (garbage guard)");
         assert_eq!(super::decode_charge(&good, &act), Some(charge), "STEP1 valid -> Some(charge)");
 
         // A non-IssueCharge act never yields a charge (the act-specific gate is preserved).
@@ -2387,5 +2470,55 @@ mod tests {
             max_cost_sats: 10,
         });
         assert_eq!(super::decode_charge(&good, &mem_act), None, "non-IssueCharge act -> no charge");
+    }
+
+    /// TOOTH MED-1b (1206 concurrent-Duplicate routing PIN): the concurrent same-key re-issue arm
+    /// (`record_charge_atomic` -> `Duplicate`) surfaces the WINNER's STORED proof to the loser's
+    /// caller via `decode_issued_charge`. Drive it with a MALFORMED (empty) stored proof and assert
+    /// the arm FAILS CLOSED (`charge = None`), never fabricating a Some. RED on reverting the g:1206
+    /// call back to `.ok()`: `ChargeIssued::decode(&[]).ok()` = `Some(ChargeIssued::default())` ->
+    /// `charge = Some` -> the `is_none()` assertion fails. (A direct `authorize_issue_charge` call
+    /// deterministically reproduces the concurrent-race OUTCOME the 1206 arm serves -- both re-issues
+    /// pass STEP1, the loser hits the record-time Duplicate -- which STEP1's replay-catch would
+    /// otherwise mask in a single-threaded test.)
+    #[tokio::test]
+    async fn concurrent_duplicate_arm_fails_closed_on_malformed_stored_proof() {
+        let svc = issuing_gateway();
+        let key = "oracle-charge-concurrent-dup";
+
+        // Seed the WINNER's ledger row under `key` with a MALFORMED (empty) stored proof, so the
+        // next same-key `record_charge_atomic` returns `Duplicate(prior)` carrying that empty proof.
+        let seed = svc
+            .treasury
+            .record_charge_atomic(
+                key,
+                "winner-charge-id",
+                crate::treasury::ChargeMethodTag::Cashu,
+                Vec::new(), // malformed: empty proof -> decodes to ChargeIssued::default()
+                Vec::new(),
+            )
+            .expect("seed the winner row");
+        assert!(
+            matches!(seed, crate::treasury::DebitOutcome::Debited { .. }),
+            "seeding a fresh key writes the winner ledger row"
+        );
+
+        // Re-issue the SAME key via the perform path DIRECTLY (bypass STEP1, which would catch the
+        // key first): `record_charge_atomic` finds the seeded row -> Duplicate(empty proof) -> 1206.
+        let req = issue_charge_req(key, 10);
+        let ic = match req.act.as_ref().expect("issue_charge_req sets act") {
+            kirby_proto::capability_request::Act::IssueCharge(ic) => ic.clone(),
+            _ => unreachable!("issue_charge_req builds an IssueCharge"),
+        };
+        let r = svc.authorize_issue_charge(&req, &ic).await.unwrap();
+        assert_eq!(
+            r.outcome,
+            kirby_proto::Outcome::DuplicateIgnored as i32,
+            "a same-key re-issue over an existing row is a Duplicate"
+        );
+        assert!(
+            r.charge.is_none(),
+            "the 1206 concurrent-Duplicate arm FAILS CLOSED on a malformed stored proof (no fabricated Some)"
+        );
     }
 }
