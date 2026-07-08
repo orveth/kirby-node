@@ -442,6 +442,104 @@ pub async fn add_relay_no_ping(client: &Client, relay_url: &str) -> anyhow::Resu
     Ok(())
 }
 
+/// How often a long-lived subscription is re-armed ([`SubscriptionRearmer`]), in seconds.
+/// A minute keeps a deaf node's outage window short (the fleet's control events —
+/// spawn requests, leases, presence — are addressable/replaceable, so the relay retains
+/// the latest and serves it on the re-armed REQ) without spamming the relay.
+pub const SUBSCRIPTION_REARM_SECS: u64 = 60;
+
+/// Periodic re-arm for a long-lived relay subscription (the DEAF-NODE fix), shared by
+/// every subscribe-once-then-loop task: the spawn control-plane (31003 + 31002), the
+/// presence peer watch, the NIP-90 inbound inbox, and the NIP-17 DM inbox.
+///
+/// WHY: `nostr-relay-pool` 0.44 re-issues REQs on a plain reconnect, but if a relay ever
+/// answers a REQ with `CLOSED` (most machine-readable prefixes — `error:`, `invalid:`,
+/// `blocked:`, ... — e.g. a relay briefly rejecting REQs while warming up after a
+/// restart), it REMOVES the subscription from its per-relay map and no later reconnect
+/// ever re-arms it. The subscriber then looks healthy (transport up, publishes fine)
+/// while being PERMANENTLY deaf. And because the pool's `subscriptions()` view merely
+/// AGGREGATES the per-relay maps, the removed subscription vanishes from the client's
+/// own view too — so the OWNER of the subscription must retain the id + filter and
+/// re-issue them, which is exactly what this struct holds. `subscribe_with_id` with the
+/// SAME id is idempotent on both sides: the pool re-registers the subscription and the
+/// relay treats a repeated REQ id as a replace.
+///
+/// Call [`tick`](Self::tick) from a `tokio::select!` timer arm every
+/// [`SUBSCRIPTION_REARM_SECS`]. A re-arm that follows a detected RECONNECT (the summed
+/// connection-success count jumped since the last tick) is logged at info — that is the
+/// interesting one; routine re-arms stay at debug so logs don't spam.
+pub struct SubscriptionRearmer {
+    /// Which task this subscription belongs to (log context).
+    label: &'static str,
+    client: Client,
+    id: SubscriptionId,
+    filter: Filter,
+    /// The summed connection-success count across the client's relays at the last tick
+    /// (each successful (re)connect increments a relay's count, so a jump = a reconnect
+    /// happened in between).
+    last_success: usize,
+}
+
+impl SubscriptionRearmer {
+    /// Wrap an already-issued subscription (`id` + `filter` as passed to `subscribe`).
+    pub async fn new(
+        label: &'static str,
+        client: Client,
+        id: SubscriptionId,
+        filter: Filter,
+    ) -> Self {
+        let last_success = Self::success_sum(&client).await;
+        Self {
+            label,
+            client,
+            id,
+            filter,
+            last_success,
+        }
+    }
+
+    /// The summed connection-success count across all the client's relays.
+    async fn success_sum(client: &Client) -> usize {
+        client
+            .pool()
+            .relays()
+            .await
+            .values()
+            .map(|relay| relay.stats().success())
+            .sum()
+    }
+
+    /// Re-arm the subscription (call on a timer tick). Failures are logged and retried
+    /// on the next tick — never fatal to the owning loop.
+    pub async fn tick(&mut self) {
+        let success = Self::success_sum(&self.client).await;
+        let reconnected = success > self.last_success;
+        self.last_success = success;
+        match self
+            .client
+            .subscribe_with_id(self.id.clone(), self.filter.clone(), None)
+            .await
+        {
+            Ok(_) if reconnected => tracing::info!(
+                task = self.label,
+                sub = %self.id,
+                "re-armed the relay subscription after a detected reconnect"
+            ),
+            Ok(_) => tracing::debug!(
+                task = self.label,
+                sub = %self.id,
+                "routine relay subscription re-arm"
+            ),
+            Err(e) => tracing::warn!(
+                task = self.label,
+                sub = %self.id,
+                error = %e,
+                "relay subscription re-arm failed (will retry next tick)"
+            ),
+        }
+    }
+}
+
 /// Build a connected Nostr [`Client`] for `identity`, add `relay_url`, and connect.
 /// Shared by the presence task and the fleet read path, and reused by the hibernation
 /// wake-request publish path ([`crate::hibernate::wake`]) so it does not duplicate the
@@ -528,10 +626,18 @@ pub async fn run_presence(
     // Subscribe to EVERY node's presence beacon (all authors, this kind). The relay
     // keeps only the latest per pubkey, so this stream is the live fleet.
     let filter = Filter::new().kind(Kind::from(KIND_KIRBY_PRESENCE));
-    client
-        .subscribe(filter, None)
+    let sub_id = client
+        .subscribe(filter.clone(), None)
         .await
-        .context("subscribe to the fleet presence")?;
+        .context("subscribe to the fleet presence")?
+        .val;
+    // The deaf-node fix (see SubscriptionRearmer): without the periodic re-arm, a
+    // relay-sent CLOSED kills the peer watch forever — every peer then reads as STALE
+    // even though the fleet is alive (the OUTBOUND beacon keeps publishing regardless).
+    let mut rearmer =
+        SubscriptionRearmer::new("presence peer watch", client.clone(), sub_id, filter).await;
+    let mut rearm_tick = tokio::time::interval(Duration::from_secs(SUBSCRIPTION_REARM_SECS));
+    rearm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // The peer set: npub -> the last-seen unix time we observed for it. Used to log
     // joins/refreshes and to sweep for staleness. Excludes this node.
@@ -571,6 +677,10 @@ pub async fn run_presence(
             // Sweep the peer set for staleness.
             _ = sweep_tick.tick() => {
                 sweep_stale(&mut peers, config.stale_after);
+            }
+            // Re-arm the peer-watch subscription (the deaf-node fix).
+            _ = rearm_tick.tick() => {
+                rearmer.tick().await;
             }
             // A relay notification: a (new) presence event from a peer.
             notif = notifications.recv() => {
@@ -1000,10 +1110,18 @@ pub async fn run_inbound(
         .map(Kind::from)
         .collect();
     let filter = Filter::new().kinds(kinds).pubkey(me);
-    client
-        .subscribe(filter, None)
+    let sub_id = client
+        .subscribe(filter.clone(), None)
         .await
-        .context("subscribe to the inbound (earn) surface")?;
+        .context("subscribe to the inbound (earn) surface")?
+        .val;
+    // The deaf-node fix (see SubscriptionRearmer): without the periodic re-arm, a
+    // relay-sent CLOSED kills the earn-loop inbox forever while the rest of the daemon
+    // looks healthy.
+    let mut rearmer =
+        SubscriptionRearmer::new("NIP-90 inbound inbox", client.clone(), sub_id, filter).await;
+    let mut rearm_tick = tokio::time::interval(Duration::from_secs(SUBSCRIPTION_REARM_SECS));
+    rearm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut notifications = client.notifications();
     loop {
@@ -1011,6 +1129,10 @@ pub async fn run_inbound(
             _ = &mut shutdown => {
                 tracing::info!(npub = %identity.npub(), "inbound task shutting down");
                 break;
+            }
+            // Re-arm the inbox subscription (the deaf-node fix).
+            _ = rearm_tick.tick() => {
+                rearmer.tick().await;
             }
             notif = notifications.recv() => {
                 match notif {
@@ -1270,10 +1392,20 @@ pub async fn run_dm_inbound(
     // kind:1059 gift wraps addressed to the DM pubkey (#p). The relay filter is a coarse
     // prefilter; `screen_and_enqueue_dm` is the authoritative wall (verify + unwrap + re-check).
     let filter = Filter::new().kind(Kind::GiftWrap).pubkey(me);
-    client
-        .subscribe(filter, None)
+    let sub_id = client
+        .subscribe(filter.clone(), None)
         .await
-        .context("subscribe to the NIP-17 DM inbox")?;
+        .context("subscribe to the NIP-17 DM inbox")?
+        .val;
+    // The deaf-node fix (see SubscriptionRearmer): without the periodic re-arm, a
+    // relay-sent CLOSED kills the fast-path DM subscription forever. The backfill sweep
+    // below (when enabled) already recovers DELIVERY on a fresh connection; the re-arm
+    // keeps the live path itself alive (and is the only recovery when the sweep is
+    // disabled).
+    let mut rearmer =
+        SubscriptionRearmer::new("NIP-17 DM inbox", client.clone(), sub_id, filter).await;
+    let mut rearm_tick = tokio::time::interval(Duration::from_secs(SUBSCRIPTION_REARM_SECS));
+    rearm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut notifications = client.notifications();
 
@@ -1313,6 +1445,10 @@ pub async fn run_dm_inbound(
                 if let Some(fetcher) = &backfill {
                     dm_backfill_sweep(fetcher, &dm_signer, me, &queue).await;
                 }
+            }
+            // Re-arm the fast-path DM subscription (the deaf-node fix).
+            _ = rearm_tick.tick() => {
+                rearmer.tick().await;
             }
             notif = notifications.recv() => {
                 match notif {

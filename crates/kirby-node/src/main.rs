@@ -1204,10 +1204,14 @@ async fn run_spawn_control_plane(
         Kind::from(KIND_KIRBY_SPAWN_REQUEST),
         Kind::from(KIND_KIRBY_LEASE),
     ]);
-    client
-        .subscribe(filter, None)
+    // Keep the subscription id + filter: the resubscribe tick below re-arms this exact
+    // subscription (same id = an idempotent REQ replace on the relay) for the life of
+    // the loop.
+    let spawn_sub_id = client
+        .subscribe(filter.clone(), None)
         .await
-        .context("subscribe to KIND_KIRBY_SPAWN_REQUEST + KIND_KIRBY_LEASE")?;
+        .context("subscribe to KIND_KIRBY_SPAWN_REQUEST + KIND_KIRBY_LEASE")?
+        .val;
     let mut notifications = client.notifications();
     println!("FLEET spawn control-plane: listening for spawn requests + leases on {relay_url}");
 
@@ -1283,8 +1287,33 @@ async fn run_spawn_control_plane(
     let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(10));
     let mut failover_scan_tick =
         tokio::time::interval(Duration::from_secs(spawn_cfg.failover_scan_secs.max(1)));
+
+    // THE DEAF-NODE FIX: re-arm the spawn/lease subscription on a cadence, mirroring how
+    // the presence beacon stays alive by timer-driven re-publish. nostr-sdk restores the
+    // TRANSPORT on a relay bounce (and re-issues REQs on a plain reconnect), but a
+    // relay-sent CLOSED (e.g. a relay briefly rejecting REQs while warming up after a
+    // restart) REMOVES the subscription from the pool and no later reconnect ever re-arms
+    // it — the node then beacons forever (outbound is timer-driven) while never hearing
+    // another spawn request OR lease (this subscription is ALSO the failover detector's
+    // only ear: a deaf lease observer = a blind failover scan). Teeth:
+    // tests/spawn_sub_reconnect.rs; mechanism: nerve::SubscriptionRearmer. The re-arm is
+    // an idempotent same-id REQ replace, and a missed spawn request/lease is recovered on
+    // the next tick because 31003/31002 are addressable (the relay retains the latest and
+    // serves it on the re-armed REQ).
+    let mut resubscribe_tick =
+        tokio::time::interval(Duration::from_secs(nerve::SUBSCRIPTION_REARM_SECS));
+    let mut rearmer = nerve::SubscriptionRearmer::new(
+        "spawn control-plane",
+        client.clone(),
+        spawn_sub_id,
+        filter,
+    )
+    .await;
     loop {
         tokio::select! {
+            _ = resubscribe_tick.tick() => {
+                rearmer.tick().await;
+            }
             _ = reap_tick.tick() => {
                 // Reap dead spawned tenants so their CID/port slots free up for new spawns.
                 let reaped = supervisor.reap_dead();
