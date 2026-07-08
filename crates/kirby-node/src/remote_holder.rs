@@ -72,7 +72,7 @@ use frost::SigningPackage;
 use kirby_custody::guardian::{self, CoSignRequest, RefuseReason};
 use kirby_custody::seam::{CoSignEvent, GuardianId, ROUND_COMMITMENT, ROUND_PACKAGE, ROUND_SHARE};
 
-use crate::quorum_signer::{identifier_to_u16, Holder, MIN_SIGNERS};
+use crate::quorum_signer::{identifier_to_u16, CeremonyGate, Holder, MIN_SIGNERS};
 
 /// Round discriminant: the coordinator's round-1 COMMIT TRIGGER (coordinator -> holder).
 /// Mirrors the proven `frost-nostr-cosign` flow where the coordinator sends a
@@ -86,6 +86,19 @@ pub const ROUND_COMMIT_REQUEST: u8 = 10;
 /// serialized [`RefuseReason`]; the proxy decodes it and surfaces it so the ceremony
 /// aborts with no signature, exactly like a co-located holder's `Err(reason)`.
 pub const ROUND_REFUSAL: u8 = 11;
+
+/// Round discriminant: the takeover-admission LIVENESS PROBE (coordinator -> holder). A bounded,
+/// read-only "are you a live holder for this agent's Q?" query the failover admission gate
+/// ([`crate::quorum_probe::can_assemble_quorum`]) sends to each placement holder BEFORE claiming a
+/// takeover. Empty payload. It generates NO nonce and touches NO share -- unlike [`ROUND_COMMIT_REQUEST`]
+/// it must NOT accumulate stranded nonces (a probe fires every failover tick), so it is a pure ping.
+pub const ROUND_PROBE: u8 = 12;
+
+/// Round discriminant: a holder's PROBE ACK (holder -> coordinator). Empty payload; the holder's
+/// identity is the reply's `from` (its FROST identifier), which the probe binds to the expected
+/// placement entry (sender-auth: an authenticated response for THIS Q's holder set, not merely
+/// "something answered"). No share, no nonce, no secret crosses.
+pub const ROUND_PROBE_ACK: u8 = 13;
 
 /// The round-2 SIGN REQUEST envelope (coordinator -> holder). Sent as the payload of a
 /// [`ROUND_PACKAGE`] event so the holder receives BOTH the assembled `SigningPackage` AND
@@ -160,6 +173,14 @@ pub trait HolderTransportFactory {
     /// [`CoSignEvent`]s. An unreachable/unknown address is an `Err` (the loader fails closed,
     /// never silently builds an under-strength quorum).
     fn connect(&self, address: &str) -> anyhow::Result<Box<dyn HolderTransport + Send + Sync>>;
+
+    /// The PER-AGENT ceremony serializer for the agent this factory coordinates (see
+    /// [`CeremonyGate`]). The factory is the agent's ONE transport authority (the co-sign hub), so
+    /// it owns the ONE gate every ceremony over these holders must hold. The distributed sign loader
+    /// ([`crate::keyset_provisioning::load_quorum_signer_distributed`]) threads this into the
+    /// [`crate::quorum_signer::QuorumSigner`] so a distributed signer CANNOT be built unserialized;
+    /// the future ECDH path takes the SAME gate, so signing + ECDH ceremonies serialize together.
+    fn ceremony_gate(&self) -> CeremonyGate;
 }
 
 /// The coordinator-side PROXY for a holder whose share lives on another machine.
@@ -363,8 +384,22 @@ impl RemoteHolderServer {
         match event.round {
             ROUND_COMMIT_REQUEST => self.handle_commit(event.session_id),
             ROUND_PACKAGE => self.handle_sign(event),
+            ROUND_PROBE => self.handle_probe(event.session_id),
             // An unknown request frame: refuse (never sign something we do not understand).
             _ => self.refuse(event.session_id, RefuseReason::BadKeyset),
+        }
+    }
+
+    /// The takeover-admission liveness PROBE (see [`ROUND_PROBE`]): reply with a `ROUND_PROBE_ACK`
+    /// carrying this holder's identity in `from` and NOTHING else. It generates no nonce and reads no
+    /// share -- a pure "I am a live holder for this agent" attestation, authenticated by the reply's
+    /// sender identity. Idempotent + side-effect-free, so a probe every failover tick costs nothing.
+    fn handle_probe(&self, session_id: u64) -> CoSignEvent {
+        CoSignEvent {
+            session_id,
+            from: self.frost_id(),
+            round: ROUND_PROBE_ACK,
+            payload: Vec::new(),
         }
     }
 
@@ -477,7 +512,7 @@ impl RemoteHolderServer {
 
 /// Reserved wire address for the coordinator (never a holder identifier). Mirrors custody
 /// `seam.rs`'s `COORDINATOR_ADDR`.
-fn coordinator_id() -> GuardianId {
+pub(crate) fn coordinator_id() -> GuardianId {
     GuardianId::try_from(u16::MAX).expect("reserved coordinator id is valid")
 }
 
@@ -561,12 +596,16 @@ impl HolderTransport for InProcessHolderLink {
 #[cfg(test)]
 pub(crate) struct InProcessHolderFleet {
     servers: HashMap<String, Arc<RemoteHolderServer>>,
+    /// The ONE per-agent ceremony gate this fleet vends (models the co-sign hub's gate). A signer
+    /// built via [`crate::keyset_provisioning::load_quorum_signer_distributed`] over this fleet
+    /// shares it, so a test can prove single-flight across concurrent ceremonies.
+    gate: CeremonyGate,
 }
 
 #[cfg(test)]
 impl InProcessHolderFleet {
     pub(crate) fn new() -> Self {
-        Self { servers: HashMap::new() }
+        Self { servers: HashMap::new(), gate: CeremonyGate::new() }
     }
 
     /// Register the holder reachable at `address` (the placement manifest's per-holder address).
@@ -583,6 +622,10 @@ impl HolderTransportFactory for InProcessHolderFleet {
             .get(address)
             .ok_or_else(|| anyhow::anyhow!("no in-process holder registered at address {address:?}"))?;
         Ok(Box::new(InProcessHolderLink::new(Arc::clone(server))))
+    }
+
+    fn ceremony_gate(&self) -> CeremonyGate {
+        self.gate.clone()
     }
 }
 
@@ -1015,6 +1058,131 @@ mod tests {
             "the rejection should name the sender mismatch: {msg}"
         );
         println!("SENDER-IDENTITY PASS: a reply from the wrong holder identifier is rejected (no misrouted/spoofed frame accepted)");
+    }
+
+    // ---- #49 TOOTH 1: the PER-AGENT CEREMONY SERIALIZER (concurrent-startup-ceremonies) --------
+
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Barrier;
+    use std::time::Duration;
+
+    /// Shared across ALL of an agent's holder links: how many co-sign round-trips are IN FLIGHT
+    /// (a `send` with no matching `recv` yet) at once, and the MAX ever seen. A single ceremony is
+    /// strictly send-then-recv per holder, so it holds at most 1 in flight; a max > 1 means TWO
+    /// ceremonies overlapped -> the serializer was NOT holding.
+    struct ConcurrencyProbe {
+        inflight: AtomicI64,
+        max: AtomicI64,
+    }
+
+    /// A holder transport that wraps [`InProcessHolderLink`] and records concurrency. Its `send`
+    /// widens the in-flight window with a tiny sleep so that IF two ceremonies ever run at once
+    /// (the serializer removed) their windows overlap and `max` reaches >= 2 -- a deterministic
+    /// red-on-revert signal, on top of the reply-clobber a shared inbox would also produce.
+    struct InstrumentedLink {
+        inner: InProcessHolderLink,
+        probe: Arc<ConcurrencyProbe>,
+    }
+    impl HolderTransport for InstrumentedLink {
+        fn send(&self, event: CoSignEvent) -> anyhow::Result<()> {
+            let now = self.probe.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.probe.max.fetch_max(now, Ordering::SeqCst);
+            // Widen the overlap window so concurrent ceremonies (if the gate is absent) are caught.
+            std::thread::sleep(Duration::from_millis(2));
+            self.inner.send(event)
+        }
+        fn recv(&self) -> anyhow::Result<CoSignEvent> {
+            let r = self.inner.recv();
+            self.probe.inflight.fetch_sub(1, Ordering::SeqCst);
+            r
+        }
+    }
+
+    /// THE #49 SERIALIZER TOOTH: an agent's STARTUP BURST -- presence (10100) + `born` lifecycle
+    /// (9100) + the 31000 agent-state emitter -- fired CONCURRENTLY over the SHARED distributed
+    /// signer (the memoized one every sign site uses) all complete with Q-valid signatures AND never
+    /// overlap on the wire: the per-agent [`CeremonyGate`] makes them run ONE AT A TIME. A barrier
+    /// releases the three threads simultaneously so they genuinely race for the signer; the
+    /// instrumented transport proves single-flight (max in-flight == 1). RED-ON-REVERT: with the gate
+    /// made a no-op, the three overlap -> max in-flight >= 2 and/or a clobbered reply fails a ceremony.
+    #[test]
+    fn tooth1_concurrent_startup_ceremonies_serialize_no_clobber() {
+        let ks = keyset();
+        let kps = three_kps(&ks);
+        let probe = Arc::new(ConcurrencyProbe { inflight: AtomicI64::new(0), max: AtomicI64::new(0) });
+
+        // Three real holder servers (identifiers 1,2,3); each proxied over an instrumented link that
+        // shares the ONE concurrency probe. The any-available-2-of-3 selection uses the first two.
+        let holders: Vec<Box<dyn Holder>> = kps
+            .iter()
+            .map(|kp| {
+                let server = Arc::new(RemoteHolderServer::new(kp.clone(), ks.pubkeys.clone()));
+                let id = server.id();
+                let link = InstrumentedLink {
+                    inner: InProcessHolderLink::new(server),
+                    probe: Arc::clone(&probe),
+                };
+                Box::new(RemoteHolder::new(id, link)) as Box<dyn Holder>
+            })
+            .collect();
+
+        // The SHARED gate = distributed engagement. Build the one memoized-style signer every sign
+        // site would share, and wrap it in an Arc to hand to the concurrent threads.
+        let gate = CeremonyGate::new();
+        let qs = Arc::new(
+            QuorumSigner::new_serialized(holders, ks.pubkeys.clone(), gate)
+                .expect("build serialized distributed signer"),
+        );
+
+        // The startup burst: (kind, content) triples fired at the SAME instant.
+        let burst = [
+            (10100u32, "{\"status\":\"online\"}"),
+            (9100u32, "{\"event\":\"born\"}"),
+            (31000u32, "{\"sats\":100}"),
+        ];
+        let barrier = Arc::new(Barrier::new(burst.len()));
+        let mut handles = Vec::new();
+        for (kind, content) in burst {
+            let qs = Arc::clone(&qs);
+            let barrier = Arc::clone(&barrier);
+            let content = content.to_string();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait(); // release all threads together -> a genuine race for the signer.
+                qs.sign_nostr_event_with_tags(kind, CREATED_AT, &[], &content)
+            }));
+        }
+
+        let pubkeys = ks.pubkeys.clone();
+        let mut signed = 0;
+        for h in handles {
+            let ev = h
+                .join()
+                .expect("ceremony thread must not panic")
+                .expect("every concurrent startup ceremony must complete (no clobbered reply)");
+            // Each result is a Q-valid BIP-340 signature over its OWN id (no cross-ceremony mixup).
+            assert_eq!(ev.pubkey, hex::encode(qs.q_bytes()), "signed under Q");
+            let id_bytes: [u8; 32] = hex::decode(&ev.id)
+                .expect("event id hex")
+                .try_into()
+                .expect("32-byte id");
+            assert!(
+                verifies_under_q(&ev.sig, &id_bytes, &pubkeys),
+                "concurrent ceremony {} produced an aggregate that does not verify under Q",
+                ev.kind
+            );
+            signed += 1;
+        }
+        assert_eq!(signed, 3, "all three startup ceremonies must complete");
+
+        // THE SERIALIZER PROOF: at no instant did two ceremonies overlap on the shared transport.
+        let max_inflight = probe.max.load(Ordering::SeqCst);
+        assert_eq!(
+            max_inflight, 1,
+            "the ceremony gate must serialize: max concurrent in-flight round-trips was {max_inflight} (>1 => two ceremonies clobbered the shared reply channels)"
+        );
+        println!(
+            "TOOTH-1 PASS: 3 concurrent startup ceremonies (presence/born/31000) all Q-valid; max in-flight = 1 (serialized, zero clobber)"
+        );
     }
 
     /// A naive subslice search for the nonce-bytes needle (no extra deps).

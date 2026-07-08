@@ -46,7 +46,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use frost_secp256k1_tr as frost;
@@ -222,6 +222,59 @@ impl Holder for LocalHolder {
     }
 }
 
+/// A PER-AGENT CEREMONY SERIALIZER: single-flight across ALL of one agent's co-sign ceremonies.
+///
+/// A DISTRIBUTED [`QuorumSigner`] is SHARED by every sign site of an agent (the memoized signer in
+/// [`crate::relay_transport::AgentCosign`]: presence, lifecycle, the 31000 emitter, voice, DM, and
+/// the lease). Those sites fire concurrently -- a startup burst alone fires presence + `born` + the
+/// 31000 emitter near the same instant (see `g_same_second_beacons_dont_collide`). But a shared
+/// distributed signer ASSUMES ceremonies are SERIALIZED per agent: each holder transport has ONE
+/// reply channel ([`crate::relay_transport::RelayHolderTransport`] -- "one ceremony thread calls
+/// `recv` per transport"), so two ceremonies in flight at once interleave their round replies on
+/// that one channel and clobber each other (a reply for ceremony A dequeued by ceremony B's `recv`
+/// fails B's session-id / sender bind and ABORTS B -- a lost, money-load-bearing publish). Enabling
+/// distributed signing WITHOUT this serializer is the money-safety violation #49 closes.
+///
+/// The gate makes an agent's ceremonies run ONE AT A TIME: a ceremony holds it for its whole
+/// duration (all rounds) and the rest QUEUE. It is CEREMONY-KIND-AGNOSTIC -- it guards the transport
+/// itself, not a signing session, so the one-round threshold-ECDH ceremony (Inc3, on the SAME
+/// transport + reply channel) takes the SAME gate and serializes against signing. `Clone`
+/// (Arc-backed) so ONE instance is shared by an agent's signer and its future ECDH path.
+///
+/// RELEASE ON TIMEOUT (never a permanent wedge): the ceremony body is synchronous and self-bounds --
+/// each wire `recv` carries its own [`crate::relay_transport::DEFAULT_WIRE_TIMEOUT`], so a ceremony
+/// stalled on a silently-dead holder returns `Err` within a bounded time and DROPS the guard,
+/// releasing the gate for the queued ceremony. A stalled ceremony delays the agent's next ceremony;
+/// it never wedges the agent's voice forever. The guard protects no data (`Mutex<()>`), so a
+/// panicking holder poisoning it is irrelevant -- we take the lock through the poison.
+#[derive(Clone)]
+pub struct CeremonyGate {
+    lock: Arc<Mutex<()>>,
+}
+
+impl CeremonyGate {
+    /// A FRESH, independent gate (its own single-flight lane). This is the CO-LOCATED default: a
+    /// co-located `load_signer` builds a FRESH signer per call (no shared instance), so its gate is
+    /// private + uncontended and the serialization is a harmless no-op. The DISTRIBUTED path instead
+    /// SHARES one gate across all of an agent's sign sites (see [`QuorumSigner::new_serialized`]).
+    pub fn new() -> Self {
+        Self { lock: Arc::new(Mutex::new(())) }
+    }
+
+    /// Enter the gate: block until no other ceremony of this agent holds it, then return a guard
+    /// held for the caller's whole ceremony (dropped on return -- including a timed-out ceremony --
+    /// which releases the gate). Poison-tolerant: the guard protects no state.
+    pub fn enter(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for CeremonyGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A live per-agent FROST quorum signer. Holds the 3 holders (in-process for S3,
 /// behind the [`Holder`] seam) + the group `PublicKeyPackage` + the derived taproot
 /// key Q. Produces aggregate BIP-340 signatures under Q via a 2-of-3 ceremony with
@@ -249,6 +302,11 @@ pub struct QuorumSigner {
     /// The guard itself stays intact: a genuine double-use of ONE session id still
     /// refuses; this just guarantees distinct ceremonies get distinct ids.
     next_session: AtomicU64,
+    /// The PER-AGENT ceremony serializer (see [`CeremonyGate`]). Held for the whole of every
+    /// `sign_*` ceremony so an agent's sign sites run one at a time over the shared holder
+    /// transports. CO-LOCATED signers get a fresh private gate ([`Self::new`], uncontended =
+    /// harmless); a DISTRIBUTED signer SHARES the agent's one gate ([`Self::new_serialized`]).
+    ceremony_gate: CeremonyGate,
 }
 
 impl QuorumSigner {
@@ -259,6 +317,33 @@ impl QuorumSigner {
         holders: Vec<Box<dyn Holder>>,
         pubkeys: PublicKeyPackage,
     ) -> anyhow::Result<Self> {
+        // A FRESH per-signer gate: the CO-LOCATED default. A co-located `load_signer` returns a
+        // fresh signer per call (no shared instance), so this gate is private + uncontended and
+        // serialization is a harmless no-op -- byte-identical behavior to the pre-serializer path.
+        Self::with_gate(holders, pubkeys, CeremonyGate::new())
+    }
+
+    /// Build a DISTRIBUTED quorum signer that SHARES `gate` -- the agent's per-agent
+    /// [`CeremonyGate`] -- with every other sign site (and the future ECDH path) of the SAME agent.
+    /// A distributed signer MUST be serialized (concurrent ceremonies clobber the shared per-holder
+    /// reply channels; see [`CeremonyGate`]), so the gate is a MANDATORY constructor argument --
+    /// there is no way to build a distributed signer WITHOUT the serializer. The only caller is
+    /// [`crate::keyset_provisioning::load_quorum_signer_distributed`], which sources the gate from
+    /// the per-agent [`crate::remote_holder::HolderTransportFactory`] (the co-sign hub), so every
+    /// sign site loading through the memoized signer shares that ONE gate.
+    pub fn new_serialized(
+        holders: Vec<Box<dyn Holder>>,
+        pubkeys: PublicKeyPackage,
+        gate: CeremonyGate,
+    ) -> anyhow::Result<Self> {
+        Self::with_gate(holders, pubkeys, gate)
+    }
+
+    fn with_gate(
+        holders: Vec<Box<dyn Holder>>,
+        pubkeys: PublicKeyPackage,
+        ceremony_gate: CeremonyGate,
+    ) -> anyhow::Result<Self> {
         let q_bytes =
             group_xonly_q(&pubkeys).map_err(|e| anyhow::anyhow!("derive group Q: {e}"))?;
         Ok(Self {
@@ -266,6 +351,7 @@ impl QuorumSigner {
             pubkeys,
             q_bytes,
             next_session: AtomicU64::new(0),
+            ceremony_gate,
         })
     }
 
@@ -346,6 +432,15 @@ impl QuorumSigner {
         tags: &[Vec<String>],
         content: &str,
     ) -> anyhow::Result<NostrEvent> {
+        // PER-AGENT SINGLE-FLIGHT: hold the ceremony gate for this WHOLE ceremony (all rounds) so an
+        // agent's sign sites (presence/lifecycle/31000/voice/DM/lease -- and the Inc3 ECDH ceremony,
+        // which takes the same gate) run ONE AT A TIME over the shared holder transports. Concurrent
+        // ceremonies would interleave their round replies on the per-holder reply channel and clobber
+        // each other. Co-located = a private uncontended gate (harmless no-op); distributed = the
+        // agent's shared gate. Released when this fn returns (incl. a timed-out ceremony); see
+        // [`CeremonyGate`].
+        let _ceremony_guard = self.ceremony_gate.enter();
+
         // 1. RE-PORT THE GUARDS. kind-restrict to the voice + the three beacon kinds.
         if !is_signable_kind(kind) {
             anyhow::bail!(

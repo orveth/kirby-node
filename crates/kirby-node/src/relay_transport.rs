@@ -76,6 +76,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use kirby_custody::seam::{CoSignEvent, GuardianId};
 
 use crate::keyset_provisioning::{LocalSealedSink, ShareSink};
+use crate::quorum_signer::CeremonyGate;
 use crate::remote_holder::{HolderTransport, HolderTransportFactory, RemoteHolderServer};
 
 /// The default per-wire timeout a [`RelayHolderTransport::recv`] waits for a reply before
@@ -236,6 +237,11 @@ pub struct CoordinatorRelayHub {
     routes: Arc<Mutex<HashMap<PublicKey, StdSender<CoSignEvent>>>>,
     /// The per-wire `recv` timeout handed to each transport.
     timeout: Duration,
+    /// The PER-AGENT ceremony serializer (see [`CeremonyGate`]). The hub is the agent's ONE
+    /// transport authority, so it owns the ONE gate every ceremony over these holders holds. Handed
+    /// to the distributed [`crate::quorum_signer::QuorumSigner`] (and the future ECDH path) so all
+    /// of an agent's ceremonies serialize; a distributed signer cannot be built without it.
+    ceremony_gate: CeremonyGate,
     /// The actor thread handle (joined on drop so the thread does not outlive the hub).
     actor: Option<std::thread::JoinHandle<()>>,
 }
@@ -283,6 +289,9 @@ impl CoordinatorRelayHub {
             outbound_tx,
             routes,
             timeout,
+            // ONE gate per hub = one per agent; every sign site loads the memoized distributed
+            // signer built from this hub, so they all share this gate and serialize.
+            ceremony_gate: CeremonyGate::new(),
             actor: Some(actor),
         })
     }
@@ -326,6 +335,10 @@ impl CoordinatorRelayHub {
 impl HolderTransportFactory for CoordinatorRelayHub {
     fn connect(&self, address: &str) -> anyhow::Result<Box<dyn HolderTransport + Send + Sync>> {
         Ok(Box::new(CoordinatorRelayHub::connect(self, address)?))
+    }
+
+    fn ceremony_gate(&self) -> CeremonyGate {
+        self.ceremony_gate.clone()
     }
 }
 

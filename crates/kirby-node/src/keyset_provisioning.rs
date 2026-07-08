@@ -1252,9 +1252,14 @@ pub(crate) fn load_quorum_signer_distributed(
         holders.push(Box::new(remote));
     }
 
-    QuorumSigner::new(holders, pubkeys).context(
+    // MANDATORY SERIALIZER (#49): a distributed signer is SHARED by every sign site of the agent,
+    // and concurrent ceremonies clobber the per-holder reply channels. Take the agent's ONE ceremony
+    // gate from the factory (the co-sign hub owns it) and build a SERIALIZED signer -- there is no
+    // path here that builds a distributed signer without the gate.
+    let gate = factory.ceremony_gate();
+    QuorumSigner::new_serialized(holders, pubkeys, gate).context(
         "build distributed QuorumSigner from RemoteHolders (each share stays on its holder; \
-         none is unsealed into this process)",
+         none is unsealed into this process; ceremonies serialized per agent)",
     )
 }
 
