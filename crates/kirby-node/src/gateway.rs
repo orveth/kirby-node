@@ -1203,7 +1203,7 @@ impl GatewayService {
                 proof: prior.proof.clone(),
                 completion: Vec::new(),
                 memory: None,
-                charge: ChargeIssued::decode(prior.proof.as_slice()).ok(),
+                charge: decode_issued_charge(prior.proof.as_slice()),
                 http_response: None,
             }),
             // Unreachable (cost=0 can't go insufficient), but surfaced cleanly.
@@ -1763,12 +1763,35 @@ fn denied(outcome: Outcome, treasury_remaining: u64) -> CapabilityReceipt {
     receipt(outcome, 0, treasury_remaining, Vec::new(), Vec::new(), None)
 }
 
+/// Decode a persisted IssueCharge `proof` back to `ChargeIssued`, FAIL-CLOSED. A stored
+/// charge proof should ALWAYS decode -- the daemon prost-encoded it itself -- so a decode
+/// failure means ledger corruption or a version skew. Surface that LOUDLY and return `None`
+/// (never a fabricated charge, never a panic); a silent `.ok()` would drop a money-bearing
+/// charge with no trace. This is the ONE place a stored charge proof is decoded: both the
+/// STEP1 resume-replay (`decode_charge`) and the concurrent same-key Duplicate arm route
+/// through it, so the loud-fail-closed contract holds for EVERY stored-proof decode (MED-1).
+fn decode_issued_charge(proof: &[u8]) -> Option<ChargeIssued> {
+    match ChargeIssued::decode(proof) {
+        Ok(charge) => Some(charge),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                proof_len = proof.len(),
+                "stored IssueCharge proof failed to decode -- fail-closed to no-charge \
+                 (ledger corruption or version skew; was a silent `.ok()`)"
+            );
+            None
+        }
+    }
+}
+
 /// Decode a persisted `proof` field back to `ChargeIssued` for an IssueCharge STEP1
 /// resume replay, so the genome always receives the SAME `charge_id` for the same
-/// idempotency key. Returns `None` for all non-IssueCharge acts (or on a decode error).
+/// idempotency key. Returns `None` for all non-IssueCharge acts; an IssueCharge proof
+/// decodes fail-closed via [`decode_issued_charge`] (loud on a corrupt/skewed proof).
 fn decode_charge(proof: &[u8], act: &Act) -> Option<ChargeIssued> {
     match act {
-        Act::IssueCharge(_) => ChargeIssued::decode(proof).ok(),
+        Act::IssueCharge(_) => decode_issued_charge(proof),
         _ => None,
     }
 }
@@ -2308,5 +2331,61 @@ mod tests {
             "a divergent Memory re-present is still REFUSED (act-specific split preserved)"
         );
         assert!(r.charge.is_none(), "a refused Memory yields no charge");
+    }
+
+    /// TOOTH MED-1 (fail-closed decode, class-closure): a STORED IssueCharge proof is decoded in
+    /// TWO places -- the STEP1 resume-replay (`decode_charge`) and the concurrent same-key
+    /// Duplicate arm (perform path, the `DuplicateIgnored` receipt). Both previously used a silent
+    /// `.ok()` that dropped a money-bearing charge with NO trace on a corrupt / version-skewed
+    /// proof. Both now route through the ONE shared helper `decode_issued_charge`, which
+    /// FAIL-CLOSES: a corrupt proof yields `None` (never a fabricated charge, never a panic) AND is
+    /// logged loudly. This asserts the shared contract BOTH sites depend on. (Log-only fix -> a
+    /// behavioral contract assertion, NOT a red-on-revert: reverting loud->silent leaves the `None`
+    /// identical, so there is no behavioral mutation to catch -- the value is the fail-closed
+    /// guarantee itself, exercised on the exact production helper both call sites now use.)
+    #[test]
+    fn stored_charge_proof_decodes_fail_closed_not_silent() {
+        use prost::Message;
+
+        // A valid stored proof round-trips through the shared helper.
+        let charge = kirby_proto::ChargeIssued {
+            charge_id: "charge-10".to_string(),
+            invoice_or_request: "cashu:charge:req".to_string(),
+            amount_sats: 10,
+            method: kirby_proto::ChargeMethod::Cashu as i32,
+        };
+        let good = charge.encode_to_vec();
+        assert_eq!(
+            super::decode_issued_charge(&good),
+            Some(charge.clone()),
+            "a valid stored charge proof decodes back to the same charge"
+        );
+
+        // A corrupt proof FAILS CLOSED to None (no panic, no fabricated charge) -- the shared
+        // contract BOTH the STEP1-replay and the concurrent-Duplicate arm now route through.
+        let corrupt = vec![0xffu8, 0x00, 0x13, 0x37, 0xde, 0xad];
+        assert_eq!(
+            super::decode_issued_charge(&corrupt),
+            None,
+            "a corrupt stored charge proof fails closed (no bogus charge, no panic)"
+        );
+
+        // STEP1 wrapper: an IssueCharge act delegates to the fail-closed helper.
+        let act = kirby_proto::capability_request::Act::IssueCharge(kirby_proto::IssueCharge {
+            amount_sats: 10,
+            memo: "oracle: PRICE BTC/USD".to_string(),
+            method: kirby_proto::ChargeMethod::Cashu as i32,
+        });
+        assert_eq!(super::decode_charge(&corrupt, &act), None, "STEP1 corrupt -> fail-closed None");
+        assert_eq!(super::decode_charge(&good, &act), Some(charge), "STEP1 valid -> Some(charge)");
+
+        // A non-IssueCharge act never yields a charge (the act-specific gate is preserved).
+        let mem_act = kirby_proto::capability_request::Act::Memory(kirby_proto::Memory {
+            op: kirby_proto::MemoryOp::Set as i32,
+            slug: "core".to_string(),
+            value: b"x".to_vec(),
+            max_cost_sats: 10,
+        });
+        assert_eq!(super::decode_charge(&good, &mem_act), None, "non-IssueCharge act -> no charge");
     }
 }
