@@ -69,8 +69,9 @@ use frost::round1::{SigningCommitments, SigningNonces};
 use frost::round2::SignatureShare;
 use frost::SigningPackage;
 
-use kirby_custody::guardian::{self, CoSignRequest, RefuseReason};
+use kirby_custody::guardian::{self, CoSignRequest, EcdhRequest, RefuseReason};
 use kirby_custody::seam::{CoSignEvent, GuardianId, ROUND_COMMITMENT, ROUND_PACKAGE, ROUND_SHARE};
+use kirby_custody::EcdhContribution;
 
 use crate::quorum_signer::{identifier_to_u16, CeremonyGate, Holder, MIN_SIGNERS};
 
@@ -99,6 +100,25 @@ pub const ROUND_PROBE: u8 = 12;
 /// placement entry (sender-auth: an authenticated response for THIS Q's holder set, not merely
 /// "something answered"). No share, no nonce, no secret crosses.
 pub const ROUND_PROBE_ACK: u8 = 13;
+
+/// Round discriminant: the coordinator's THRESHOLD-ECDH REQUEST (coordinator -> holder). Payload is a
+/// serialized [`kirby_custody::guardian::EcdhRequest`] (the typed target + purpose). A SINGLE
+/// request→response round (no commitment round, no nonce) — strictly simpler than signing. The holder
+/// runs the ECDH membrane ([`kirby_custody::guardian::validate_ecdh`]) against its OWN pubkeys and, on
+/// `Ok`, replies its RAW contribution `D_i = s_i·B` + a DLEQ proof.
+pub const ROUND_ECDH_REQUEST: u8 = 20;
+
+/// Round discriminant: a holder's THRESHOLD-ECDH CONTRIBUTION (holder -> coordinator). Payload is a
+/// serialized [`kirby_custody::EcdhContribution`] (`D_i` + its DLEQ proof) — a POINT + a proof, NEVER
+/// the share.
+pub const ROUND_ECDH_CONTRIBUTION: u8 = 21;
+
+/// Round discriminant: a holder's THRESHOLD-ECDH REFUSAL (holder -> coordinator). Payload is a
+/// serialized [`RefuseReason`]. DEDICATED (not the signing [`ROUND_REFUSAL`]) so the coordinator hub
+/// demuxes it through the SESSION-SCOPED ECDH route (like a probe ack), never the per-holder signing
+/// route — the ECDH ceremony rides a session-scoped reply channel to avoid clobbering the memoized
+/// signer's routes.
+pub const ROUND_ECDH_REFUSAL: u8 = 22;
 
 /// The round-2 SIGN REQUEST envelope (coordinator -> holder). Sent as the payload of a
 /// [`ROUND_PACKAGE`] event so the holder receives BOTH the assembled `SigningPackage` AND
@@ -366,6 +386,88 @@ impl<T: HolderTransport + Send + Sync> Holder for RemoteHolder<T> {
     }
 }
 
+/// The coordinator-side PROXY for a remote holder's THRESHOLD-ECDH contribution. The ECDH sibling
+/// of [`RemoteHolder`]: a single request→response (no commitment round, no nonce) that sends a typed
+/// [`EcdhRequest`] and receives the holder's RAW `D_i = s_i·B` + DLEQ ([`EcdhContribution`]), or a
+/// refusal. Owns NO share — only the holder's PUBLIC u16 id + the transport. It is deliberately NOT a
+/// [`Holder`] (that trait is commit/validate_and_sign-shaped); the coordinator
+/// ([`crate::quorum_ecdh`]) drives a set of these + verifies + aggregates.
+pub struct RemoteEcdhHolder<T: HolderTransport> {
+    /// The remote holder's FROST identifier as a u16 (PUBLIC — the membrane's signer-set element).
+    id_u16: u16,
+    /// The transport to the holder's machine. Carries ONLY opaque CoSignEvents.
+    transport: T,
+}
+
+impl<T: HolderTransport> RemoteEcdhHolder<T> {
+    /// Build an ECDH proxy for the holder identified by `id_u16`, talking over `transport`. Holds NO
+    /// secret material.
+    pub fn new(id_u16: u16, transport: T) -> Self {
+        Self { id_u16, transport }
+    }
+
+    /// This remote holder's FROST identifier (u16, public).
+    pub fn id(&self) -> u16 {
+        self.id_u16
+    }
+
+    /// Request this holder's RAW ECDH contribution for `req` (which names the target `B`). Sends one
+    /// [`ROUND_ECDH_REQUEST`] and returns the [`EcdhContribution`] on [`ROUND_ECDH_CONTRIBUTION`], or
+    /// an `Err` on refusal / transport failure / session-or-sender mismatch. The coordinator treats an
+    /// `Err` as "this holder unavailable" and tries another `>=`-threshold responding subset — exactly
+    /// like signing's any-available-2-of-3 fallback. The DLEQ is verified by the COORDINATOR (not
+    /// here); this proxy only carries the opaque contribution back.
+    pub fn contribute(
+        &self,
+        session_id: u64,
+        req: &EcdhRequest,
+    ) -> anyhow::Result<EcdhContribution> {
+        let payload = serde_json::to_vec(req)
+            .map_err(|e| anyhow::anyhow!("serialize EcdhRequest for holder {}: {e}", self.id_u16))?;
+        self.transport.send(CoSignEvent {
+            session_id,
+            from: coordinator_id(),
+            round: ROUND_ECDH_REQUEST,
+            payload,
+        })?;
+        let reply = self.transport.recv()?;
+        if reply.session_id != session_id {
+            anyhow::bail!(
+                "remote ECDH holder {} reply session mismatch (asked {session_id}, got {})",
+                self.id_u16,
+                reply.session_id
+            );
+        }
+        // SENDER-IDENTITY CHECK (the new-entry-point guard, as in `RemoteHolder`): the reply MUST come
+        // from THIS holder — a misrouted/spoofed contribution for the same session must never be
+        // accepted as this holder's (the coordinator would verify its DLEQ against the WRONG canonical
+        // V_i and drop it, but bind it here regardless).
+        if identifier_to_u16(&reply.from) != self.id_u16 {
+            anyhow::bail!(
+                "remote ECDH holder {} reply came from {} (expected {})",
+                self.id_u16,
+                identifier_to_u16(&reply.from),
+                self.id_u16
+            );
+        }
+        match reply.round {
+            ROUND_ECDH_CONTRIBUTION => serde_json::from_slice::<EcdhContribution>(&reply.payload)
+                .map_err(|e| {
+                    anyhow::anyhow!("remote ECDH holder {} contribution decode: {e}", self.id_u16)
+                }),
+            ROUND_ECDH_REFUSAL => {
+                let reason: RefuseReason = serde_json::from_slice(&reply.payload)
+                    .unwrap_or(RefuseReason::BadKeyset);
+                anyhow::bail!("remote ECDH holder {} REFUSED ({reason:?})", self.id_u16)
+            }
+            other => anyhow::bail!(
+                "remote ECDH holder {} reply has unexpected round {other}",
+                self.id_u16
+            ),
+        }
+    }
+}
+
 /// The HOLDER-SIDE endpoint: the thing that runs on the holder's OWN machine and owns that
 /// holder's one share. It holds the `KeyPackage`, its OWN copy of the group
 /// `PublicKeyPackage` (the membrane derives Q from THIS, never a coordinator-asserted Q),
@@ -417,8 +519,61 @@ impl RemoteHolderServer {
             ROUND_COMMIT_REQUEST => self.handle_commit(event.session_id),
             ROUND_PACKAGE => self.handle_sign(event),
             ROUND_PROBE => self.handle_probe(event.session_id),
+            ROUND_ECDH_REQUEST => self.handle_ecdh(event),
             // An unknown request frame: refuse (never sign something we do not understand).
             _ => self.refuse(event.session_id, RefuseReason::BadKeyset),
+        }
+    }
+
+    /// THE ECDH MEMBRANE + the raw contribution, executed ON THE HOLDER'S MACHINE. Decode the typed
+    /// [`EcdhRequest`], run [`guardian::validate_ecdh`] against THIS holder's OWN pubkeys (self-decrypt
+    /// only: the target MUST be the agent's own Q), and ONLY on `Ok(())` compute + reply the RAW
+    /// contribution `D_i = s_i·B` + a DLEQ proof ([`ROUND_ECDH_CONTRIBUTION`]). A refusal (or a
+    /// malformed request) replies [`ROUND_ECDH_REFUSAL`] with the reason. NO nonce, NO commitment
+    /// round — a single request→response; the secret share never leaves this method.
+    fn handle_ecdh(&self, event: CoSignEvent) -> CoSignEvent {
+        let session_id = event.session_id;
+        let req: EcdhRequest = match serde_json::from_slice(&event.payload) {
+            Ok(r) => r,
+            Err(_) => return self.refuse_ecdh(session_id, RefuseReason::BadKeyset),
+        };
+        // THE MEMBRANE: derive Q from THIS holder's OWN pubkeys (never a coordinator-asserted Q) and
+        // require the target to be the agent's own Q. A refusal means NO contribution is produced.
+        if let Err(reason) =
+            guardian::validate_ecdh(&req, &self.own_pubkeys, self.id_u16, MIN_SIGNERS)
+        {
+            return self.refuse_ecdh(session_id, reason);
+        }
+        // Lift the (validated) target to its even-Y point B and compute D_i = s_i·B + DLEQ. A
+        // malformed target that survived the membrane (its x-only == Q) but does not lift is a hard
+        // refusal (never emit a degenerate contribution).
+        let peer = match kirby_custody::peer_point_from_xonly(&req.target_xonly) {
+            Ok(p) => p,
+            Err(_) => return self.refuse_ecdh(session_id, RefuseReason::EcdhTargetNotSelf),
+        };
+        match kirby_custody::holder_ecdh_raw_contribution(&self.key_package, &peer) {
+            Ok(contrib) => match serde_json::to_vec(&contrib) {
+                Ok(payload) => CoSignEvent {
+                    session_id,
+                    from: self.frost_id(),
+                    round: ROUND_ECDH_CONTRIBUTION,
+                    payload,
+                },
+                Err(_) => self.refuse_ecdh(session_id, RefuseReason::BadKeyset),
+            },
+            Err(_) => self.refuse_ecdh(session_id, RefuseReason::BadKeyset),
+        }
+    }
+
+    /// Build a [`ROUND_ECDH_REFUSAL`] reply carrying the serialized reason (the ECDH sibling of
+    /// [`Self::refuse`]; a dedicated round so the hub demuxes it session-scoped).
+    fn refuse_ecdh(&self, session_id: u64, reason: RefuseReason) -> CoSignEvent {
+        let payload = serde_json::to_vec(&reason).unwrap_or_default();
+        CoSignEvent {
+            session_id,
+            from: self.frost_id(),
+            round: ROUND_ECDH_REFUSAL,
+            payload,
         }
     }
 
@@ -1225,5 +1380,117 @@ mod tests {
         haystack
             .windows(needle.len())
             .any(|window| window == needle)
+    }
+
+    // ---- CROSS-MACHINE threshold-ECDH (self-decrypt) ----
+
+    use kirby_custody::guardian::{EcdhPurpose, EcdhRequest};
+
+    fn self_decrypt_req(session_id: u64, q: [u8; 32], set: &[u16]) -> EcdhRequest {
+        EcdhRequest {
+            session_id,
+            purpose: EcdhPurpose::SelfDecrypt,
+            target_xonly: q,
+            signer_set: set.iter().copied().collect(),
+        }
+    }
+
+    /// THE CROSS-MACHINE ECDH KEYSTONE: a 2-of-3 self-decrypt (B == Q) where BOTH holders are remote
+    /// (each `RemoteEcdhHolder` over the mock transport) yields, after the coordinator verifies each
+    /// DLEQ + aggregates, the SAME tweaked-Q shared point as the co-located
+    /// [`kirby_custody::threshold_ecdh_tweaked_q`] — i.e. the SAME `K_self` a co-located agent
+    /// derives. This is the memory-decrypt root reconstructed with NO share co-located.
+    #[test]
+    fn two_remote_ecdh_holders_self_decrypt_matches_colocated() {
+        let ks = keyset();
+        let kps = three_kps(&ks);
+        let q = group_xonly_q(&ks.pubkeys).expect("Q"); // self-decrypt target
+        let session = 42u64;
+
+        let s1 = Arc::new(RemoteHolderServer::new(kps[0].clone(), ks.pubkeys.clone()));
+        let s2 = Arc::new(RemoteHolderServer::new(kps[1].clone(), ks.pubkeys.clone()));
+        let e1 = RemoteEcdhHolder::new(s1.id(), InProcessHolderLink::new(Arc::clone(&s1)));
+        let e2 = RemoteEcdhHolder::new(s2.id(), InProcessHolderLink::new(Arc::clone(&s2)));
+        let req = self_decrypt_req(session, q, &[s1.id(), s2.id()]);
+
+        let c1 = e1.contribute(session, &req).expect("holder 1 contributes");
+        let c2 = e2.contribute(session, &req).expect("holder 2 contributes");
+
+        // Coordinator: verify each DLEQ against the canonical V_i + fold to the tweaked-Q point.
+        let contribs = vec![(*kps[0].identifier(), c1), (*kps[1].identifier(), c2)];
+        let distributed =
+            kirby_custody::aggregate_raw_contributions_tweaked_q(&contribs, &ks.pubkeys, 2, &q)
+                .expect("aggregate the remote contributions");
+        let colocated =
+            kirby_custody::threshold_ecdh_tweaked_q(&[&kps[0], &kps[1]], &ks.pubkeys, &q).unwrap();
+        assert_eq!(
+            distributed, colocated,
+            "the fully-off-box self-decrypt ECDH must equal the co-located tweaked-Q point (same K_self)"
+        );
+        // And the NIP-44 conversation key (K_self) matches on both paths.
+        assert_eq!(
+            kirby_custody::nip44_conversation_key(&distributed).unwrap(),
+            kirby_custody::nip44_conversation_key(&colocated).unwrap(),
+            "the derived K_self conversation key must match the co-located derivation"
+        );
+        println!("REMOTE-ECDH-SELF-DECRYPT PASS: an all-remote 2-of-3 self-decrypt derives the same K_self as co-located");
+    }
+
+    /// THE ECDH MEMBRANE RUNS HOLDER-SIDE: a request whose target is NOT the agent's own Q is
+    /// REFUSED (ROUND_ECDH_REFUSAL / EcdhTargetNotSelf), so no contribution is produced — a holder is
+    /// never a blind-ECDH oracle for an arbitrary peer B. The proxy surfaces the refusal as an `Err`.
+    #[test]
+    fn remote_ecdh_holder_refuses_non_self_target() {
+        let ks = keyset();
+        let kps = three_kps(&ks);
+        let q = group_xonly_q(&ks.pubkeys).expect("Q");
+        let mut not_q = q;
+        not_q[0] ^= 0x01; // a target that is not the agent's own Q
+
+        let server = Arc::new(RemoteHolderServer::new(kps[0].clone(), ks.pubkeys.clone()));
+        let e = RemoteEcdhHolder::new(server.id(), InProcessHolderLink::new(Arc::clone(&server)));
+        let req = self_decrypt_req(7, not_q, &[server.id()]);
+        let res = e.contribute(7, &req);
+        assert!(res.is_err(), "a non-self target must be refused holder-side, got {res:?}");
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("REFUSED") && msg.contains("EcdhTargetNotSelf"),
+            "the refusal must name EcdhTargetNotSelf: {msg}"
+        );
+
+        // Direct holder-side check too: the reply frame is a dedicated ECDH refusal (not a signing one).
+        let reply = server.handle(CoSignEvent {
+            session_id: 7,
+            from: coordinator_id(),
+            round: ROUND_ECDH_REQUEST,
+            payload: serde_json::to_vec(&req).unwrap(),
+        });
+        assert_eq!(reply.round, ROUND_ECDH_REFUSAL, "a refused ECDH replies ROUND_ECDH_REFUSAL");
+        println!("REMOTE-ECDH-MEMBRANE PASS: a non-Q target is refused holder-side (EcdhTargetNotSelf), no contribution");
+    }
+
+    /// THE SENDER-IDENTITY GUARD (ECDH): a contribution reply whose `from` is NOT this holder's
+    /// identifier is rejected — a misrouted/spoofed contribution for the session is never accepted.
+    #[test]
+    fn remote_ecdh_holder_rejects_reply_from_wrong_sender() {
+        let ks = keyset();
+        let kps = three_kps(&ks);
+        let q = group_xonly_q(&ks.pubkeys).expect("Q");
+        // Server is identifier 2; the link rewrites replies to claim identifier 1.
+        let server = Arc::new(RemoteHolderServer::new(kps[1].clone(), ks.pubkeys.clone()));
+        let wrong_from = GuardianId::try_from(identifier_to_u16(kps[0].identifier())).unwrap();
+        let link = SpoofingFromLink {
+            inner: InProcessHolderLink::new(Arc::clone(&server)),
+            spoof_from: wrong_from,
+        };
+        let e = RemoteEcdhHolder::new(server.id(), link);
+        let req = self_decrypt_req(9, q, &[server.id()]);
+        let res = e.contribute(9, &req);
+        assert!(res.is_err(), "an ECDH reply from the wrong sender must be rejected, got {res:?}");
+        assert!(
+            format!("{}", res.unwrap_err()).contains("came from"),
+            "the rejection should name the sender mismatch"
+        );
+        println!("REMOTE-ECDH-SENDER PASS: an ECDH contribution from the wrong holder identifier is rejected");
     }
 }

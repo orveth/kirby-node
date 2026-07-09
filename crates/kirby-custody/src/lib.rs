@@ -28,8 +28,9 @@ pub mod reshare;
 pub mod seam;
 pub use coordinator::{commit_for, key_packages, Coordinator, SessionState, SignError};
 pub use ecdh::{
-    holder_ecdh_contribution, nip44_conversation_key, threshold_ecdh_tweaked_q,
-    threshold_ecdh_untweaked, EcdhError, WirePoint,
+    aggregate_raw_contributions_tweaked_q, holder_ecdh_contribution, holder_ecdh_raw_contribution,
+    nip44_conversation_key, peer_point_from_xonly, threshold_ecdh_tweaked_q,
+    threshold_ecdh_untweaked, verify_dleq_share, DleqProof, EcdhContribution, EcdhError, WirePoint,
 };
 pub use reshare::{reshare_same_membership, RefreshedKeyset};
 pub use seam::{coordinate_2of3_over_seam, CoSignEvent, GuardianId, InMemoryRelay, RelayAdapter};
