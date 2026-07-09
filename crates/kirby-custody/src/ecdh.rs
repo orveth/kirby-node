@@ -60,10 +60,17 @@ use k256::elliptic_curve::PrimeField;
 use k256::{AffinePoint, EncodedPoint, FieldBytes, ProjectivePoint, Scalar};
 
 use hkdf::Hkdf;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// NIP-44 v2 HKDF-Extract salt (<https://nips.nostr.com/44>).
 const NIP44_V2_SALT: &[u8] = b"nip44-v2";
+
+/// Domain-separation tag for the threshold-ECDH DLEQ challenge (a BIP-340-style tagged hash,
+/// [`dleq_challenge`]). Versioned so a future construction change is unambiguous. codex flagged
+/// transcript binding + a ciphersuite/domain tag as mandatory (protocol hygiene, not algebraic
+/// necessity); this is that tag.
+const DLEQ_DST: &[u8] = b"kirby/threshold-ecdh/dleq/v1";
 
 /// Errors from the threshold-ECDH primitive. Never panics; mirrors the
 /// coordinator's fail-closed posture (a bad ceremony yields an error, not a secret).
@@ -89,6 +96,12 @@ pub enum EcdhError {
     /// `PublicKeyPackage` (shares from a different keyset would fold to a secret for no
     /// real key). Binds the ceremony to exactly one Q.
     MismatchedGroup(String),
+    /// A holder's DLEQ proof did not verify against its CANONICAL public verifying share:
+    /// the raw contribution `D_i` does NOT use the same secret share `s_i` as `V_i = s_i·G`.
+    /// The `String` names the holder (identifiable blame) — an ECDH aggregate has no public
+    /// verification equation, so an unverified `D_i` MUST be dropped + attributed here rather
+    /// than silently folded into a corrupt shared secret. Fail-closed.
+    DleqVerifyFailed(String),
 }
 
 impl fmt::Display for EcdhError {
@@ -101,6 +114,7 @@ impl fmt::Display for EcdhError {
             EcdhError::SignerNotInSet(m) => write!(f, "signer not in its signing set: {m}"),
             EcdhError::SubThreshold(m) => write!(f, "sub-threshold signing set: {m}"),
             EcdhError::MismatchedGroup(m) => write!(f, "mismatched signing group: {m}"),
+            EcdhError::DleqVerifyFailed(m) => write!(f, "DLEQ proof failed to verify: {m}"),
         }
     }
 }
@@ -142,6 +156,28 @@ impl WirePoint {
     fn x_coordinate(self) -> Result<[u8; 32], EcdhError> {
         let p = self.to_projective()?;
         Ok(p.to_affine().x().into())
+    }
+}
+
+// A `WirePoint` crosses the ceremony seam (inside an [`EcdhContribution`] / [`DleqProof`]), so it
+// serializes. It is a fixed 33-byte compressed SEC1 point; serde has no built-in impl for `[u8; 33]`
+// (only arrays up to 32), so encode as lowercase hex (canonical, human-debuggable on the wire). This
+// is a pure BYTE container — on-curve validation happens at [`WirePoint::to_projective`] use-sites,
+// exactly as for a `WirePoint` built any other way (a malformed hex point is caught there, not here).
+impl Serialize for WirePoint {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for WirePoint {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        let arr: [u8; 33] = bytes.as_slice().try_into().map_err(|_| {
+            serde::de::Error::custom("WirePoint must be exactly 33 bytes (compressed SEC1)")
+        })?;
+        Ok(WirePoint(arr))
     }
 }
 
@@ -414,6 +450,236 @@ pub fn threshold_ecdh_tweaked_q(
         s_b
     };
     // + t·B, the public taproot tweak folded on the ECDH side.
+    let r = d_int_b + b * tap_tweak_none(&p);
+    WirePoint::from_projective(&r)
+}
+
+// ================================================================================================
+// CROSS-MACHINE threshold-ECDH: RAW holder contributions + a Chaum-Pedersen DLEQ integrity proof.
+//
+// The co-located [`holder_ecdh_contribution`] bakes the Lagrange weight λ_i into the holder's
+// output (`λ_i·s_i·B`). The CROSS-MACHINE path instead has each holder emit the RAW point
+// `D_i = s_i·B` + a DLEQ proof, and the COORDINATOR applies λ_i over the responding set. This
+// (codex-recommended) split makes the DLEQ a DIRECT proof against the holder's PUBLIC verifying
+// share `V_i = s_i·G` (`log_G(V_i) == log_B(D_i)`), and the holder no longer needs to know the
+// signing set. The final aggregate is identical to the co-located tweaked-Q path (a test locks
+// `aggregate_raw_contributions_tweaked_q == threshold_ecdh_tweaked_q`, so the NIP-44 vectors
+// validate this path transitively).
+//
+// WHY THE PROOF (codex Q3): unlike a bad *signature* share (which fails aggregate verification
+// against Q for free), a bad *ECDH* share has NO public verification equation — a wrong `D_i`
+// silently yields a wrong shared point with no way to attribute the fault. The DLEQ gives
+// per-contribution correctness + IDENTIFIABLE BLAME at contribution time, so the coordinator
+// drops + names the cheating holder and never folds an unverified `D_i` into the secret.
+// ================================================================================================
+
+/// A holder's RAW ECDH contribution `D_i = s_i·B` (NO Lagrange weight — the coordinator applies λ
+/// over the responding set) plus a [`DleqProof`] that `D_i` uses the SAME secret share `s_i` as the
+/// holder's PUBLIC verifying share `V_i = s_i·G`. Crosses the ceremony seam holder→coordinator:
+/// a POINT + a proof, NEVER the share (recovering `s_i` from `s_i·B` is a discrete-log problem).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EcdhContribution {
+    /// The raw contribution point `D_i = s_i·B` (compressed SEC1).
+    pub d_i: WirePoint,
+    /// The DLEQ proof binding `D_i` to the holder's canonical `V_i`.
+    pub proof: DleqProof,
+}
+
+/// A non-interactive Chaum-Pedersen DLEQ proof that `log_G(V) == log_B(D)` for a secret scalar `s`
+/// (`V = s·G` public, `D = s·B`), over secp256k1 with Fiat-Shamir. Carries the `(R1, R2, z)`
+/// variant. codex confirmed the exact construction (both verification equations). Without it a
+/// byzantine holder's wrong `D` silently corrupts the aggregate with no identifiable blame.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DleqProof {
+    /// `R1 = r·G` (the commitment on the `G` base).
+    r1: WirePoint,
+    /// `R2 = r·B` (the commitment on the `B` base).
+    r2: WirePoint,
+    /// `z = r + c·s` (mod n), 32-byte big-endian.
+    z: [u8; 32],
+}
+
+/// Serialize a k256 scalar to its 32-byte big-endian form (the wire encoding of `z`).
+fn scalar_to_be_bytes(s: &Scalar) -> [u8; 32] {
+    s.to_bytes().into()
+}
+
+/// The Fiat-Shamir challenge `c = tagged_hash(DLEQ_DST, G ‖ B ‖ V ‖ D ‖ R1 ‖ R2) mod n`. Binds
+/// ALL public points (codex: transcript binding is mandatory) + a domain-separation tag. `G` is
+/// fixed by the ciphersuite but included for cleanliness. Points are canonical compressed SEC1.
+/// A `tagged_hash` per BIP-340 (`SHA256(SHA256(tag)‖SHA256(tag)‖msg)`), reduced mod n like
+/// [`tap_tweak_none`]. The caller REJECTS `c == 0` (a zero challenge makes the proof trivially
+/// satisfiable for any `D`); its probability is ~2⁻²⁵⁶.
+fn dleq_challenge(
+    b: &WirePoint,
+    v: &WirePoint,
+    d: &WirePoint,
+    r1: &WirePoint,
+    r2: &WirePoint,
+) -> Scalar {
+    let g = ProjectivePoint::GENERATOR.to_affine().to_encoded_point(true);
+    let tag_hash = Sha256::digest(DLEQ_DST);
+    let mut hasher = Sha256::new();
+    hasher.update(tag_hash);
+    hasher.update(tag_hash);
+    hasher.update(g.as_bytes());
+    hasher.update(b.0);
+    hasher.update(v.0);
+    hasher.update(d.0);
+    hasher.update(r1.0);
+    hasher.update(r2.0);
+    Scalar::reduce(U256::from_be_slice(&hasher.finalize()))
+}
+
+/// Holder-side: compute the RAW ECDH contribution `D = s·B` for the PUBLIC peer point `B` (which is
+/// the target key, or `Q` itself for self-decrypt), and a DLEQ proof that `D` uses the SAME `s` as
+/// the holder's public verifying share `V = s·G`. The secret share never leaves the holder; only a
+/// point + a proof cross the seam.
+///
+/// The proof is built over `V = s·G` recomputed from the holder's own `s`, so the proof is
+/// internally consistent; the COORDINATOR verifies it against the CANONICAL `V_i` from the group
+/// `PublicKeyPackage` (never a holder-asserted one), so a holder whose `s` does not match its
+/// canonical share cannot produce a passing contribution (it is caught + attributed).
+pub fn holder_ecdh_raw_contribution(
+    kp: &KeyPackage,
+    peer: &WirePoint,
+) -> Result<EcdhContribution, EcdhError> {
+    let s = scalar_from_be_bytes(&kp.signing_share().serialize())?;
+    let b = peer.to_projective()?;
+    // D = s·B (raw). from_projective rejects the identity (a zero share / canceling combine).
+    let d_i = WirePoint::from_projective(&(b * s))?;
+    // V = s·G, recomputed from THIS holder's s (binds the proof to the same s that made D).
+    let v = WirePoint::from_projective(&(ProjectivePoint::GENERATOR * s))?;
+    // Fiat-Shamir: r ← nonzero CSPRNG scalar; R1 = r·G, R2 = r·B; c = H(transcript); z = r + c·s.
+    let mut rng = rand::rngs::OsRng;
+    let r = *k256::NonZeroScalar::random(&mut rng);
+    let r1 = WirePoint::from_projective(&(ProjectivePoint::GENERATOR * r))?;
+    let r2 = WirePoint::from_projective(&(b * r))?;
+    let c = dleq_challenge(peer, &v, &d_i, &r1, &r2);
+    if c == Scalar::ZERO {
+        // ~2⁻²⁵⁶; a zero challenge makes the proof trivially satisfiable — refuse to emit one.
+        return Err(EcdhError::MalformedScalar("DLEQ challenge reduced to zero".to_string()));
+    }
+    let z = r + c * s;
+    Ok(EcdhContribution {
+        d_i,
+        proof: DleqProof { r1, r2, z: scalar_to_be_bytes(&z) },
+    })
+}
+
+/// Verify a [`DleqProof`] that `D = s·B` uses the SAME `s` as the public `V = s·G`
+/// (`log_G(V) == log_B(D)`). Recomputes the Fiat-Shamir challenge over the SAME transcript,
+/// rejects a zero challenge and a non-canonical `z`, then checks BOTH equations
+/// `z·G == R1 + c·V` and `z·B == R2 + c·D`. `Ok(())` iff valid; any failure is a
+/// [`EcdhError::DleqVerifyFailed`] (fail-closed). Every point is validated on decode
+/// ([`WirePoint::to_projective`]); the identity has no 33-byte compressed form so it cannot appear.
+pub fn verify_dleq_share(
+    proof: &DleqProof,
+    b: &WirePoint,
+    v: &WirePoint,
+    d: &WirePoint,
+) -> Result<(), EcdhError> {
+    let b_pt = b.to_projective()?;
+    let v_pt = v.to_projective()?;
+    let d_pt = d.to_projective()?;
+    let r1_pt = proof.r1.to_projective()?;
+    let r2_pt = proof.r2.to_projective()?;
+    // z must be a canonical (< n) scalar.
+    let z = scalar_from_be_bytes(&proof.z)?;
+    let c = dleq_challenge(b, v, d, &proof.r1, &proof.r2);
+    if c == Scalar::ZERO {
+        return Err(EcdhError::DleqVerifyFailed("challenge reduced to zero".to_string()));
+    }
+    // z·G == R1 + c·V  AND  z·B == R2 + c·D
+    let ok_g = ProjectivePoint::GENERATOR * z == r1_pt + v_pt * c;
+    let ok_b = b_pt * z == r2_pt + d_pt * c;
+    if ok_g && ok_b {
+        Ok(())
+    } else {
+        Err(EcdhError::DleqVerifyFailed("DLEQ equation check failed".to_string()))
+    }
+}
+
+/// The CANONICAL public verifying share `V_i = s_i·G` for holder `id`, from the group
+/// `PublicKeyPackage`. The coordinator verifies each DLEQ against THIS (never a holder-asserted V):
+/// it is what binds a raw contribution to the fleet's known share for that identifier.
+fn verifying_share_point(
+    pubkeys: &PublicKeyPackage,
+    id: &Identifier,
+) -> Result<WirePoint, EcdhError> {
+    let vs = pubkeys.verifying_shares().get(id).ok_or_else(|| {
+        EcdhError::MismatchedGroup(format!("{id:?} is not a member of the PublicKeyPackage"))
+    })?;
+    let bytes = vs
+        .serialize()
+        .map_err(|e| EcdhError::MalformedPoint(e.to_string()))?;
+    let arr: [u8; 33] = bytes.as_slice().try_into().map_err(|_| {
+        EcdhError::MalformedPoint("verifying share is not a 33-byte compressed point".to_string())
+    })?;
+    Ok(WirePoint(arr))
+}
+
+/// The COORDINATOR aggregate over the RESPONDING holders for the tweaked identity `Q`. For each
+/// contribution: VERIFY its DLEQ against the CANONICAL `V_i` (fail-closed + attributed — an
+/// unverified `D_i` is never folded), then λ-weight `D_i` over the EXACT responding set and sum to
+/// `S_B = Σ λ_i·D_i = s·B` (untweaked; `s` never formed). Finally fold parity + the public taproot
+/// tweak once — `Q_B = μ·S_B + t·B` — identical to [`threshold_ecdh_tweaked_q`] (the tweak lives
+/// entirely in the coordinator's public post-step; the per-holder DLEQ is about `s_i`, not the
+/// tweak — codex).
+///
+/// `contributions` is `(identifier, contribution)` for each responding holder. Requires
+/// `>= min_signers` DISTINCT responders that are members of `pubkeys` (a sub-threshold or
+/// cross-keyset combine folds to the WRONG scalar and is rejected up front, fail-closed).
+pub fn aggregate_raw_contributions_tweaked_q(
+    contributions: &[(Identifier, EcdhContribution)],
+    pubkeys: &PublicKeyPackage,
+    min_signers: u16,
+    peer_xonly: &[u8; 32],
+) -> Result<WirePoint, EcdhError> {
+    if contributions.is_empty() {
+        return Err(EcdhError::EmptySet);
+    }
+    let peer = peer_point_from_xonly(peer_xonly)?;
+    let b = peer.to_projective()?;
+
+    // The responding set (drives Lagrange). Reject duplicates — a repeated identifier would
+    // double-count a share in the combine.
+    let responding: Vec<Identifier> = contributions.iter().map(|(id, _)| *id).collect();
+    let mut seen: BTreeSet<Identifier> = BTreeSet::new();
+    for id in &responding {
+        if !seen.insert(*id) {
+            return Err(EcdhError::DuplicateSigner(format!("{id:?}")));
+        }
+    }
+    // Threshold: a sub-threshold responding set Lagrange-combines to the WRONG scalar (not `s`),
+    // and an ECDH aggregate has no self-check to catch it — reject it here, fail-closed.
+    if responding.len() < min_signers as usize {
+        return Err(EcdhError::SubThreshold(format!(
+            "{} of {} required responders",
+            responding.len(),
+            min_signers
+        )));
+    }
+
+    let mut acc = ProjectivePoint::IDENTITY;
+    for (id, contrib) in contributions {
+        // VERIFY against the CANONICAL V_i (membership is checked inside). A failure is a hard,
+        // attributed drop — never fold an unverified contribution into the secret.
+        let v_i = verifying_share_point(pubkeys, id)?;
+        verify_dleq_share(&contrib.proof, &peer, &v_i, &contrib.d_i)
+            .map_err(|_| EcdhError::DleqVerifyFailed(format!("holder {id:?}")))?;
+        let lambda = lagrange_coefficient(id, &responding)?;
+        acc += contrib.d_i.to_projective()? * lambda;
+    }
+
+    // acc = Σ λ_i·D_i = s·B (untweaked). Fold parity (frost even-Y) + the public tweak t·B once,
+    // exactly as `threshold_ecdh_tweaked_q` does.
+    let p = verifying_key_point(pubkeys)?;
+    let d_int_b = if bool::from(p.to_affine().y_is_odd()) {
+        -acc
+    } else {
+        acc
+    };
     let r = d_int_b + b * tap_tweak_none(&p);
     WirePoint::from_projective(&r)
 }
@@ -784,5 +1050,150 @@ mod tests {
         // Sanity: the matching pubkeys is accepted.
         assert!(threshold_ecdh_tweaked_q(&[&kps_a[0], &kps_a[1]], &pk_a, &pub2).is_ok());
         println!("TOOTH group-binding PASS: cross-keyset shares and mismatched pubkeys are rejected (MismatchedGroup)");
+    }
+
+    // ---- CROSS-MACHINE raw-contribution + DLEQ ----
+
+    /// A holder's DLEQ proof round-trips: a raw contribution's proof verifies against the SAME
+    /// holder's canonical `V_i` and its `D_i` (the honest-holder happy path).
+    #[test]
+    fn dleq_prove_verify_roundtrips() {
+        let (kps, pk) = dealer_keyset();
+        let peer = peer_point_from_xonly(&hex32(NIP44_VECTORS[0].1)).unwrap();
+        for kp in &kps {
+            let contrib = holder_ecdh_raw_contribution(kp, &peer).unwrap();
+            let v_i = verifying_share_point(&pk, kp.identifier()).unwrap();
+            verify_dleq_share(&contrib.proof, &peer, &v_i, &contrib.d_i)
+                .expect("an honest holder's DLEQ must verify against its canonical V_i");
+        }
+        println!("DLEQ-ROUNDTRIP PASS: each honest raw contribution's DLEQ verifies against its canonical V_i");
+    }
+
+    /// The DLEQ is load-bearing: a raw contribution with a TAMPERED `D_i` (a valid on-curve point,
+    /// but not `s_i·B`) does NOT verify — the proof binds `D_i` to the same `s_i` as `V_i`, and the
+    /// Fiat-Shamir transcript binds `D_i`, so swapping it breaks BOTH equations.
+    #[test]
+    fn dleq_verify_rejects_tampered_d() {
+        let (kps, pk) = dealer_keyset();
+        let peer = peer_point_from_xonly(&hex32(NIP44_VECTORS[0].1)).unwrap();
+        let c0 = holder_ecdh_raw_contribution(&kps[0], &peer).unwrap();
+        let c1 = holder_ecdh_raw_contribution(&kps[1], &peer).unwrap();
+        let v0 = verifying_share_point(&pk, kps[0].identifier()).unwrap();
+        // Verify holder 0's proof but against holder 1's D — must fail (D is bound in the proof).
+        let res = verify_dleq_share(&c0.proof, &peer, &v0, &c1.d_i);
+        assert!(
+            matches!(res, Err(EcdhError::DleqVerifyFailed(_))),
+            "a tampered D must fail DLEQ verification, got {res:?}"
+        );
+        // And verifying holder 0's proof against the WRONG V (holder 1's canonical V) fails too.
+        let v1 = verifying_share_point(&pk, kps[1].identifier()).unwrap();
+        assert!(
+            matches!(verify_dleq_share(&c0.proof, &peer, &v1, &c0.d_i), Err(EcdhError::DleqVerifyFailed(_))),
+            "verifying a proof against the wrong canonical V must fail"
+        );
+        println!("DLEQ-TAMPER PASS: a tampered D_i and a wrong-V both fail DLEQ verification (fail-closed)");
+    }
+
+    /// THE CORRECTNESS ORACLE: the cross-machine raw+DLEQ+aggregate path derives the SAME tweaked-Q
+    /// shared point as the co-located [`threshold_ecdh_tweaked_q`] — which is itself validated
+    /// against the paulmillr/nip44 v2 vectors + peer symmetry. So the distributed path inherits that
+    /// validation transitively, for a real peer AND for self-decrypt (B == Q), across BOTH parities
+    /// of the group key P and all three 2-of-3 quorums.
+    #[test]
+    fn aggregate_raw_matches_tweaked_q_both_parities() {
+        // A fixed real peer, plus self-decrypt (peer == Q) exercised per keyset.
+        let real_peer = hex32(NIP44_VECTORS[0].1);
+        let mut even = None;
+        let mut odd = None;
+        for seed_byte in 0u8..64 {
+            let (kps, pk, p_odd) = keyset_for_seed(seed_byte);
+            if p_odd && odd.is_none() {
+                odd = Some((kps, pk));
+            } else if !p_odd && even.is_none() {
+                even = Some((kps, pk));
+            }
+            if even.is_some() && odd.is_some() {
+                break;
+            }
+        }
+        for (parity, (kps, pk)) in [("even-Y P", even.unwrap()), ("odd-Y P", odd.unwrap())] {
+            let self_q = tweaked_q_xonly(&pk).unwrap();
+            for peer_xonly in [real_peer, self_q] {
+                let peer = peer_point_from_xonly(&peer_xonly).unwrap();
+                for (a, c, label) in [(0usize, 1usize, "{1,2}"), (0, 2, "{1,3}"), (1, 2, "{2,3}")] {
+                    let ca = holder_ecdh_raw_contribution(&kps[a], &peer).unwrap();
+                    let cc = holder_ecdh_raw_contribution(&kps[c], &peer).unwrap();
+                    let contribs = vec![(*kps[a].identifier(), ca), (*kps[c].identifier(), cc)];
+                    let distributed =
+                        aggregate_raw_contributions_tweaked_q(&contribs, &pk, 2, &peer_xonly).unwrap();
+                    let colocated =
+                        threshold_ecdh_tweaked_q(&[&kps[a], &kps[c]], &pk, &peer_xonly).unwrap();
+                    assert_eq!(
+                        distributed, colocated,
+                        "{parity} quorum {label}: distributed raw+DLEQ aggregate must equal the co-located tweaked-Q ECDH"
+                    );
+                }
+            }
+        }
+        println!("AGGREGATE-MATCHES PASS: distributed raw+DLEQ aggregate == co-located tweaked-Q ECDH (real peer + self-decrypt, both parities, all quorums)");
+    }
+
+    /// THE FAIL-CLOSED + IDENTIFIABLE-BLAME TOOTH: a single byzantine holder that returns a valid
+    /// on-curve `D_i` which is NOT `s_i·B` (here, another holder's contribution point) is CAUGHT by
+    /// the coordinator (its DLEQ fails against the canonical V_i) and the error NAMES that holder —
+    /// the aggregate is never computed over an unverified contribution.
+    #[test]
+    fn tooth_aggregate_catches_and_attributes_tampered_contribution() {
+        let (kps, pk) = dealer_keyset();
+        let peer_xonly = hex32(NIP44_VECTORS[0].1);
+        let peer = peer_point_from_xonly(&peer_xonly).unwrap();
+        let c0 = holder_ecdh_raw_contribution(&kps[0], &peer).unwrap();
+        let mut c1 = holder_ecdh_raw_contribution(&kps[1], &peer).unwrap();
+        // Byzantine holder 1 swaps in holder 0's D (a valid point, wrong for holder 1's s_i).
+        c1.d_i = c0.d_i;
+        let contribs = vec![(*kps[0].identifier(), c0), (*kps[1].identifier(), c1)];
+        let res = aggregate_raw_contributions_tweaked_q(&contribs, &pk, 2, &peer_xonly);
+        let expected_blame = format!("holder {:?}", kps[1].identifier());
+        match res {
+            Err(EcdhError::DleqVerifyFailed(msg)) => assert_eq!(
+                msg, expected_blame,
+                "the refusal must ATTRIBUTE the failure to the byzantine holder"
+            ),
+            other => panic!("a tampered contribution must be caught + attributed, got {other:?}"),
+        }
+        println!("AGGREGATE-BLAME PASS: a byzantine D_i is caught and the refusal names the cheating holder (fail-closed)");
+    }
+
+    /// A sub-threshold responding set is rejected up front (an ECDH aggregate has no self-check to
+    /// catch a wrong-scalar fold, so the threshold gate is load-bearing).
+    #[test]
+    fn tooth_aggregate_rejects_subthreshold() {
+        let (kps, pk) = dealer_keyset();
+        let peer_xonly = hex32(NIP44_VECTORS[0].1);
+        let peer = peer_point_from_xonly(&peer_xonly).unwrap();
+        let c0 = holder_ecdh_raw_contribution(&kps[0], &peer).unwrap();
+        let contribs = vec![(*kps[0].identifier(), c0)];
+        let res = aggregate_raw_contributions_tweaked_q(&contribs, &pk, 2, &peer_xonly);
+        assert!(
+            matches!(res, Err(EcdhError::SubThreshold(_))),
+            "a lone responder (1 of 2-of-3) must be rejected as SubThreshold, got {res:?}"
+        );
+        println!("AGGREGATE-SUBTHRESHOLD PASS: a sub-threshold responding set is rejected (no wrong-scalar fold)");
+    }
+
+    /// The wire types survive serde_json (the remote-holder seam serializes an `EcdhContribution`):
+    /// a round-trip is byte-preserving and the recovered contribution still DLEQ-verifies.
+    #[test]
+    fn ecdh_contribution_serde_roundtrips() {
+        let (kps, pk) = dealer_keyset();
+        let peer = peer_point_from_xonly(&hex32(NIP44_VECTORS[0].1)).unwrap();
+        let contrib = holder_ecdh_raw_contribution(&kps[0], &peer).unwrap();
+        let json = serde_json::to_vec(&contrib).unwrap();
+        let back: EcdhContribution = serde_json::from_slice(&json).unwrap();
+        assert_eq!(contrib, back, "EcdhContribution must round-trip through serde_json");
+        let v0 = verifying_share_point(&pk, kps[0].identifier()).unwrap();
+        verify_dleq_share(&back.proof, &peer, &v0, &back.d_i)
+            .expect("the deserialized contribution must still verify");
+        println!("ECDH-SERDE PASS: EcdhContribution round-trips through serde_json and still verifies");
     }
 }
