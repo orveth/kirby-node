@@ -202,16 +202,21 @@ impl HolderQuorumProbe for RelayHolderProbe<'_> {
         _agent_id: &str,
         _deadline: Duration,
     ) -> impl Future<Output = ProbeOutcome> + Send {
+        // A monotonic session id for THIS probe, generated BEFORE connecting so the transport's
+        // reply route is SESSION-SCOPED (`connect_probe`) -- it cannot clobber, nor be clobbered
+        // by, a live signing ceremony's per-holder route over the same hub (the F2 non-mutating
+        // routing fix). The holder echoes it in the `ROUND_PROBE_ACK`, which the hub demuxes back
+        // to this transport by (holder, session_id).
+        let session_id = next_probe_session();
         // Connect SYNCHRONOUSLY (borrowing the factory) BEFORE the async block, so the returned
         // future owns only its transport + Copy data and does not borrow `self` -- keeping it Send.
         // A connect failure (unreachable/unknown address) is fail-closed Unreachable.
-        let connected = self.factory.connect(address);
+        let connected = self.factory.connect_probe(address, session_id);
         async move {
             let transport = match connected {
                 Ok(t) => t,
                 Err(_) => return ProbeOutcome::Unreachable,
             };
-            let session_id = next_probe_session();
             let req = CoSignEvent {
                 session_id,
                 from: coordinator_id(),

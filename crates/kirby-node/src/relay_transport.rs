@@ -85,6 +85,12 @@ use crate::remote_holder::{HolderTransport, HolderTransportFactory, RemoteHolder
 /// under a second; this generous bound tolerates a slow relay without hanging a ceremony.
 pub const DEFAULT_WIRE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Session-scoped inbound PROBE-reply routing: (holder transport pubkey, probe session id) -> that
+/// probe's reply channel. Held separately from the signer's per-holder `routes` so a probe and a
+/// live ceremony can never clobber each other (the F2 non-mutating routing fix); see
+/// [`CoordinatorRelayHub::connect_probe`].
+type ProbeRoutes = Arc<Mutex<HashMap<(PublicKey, u64), StdSender<CoSignEvent>>>>;
+
 /// A holder-side gate: may this coordinator (its transport pubkey) solicit a co-sign for this
 /// agent right now? Consulted by [`run_holder_server`] BEFORE it lets a frame reach the
 /// `RemoteHolderServer`, so an un-entitled node cannot burn a holder's nonces or grief it.
@@ -235,6 +241,14 @@ pub struct CoordinatorRelayHub {
     /// Inbound-reply routing: holder transport pubkey -> that holder's reply channel. The
     /// actor reads it on every inbound frame; [`Self::connect`] registers a route.
     routes: Arc<Mutex<HashMap<PublicKey, StdSender<CoSignEvent>>>>,
+    /// Inbound PROBE-reply routing, held SEPARATELY from `routes` (keyed by (holder pubkey, probe
+    /// session id)) so a takeover-admission liveness probe ([`crate::quorum_probe`]) and a live
+    /// signing ceremony over the SAME holder can never clobber each other's reply route. A probe
+    /// registers a SESSION-SCOPED route via [`Self::connect_probe`]; the actor demuxes a
+    /// `ROUND_PROBE_ACK` reply here and EVERY other reply (commitment / share / refusal) through
+    /// `routes` (unchanged). A probe route is removed when its transport drops, so the map holds
+    /// only in-flight probes (bounded over a long-lived node's periodic failover probes).
+    probe_routes: ProbeRoutes,
     /// The per-wire `recv` timeout handed to each transport.
     timeout: Duration,
     /// The PER-AGENT ceremony serializer (see [`CeremonyGate`]). The hub is the agent's ONE
@@ -265,7 +279,10 @@ impl CoordinatorRelayHub {
         let (outbound_tx, outbound_rx) = unbounded_channel::<Event>();
         let routes: Arc<Mutex<HashMap<PublicKey, StdSender<CoSignEvent>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let probe_routes: ProbeRoutes =
+            Arc::new(Mutex::new(HashMap::new()));
         let actor_routes = Arc::clone(&routes);
+        let actor_probe_routes = Arc::clone(&probe_routes);
         let actor_agent = agent_id.clone();
         let actor = std::thread::Builder::new()
             .name("kirby-cosign-coordinator".to_string())
@@ -280,7 +297,13 @@ impl CoordinatorRelayHub {
                         return;
                     }
                 };
-                rt.block_on(coordinator_actor(conn, outbound_rx, actor_routes, actor_agent));
+                rt.block_on(coordinator_actor(
+                    conn,
+                    outbound_rx,
+                    actor_routes,
+                    actor_probe_routes,
+                    actor_agent,
+                ));
             })
             .context("spawn the co-sign coordinator actor thread")?;
         Ok(Self {
@@ -288,6 +311,7 @@ impl CoordinatorRelayHub {
             agent_id,
             outbound_tx,
             routes,
+            probe_routes,
             timeout,
             // ONE gate per hub = one per agent; every sign site loads the memoized distributed
             // signer built from this hub, so they all share this gate and serialize.
@@ -324,6 +348,45 @@ impl CoordinatorRelayHub {
             // thread at a time per transport, so the lock is uncontended.
             reply_rx: Mutex::new(reply_rx),
             timeout: self.timeout,
+            // A signing transport uses the session-AGNOSTIC `routes` map; no per-transport
+            // cleanup (its route is bounded -- one per holder -- and lives for the hub). Byte
+            // identical to before `probe_routes` existed.
+            probe_route: None,
+        })
+    }
+
+    /// Connect a SESSION-SCOPED transport for a takeover-admission liveness probe
+    /// ([`crate::quorum_probe`]). Unlike [`Self::connect`], its reply route lands in `probe_routes`
+    /// keyed by (holder pubkey, `session_id`), so registering it can NEVER overwrite the memoized
+    /// signer's session-agnostic `routes` entry for the same holder (the pre-#49 clobber: a bare
+    /// `routes.insert(pubkey, ..)` shared one channel per holder, so a probe's connect stole the
+    /// live signer's reply route). The returned transport removes its own probe route on drop, so a
+    /// per-probe route never outlives its one round-trip. Its `send` carries `ROUND_PROBE`, and the
+    /// holder answers `ROUND_PROBE_ACK` echoing `session_id` -- which the actor demuxes back here.
+    pub fn connect_probe(
+        &self,
+        address: &str,
+        session_id: u64,
+    ) -> anyhow::Result<RelayHolderTransport> {
+        let (holder_pubkey, _relays) = parse_holder_address(address)?;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<CoSignEvent>();
+        self.probe_routes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("co-sign hub probe routes poisoned"))?
+            .insert((holder_pubkey, session_id), reply_tx);
+        Ok(RelayHolderTransport {
+            agent_id: self.agent_id.clone(),
+            holder_pubkey,
+            coordinator_keys: self.coordinator_keys.clone(),
+            outbound_tx: self.outbound_tx.clone(),
+            reply_rx: Mutex::new(reply_rx),
+            timeout: self.timeout,
+            // Remove THIS probe's (pubkey, session) route when the transport drops (probe done,
+            // whether it got an ack or timed out) so `probe_routes` tracks only live probes.
+            probe_route: Some(ProbeRouteHandle {
+                probe_routes: Arc::clone(&self.probe_routes),
+                key: (holder_pubkey, session_id),
+            }),
         })
     }
 }
@@ -335,6 +398,14 @@ impl CoordinatorRelayHub {
 impl HolderTransportFactory for CoordinatorRelayHub {
     fn connect(&self, address: &str) -> anyhow::Result<Box<dyn HolderTransport + Send + Sync>> {
         Ok(Box::new(CoordinatorRelayHub::connect(self, address)?))
+    }
+
+    fn connect_probe(
+        &self,
+        address: &str,
+        session_id: u64,
+    ) -> anyhow::Result<Box<dyn HolderTransport + Send + Sync>> {
+        Ok(Box::new(CoordinatorRelayHub::connect_probe(self, address, session_id)?))
     }
 
     fn ceremony_gate(&self) -> CeremonyGate {
@@ -556,6 +627,7 @@ async fn coordinator_actor<C: RelayConn>(
     conn: C,
     mut outbound_rx: UnboundedReceiver<Event>,
     routes: Arc<Mutex<HashMap<PublicKey, StdSender<CoSignEvent>>>>,
+    probe_routes: ProbeRoutes,
     agent_id: String,
 ) {
     loop {
@@ -575,10 +647,20 @@ async fn coordinator_actor<C: RelayConn>(
                             if frame_agent != agent_id {
                                 continue; // a frame for another agent on the shared relay
                             }
-                            let route = routes
-                                .lock()
-                                .ok()
-                                .and_then(|m| m.get(&sender).cloned());
+                            // A ROUND_PROBE_ACK is a takeover-admission liveness reply: demux it to
+                            // its SESSION-SCOPED probe route (keyed by (sender, session_id)) so it can
+                            // neither clobber nor be clobbered by the memoized signer's per-holder
+                            // route. Every other reply (commitment / share / refusal) is a signing
+                            // ceremony reply and routes through `routes` by the sender alone -- the
+                            // pre-#49 path, unchanged.
+                            let route = if cosign.round == crate::remote_holder::ROUND_PROBE_ACK {
+                                probe_routes
+                                    .lock()
+                                    .ok()
+                                    .and_then(|m| m.get(&(sender, cosign.session_id)).cloned())
+                            } else {
+                                routes.lock().ok().and_then(|m| m.get(&sender).cloned())
+                            };
                             match route {
                                 Some(tx) => {
                                     // A closed receiver (its RemoteHolder gave up) is harmless.
@@ -614,6 +696,28 @@ pub struct RelayHolderTransport {
     /// one ceremony thread calls `recv` per transport, so the lock is uncontended.
     reply_rx: Mutex<StdReceiver<CoSignEvent>>,
     timeout: Duration,
+    /// Set ONLY for a probe transport ([`CoordinatorRelayHub::connect_probe`]): removes this
+    /// probe's session-scoped route from `probe_routes` on drop. `None` for a signing transport
+    /// ([`CoordinatorRelayHub::connect`]) -- its session-agnostic route is bounded and lives for
+    /// the hub, so the signer path is unchanged.
+    probe_route: Option<ProbeRouteHandle>,
+}
+
+/// Removes a probe's `(holder pubkey, session id)` route from the hub's `probe_routes` when the
+/// probe transport drops, so a per-probe route never outlives its one round-trip.
+struct ProbeRouteHandle {
+    probe_routes: ProbeRoutes,
+    key: (PublicKey, u64),
+}
+
+impl Drop for RelayHolderTransport {
+    fn drop(&mut self) {
+        if let Some(handle) = self.probe_route.take() {
+            if let Ok(mut routes) = handle.probe_routes.lock() {
+                routes.remove(&handle.key);
+            }
+        }
+    }
 }
 
 impl HolderTransport for RelayHolderTransport {
@@ -2046,6 +2150,101 @@ mod tests {
         drop(hub);
         let _ = holder_thread.join();
         println!("RELAY-REMOTE-HOLDER PASS: a 2-of-3 quorum with one RemoteHolder over the relay produced a Q-valid signature");
+    }
+
+    /// F2 TOOTH (non-mutating probe routing): a takeover-admission PROBE and a live signing ceremony
+    /// share ONE hub + ONE holder, concurrently -- and NEITHER loses its reply route. The signer's
+    /// transport ([`CoordinatorRelayHub::connect`]) takes a session-agnostic route; the probe's
+    /// ([`CoordinatorRelayHub::connect_probe`]) a session-scoped one. The holder then emits BOTH a
+    /// ceremony reply (`ROUND_COMMITMENT`) and a probe ack (`ROUND_PROBE_ACK`), and each is demuxed to
+    /// its OWN transport. Before #49 the probe's connect did a bare `routes.insert(pubkey, ..)` that
+    /// OVERWROTE the memoized signer's per-holder reply route -- so the ceremony reply would land in
+    /// the probe's channel and the live signer would hang. RED-on-revert: route `connect_probe` back
+    /// into `routes` (the pre-fix clobber) and the signer's `recv` below times out (route stolen).
+    #[test]
+    fn probe_and_live_ceremony_over_one_hub_keep_their_reply_routes() {
+        let relay = InMemoryRelay::new();
+        let coordinator_keys = Keys::generate();
+        let holder_keys = Keys::generate();
+
+        let coord_conn = relay.endpoint(coordinator_keys.public_key());
+        let hub = CoordinatorRelayHub::start(
+            coord_conn,
+            coordinator_keys.clone(),
+            AGENT,
+            DEFAULT_WIRE_TIMEOUT,
+        )
+        .expect("start hub");
+
+        let holder_addr = format!("{}@inmem", holder_keys.public_key().to_hex());
+        // The memoized SIGNER's transport for this holder (session-agnostic route in `routes`).
+        let signer_transport = hub.connect(&holder_addr).expect("signer connect");
+        // A PROBE's transport for the SAME holder, session-scoped in `probe_routes`.
+        const PROBE_SESSION: u64 = 7;
+        let probe_transport =
+            hub.connect_probe(&holder_addr, PROBE_SESSION).expect("probe connect");
+
+        // The holder emits BOTH replies (signed by its transport key, #p-addressed to the
+        // coordinator): the probe ack FIRST, so a clobbered signer route would drop the ceremony
+        // reply that follows. The ceremony reply carries the signer's first session id (0).
+        let probe_ack = CoSignEvent {
+            session_id: PROBE_SESSION,
+            from: GuardianId::try_from(2u16).unwrap(),
+            round: crate::remote_holder::ROUND_PROBE_ACK,
+            payload: Vec::new(),
+        };
+        let ceremony_reply = CoSignEvent {
+            session_id: 0,
+            from: GuardianId::try_from(2u16).unwrap(),
+            round: kirby_custody::seam::ROUND_COMMITMENT,
+            payload: vec![0xAB, 0xCD],
+        };
+        let ack_frame =
+            encode_cosign_frame(AGENT, &probe_ack, coordinator_keys.public_key(), &holder_keys)
+                .expect("encode probe ack");
+        let reply_frame = encode_cosign_frame(
+            AGENT,
+            &ceremony_reply,
+            coordinator_keys.public_key(),
+            &holder_keys,
+        )
+        .expect("encode ceremony reply");
+
+        let holder_conn = relay.endpoint(holder_keys.public_key());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("publish rt");
+        rt.block_on(async {
+            holder_conn.publish(ack_frame).await.expect("publish probe ack");
+            holder_conn.publish(reply_frame).await.expect("publish ceremony reply");
+        });
+
+        // The signer's route must still receive the CEREMONY reply, and the probe's route the PROBE
+        // ACK -- neither clobbered by the other's connect over the shared hub.
+        let got_signer = signer_transport
+            .recv()
+            .expect("signer route intact: the ceremony reply must reach the signer transport");
+        assert_eq!(
+            got_signer.round,
+            kirby_custody::seam::ROUND_COMMITMENT,
+            "the signer transport got the ceremony reply, not the probe ack"
+        );
+        assert_eq!(got_signer.payload, vec![0xAB, 0xCD]);
+
+        let got_probe = probe_transport
+            .recv()
+            .expect("probe route intact: the probe ack must reach the probe transport");
+        assert_eq!(got_probe.round, crate::remote_holder::ROUND_PROBE_ACK);
+        assert_eq!(
+            got_probe.session_id, PROBE_SESSION,
+            "the probe transport got its own session-scoped ack"
+        );
+
+        drop(hub);
+        println!(
+            "F2 PASS: a probe + a live ceremony over one hub keep distinct reply routes (no clobber)"
+        );
     }
 
     /// A fresh temp keystore base unique to this test + process (the holder's sealed store).

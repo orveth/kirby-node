@@ -174,6 +174,20 @@ pub trait HolderTransportFactory {
     /// never silently builds an under-strength quorum).
     fn connect(&self, address: &str) -> anyhow::Result<Box<dyn HolderTransport + Send + Sync>>;
 
+    /// Connect a SESSION-SCOPED transport for a takeover-admission liveness probe
+    /// ([`crate::quorum_probe`]). The production relay factory ([`crate::relay_transport`]) routes a
+    /// probe's reply under (holder, `session_id`), SEPARATELY from a live signer's per-holder route,
+    /// so a probe can never clobber the memoized signer's reply route (the pre-#49 hazard the #49
+    /// serializer + this seam close). The default delegates to [`Self::connect`]: an in-process test
+    /// factory has no shared reply-route map to clobber, so a distinct probe transport suffices.
+    fn connect_probe(
+        &self,
+        address: &str,
+        _session_id: u64,
+    ) -> anyhow::Result<Box<dyn HolderTransport + Send + Sync>> {
+        self.connect(address)
+    }
+
     /// The PER-AGENT ceremony serializer for the agent this factory coordinates (see
     /// [`CeremonyGate`]). The factory is the agent's ONE transport authority (the co-sign hub), so
     /// it owns the ONE gate every ceremony over these holders must hold. The distributed sign loader
