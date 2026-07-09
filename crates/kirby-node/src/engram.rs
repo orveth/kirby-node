@@ -165,6 +165,10 @@ impl EngramCrypto {
         let pubkey = keys.public_key();
         // K_self: the self-ECDH conversation-key root (derivable from the privkey
         // alone -> portable across every reborn instance of this agent).
+        // TODO(hygiene): this `ConversationKey` (and the ones `nip44::encrypt` / `decrypt_to_bytes`
+        // derive per call on this DEFAULT node-key path) is a `Copy` upstream type that cannot be
+        // zeroized on drop — the same upstream limitation documented at the Q path in `encrypt`.
+        // Adopt a zeroizable conversation key here too if nostr-sdk ever exposes one.
         let root = ConversationKey::derive(secret, &pubkey)
             .map_err(|e| anyhow!("derive self-ECDH conversation key (NIP-44 self-encrypt): {e}"))?;
         let k_dtag = hkdf_dtag(root.as_bytes());
@@ -215,7 +219,17 @@ impl EngramCrypto {
                     .context("NIP-44 self-encrypt the engram content")
             }
             Sealer::QSelf(k_self) => {
-                let ck = ConversationKey::new(**k_self);
+                // Borrow K_self straight from its `Zeroizing` buffer (no extra plaintext `[u8; 32]`
+                // temporary, vs `new(**k_self)`) into the tightest possible scope. NOTE (codex F1,
+                // upstream limitation): the resulting `ConversationKey` is a `Copy` newtype over
+                // `bitcoin_hashes::Hmac` — Rust forbids `Drop` on a `Copy` type and it exposes no
+                // scrub hook, so it CANNOT be zeroized on drop. We minimize the window (it drops at
+                // the end of this arm) but cannot scrub it. This is marginal defense-in-depth on a
+                // default-off path: the `Zeroizing` K_self is co-resident in RAM for the same op
+                // regardless. `from_slice` is byte-identical to `new([u8; 32])` for a 32-byte key
+                // (both wrap the same `Hmac` value), so the wire form is unchanged.
+                let ck = ConversationKey::from_slice(&k_self[..])
+                    .context("build the NIP-44 conversation key from K_self (Q path)")?;
                 let payload = encrypt_to_bytes(&ck, &frame.encode())
                     .context("NIP-44 self-encrypt the engram content under Q (K_self)")?;
                 Ok(BASE64.encode(payload))
@@ -233,7 +247,11 @@ impl EngramCrypto {
                     .context("NIP-44 self-decrypt the engram content")?
             }
             Sealer::QSelf(k_self) => {
-                let ck = ConversationKey::new(**k_self);
+                // F2, mirror of F1 in `encrypt`: borrow K_self from `Zeroizing` (no extra plaintext
+                // copy); the `ConversationKey` is upstream-non-zeroizable (`Copy`), so tightest scope
+                // is the only lever. `from_slice` is byte-identical to `new` for a 32-byte key.
+                let ck = ConversationKey::from_slice(&k_self[..])
+                    .context("build the NIP-44 conversation key from K_self (Q path)")?;
                 let raw = BASE64
                     .decode(content)
                     .context("base64-decode the engram content (Q path)")?;

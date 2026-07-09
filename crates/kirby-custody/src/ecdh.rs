@@ -477,7 +477,7 @@ pub fn threshold_ecdh_tweaked_q(
 /// over the responding set) plus a [`DleqProof`] that `D_i` uses the SAME secret share `s_i` as the
 /// holder's PUBLIC verifying share `V_i = s_i·G`. Crosses the ceremony seam holder→coordinator:
 /// a POINT + a proof, NEVER the share (recovering `s_i` from `s_i·B` is a discrete-log problem).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EcdhContribution {
     /// The raw contribution point `D_i = s_i·B` (compressed SEC1).
     pub d_i: WirePoint,
@@ -489,7 +489,7 @@ pub struct EcdhContribution {
 /// (`V = s·G` public, `D = s·B`), over secp256k1 with Fiat-Shamir. Carries the `(R1, R2, z)`
 /// variant. codex confirmed the exact construction (both verification equations). Without it a
 /// byzantine holder's wrong `D` silently corrupts the aggregate with no identifiable blame.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DleqProof {
     /// `R1 = r·G` (the commitment on the `G` base).
     r1: WirePoint,
@@ -497,6 +497,31 @@ pub struct DleqProof {
     r2: WirePoint,
     /// `z = r + c·s` (mod n), 32-byte big-endian.
     z: [u8; 32],
+}
+
+// Hand-written Debug (NOT derived) — REDACT the secret-derived point material so a stray `{:?}` on a
+// contribution can never dump it to a log (codex F3). `D_i = s_i·B` is sensitive: a threshold of D_i's
+// reconstructs K_self (the NIP-44 conversation key). The DLEQ transcript (R1, R2, z) is derived from
+// the holder's secret nonce r (z also folds in the share s); though it crosses the wire alongside D_i,
+// we keep raw nonce-derived point/scalar hex out of logs on this money path. Serde (the ACTUAL wire
+// form) is untouched — only the human/log rendering is redacted; the struct name stays for diagnostics.
+impl fmt::Debug for EcdhContribution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EcdhContribution")
+            .field("d_i", &"<redacted D_i>")
+            .field("proof", &self.proof)
+            .finish()
+    }
+}
+
+impl fmt::Debug for DleqProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DleqProof")
+            .field("r1", &"<redacted>")
+            .field("r2", &"<redacted>")
+            .field("z", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Serialize a k256 scalar to its 32-byte big-endian form (the wire encoding of `z`).
@@ -1084,6 +1109,32 @@ mod tests {
                 .expect("an honest holder's DLEQ must verify against its canonical V_i");
         }
         println!("DLEQ-ROUNDTRIP PASS: each honest raw contribution's DLEQ verifies against its canonical V_i");
+    }
+
+    /// F3 (codex LOW, secret hygiene): the hand-written Debug on [`EcdhContribution`] / [`DleqProof`]
+    /// REDACTS the secret-derived point material. `D_i` (a threshold of which reconstructs K_self) must
+    /// never reach a log via a stray `{:?}`. Assert the Debug string carries NEITHER the hex NOR the
+    /// derived decimal-array dump of `D_i` (nor the DLEQ transcript points/scalar), while the struct
+    /// name stays visible for diagnostics.
+    #[test]
+    fn debug_redacts_secret_ecdh_point_material() {
+        let (kps, _pk) = dealer_keyset();
+        let peer = peer_point_from_xonly(&hex32(NIP44_VECTORS[0].1)).unwrap();
+        let contrib = holder_ecdh_raw_contribution(&kps[0], &peer).unwrap();
+
+        let dbg = format!("{contrib:?}");
+
+        // D_i absent in EVERY dump form (hex + the derived decimal-array form).
+        assert!(!dbg.contains(&hex::encode(contrib.d_i.0)), "Debug leaked raw D_i hex: {dbg}");
+        assert!(!dbg.contains(&format!("{:?}", contrib.d_i.0)), "Debug leaked raw D_i byte array: {dbg}");
+        // The DLEQ transcript points/scalar are redacted too.
+        assert!(!dbg.contains(&hex::encode(contrib.proof.r1.0)), "Debug leaked R1: {dbg}");
+        assert!(!dbg.contains(&hex::encode(contrib.proof.r2.0)), "Debug leaked R2: {dbg}");
+        assert!(!dbg.contains(&hex::encode(contrib.proof.z)), "Debug leaked z: {dbg}");
+        // Struct stays identifiable; the secret is marked redacted.
+        assert!(dbg.contains("EcdhContribution"), "struct name should remain: {dbg}");
+        assert!(dbg.contains("redacted"), "expected a redacted placeholder: {dbg}");
+        println!("F3 PASS: EcdhContribution/DleqProof Debug redacts D_i + DLEQ transcript (no secret point hex/bytes in the dump)");
     }
 
     /// The DLEQ is load-bearing: a raw contribution with a TAMPERED `D_i` (a valid on-curve point,
