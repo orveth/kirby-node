@@ -831,7 +831,21 @@ impl HolderTransport for RelayHolderTransport {
             .lock()
             .map_err(|_| anyhow::anyhow!("relay holder transport reply channel poisoned"))?;
         match rx.recv_timeout(self.timeout) {
-            Ok(event) => Ok(event),
+            Ok(mut event) => {
+                // Open a sealed ECDH contribution (see `seal_ecdh_contribution`): decrypt
+                // coordinator<-holder before it reaches DLEQ-verify/aggregate. Every other round is
+                // plaintext (a signing share / refusal carries no secret). A decrypt failure is an
+                // `Err` -> the coordinator treats this holder as unavailable (any-available skip).
+                if event.round == crate::remote_holder::ROUND_ECDH_CONTRIBUTION {
+                    event.payload = open_ecdh_contribution(
+                        &self.coordinator_keys,
+                        &self.holder_pubkey,
+                        &event.payload,
+                    )
+                    .context("open the sealed ECDH contribution from the holder")?;
+                }
+                Ok(event)
+            }
             Err(RecvTimeoutError::Timeout) => anyhow::bail!(
                 "timed out after {:?} waiting for a reply from holder {}",
                 self.timeout,
@@ -842,6 +856,35 @@ impl HolderTransport for RelayHolderTransport {
             }
         }
     }
+}
+
+/// Seal an ECDH CONTRIBUTION holder->coordinator with NIP-44 so its raw `D_i` never crosses the
+/// relay in plaintext. Unlike a signature share (whose output is a PUBLIC signature), the ECDH
+/// contribution reconstructs the shared secret / `K_self` from PUBLIC group material (the Lagrange
+/// weights, parity, and tweak are all public), so a relay observer capturing a threshold of plaintext
+/// `D_i`s could derive `K_self` itself. Encrypting holder->coordinator (the coordinator IS the agent,
+/// legitimately deriving its own key) closes that. The frame is signed OVER the ciphertext
+/// (encrypt-then-sign), so integrity + sender-binding of (agent, session, round) are unchanged.
+fn seal_ecdh_contribution(
+    holder: &Keys,
+    coordinator: &PublicKey,
+    payload: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let ct = nip44::encrypt(holder.secret_key(), coordinator, payload, Version::V2)
+        .map_err(|e| anyhow::anyhow!("NIP-44 seal ECDH contribution: {e}"))?;
+    Ok(ct.into_bytes())
+}
+
+/// Open a sealed ECDH contribution coordinator<-holder (the inverse of [`seal_ecdh_contribution`]).
+fn open_ecdh_contribution(
+    coordinator: &Keys,
+    holder: &PublicKey,
+    payload: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let ct = std::str::from_utf8(payload)
+        .context("sealed ECDH contribution payload is not UTF-8 base64")?;
+    nip44::decrypt_to_bytes(coordinator.secret_key(), holder, ct)
+        .map_err(|e| anyhow::anyhow!("NIP-44 open ECDH contribution: {e}"))
 }
 
 /// Run a holder-side server loop: subscribe (via `conn`) to co-sign frames `#p`-addressed to
@@ -929,7 +972,14 @@ async fn handle_holder_frame<C: RelayConn>(
         .context("anti-replay guard refused the solicit")?;
     // Run the membrane + the share on THIS machine. The reply is itself an opaque CoSignEvent
     // (a commitment, a share, or a refusal); publish it back to the soliciting coordinator.
-    let reply = server.handle(cosign);
+    let mut reply = server.handle(cosign);
+    // CONFIDENTIALITY: an ECDH contribution's raw D_i reconstructs K_self from PUBLIC group material,
+    // so seal it holder->coordinator (the refusal + every signing round carry no secret and stay
+    // plaintext). The coordinator opens it in `RelayHolderTransport::recv` before verify/aggregate.
+    if reply.round == crate::remote_holder::ROUND_ECDH_CONTRIBUTION {
+        reply.payload = seal_ecdh_contribution(holder_keys, &coordinator, &reply.payload)
+            .context("seal the ECDH contribution to the coordinator")?;
+    }
     let reply_frame = encode_cosign_frame(agent_id, &reply, coordinator, holder_keys)?;
     conn.publish(reply_frame)
         .await
@@ -2368,11 +2418,15 @@ mod tests {
 
         // The holder emits the ECDH contribution FIRST (a clobbered signer route would then drop the
         // ceremony reply that follows). The ceremony reply carries the signer's first session id (0).
+        // The contribution rides SEALED holder->coordinator (recv opens it), so seal the payload
+        // exactly as a real holder would; the coordinator's recv decrypts it back to these bytes.
+        let ecdh_plaintext = vec![0x01u8, 0x02, 0x03];
         let ecdh_reply = CoSignEvent {
             session_id: ECDH_SESSION,
             from: GuardianId::try_from(2u16).unwrap(),
             round: crate::remote_holder::ROUND_ECDH_CONTRIBUTION,
-            payload: vec![0x01, 0x02, 0x03],
+            payload: seal_ecdh_contribution(&holder_keys, &coordinator_keys.public_key(), &ecdh_plaintext)
+                .expect("seal the ecdh contribution"),
         };
         let ceremony_reply = CoSignEvent {
             session_id: 0,
@@ -2421,12 +2475,51 @@ mod tests {
             got_ecdh.session_id, ECDH_SESSION,
             "the ECDH transport got its own session-scoped contribution"
         );
-        assert_eq!(got_ecdh.payload, vec![0x01, 0x02, 0x03]);
+        assert_eq!(
+            got_ecdh.payload, ecdh_plaintext,
+            "recv must decrypt the sealed contribution back to the plaintext"
+        );
 
         drop(hub);
         println!(
             "ECDH-DEMUX PASS: an ECDH ceremony + a live signer over one hub keep distinct reply routes (no clobber)"
         );
+    }
+
+    /// THE ECDH WIRE-CONFIDENTIALITY TOOTH (codex re-review HIGH): a holder's ECDH contribution is
+    /// SEALED holder->coordinator, so the raw D_i — which reconstructs K_self from PUBLIC group
+    /// material — NEVER appears in the wire payload. Only the coordinator opens it; a third party
+    /// cannot. (Signature shares stay plaintext: their output is a public signature. This is the
+    /// ECDH-specific confidentiality the primitive requires.)
+    #[test]
+    fn ecdh_contribution_is_sealed_holder_to_coordinator() {
+        let holder = Keys::generate();
+        let coordinator = Keys::generate();
+        // A REAL ECDH contribution payload (raw D_i + DLEQ), as handle_ecdh serializes it.
+        let ks = keyset();
+        let kps = three_kps(&ks);
+        let q_xonly = kirby_custody::group_xonly_q(&ks.pubkeys).unwrap();
+        let peer = kirby_custody::peer_point_from_xonly(&q_xonly).unwrap();
+        let contrib = kirby_custody::holder_ecdh_raw_contribution(&kps[0], &peer).unwrap();
+        let plaintext = serde_json::to_vec(&contrib).unwrap();
+
+        // Seal: the wire bytes must differ from the plaintext AND not contain it verbatim.
+        let sealed = seal_ecdh_contribution(&holder, &coordinator.public_key(), &plaintext).unwrap();
+        assert_ne!(sealed, plaintext, "sealed payload must differ from plaintext");
+        assert!(
+            !sealed.windows(plaintext.len()).any(|w| w == plaintext.as_slice()),
+            "the plaintext contribution must not appear verbatim in the sealed wire bytes"
+        );
+        // Only the coordinator opens it, recovering the EXACT contribution (round-trip).
+        let opened = open_ecdh_contribution(&coordinator, &holder.public_key(), &sealed).unwrap();
+        assert_eq!(opened, plaintext, "the coordinator must recover the exact contribution");
+        // A third party (wrong key) cannot open it.
+        let stranger = Keys::generate();
+        assert!(
+            open_ecdh_contribution(&stranger, &holder.public_key(), &sealed).is_err(),
+            "a non-coordinator must not open the sealed contribution"
+        );
+        println!("ECDH-WIRE-CONFIDENTIALITY PASS: contribution sealed holder->coordinator; plaintext D_i absent from the wire; only the coordinator opens it");
     }
 
     /// A fresh temp keystore base unique to this test + process (the holder's sealed store).
