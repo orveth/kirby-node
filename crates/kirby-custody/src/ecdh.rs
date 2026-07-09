@@ -1127,10 +1127,15 @@ mod tests {
         // D_i absent in EVERY dump form (hex + the derived decimal-array form).
         assert!(!dbg.contains(&hex::encode(contrib.d_i.0)), "Debug leaked raw D_i hex: {dbg}");
         assert!(!dbg.contains(&format!("{:?}", contrib.d_i.0)), "Debug leaked raw D_i byte array: {dbg}");
-        // The DLEQ transcript points/scalar are redacted too.
-        assert!(!dbg.contains(&hex::encode(contrib.proof.r1.0)), "Debug leaked R1: {dbg}");
-        assert!(!dbg.contains(&hex::encode(contrib.proof.r2.0)), "Debug leaked R2: {dbg}");
-        assert!(!dbg.contains(&hex::encode(contrib.proof.z)), "Debug leaked z: {dbg}");
+        // The DLEQ transcript points/scalar are redacted too — in EVERY dump form (hex + the derived
+        // decimal-array form), mirroring the D_i coverage. (A derived Debug on DleqProof would dump
+        // these as decimal arrays, which the hex checks alone would miss — codex F3 tooth-gap follow-up.)
+        assert!(!dbg.contains(&hex::encode(contrib.proof.r1.0)), "Debug leaked R1 hex: {dbg}");
+        assert!(!dbg.contains(&format!("{:?}", contrib.proof.r1.0)), "Debug leaked R1 byte array: {dbg}");
+        assert!(!dbg.contains(&hex::encode(contrib.proof.r2.0)), "Debug leaked R2 hex: {dbg}");
+        assert!(!dbg.contains(&format!("{:?}", contrib.proof.r2.0)), "Debug leaked R2 byte array: {dbg}");
+        assert!(!dbg.contains(&hex::encode(contrib.proof.z)), "Debug leaked z hex: {dbg}");
+        assert!(!dbg.contains(&format!("{:?}", contrib.proof.z)), "Debug leaked z byte array: {dbg}");
         // Struct stays identifiable; the secret is marked redacted.
         assert!(dbg.contains("EcdhContribution"), "struct name should remain: {dbg}");
         assert!(dbg.contains("redacted"), "expected a redacted placeholder: {dbg}");
