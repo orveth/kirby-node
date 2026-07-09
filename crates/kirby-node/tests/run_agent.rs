@@ -60,6 +60,7 @@ fn bootstrap_config(test: &str, image_dir: PathBuf, funding_sats: u64) -> KirbyC
             frost_keystore_dir: None,
             dm_under_q: false,
             distributed_signing_enabled: false,
+            memory_under_q: false,
         },
         relay: RelayConfig {
             url: test_relay(),
