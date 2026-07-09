@@ -2919,7 +2919,7 @@ mod tests {
 
         // The CO-LOCATED reference K_self: unseal all 3 shares + derive the self-ECDH under Q
         // in-process (this touches NO relay). The distributed round must match this exactly.
-        let kps: Vec<KeyPackage> = (1..=SHARE_COUNT as u16)
+        let kps: Vec<KeyPackage> = (1..=SHARE_COUNT)
             .map(|idx| {
                 serde_json::from_slice(&sinks[(idx - 1) as usize].get_share(idx).unwrap()).unwrap()
             })
