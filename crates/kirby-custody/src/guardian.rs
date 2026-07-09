@@ -230,6 +230,12 @@ pub enum RefuseReason {
     /// P1 introduces by publishing a 10050 under Q). A TARGETED check; full content-schema
     /// validation across all authorizable kinds is a membrane-wide typed-intents follow-up.
     MalformedInboxRelays,
+    /// A threshold-ECDH request whose target `B` is NOT the agent's own Q (self-decrypt only).
+    /// THE core ECDH-membrane gate ([`validate_ecdh`]): an ECDH request has no message to
+    /// reconstruct, so a byzantine coordinator with quorum reach could otherwise harvest the
+    /// shared secret for ANY peer (reading a DM, or the memory root). CUT-1 admits ONLY
+    /// `B == Q` — the holder helps the agent read ITS OWN encrypted state and nothing else.
+    EcdhTargetNotSelf,
 }
 
 /// A deliberate, hand-maintained REPLICA of `kirby_proto::sanitize_note_for_publish`
@@ -418,6 +424,82 @@ pub fn validate(
     }
 
     // 5. Only here is it safe to sign.
+    Ok(())
+}
+
+/// The typed PURPOSE of a threshold-ECDH request a holder authorizes ([`validate_ecdh`]). CUT-1
+/// admits ONLY self-decrypt (target `B == the agent's own Q`) — the memory-root / wallet-self-read
+/// plane. DM-peer ECDH authorization (which peer targets a coordinator may request) is an OPEN
+/// design problem — a signing membrane authorizes by reconstructing a message, but an ECDH request
+/// has no message, so a byzantine coordinator with quorum reach could harvest the shared secret for
+/// an arbitrary peer. Self-decrypt sidesteps it (the holder only ever helps derive the agent's OWN
+/// self-key), which is all the MEMORY plane needs; DM-peer ECDH is deliberately NOT admitted here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EcdhPurpose {
+    /// Derive the agent's own self-ECDH key: target `B` MUST equal the agent's own Q. Unconditionally
+    /// allowed for an entitled coordinator (the endpoint auth + anti-replay gate WHO can ask).
+    SelfDecrypt,
+}
+
+/// A typed threshold-ECDH request a holder validates BEFORE emitting a raw contribution
+/// ([`crate::ecdh::holder_ecdh_raw_contribution`]). The holder derives Q from its OWN `pubkeys` and
+/// requires `target_xonly == Q` (for [`EcdhPurpose::SelfDecrypt`]) — it NEVER computes `s_i·B` for a
+/// coordinator-chosen `B`. Carries NO secret material (the target key + claimed set are public), so
+/// serializing it over the seam leaks nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EcdhRequest {
+    /// The ceremony session id (routing/dedupe; not security-load-bearing here).
+    pub session_id: u64,
+    /// What the holder is being asked to authorize.
+    pub purpose: EcdhPurpose,
+    /// The 32-byte x-only target key `B` the coordinator wants `s_i·B` for. Equality-checked against
+    /// the holder's OWN Q (SelfDecrypt) — the membrane's core gate.
+    pub target_xonly: [u8; 32],
+    /// The claimed quorum (FROST identifiers as u16). The RAW contribution does not depend on it (no
+    /// holder-side Lagrange), but the membrane checks this holder is in it and it is `>= threshold`,
+    /// for parity with the signing membrane.
+    pub signer_set: BTreeSet<u16>,
+}
+
+/// Validate a threshold-ECDH request BEFORE a holder emits its raw `D_i = s_i·B` contribution.
+/// `Ok(())` is the ONLY value that means "safe to contribute". Pure, no network, no secret touched.
+///
+/// This is the ECDH-membrane parallel of [`validate`]. A signing request is authorized by MESSAGE
+/// RECONSTRUCTION; an ECDH request has no message, so the membrane gates on POLICY instead:
+///   1. Derive Q from the holder's OWN `pubkeys` (never a coordinator-asserted Q).
+///   2. PURPOSE + TARGET gate: self-decrypt only — `target_xonly` MUST equal the agent's own Q, so a
+///      byzantine coordinator can never get the holder to ECDH an arbitrary peer (the core gate).
+///   3. Signer-set checks (this holder in the claimed set; set `>= min_signers`) — parity with
+///      [`validate`]; the endpoint-auth + anti-replay guards live transport-side (unchanged).
+///
+/// CALLER PROVENANCE (load-bearing, same as [`validate`]): `pubkeys` + `min_signers` MUST come from
+/// the holder's OWN persisted keyset, NEVER from the coordinator/wire.
+pub fn validate_ecdh(
+    req: &EcdhRequest,
+    pubkeys: &PublicKeyPackage,
+    my_identifier: u16,
+    min_signers: u16,
+) -> Result<(), RefuseReason> {
+    // 1. Derive Q from the holder's OWN PublicKeyPackage.
+    let q = group_xonly_q(pubkeys).map_err(|_| RefuseReason::BadKeyset)?;
+
+    // 2. PURPOSE + TARGET: self-decrypt only. The target MUST be the agent's own Q — the holder
+    //    only ever helps the agent read ITS OWN encrypted state, never a third party's key.
+    match req.purpose {
+        EcdhPurpose::SelfDecrypt => {
+            if req.target_xonly != q {
+                return Err(RefuseReason::EcdhTargetNotSelf);
+            }
+        }
+    }
+
+    // 3. Signer-set checks (parity with the signing membrane).
+    if !req.signer_set.contains(&my_identifier) {
+        return Err(RefuseReason::NotInSignerSet);
+    }
+    if req.signer_set.len() < min_signers as usize {
+        return Err(RefuseReason::SubThreshold);
+    }
     Ok(())
 }
 
@@ -793,5 +875,72 @@ mod tests {
         );
 
         println!("G-BEACON-MEMBRANE (custody) PASS: 10100/9100/31000 accept on matching id+tags, refuse tampered tags/content (MessageMismatch), beacon JSON NOT sanitized, kind:0 still BadKind");
+    }
+
+    // ---- ECDH membrane (self-decrypt only) ----
+
+    fn ecdh_req(target_xonly: [u8; 32], set: &[u16]) -> EcdhRequest {
+        EcdhRequest {
+            session_id: 7,
+            purpose: EcdhPurpose::SelfDecrypt,
+            target_xonly,
+            signer_set: set.iter().copied().collect(),
+        }
+    }
+
+    /// G-ECDH-ACCEPTS-SELF: a self-decrypt request whose target IS the agent's own Q, from a holder
+    /// in a `>=`-threshold set, validates Ok.
+    #[test]
+    fn g_ecdh_accepts_self_decrypt() {
+        let (keyset, _signers) = keyset_and_two();
+        let q = group_xonly_q(&keyset.pubkeys).expect("Q");
+        let req = ecdh_req(q, &[1, 2]);
+        assert_eq!(
+            validate_ecdh(&req, &keyset.pubkeys, 1, 2),
+            Ok(()),
+            "self-decrypt against the agent's own Q must validate"
+        );
+        println!("G-ECDH-ACCEPTS-SELF PASS: target == Q, holder in a >=threshold set -> Ok");
+    }
+
+    /// G-ECDH-REJECTS-NON-SELF (THE core gate): a request whose target is ANY key other than the
+    /// agent's own Q is refused `EcdhTargetNotSelf` — the holder never computes s_i·B for a
+    /// coordinator-chosen peer B (which would harvest a shared secret for reading a DM / another key).
+    #[test]
+    fn g_ecdh_rejects_non_self_target() {
+        let (keyset, _signers) = keyset_and_two();
+        let q = group_xonly_q(&keyset.pubkeys).expect("Q");
+        // A peer key that is definitely not Q (flip a byte of Q so it stays 32 bytes but differs).
+        let mut not_q = q;
+        not_q[0] ^= 0x01;
+        let req = ecdh_req(not_q, &[1, 2]);
+        assert_eq!(
+            validate_ecdh(&req, &keyset.pubkeys, 1, 2),
+            Err(RefuseReason::EcdhTargetNotSelf),
+            "an ECDH target that is not the agent's own Q must be refused (self-decrypt only)"
+        );
+        println!("G-ECDH-REJECTS-NON-SELF PASS: a non-Q target is refused EcdhTargetNotSelf (no arbitrary-peer ECDH)");
+    }
+
+    /// G-ECDH-SIGNER-SET: my_identifier not in the claimed set -> NotInSignerSet; a sub-threshold
+    /// set -> SubThreshold (parity with the signing membrane).
+    #[test]
+    fn g_ecdh_signer_set() {
+        let (keyset, _signers) = keyset_and_two();
+        let q = group_xonly_q(&keyset.pubkeys).expect("Q");
+        // (a) holder 3 is not in the claimed set {1,2} -> NotInSignerSet (target is valid, isolating
+        //     the signer-set check).
+        assert_eq!(
+            validate_ecdh(&ecdh_req(q, &[1, 2]), &keyset.pubkeys, 3, 2),
+            Err(RefuseReason::NotInSignerSet),
+            "holder not in the claimed set -> NotInSignerSet"
+        );
+        // (b) a sub-threshold claimed set {1} -> SubThreshold.
+        assert_eq!(
+            validate_ecdh(&ecdh_req(q, &[1]), &keyset.pubkeys, 1, 2),
+            Err(RefuseReason::SubThreshold),
+            "sub-threshold claimed set -> SubThreshold"
+        );
+        println!("G-ECDH-SIGNER-SET PASS: NotInSignerSet + SubThreshold refused (parity with signing membrane)");
     }
 }
