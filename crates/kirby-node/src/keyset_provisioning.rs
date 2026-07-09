@@ -409,6 +409,38 @@ pub fn load_quorum_ecdh_at(keystore_dir: &Path) -> anyhow::Result<crate::quorum_
         .context("build co-located QuorumEcdh from the persisted keystore")
 }
 
+/// Load a DISTRIBUTED [`QuorumEcdh`](crate::quorum_ecdh::QuorumEcdh) over REMOTE holders reached
+/// through the co-sign hub `factory` -- the ECDH counterpart of [`load_quorum_signer_distributed`].
+/// The group anchor (verifying material) is node-local; the SECRET shares stay on the holders, so
+/// NONE is unsealed into this process. The self-decrypt round runs over the placement roster (the
+/// SAME identifier->address map the distributed signer dials). Fail-closed on a placement without an
+/// anchor (a keystore that crashed mid-first-spawn, never launched in that state).
+pub fn load_quorum_ecdh_distributed(
+    keystore_dir: &Path,
+    factory: std::sync::Arc<dyn crate::remote_holder::HolderTransportFactory + Send + Sync>,
+) -> anyhow::Result<crate::quorum_ecdh::QuorumEcdh> {
+    if !has_identity_anchor(keystore_dir) {
+        anyhow::bail!(
+            "distributed FROST keystore {} has a placement manifest but no group anchor \
+             (group_pubkeys.json); it is not fully provisioned -- refusing to load (fail closed)",
+            keystore_dir.display()
+        );
+    }
+    let identity = FrostIdentity::load(&pubkeys_path(keystore_dir))
+        .with_context(|| format!("load group pubkeys from {}", keystore_dir.display()))?;
+    let pubkeys: PublicKeyPackage = identity.pubkeys().clone();
+    let placement = load_placement(keystore_dir)?;
+    // The full holder roster (identifier, address); any-available selection picks a reachable
+    // >=-threshold subset per ceremony. NO share is held here.
+    let holders: Vec<(u16, String)> = placement
+        .holders
+        .iter()
+        .map(|h| (h.identifier, h.address.clone()))
+        .collect();
+    crate::quorum_ecdh::QuorumEcdh::new_distributed(factory, holders, pubkeys)
+        .context("build distributed QuorumEcdh from the placement roster (shares stay on holders)")
+}
+
 /// Load the agent's group taproot key Q (32 x-only bytes) from a keystore dir using ONLY its
 /// PUBLIC `group_pubkeys.json` -- no secret shares. This is the verifying key a lease's FROST
 /// signature is checked under (`event.pubkey == hex(Q)` + the BIP-340 sig verifies under Q).
@@ -2865,15 +2897,17 @@ mod tests {
         println!("INC2a INERT PASS: placement.json present + flag OFF => NO hub, co-located sign Q-valid (placement alone does NOT engage distributed)");
     }
 
-    /// ★ INC2a ECDH CO-GATE (fail-closed IN CODE): a DISTRIBUTED keystore must refuse an in-process
-    /// ECDH load LOUDLY -- cross-machine threshold ECDH is Inc3, and a distributed box holds fewer
-    /// than the quorum of shares locally. This enforces the Inc2+3 co-gate in code, not merely by a
-    /// config default. RED-on-revert (manual): delete the `self.hub.is_some()` guard in
-    /// `AgentCosign::load_ecdh` and this FAILS -- the load falls through to `load_quorum_ecdh_at`,
-    /// which proceeds on the < quorum local shares instead of failing closed.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn distributed_keystore_ecdh_load_fails_closed_naming_the_inc3_co_gate() {
-        let (anchor, dirs) = dist_dirs("inc2-ecdh-cogate");
+    /// ★ INC3 ECDH OVER THE WIRE (the Inc2+3 co-gate now CLOSED): a DISTRIBUTED keystore loads a
+    /// distributed `QuorumEcdh` whose self-decrypt round runs over the REAL relay holders (the
+    /// pre-Inc3 fail-closed bail is deleted). With all 3 relay holders up, `load_ecdh` +
+    /// `conversation_key(Q)` derives the SAME `K_self` a co-located provider (over the same unsealed
+    /// shares) derives — proving cross-machine threshold ECDH is WIRED, not merely refused. Each
+    /// spawned `RemoteHolderServer` handles `ROUND_ECDH_REQUEST` (the membrane + the raw D_i + DLEQ)
+    /// and the coordinator verifies every DLEQ + aggregates. (This REPLACES the pre-Inc3 co-gate
+    /// fail-closed tooth: the behavior it asserted — a loud bail — is exactly what this change removes.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn distributed_keystore_ecdh_derives_k_self_over_the_real_relay() {
+        let (anchor, dirs) = dist_dirs("inc3-ecdh-wire");
         let sinks = sealed_sinks(&dirs);
         let holder_keys: Vec<Keys> = (0..SHARE_COUNT).map(|_| Keys::generate()).collect();
 
@@ -2881,9 +2915,32 @@ mod tests {
         let url = relay.url().await.to_string();
         let placement = relay_placement(&holder_keys, &url);
         provision_keyset_distributed(&anchor, &placement, &as_dyn(&sinks)).expect("provision");
+        let pubkeys = FrostIdentity::load(&pubkeys_path(&anchor)).unwrap().pubkeys().clone();
 
-        // The REAL production object: a distributed AgentCosign (hub started). ECDH never dials the
-        // hub -- the guard fires purely on the keystore shape.
+        // The CO-LOCATED reference K_self: unseal all 3 shares + derive the self-ECDH under Q
+        // in-process (this touches NO relay). The distributed round must match this exactly.
+        let kps: Vec<KeyPackage> = (1..=SHARE_COUNT as u16)
+            .map(|idx| {
+                serde_json::from_slice(&sinks[(idx - 1) as usize].get_share(idx).unwrap()).unwrap()
+            })
+            .collect();
+        let colocated =
+            crate::quorum_ecdh::QuorumEcdh::new(kps, pubkeys.clone()).expect("co-located ecdh");
+        let q = colocated.q_public_key().expect("Q");
+        let reference = colocated.conversation_key(&q).expect("co-located K_self");
+
+        // Bring up all 3 relay holders (each RemoteHolderServer now handles ROUND_ECDH_REQUEST).
+        let (tx1, h1) =
+            spawn_relay_holder(holder_keys[0].clone(), 1, &sinks[0], pubkeys.clone(), url.clone())
+                .await;
+        let (tx2, h2) =
+            spawn_relay_holder(holder_keys[1].clone(), 2, &sinks[1], pubkeys.clone(), url.clone())
+                .await;
+        let (tx3, h3) =
+            spawn_relay_holder(holder_keys[2].clone(), 3, &sinks[2], pubkeys.clone(), url.clone())
+                .await;
+
+        // The distributed provider: load_ecdh no longer bails -> a QuorumEcdh over the hub.
         let cosign = AgentCosign::build(
             Some(anchor.clone()),
             Keys::generate(),
@@ -2893,20 +2950,32 @@ mod tests {
         )
         .await
         .expect("build distributed AgentCosign");
+        let ecdh = cosign.load_ecdh().expect("distributed load_ecdh succeeds (Inc3 wired)");
 
-        // `QuorumEcdh` isn't `Debug`, so match rather than `expect_err`.
-        let err = match cosign.load_ecdh() {
-            Ok(_) => panic!(
-                "load_ecdh MUST fail closed on a distributed keystore (the Inc2+3 co-gate)"
-            ),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("Inc3") && msg.contains("DISTRIBUTED"),
-            "the co-gate error must name Inc3 + the distributed keystore, got: {msg}"
+        // The self-decrypt round is a blocking ceremony (bounded by the wire timeout); run it off the
+        // async runtime, exactly as the distributed SIGN path does.
+        let derived = tokio::task::spawn_blocking(move || {
+            let q = ecdh.q_public_key().expect("Q");
+            ecdh.conversation_key(&q)
+        })
+        .await
+        .expect("join the ECDH ceremony task")
+        .expect("the distributed self-decrypt round derives K_self over the wire");
+
+        assert_eq!(
+            derived.as_bytes(),
+            reference.as_bytes(),
+            "the distributed self-decrypt K_self must equal the co-located derivation"
         );
-        println!("INC2a ECDH CO-GATE PASS (fail-closed in code): {msg}");
+
+        let _ = tx1.send(());
+        let _ = tx2.send(());
+        let _ = tx3.send(());
+        drop(cosign);
+        let _ = h1.join();
+        let _ = h2.join();
+        let _ = h3.join();
+        println!("INC3 ECDH-OVER-WIRE PASS: distributed load_ecdh derives the same K_self over the real relay as co-located");
     }
 
     /// ★ INC2a ANY-AVAILABLE over the REAL wire: with one holder-server down, the coordinator's

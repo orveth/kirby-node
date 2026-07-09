@@ -91,6 +91,14 @@ pub const DEFAULT_WIRE_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`CoordinatorRelayHub::connect_probe`].
 type ProbeRoutes = Arc<Mutex<HashMap<(PublicKey, u64), StdSender<CoSignEvent>>>>;
 
+/// Session-scoped inbound THRESHOLD-ECDH-reply routing: (holder transport pubkey, ECDH session id)
+/// -> that ceremony's reply channel. Held SEPARATELY from the signer's per-holder `routes` (exactly
+/// like [`ProbeRoutes`]) so a single-round ECDH ceremony can never clobber the memoized signer's
+/// route for the same holder; see [`CoordinatorRelayHub::connect_ecdh`]. Same shape as `ProbeRoutes`
+/// but a DISTINCT map (a probe session id and an ECDH session id come from different counters, so
+/// they must not share a keyspace).
+type EcdhRoutes = Arc<Mutex<HashMap<(PublicKey, u64), StdSender<CoSignEvent>>>>;
+
 /// A holder-side gate: may this coordinator (its transport pubkey) solicit a co-sign for this
 /// agent right now? Consulted by [`run_holder_server`] BEFORE it lets a frame reach the
 /// `RemoteHolderServer`, so an un-entitled node cannot burn a holder's nonces or grief it.
@@ -249,6 +257,11 @@ pub struct CoordinatorRelayHub {
     /// `routes` (unchanged). A probe route is removed when its transport drops, so the map holds
     /// only in-flight probes (bounded over a long-lived node's periodic failover probes).
     probe_routes: ProbeRoutes,
+    /// Session-scoped ECDH-reply routing (see [`EcdhRoutes`]): the single-round threshold-ECDH
+    /// ceremony ([`crate::quorum_ecdh`]) registers a route here via [`Self::connect_ecdh`], so its
+    /// contribution/refusal reply demuxes SEPARATELY from the memoized signer's per-holder `routes`.
+    /// A route is removed when its transport drops, so the map holds only in-flight ECDH ceremonies.
+    ecdh_routes: EcdhRoutes,
     /// The per-wire `recv` timeout handed to each transport.
     timeout: Duration,
     /// The PER-AGENT ceremony serializer (see [`CeremonyGate`]). The hub is the agent's ONE
@@ -281,8 +294,10 @@ impl CoordinatorRelayHub {
             Arc::new(Mutex::new(HashMap::new()));
         let probe_routes: ProbeRoutes =
             Arc::new(Mutex::new(HashMap::new()));
+        let ecdh_routes: EcdhRoutes = Arc::new(Mutex::new(HashMap::new()));
         let actor_routes = Arc::clone(&routes);
         let actor_probe_routes = Arc::clone(&probe_routes);
+        let actor_ecdh_routes = Arc::clone(&ecdh_routes);
         let actor_agent = agent_id.clone();
         let actor = std::thread::Builder::new()
             .name("kirby-cosign-coordinator".to_string())
@@ -302,6 +317,7 @@ impl CoordinatorRelayHub {
                     outbound_rx,
                     actor_routes,
                     actor_probe_routes,
+                    actor_ecdh_routes,
                     actor_agent,
                 ));
             })
@@ -312,6 +328,7 @@ impl CoordinatorRelayHub {
             outbound_tx,
             routes,
             probe_routes,
+            ecdh_routes,
             timeout,
             // ONE gate per hub = one per agent; every sign site loads the memoized distributed
             // signer built from this hub, so they all share this gate and serialize.
@@ -352,6 +369,7 @@ impl CoordinatorRelayHub {
             // cleanup (its route is bounded -- one per holder -- and lives for the hub). Byte
             // identical to before `probe_routes` existed.
             probe_route: None,
+            ecdh_route: None,
         })
     }
 
@@ -387,6 +405,42 @@ impl CoordinatorRelayHub {
                 probe_routes: Arc::clone(&self.probe_routes),
                 key: (holder_pubkey, session_id),
             }),
+            ecdh_route: None,
+        })
+    }
+
+    /// Connect a SESSION-SCOPED transport for a single-round THRESHOLD-ECDH ceremony
+    /// ([`crate::quorum_ecdh::QuorumEcdh`] distributed mode). Mirrors [`Self::connect_probe`]: its
+    /// reply route lands in `ecdh_routes` keyed by (holder pubkey, `session_id`), so registering it
+    /// can NEVER overwrite the memoized signer's session-agnostic `routes` entry for the same holder
+    /// (the same clobber `connect_probe` was built to avoid). The returned transport removes its own
+    /// ECDH route on drop. Its `send` carries [`crate::remote_holder::ROUND_ECDH_REQUEST`]; the holder
+    /// answers `ROUND_ECDH_CONTRIBUTION` (or `ROUND_ECDH_REFUSAL`) echoing `session_id`, which the
+    /// actor demuxes back here.
+    pub fn connect_ecdh(
+        &self,
+        address: &str,
+        session_id: u64,
+    ) -> anyhow::Result<RelayHolderTransport> {
+        let (holder_pubkey, _relays) = parse_holder_address(address)?;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<CoSignEvent>();
+        self.ecdh_routes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("co-sign hub ecdh routes poisoned"))?
+            .insert((holder_pubkey, session_id), reply_tx);
+        Ok(RelayHolderTransport {
+            agent_id: self.agent_id.clone(),
+            holder_pubkey,
+            coordinator_keys: self.coordinator_keys.clone(),
+            outbound_tx: self.outbound_tx.clone(),
+            reply_rx: Mutex::new(reply_rx),
+            timeout: self.timeout,
+            probe_route: None,
+            // Remove THIS ceremony's (pubkey, session) route when the transport drops.
+            ecdh_route: Some(EcdhRouteHandle {
+                ecdh_routes: Arc::clone(&self.ecdh_routes),
+                key: (holder_pubkey, session_id),
+            }),
         })
     }
 }
@@ -406,6 +460,14 @@ impl HolderTransportFactory for CoordinatorRelayHub {
         session_id: u64,
     ) -> anyhow::Result<Box<dyn HolderTransport + Send + Sync>> {
         Ok(Box::new(CoordinatorRelayHub::connect_probe(self, address, session_id)?))
+    }
+
+    fn connect_ecdh(
+        &self,
+        address: &str,
+        session_id: u64,
+    ) -> anyhow::Result<Box<dyn HolderTransport + Send + Sync>> {
+        Ok(Box::new(CoordinatorRelayHub::connect_ecdh(self, address, session_id)?))
     }
 
     fn ceremony_gate(&self) -> CeremonyGate {
@@ -594,29 +656,34 @@ impl AgentCosign {
         }
     }
 
-    /// The [`QuorumEcdh`](crate::quorum_ecdh::QuorumEcdh) for the DM / wallet-read (NIP-44) path.
-    /// FAIL-CLOSED LOUD when distributed signing is ENGAGED (`self.hub.is_some()` -- placement
-    /// present AND the ON-flip gate set): cross-machine threshold ECDH lands in Inc3, and an engaged
-    /// distributed agent holds FEWER than the quorum of shares locally, so in-process ECDH cannot
-    /// reach quorum. This enforces the Inc2+3 co-gate IN CODE, keyed off the SAME engagement decision
-    /// as [`Self::load_signer`] (so a placement-present-but-INERT keystore, flag off, stays on the
-    /// co-located ECDH path -- consistent with its co-located signing). Not-engaged =>
-    /// [`crate::keyset_provisioning::load_quorum_ecdh_at`] (unchanged).
+    /// The [`QuorumEcdh`](crate::quorum_ecdh::QuorumEcdh) for the DM / wallet-read / memory (NIP-44)
+    /// path, dispatched by the SAME engagement decision as [`Self::load_signer`]:
+    ///   * DISTRIBUTED (`self.hub.is_some()` -- placement present AND the ON-flip gate set): the
+    ///     cross-machine threshold-ECDH self-decrypt round over the shared hub (Inc3, now WIRED). An
+    ///     engaged distributed agent holds fewer than the quorum of shares locally, so ECDH runs over
+    ///     the SAME remote holders + relay transport as signing, serialized by the shared ceremony
+    ///     gate. (This deletes the pre-Inc3 fail-closed bail.)
+    ///   * CO-LOCATED (or placement-present-but-INERT, flag off): the in-process combine
+    ///     ([`crate::keyset_provisioning::load_quorum_ecdh_at`]), byte-identical to before.
     pub fn load_ecdh(&self) -> anyhow::Result<crate::quorum_ecdh::QuorumEcdh> {
         let dir = self.keystore_dir.as_deref().ok_or_else(|| {
             anyhow::anyhow!("AgentCosign::load_ecdh called with no FROST keystore configured")
         })?;
-        if self.hub.is_some() {
-            anyhow::bail!(
-                "FROST keystore {} has DISTRIBUTED signing ENGAGED, but cross-machine threshold ECDH \
-                 (the DM / wallet-read path) is not yet wired -- it lands in Inc3. This is the Inc2+3 \
-                 co-gate: an engaged distributed agent holds fewer than the quorum of shares locally, \
-                 so in-process ECDH cannot reach quorum. Refusing to load (fail closed).",
-                dir.display()
-            );
+        match &self.hub {
+            Some(hub) => crate::keyset_provisioning::load_quorum_ecdh_distributed(
+                dir,
+                Arc::clone(hub) as Arc<dyn HolderTransportFactory + Send + Sync>,
+            )
+            .with_context(|| {
+                format!(
+                    "load the distributed QuorumEcdh via the shared co-sign hub (keystore {})",
+                    dir.display()
+                )
+            }),
+            None => crate::keyset_provisioning::load_quorum_ecdh_at(dir).with_context(|| {
+                format!("load co-located QuorumEcdh from keystore {}", dir.display())
+            }),
         }
-        crate::keyset_provisioning::load_quorum_ecdh_at(dir)
-            .with_context(|| format!("load co-located QuorumEcdh from keystore {}", dir.display()))
     }
 }
 
@@ -628,6 +695,7 @@ async fn coordinator_actor<C: RelayConn>(
     mut outbound_rx: UnboundedReceiver<Event>,
     routes: Arc<Mutex<HashMap<PublicKey, StdSender<CoSignEvent>>>>,
     probe_routes: ProbeRoutes,
+    ecdh_routes: EcdhRoutes,
     agent_id: String,
 ) {
     loop {
@@ -653,13 +721,20 @@ async fn coordinator_actor<C: RelayConn>(
                             // route. Every other reply (commitment / share / refusal) is a signing
                             // ceremony reply and routes through `routes` by the sender alone -- the
                             // pre-#49 path, unchanged.
-                            let route = if cosign.round == crate::remote_holder::ROUND_PROBE_ACK {
-                                probe_routes
+                            let route = match cosign.round {
+                                crate::remote_holder::ROUND_PROBE_ACK => probe_routes
                                     .lock()
                                     .ok()
-                                    .and_then(|m| m.get(&(sender, cosign.session_id)).cloned())
-                            } else {
-                                routes.lock().ok().and_then(|m| m.get(&sender).cloned())
+                                    .and_then(|m| m.get(&(sender, cosign.session_id)).cloned()),
+                                // A single-round ECDH reply (contribution or refusal) demuxes to its
+                                // SESSION-SCOPED route, so it never clobbers / is clobbered by the
+                                // memoized signer's per-holder route.
+                                crate::remote_holder::ROUND_ECDH_CONTRIBUTION
+                                | crate::remote_holder::ROUND_ECDH_REFUSAL => ecdh_routes
+                                    .lock()
+                                    .ok()
+                                    .and_then(|m| m.get(&(sender, cosign.session_id)).cloned()),
+                                _ => routes.lock().ok().and_then(|m| m.get(&sender).cloned()),
                             };
                             match route {
                                 Some(tx) => {
@@ -701,6 +776,9 @@ pub struct RelayHolderTransport {
     /// ([`CoordinatorRelayHub::connect`]) -- its session-agnostic route is bounded and lives for
     /// the hub, so the signer path is unchanged.
     probe_route: Option<ProbeRouteHandle>,
+    /// Set ONLY for an ECDH transport ([`CoordinatorRelayHub::connect_ecdh`]): removes this ceremony's
+    /// session-scoped route from `ecdh_routes` on drop. `None` for signing / probe transports.
+    ecdh_route: Option<EcdhRouteHandle>,
 }
 
 /// Removes a probe's `(holder pubkey, session id)` route from the hub's `probe_routes` when the
@@ -710,10 +788,23 @@ struct ProbeRouteHandle {
     key: (PublicKey, u64),
 }
 
+/// Removes an ECDH ceremony's `(holder pubkey, session id)` route from the hub's `ecdh_routes` when
+/// the ECDH transport drops, so a per-ceremony route never outlives its one round-trip (mirrors
+/// [`ProbeRouteHandle`]).
+struct EcdhRouteHandle {
+    ecdh_routes: EcdhRoutes,
+    key: (PublicKey, u64),
+}
+
 impl Drop for RelayHolderTransport {
     fn drop(&mut self) {
         if let Some(handle) = self.probe_route.take() {
             if let Ok(mut routes) = handle.probe_routes.lock() {
+                routes.remove(&handle.key);
+            }
+        }
+        if let Some(handle) = self.ecdh_route.take() {
+            if let Ok(mut routes) = handle.ecdh_routes.lock() {
                 routes.remove(&handle.key);
             }
         }
@@ -2244,6 +2335,97 @@ mod tests {
         drop(hub);
         println!(
             "F2 PASS: a probe + a live ceremony over one hub keep distinct reply routes (no clobber)"
+        );
+    }
+
+    /// THE ECDH-DEMUX TOOTH: a live SIGNER ceremony and a single-round ECDH ceremony over the SAME
+    /// hub for the SAME holder keep DISTINCT reply routes. The holder emits BOTH an ECDH contribution
+    /// (`ROUND_ECDH_CONTRIBUTION`, session-scoped) and a signing reply (`ROUND_COMMITMENT`,
+    /// per-holder); each demuxes to its OWN transport. If `connect_ecdh` had registered in the
+    /// signer's per-holder `routes` (the clobber), the ceremony reply would land in the ECDH channel
+    /// and the live signer would hang — this proves the session-scoped ECDH route avoids that.
+    #[test]
+    fn ecdh_and_live_ceremony_over_one_hub_keep_their_reply_routes() {
+        let relay = InMemoryRelay::new();
+        let coordinator_keys = Keys::generate();
+        let holder_keys = Keys::generate();
+
+        let coord_conn = relay.endpoint(coordinator_keys.public_key());
+        let hub = CoordinatorRelayHub::start(
+            coord_conn,
+            coordinator_keys.clone(),
+            AGENT,
+            DEFAULT_WIRE_TIMEOUT,
+        )
+        .expect("start hub");
+
+        let holder_addr = format!("{}@inmem", holder_keys.public_key().to_hex());
+        // The memoized SIGNER's transport (session-agnostic route in `routes`).
+        let signer_transport = hub.connect(&holder_addr).expect("signer connect");
+        // An ECDH ceremony's transport for the SAME holder, session-scoped in `ecdh_routes`.
+        const ECDH_SESSION: u64 = 5;
+        let ecdh_transport = hub.connect_ecdh(&holder_addr, ECDH_SESSION).expect("ecdh connect");
+
+        // The holder emits the ECDH contribution FIRST (a clobbered signer route would then drop the
+        // ceremony reply that follows). The ceremony reply carries the signer's first session id (0).
+        let ecdh_reply = CoSignEvent {
+            session_id: ECDH_SESSION,
+            from: GuardianId::try_from(2u16).unwrap(),
+            round: crate::remote_holder::ROUND_ECDH_CONTRIBUTION,
+            payload: vec![0x01, 0x02, 0x03],
+        };
+        let ceremony_reply = CoSignEvent {
+            session_id: 0,
+            from: GuardianId::try_from(2u16).unwrap(),
+            round: kirby_custody::seam::ROUND_COMMITMENT,
+            payload: vec![0xAB, 0xCD],
+        };
+        let ecdh_frame =
+            encode_cosign_frame(AGENT, &ecdh_reply, coordinator_keys.public_key(), &holder_keys)
+                .expect("encode ecdh reply");
+        let reply_frame = encode_cosign_frame(
+            AGENT,
+            &ceremony_reply,
+            coordinator_keys.public_key(),
+            &holder_keys,
+        )
+        .expect("encode ceremony reply");
+
+        let holder_conn = relay.endpoint(holder_keys.public_key());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("publish rt");
+        rt.block_on(async {
+            holder_conn.publish(ecdh_frame).await.expect("publish ecdh reply");
+            holder_conn.publish(reply_frame).await.expect("publish ceremony reply");
+        });
+
+        // The signer's route must still receive the CEREMONY reply, and the ECDH route the ECDH
+        // contribution -- neither clobbered by the other's connect over the shared hub.
+        let got_signer = signer_transport
+            .recv()
+            .expect("signer route intact: the ceremony reply must reach the signer transport");
+        assert_eq!(
+            got_signer.round,
+            kirby_custody::seam::ROUND_COMMITMENT,
+            "the signer transport got the ceremony reply, not the ECDH contribution"
+        );
+        assert_eq!(got_signer.payload, vec![0xAB, 0xCD]);
+
+        let got_ecdh = ecdh_transport
+            .recv()
+            .expect("ecdh route intact: the contribution must reach the ecdh transport");
+        assert_eq!(got_ecdh.round, crate::remote_holder::ROUND_ECDH_CONTRIBUTION);
+        assert_eq!(
+            got_ecdh.session_id, ECDH_SESSION,
+            "the ECDH transport got its own session-scoped contribution"
+        );
+        assert_eq!(got_ecdh.payload, vec![0x01, 0x02, 0x03]);
+
+        drop(hub);
+        println!(
+            "ECDH-DEMUX PASS: an ECDH ceremony + a live signer over one hub keep distinct reply routes (no clobber)"
         );
     }
 

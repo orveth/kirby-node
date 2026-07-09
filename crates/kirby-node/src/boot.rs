@@ -693,8 +693,9 @@ async fn build_nostr_actuator(
         let quorum = frost_quorum.ok_or_else(|| {
             anyhow::anyhow!("dm_under_q requires FROST publish mode (boot-wiring bug)")
         })?;
-        // INC2a co-gate: `load_ecdh` FAILS CLOSED LOUD on a DISTRIBUTED keystore (cross-machine ECDH
-        // is Inc3). A co-located keystore is unchanged.
+        // `load_ecdh` dispatches by keystore shape: a DISTRIBUTED keystore now returns a distributed
+        // QuorumEcdh (the self-decrypt round over the hub — Inc3 wired); a co-located keystore is the
+        // in-process combine, unchanged.
         let ecdh = Arc::new(cosign.load_ecdh().with_context(|| {
             format!("load QuorumEcdh from keystore {} (dm_under_q)", keystore_dir.display())
         })?);
@@ -2105,10 +2106,10 @@ pub async fn boot_and_observe_with_rail(
                             "dm_under_q requires a provisioned FROST keystore for the DM identity Q"
                         )
                     })?;
-                    // INC2a: through the shared `AgentCosign` seam. `load_ecdh` FAILS CLOSED LOUD on a
-                    // DISTRIBUTED keystore (cross-machine ECDH is Inc3, the co-gate); co-located is
-                    // unchanged. `load_signer` gives the ONE shared signer (distributed) or a fresh
-                    // one (co-located).
+                    // Through the shared `AgentCosign` seam. `load_ecdh` returns a DISTRIBUTED
+                    // QuorumEcdh (the self-decrypt round over the hub — Inc3 wired) or the co-located
+                    // combine, keyed off the SAME engagement decision as `load_signer` (which gives the
+                    // ONE shared signer, distributed, or a fresh co-located one).
                     let ecdh = std::sync::Arc::new(config.cosign.load_ecdh()?);
                     let quorum = config.cosign.load_signer()?;
                     let q = ecdh.q_public_key()?;
