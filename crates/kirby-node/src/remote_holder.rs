@@ -208,6 +208,22 @@ pub trait HolderTransportFactory {
         self.connect(address)
     }
 
+    /// Connect a SESSION-SCOPED transport for a THRESHOLD-ECDH ceremony ([`crate::quorum_ecdh`]).
+    /// Like [`Self::connect_probe`], the ECDH round is a single request→response whose reply must
+    /// route SEPARATELY from a live signer's per-holder route (the memoized signer's session-agnostic
+    /// route would otherwise be clobbered). The production relay factory ([`crate::relay_transport`])
+    /// routes an ECDH reply under (holder, `session_id`); the default delegates to [`Self::connect`]:
+    /// an in-process test factory has no shared reply-route map to clobber, so a distinct transport
+    /// suffices (its `InProcessHolderLink` drives `RemoteHolderServer::handle`, which dispatches the
+    /// ECDH request arm directly).
+    fn connect_ecdh(
+        &self,
+        address: &str,
+        _session_id: u64,
+    ) -> anyhow::Result<Box<dyn HolderTransport + Send + Sync>> {
+        self.connect(address)
+    }
+
     /// The PER-AGENT ceremony serializer for the agent this factory coordinates (see
     /// [`CeremonyGate`]). The factory is the agent's ONE transport authority (the co-sign hub), so
     /// it owns the ONE gate every ceremony over these holders must hold. The distributed sign loader
