@@ -139,7 +139,12 @@ impl QuorumEcdh {
                 factory,
                 holders,
                 gate,
-                next_session: AtomicU64::new(0),
+                // SEED the session counter with a random base (NOT 0): two independently-constructed
+                // distributed providers over the SAME coordinator key must not both start at session
+                // 0, or the holder's anti-replay guard would reject the second provider's first
+                // ceremony as a duplicate (coordinator, session, round). Random 64-bit bases collide
+                // with negligible probability; each provider still increments monotonically.
+                next_session: AtomicU64::new(rand::random::<u64>()),
             },
             pubkeys,
             min_signers,
@@ -196,6 +201,18 @@ impl QuorumEcdh {
         next_session: &AtomicU64,
         target_xonly: &[u8; 32],
     ) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+        // SELF-DECRYPT ONLY: the distributed path (and its holder membrane) authorize ONLY B == Q.
+        // A peer target (e.g. a DM correspondent's key) has NO distributed ECDH authorization yet
+        // (the §6.1 open problem), so refuse it here with a clear error rather than emit a request
+        // every holder will reject — fail-closed. Self-decrypt is all the memory plane needs, and
+        // this keeps a distributed DM path (which needs peer keys) from silently booting-then-failing.
+        if *target_xonly != self.q_xonly {
+            anyhow::bail!(
+                "distributed threshold-ECDH supports ONLY self-decrypt (target must be the agent's \
+                 own Q); a peer target is not authorized on a distributed keystore (peer-DM ECDH is \
+                 the deferred §6.1 design problem). Refusing (fail closed)."
+            );
+        }
         // Serialize this ceremony against signing (and any other ECDH) over the shared transports.
         let _guard = gate.enter();
         let session_id = next_session.fetch_add(1, Ordering::SeqCst);
@@ -228,7 +245,15 @@ impl QuorumEcdh {
                 Ok(c) => {
                     let id = Identifier::try_from(*id_u16)
                         .map_err(|e| anyhow::anyhow!("holder u16 {id_u16} -> Identifier: {e}"))?;
-                    contributions.push((id, c));
+                    // VERIFY the DLEQ against the canonical V_i BEFORE counting this responder toward
+                    // the threshold: a byzantine holder's bad D_i is skipped (like an unreachable
+                    // one) so an honest-majority round still completes, instead of one bad share
+                    // aborting it. (`aggregate_raw_contributions_tweaked_q` re-verifies as
+                    // defense-in-depth, so a bad share can never be folded even if this is bypassed.)
+                    match kirby_custody::verify_contribution(&self.pubkeys, &id, target_xonly, &c) {
+                        Ok(()) => contributions.push((id, c)),
+                        Err(e) => errors.push(format!("holder {id_u16} bad contribution: {e}")),
+                    }
                 }
                 Err(e) => errors.push(format!("holder {id_u16}: {e}")),
             }
@@ -394,5 +419,158 @@ mod tests {
         let again = distributed.conversation_key(&q).expect("cache hit");
         assert_eq!(again.as_bytes(), ck_dist.as_bytes(), "distributed cache hit must match");
         println!("DISTRIBUTED-QECDH PASS: distributed self-decrypt derives the same K_self as co-located (Zeroizing cache)");
+    }
+
+    // ---- codex adjudication teeth ----
+
+    /// Build a distributed provider over 3 HONEST in-process holders.
+    fn distributed_over_honest_fleet() -> QuorumEcdh {
+        let keyset = kirby_custody::generate_dealer_keyset(2, 3).expect("keygen");
+        let kps: Vec<KeyPackage> = kirby_custody::key_packages(&keyset)
+            .expect("kps")
+            .into_values()
+            .collect();
+        let mut fleet = crate::remote_holder::InProcessHolderFleet::new();
+        let mut roster: Vec<(u16, String)> = Vec::new();
+        for kp in &kps {
+            let server = Arc::new(crate::remote_holder::RemoteHolderServer::new(
+                kp.clone(),
+                keyset.pubkeys.clone(),
+            ));
+            let id = server.id();
+            let addr = format!("holder-{id}");
+            fleet.register(addr.clone(), server);
+            roster.push((id, addr));
+        }
+        let factory: Arc<dyn HolderTransportFactory + Send + Sync> = Arc::new(fleet);
+        QuorumEcdh::new_distributed(factory, roster, keyset.pubkeys).expect("distributed")
+    }
+
+    /// codex HIGH adjudication: distributed threshold-ECDH is SELF-DECRYPT-ONLY. A PEER target (not
+    /// Q) is refused fail-closed (naming self-decrypt), so a distributed DM path can never silently
+    /// use it; the agent's own Q still derives. (Paired with the boot-time refusal of distributed
+    /// dm_under_q in boot.rs.)
+    #[test]
+    fn distributed_ecdh_is_self_decrypt_only() {
+        let provider = distributed_over_honest_fleet();
+        let peer = Keys::generate().public_key();
+        let res = provider.conversation_key(&peer);
+        assert!(res.is_err(), "a peer target must be refused on a distributed provider, got Ok");
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(msg.contains("self-decrypt"), "the refusal must name self-decrypt-only: {msg}");
+        // Self (Q) still derives.
+        let q = provider.q_public_key().expect("Q");
+        provider.conversation_key(&q).expect("self-decrypt (Q) must still work");
+        println!("DISTRIBUTED-SELF-DECRYPT-ONLY PASS: a peer target is refused fail-closed; Q self-decrypt works");
+    }
+
+    /// A holder link that TAMPERS its ECDH contribution: replaces d_i with a valid-but-wrong point
+    /// (keeping the original proof), so the coordinator's per-contribution DLEQ verify rejects it —
+    /// modelling a byzantine holder the round must SKIP (not abort on).
+    struct TamperingEcdhLink {
+        inner: crate::remote_holder::InProcessHolderLink,
+        wrong_d_i: kirby_custody::WirePoint,
+    }
+    impl crate::remote_holder::HolderTransport for TamperingEcdhLink {
+        fn send(&self, event: kirby_custody::seam::CoSignEvent) -> anyhow::Result<()> {
+            self.inner.send(event)
+        }
+        fn recv(&self) -> anyhow::Result<kirby_custody::seam::CoSignEvent> {
+            let mut e = self.inner.recv()?;
+            if e.round == crate::remote_holder::ROUND_ECDH_CONTRIBUTION {
+                let mut c: kirby_custody::EcdhContribution = serde_json::from_slice(&e.payload)?;
+                c.d_i = self.wrong_d_i; // a valid point, wrong for this holder's V -> DLEQ fails
+                e.payload = serde_json::to_vec(&c)?;
+            }
+            Ok(e)
+        }
+    }
+
+    /// A fleet where the holder at `byzantine_addr` is served over a [`TamperingEcdhLink`].
+    struct ByzantineFleet {
+        servers: HashMap<String, Arc<crate::remote_holder::RemoteHolderServer>>,
+        byzantine_addr: String,
+        wrong_d_i: kirby_custody::WirePoint,
+        gate: CeremonyGate,
+    }
+    impl HolderTransportFactory for ByzantineFleet {
+        fn connect(
+            &self,
+            address: &str,
+        ) -> anyhow::Result<Box<dyn crate::remote_holder::HolderTransport + Send + Sync>> {
+            let server = self
+                .servers
+                .get(address)
+                .ok_or_else(|| anyhow::anyhow!("no holder at {address}"))?;
+            let inner = crate::remote_holder::InProcessHolderLink::new(Arc::clone(server));
+            if address == self.byzantine_addr {
+                Ok(Box::new(TamperingEcdhLink { inner, wrong_d_i: self.wrong_d_i }))
+            } else {
+                Ok(Box::new(inner))
+            }
+        }
+        fn ceremony_gate(&self) -> CeremonyGate {
+            self.gate.clone()
+        }
+    }
+
+    /// codex MED adjudication (any-available): a byzantine holder returning a bad D_i is SKIPPED (the
+    /// coordinator's per-contribution DLEQ verify) so an honest-majority round still derives the
+    /// CORRECT K_self — one bad share does not abort a round two honest holders can complete.
+    #[test]
+    fn distributed_self_decrypt_survives_one_byzantine_holder() {
+        let keyset = kirby_custody::generate_dealer_keyset(2, 3).expect("keygen");
+        let kps: Vec<KeyPackage> = kirby_custody::key_packages(&keyset)
+            .expect("kps")
+            .into_values()
+            .collect();
+        let q_xonly = kirby_custody::group_xonly_q(&keyset.pubkeys).expect("Q");
+        let peer_q = kirby_custody::peer_point_from_xonly(&q_xonly).expect("peer Q");
+        // A valid-but-wrong D for holder-1: holder-2's D (s_2·Q), which fails against V_1.
+        let wrong = kirby_custody::holder_ecdh_raw_contribution(&kps[1], &peer_q)
+            .expect("raw")
+            .d_i;
+
+        let mut servers = HashMap::new();
+        let mut roster: Vec<(u16, String)> = Vec::new();
+        let mut byzantine_addr = String::new();
+        for (i, kp) in kps.iter().enumerate() {
+            let server = Arc::new(crate::remote_holder::RemoteHolderServer::new(
+                kp.clone(),
+                keyset.pubkeys.clone(),
+            ));
+            let id = server.id();
+            let addr = format!("holder-{id}");
+            if i == 0 {
+                byzantine_addr = addr.clone(); // holder-1 (tried first) is byzantine
+            }
+            servers.insert(addr.clone(), server);
+            roster.push((id, addr));
+        }
+        let fleet = ByzantineFleet {
+            servers,
+            byzantine_addr,
+            wrong_d_i: wrong,
+            gate: CeremonyGate::new(),
+        };
+        let factory: Arc<dyn HolderTransportFactory + Send + Sync> = Arc::new(fleet);
+        let distributed =
+            QuorumEcdh::new_distributed(factory, roster, keyset.pubkeys.clone()).expect("distributed");
+
+        // The co-located reference K_self.
+        let colocated = QuorumEcdh::new(kps, keyset.pubkeys.clone()).expect("co-located");
+        let q = colocated.q_public_key().expect("Q");
+        let reference = colocated.conversation_key(&q).expect("ref");
+
+        // Byzantine holder-1 is skipped; holders 2+3 carry the round -> the correct K_self.
+        let derived = distributed
+            .conversation_key(&q)
+            .expect("round survives one byzantine holder");
+        assert_eq!(
+            derived.as_bytes(),
+            reference.as_bytes(),
+            "the surviving quorum must derive the correct K_self"
+        );
+        println!("DISTRIBUTED-BYZANTINE-SURVIVE PASS: a bad contribution is skipped; the honest majority derives K_self");
     }
 }

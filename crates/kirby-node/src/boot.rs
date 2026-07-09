@@ -693,6 +693,19 @@ async fn build_nostr_actuator(
         let quorum = frost_quorum.ok_or_else(|| {
             anyhow::anyhow!("dm_under_q requires FROST publish mode (boot-wiring bug)")
         })?;
+        // FAIL CLOSED at boot for DISTRIBUTED dm_under_q: the DM identity Q needs PEER-target ECDH (a
+        // correspondent's key + the per-message gift-wrap key), but distributed threshold-ECDH is
+        // self-decrypt-only (target == Q) — peer-DM ECDH authorization is the deferred §6.1 open
+        // problem. Refuse LOUDLY here rather than boot then fail on the first DM. (Co-located
+        // dm_under_q is unaffected: it derives peer keys in-process.)
+        if cosign.is_distributed() {
+            anyhow::bail!(
+                "distributed dm_under_q is not supported: the DM identity Q needs peer-target ECDH, \
+                 but distributed threshold-ECDH is self-decrypt-only (peer-DM ECDH is the deferred \
+                 §6.1 design problem). Use co-located dm_under_q, or keep distributed signing off \
+                 (identity.distributed_signing_enabled=false)."
+            );
+        }
         // `load_ecdh` dispatches by keystore shape: a DISTRIBUTED keystore now returns a distributed
         // QuorumEcdh (the self-decrypt round over the hub — Inc3 wired); a co-located keystore is the
         // in-process combine, unchanged.
@@ -2106,6 +2119,16 @@ pub async fn boot_and_observe_with_rail(
                             "dm_under_q requires a provisioned FROST keystore for the DM identity Q"
                         )
                     })?;
+                    // FAIL CLOSED at boot for DISTRIBUTED dm_under_q (peer-DM ECDH is self-decrypt-only
+                    // on a distributed keystore — the §6.1 open problem); mirrors build_nostr_actuator.
+                    if config.cosign.is_distributed() {
+                        anyhow::bail!(
+                            "distributed dm_under_q is not supported: the DM identity Q needs \
+                             peer-target ECDH, but distributed threshold-ECDH is self-decrypt-only \
+                             (peer-DM ECDH is the deferred §6.1 design problem). Use co-located \
+                             dm_under_q, or keep distributed signing off."
+                        );
+                    }
                     // Through the shared `AgentCosign` seam. `load_ecdh` returns a DISTRIBUTED
                     // QuorumEcdh (the self-decrypt round over the hub — Inc3 wired) or the co-located
                     // combine, keyed off the SAME engagement decision as `load_signer` (which gives the

@@ -600,6 +600,23 @@ pub fn verify_dleq_share(
     }
 }
 
+/// Verify a SINGLE holder's contribution against its CANONICAL verifying share `V_i` (the group's
+/// known share for `id`) for the peer `peer_xonly`. This is the per-contribution check a coordinator
+/// runs to ACCEPT or REJECT a responder BEFORE counting it toward the threshold: a byzantine holder
+/// whose `D_i` fails is then skipped like an unreachable one (the round continues to another holder),
+/// rather than a single bad share aborting a round an honest majority could complete. Returns
+/// [`EcdhError::DleqVerifyFailed`] (attributed) on a bad proof.
+pub fn verify_contribution(
+    pubkeys: &PublicKeyPackage,
+    id: &Identifier,
+    peer_xonly: &[u8; 32],
+    contribution: &EcdhContribution,
+) -> Result<(), EcdhError> {
+    let peer = peer_point_from_xonly(peer_xonly)?;
+    let v_i = verifying_share_point(pubkeys, id)?;
+    verify_dleq_share(&contribution.proof, &peer, &v_i, &contribution.d_i)
+}
+
 /// The CANONICAL public verifying share `V_i = s_i·G` for holder `id`, from the group
 /// `PublicKeyPackage`. The coordinator verifies each DLEQ against THIS (never a holder-asserted V):
 /// it is what binds a raw contribution to the fleet's known share for that identifier.

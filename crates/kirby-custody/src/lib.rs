@@ -30,7 +30,8 @@ pub use coordinator::{commit_for, key_packages, Coordinator, SessionState, SignE
 pub use ecdh::{
     aggregate_raw_contributions_tweaked_q, holder_ecdh_contribution, holder_ecdh_raw_contribution,
     nip44_conversation_key, peer_point_from_xonly, threshold_ecdh_tweaked_q,
-    threshold_ecdh_untweaked, verify_dleq_share, DleqProof, EcdhContribution, EcdhError, WirePoint,
+    threshold_ecdh_untweaked, verify_contribution, verify_dleq_share, DleqProof, EcdhContribution,
+    EcdhError, WirePoint,
 };
 pub use reshare::{reshare_same_membership, RefreshedKeyset};
 pub use seam::{coordinate_2of3_over_seam, CoSignEvent, GuardianId, InMemoryRelay, RelayAdapter};
