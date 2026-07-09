@@ -1078,6 +1078,7 @@ mod tests {
                 frost_keystore_dir: None,
                 dm_under_q: false,
                 distributed_signing_enabled: false,
+                memory_under_q: false,
             },
             relay: RelayConfig {
                 url: "ws://127.0.0.1:7777".to_string(),
@@ -1118,6 +1119,7 @@ mod tests {
             frost_keystore_dir: None,
             dm_under_q: false,
             distributed_signing_enabled: false,
+            memory_under_q: false,
         };
 
         // Unset => pinned to the resolved identity key (the SAME resolution the run uses).

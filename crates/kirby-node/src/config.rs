@@ -436,6 +436,15 @@ pub struct IdentityConfig {
     /// ceremonies clobber each other's reply routes.
     #[serde(default)]
     pub distributed_signing_enabled: bool,
+    /// memory-under-Q gate (the MEMORY axis of the cross-machine revive): when true (AND a FROST
+    /// keystore is provisioned), the agent's engram MEMORY roots under its group key Q — the content
+    /// key `K_self` is derived by threshold ECDH under Q (re-derived each boot from the quorum, never
+    /// persisted) instead of a node-local key, so a REBORN agent re-derives the same `K_self` and
+    /// reads its own past engrams. Defaults FALSE, so a live agent's memory path is byte-identical
+    /// until opted in. Mirrors [`dm_under_q`](Self::dm_under_q); like it, the memory events must sign
+    /// under Q (so the addressing author == Q) — see the boot wiring's honest-boundary note.
+    #[serde(default)]
+    pub memory_under_q: bool,
 }
 
 impl IdentityConfig {
