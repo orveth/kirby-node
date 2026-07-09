@@ -2522,6 +2522,135 @@ mod tests {
         println!("ECDH-WIRE-CONFIDENTIALITY PASS: contribution sealed holder->coordinator; plaintext D_i absent from the wire; only the coordinator opens it");
     }
 
+    /// A `RelayConn` that CAPTURES every event a holder publishes (a relay-operator's view) and never
+    /// delivers — for asserting what actually crosses the wire.
+    struct CapturingConn {
+        published: Arc<Mutex<Vec<Event>>>,
+    }
+    impl RelayConn for CapturingConn {
+        async fn publish(&self, event: Event) -> anyhow::Result<()> {
+            self.published.lock().unwrap().push(event);
+            Ok(())
+        }
+        async fn next_event(&self) -> anyhow::Result<Event> {
+            std::future::pending().await
+        }
+    }
+
+    /// THE WIRE-CONFIDENTIALITY PROOF (codex re-review HIGH — the leak is CLOSED): run a REAL 2-of-3
+    /// self-decrypt (B=Q) ECDH ceremony holder-side, CAPTURE the co-sign contribution frames a relay
+    /// operator would see, then run the OBSERVER ATTACK — reconstruct K_self from the captured frames
+    /// using ONLY public group material (the exact aggregation the coordinator does). With the seal in
+    /// place the raw D_i's are ciphertext (unparseable), so the observer recovers NOTHING; the
+    /// legitimate coordinator still derives K_self (proven by the real-relay e2e). RED-ON-REVERT:
+    /// disable the NIP-44 seal and this SAME observer recovers K_self byte-for-byte from the wire.
+    #[test]
+    fn k_self_is_not_recoverable_from_the_captured_wire_frames() {
+        let ks = keyset();
+        let kps = three_kps(&ks);
+        let q_xonly = kirby_custody::group_xonly_q(&ks.pubkeys).unwrap();
+        let coordinator = Keys::generate();
+
+        // The co-located reference K_self — exactly what an observer would be trying to steal.
+        let shared = kirby_custody::threshold_ecdh_tweaked_q(&[&kps[0], &kps[1]], &ks.pubkeys, &q_xonly).unwrap();
+        let reference = kirby_custody::nip44_conversation_key(&shared).unwrap();
+
+        // Drive holders 1 and 2 through the REAL seal path (handle_holder_frame), capturing each
+        // published contribution frame.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut captured: Vec<(frost_secp256k1_tr::Identifier, Event)> = Vec::new();
+        for kp in [&kps[0], &kps[1]] {
+            let holder = Keys::generate();
+            let server = RemoteHolderServer::new(kp.clone(), ks.pubkeys.clone());
+            let req = kirby_custody::guardian::EcdhRequest {
+                session_id: 1,
+                purpose: kirby_custody::guardian::EcdhPurpose::SelfDecrypt,
+                target_xonly: q_xonly,
+                signer_set: [1u16, 2u16, 3u16].into_iter().collect(),
+            };
+            let request_event = encode_cosign_frame(
+                AGENT,
+                &CoSignEvent {
+                    session_id: 1,
+                    from: crate::remote_holder::coordinator_id(),
+                    round: crate::remote_holder::ROUND_ECDH_REQUEST,
+                    payload: serde_json::to_vec(&req).unwrap(),
+                },
+                holder.public_key(),
+                &coordinator,
+            )
+            .unwrap();
+            let conn = CapturingConn { published: Arc::new(Mutex::new(Vec::new())) };
+            let authorize: CoordinatorAuthorizer = Arc::new(|_: &str, _: &PublicKey| true);
+            let guard = ReplayGuard::new();
+            rt.block_on(handle_holder_frame(&holder, AGENT, &server, &conn, &authorize, &guard, &request_event))
+                .expect("holder handles the ECDH request + publishes a sealed contribution");
+            let frame = conn
+                .published
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| {
+                    decode_cosign_frame(e)
+                        .map(|(_, c, _)| c.round == crate::remote_holder::ROUND_ECDH_CONTRIBUTION)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .expect("a ROUND_ECDH_CONTRIBUTION frame was published");
+            captured.push((*kp.identifier(), frame));
+        }
+
+        // THE OBSERVER ATTACK: from the captured wire frames + PUBLIC group material, try to recover
+        // K_self (the coordinator's own aggregation). Returns Some(K_self) iff the raw D_i's are
+        // recoverable from the wire, None if sealed.
+        let recover = |frames: &[(frost_secp256k1_tr::Identifier, Event)]| -> Option<[u8; 32]> {
+            let mut contribs = Vec::new();
+            for (id, frame) in frames {
+                let (_, cosign, _) = decode_cosign_frame(frame).ok()?;
+                let c: kirby_custody::EcdhContribution = serde_json::from_slice(&cosign.payload).ok()?;
+                contribs.push((*id, c));
+            }
+            let shared =
+                kirby_custody::aggregate_raw_contributions_tweaked_q(&contribs, &ks.pubkeys, 2, &q_xonly).ok()?;
+            kirby_custody::nip44_conversation_key(&shared).ok()
+        };
+        let stolen = recover(&captured);
+        assert!(
+            stolen.is_none(),
+            "the observer must NOT parse the raw D_i's from the sealed wire frames"
+        );
+        assert_ne!(
+            stolen,
+            Some(reference),
+            "K_self must NOT be recoverable from the captured wire frames"
+        );
+        println!("K-SELF-WIRE-CONFIDENTIALITY PASS: an observer with full public material cannot reconstruct K_self from the captured (sealed) contribution frames");
+    }
+
+    /// THE SEAL-INTEGRITY TOOTH (guardrail 3 — authenticated transport hop): NIP-44 v2 is an AEAD
+    /// (ChaCha20 + HMAC-SHA256 MAC), so a TAMPERED sealed contribution fails to open — the hop has
+    /// integrity, not just confidentiality (on top of the outer frame signature).
+    #[test]
+    fn tampered_sealed_ecdh_contribution_fails_to_open() {
+        let holder = Keys::generate();
+        let coordinator = Keys::generate();
+        let sealed = seal_ecdh_contribution(&holder, &coordinator.public_key(), b"the raw D_i + proof").unwrap();
+        // The untampered contribution opens (control).
+        assert_eq!(
+            open_ecdh_contribution(&coordinator, &holder.public_key(), &sealed).unwrap(),
+            b"the raw D_i + proof"
+        );
+        // Flip a byte in the sealed ciphertext -> the MAC (or base64) rejects it on open.
+        let mut tampered = sealed.clone();
+        let n = tampered.len();
+        tampered[n / 2] ^= 0x01;
+        assert!(
+            open_ecdh_contribution(&coordinator, &holder.public_key(), &tampered).is_err(),
+            "a tampered sealed contribution must fail to open (NIP-44 v2 is authenticated)"
+        );
+        println!("ECDH-SEAL-INTEGRITY PASS: NIP-44 v2 MAC rejects a tampered sealed contribution");
+    }
+
     /// A fresh temp keystore base unique to this test + process (the holder's sealed store).
     fn temp_keystore_base(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
