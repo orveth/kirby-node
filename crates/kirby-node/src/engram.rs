@@ -34,9 +34,13 @@ use anyhow::{anyhow, Context, Result};
 // `nostr_sdk::prelude::*` glob also brings into scope (nostr's internal crypto util).
 use ::hkdf::Hkdf;
 use ::hmac::{Hmac, Mac};
-use nostr_sdk::nips::nip44::{self, v2::ConversationKey, Version};
+use nostr_sdk::base64::engine::general_purpose::STANDARD as BASE64;
+use nostr_sdk::base64::Engine as _;
+use nostr_sdk::nips::nip44::v2::{decrypt_to_bytes, encrypt_to_bytes, ConversationKey};
+use nostr_sdk::nips::nip44::{self, Version};
 use nostr_sdk::prelude::*;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -117,16 +121,37 @@ impl EngramFrame {
     }
 }
 
-/// The per-key engram crypto + addressing. Cheap to clone (a `Keys` over an `Arc`
-/// secret + the 32-byte derived d-tag key). Construct once per node from the
-/// identity keyfile; every method is deterministic in the key, so two instances
-/// from the SAME key are interchangeable (the F8 portability property).
+/// The per-key engram crypto + addressing. Cheap to clone. Construct once per node —
+/// from the identity keyfile ([`Self::new`], the default node-key path) OR from a
+/// threshold-ECDH-under-Q conversation key ([`Self::from_conversation_key`], the
+/// `memory_under_q` path). Every method is deterministic in the key/root, so two
+/// instances from the SAME root are interchangeable (the F8 portability property — and,
+/// under Q, the property that lets a REBORN agent read its own past engrams).
 #[derive(Clone)]
 pub struct EngramCrypto {
-    keys: Keys,
+    /// The engram author identity: the event author + the `#p` self-tag. NODE-KEY path: the
+    /// node key's pubkey. Q path: the agent's group taproot key Q. The addressing (kind,
+    /// author, d-tag) is keyed on this, so it MUST match whoever signs the engram events.
+    pubkey: PublicKey,
+    /// How the content is sealed/opened (see [`Sealer`]).
+    sealer: Sealer,
     /// HKDF-derived d-tag HMAC key (32 bytes), domain-separated from the content
     /// key (codex C-low). Held so `dtag` is a cheap HMAC, not a re-derivation.
     k_dtag: [u8; 32],
+}
+
+/// The content-sealing root behind an [`EngramCrypto`].
+#[derive(Clone)]
+enum Sealer {
+    /// DEFAULT (node-key): the plain identity `Keys`. Seal/open run through nostr's `nip44::encrypt`
+    /// / `nip44::decrypt_to_bytes` EXACTLY as before — the wire form is byte-unchanged.
+    NodeKey(Keys),
+    /// `memory_under_q`: `K_self` = the NIP-44 conversation key from threshold ECDH under Q,
+    /// re-derived at each boot from the quorum (NEVER persisted — held in [`Zeroizing`] RAM). Seal/open
+    /// run through the lower-level [`ConversationKey`]-based `encrypt_to_bytes` / `decrypt_to_bytes` +
+    /// base64(STANDARD), which is BYTE-IDENTICAL on the wire to the node-key `nip44::encrypt` path for
+    /// the same conversation key (a tooth proves it), so a reborn agent decrypts its own past engrams.
+    QSelf(Zeroizing<[u8; 32]>),
 }
 
 impl EngramCrypto {
@@ -142,18 +167,30 @@ impl EngramCrypto {
         // alone -> portable across every reborn instance of this agent).
         let root = ConversationKey::derive(secret, &pubkey)
             .map_err(|e| anyhow!("derive self-ECDH conversation key (NIP-44 self-encrypt): {e}"))?;
-        // Domain-separate the d-tag key from the root (C-low). HKDF-SHA256 with a
-        // labeled info; 32 bytes is always a valid OKM length for SHA-256.
-        let hk = Hkdf::<Sha256>::new(None, root.as_bytes());
-        let mut k_dtag = [0u8; 32];
-        hk.expand(HKDF_DTAG_INFO, &mut k_dtag)
-            .expect("32-byte OKM is within HKDF-SHA256's 255*32 limit");
-        Ok(EngramCrypto { keys, k_dtag })
+        let k_dtag = hkdf_dtag(root.as_bytes());
+        Ok(EngramCrypto { pubkey, sealer: Sealer::NodeKey(keys), k_dtag })
+    }
+
+    /// The `memory_under_q` constructor: seal/open + d-tag off a PRECOMPUTED `K_self` (the NIP-44
+    /// conversation key derived by threshold ECDH under Q, [`crate::quorum_ecdh::QuorumEcdh`]) instead
+    /// of a node key. `q_pubkey` is the agent's group Q — the engram author + `#p` self-tag (so the
+    /// events must be signed under Q for the addressing to be coherent). `k_self` is held in
+    /// [`Zeroizing`] and NEVER persisted; a reborn agent re-derives the SAME `K_self` from the same Q
+    /// (the threshold ECDH is quorum-agnostic) and so computes the SAME d-tags + opens the same
+    /// content — this is what carries an agent's memory across a cross-machine revive.
+    ///
+    /// BYTE-IDENTITY (load-bearing): the d-tag HKDF here takes the SAME `K_self` bytes the node-key
+    /// path feeds it (`ConversationKey::as_bytes()`), and the seal/open uses the SAME NIP-44 v2
+    /// primitive `nip44::encrypt` wraps — so for one shared `K_self`, content sealed by either path is
+    /// openable by the other and the d-tags match (proven by `byte_identical_migration_*` teeth).
+    pub fn from_conversation_key(k_self: Zeroizing<[u8; 32]>, q_pubkey: PublicKey) -> Result<Self> {
+        let k_dtag = hkdf_dtag(&k_self[..]);
+        Ok(EngramCrypto { pubkey: q_pubkey, sealer: Sealer::QSelf(k_self), k_dtag })
     }
 
     /// This agent's public key (the engram event author + the `#p` self-tag).
     pub fn public_key(&self) -> PublicKey {
-        self.keys.public_key()
+        self.pubkey
     }
 
     /// The addressable `d` tag for a slug: `hex(HMAC-SHA256(K_dtag, slug))`. The
@@ -167,18 +204,43 @@ impl EngramCrypto {
         to_hex(mac.finalize().into_bytes().as_slice())
     }
 
-    /// Seal a frame into NIP-44 (v2) self-encrypted content (encrypt to the OWN
-    /// pubkey). The returned base64 string is the event content.
+    /// Seal a frame into NIP-44 (v2) self-encrypted content. The returned base64 string is the event
+    /// content. NODE-KEY: nostr's `nip44::encrypt` (unchanged). Q: the lower-level
+    /// `encrypt_to_bytes` under `K_self` + base64(STANDARD) — byte-identical wire form (the base64
+    /// alphabet matches nostr's own `nip44` mod, so either path decodes the other).
     pub fn encrypt(&self, frame: &EngramFrame) -> Result<String> {
-        nip44::encrypt(self.keys.secret_key(), &self.keys.public_key(), frame.encode(), Version::V2)
-            .context("NIP-44 self-encrypt the engram content")
+        match &self.sealer {
+            Sealer::NodeKey(keys) => {
+                nip44::encrypt(keys.secret_key(), &self.pubkey, frame.encode(), Version::V2)
+                    .context("NIP-44 self-encrypt the engram content")
+            }
+            Sealer::QSelf(k_self) => {
+                let ck = ConversationKey::new(**k_self);
+                let payload = encrypt_to_bytes(&ck, &frame.encode())
+                    .context("NIP-44 self-encrypt the engram content under Q (K_self)")?;
+                Ok(BASE64.encode(payload))
+            }
+        }
     }
 
-    /// Open NIP-44 self-encrypted content back into a frame. Reads as BYTES (the
-    /// value may be non-UTF-8), then decodes the frame.
+    /// Open NIP-44 self-encrypted content back into a frame. Reads as BYTES (the value may be
+    /// non-UTF-8), then decodes the frame. Mirrors [`Self::encrypt`]: NODE-KEY via nostr's
+    /// `nip44::decrypt_to_bytes`, Q via base64-decode + the `ConversationKey`-based `decrypt_to_bytes`.
     pub fn decrypt(&self, content: &str) -> Result<EngramFrame> {
-        let bytes = nip44::decrypt_to_bytes(self.keys.secret_key(), &self.keys.public_key(), content)
-            .context("NIP-44 self-decrypt the engram content")?;
+        let bytes = match &self.sealer {
+            Sealer::NodeKey(keys) => {
+                nip44::decrypt_to_bytes(keys.secret_key(), &self.pubkey, content)
+                    .context("NIP-44 self-decrypt the engram content")?
+            }
+            Sealer::QSelf(k_self) => {
+                let ck = ConversationKey::new(**k_self);
+                let raw = BASE64
+                    .decode(content)
+                    .context("base64-decode the engram content (Q path)")?;
+                decrypt_to_bytes(&ck, &raw)
+                    .context("NIP-44 self-decrypt the engram content under Q (K_self)")?
+            }
+        };
         EngramFrame::decode(&bytes)
     }
 
@@ -191,12 +253,24 @@ impl EngramCrypto {
         let content = self.encrypt(frame)?;
         let tags = vec![
             Tag::identifier(self.dtag(&frame.slug)),
-            Tag::public_key(self.keys.public_key()),
+            Tag::public_key(self.pubkey),
         ];
         Ok(EventBuilder::new(Kind::from(KIND_ENGRAM), content)
             .tags(tags)
             .custom_created_at(created_at))
     }
+}
+
+/// HKDF-SHA256-derive the 32-byte d-tag HMAC key from the content root `K_self` (codex C-low domain
+/// separation: the d-tag key is NOT the content key). ONE implementation shared by both constructors
+/// ([`EngramCrypto::new`] feeds `ConversationKey::derive(...).as_bytes()`; [`EngramCrypto::from_conversation_key`]
+/// feeds the threshold-ECDH `K_self`), so the d-tag is byte-identical whenever the `K_self` bytes match.
+fn hkdf_dtag(root: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, root);
+    let mut k_dtag = [0u8; 32];
+    hk.expand(HKDF_DTAG_INFO, &mut k_dtag)
+        .expect("32-byte OKM is within HKDF-SHA256's 255*32 limit");
+    k_dtag
 }
 
 /// Lowercase-hex encode (dep-free; the d-tag is the only hex this crate needs).
@@ -380,5 +454,82 @@ mod tests {
             .sign_with_keys(&signer)
             .unwrap();
         assert_eq!(event_dtag(&ev).as_deref(), Some(crypto.dtag("mem/z").as_str()));
+    }
+
+    // ---- memory-under-Q: the migration + the revive property ----
+
+    /// THE BYTE-IDENTICAL-MIGRATION TOOTH (STOP-TRIGGER #2): for ONE shared conversation key, the
+    /// node-key path (`nip44::encrypt`/`decrypt`, unchanged) and the `from_conversation_key` path
+    /// (`ConversationKey` `encrypt_to_bytes`/`decrypt_to_bytes` + base64) are WIRE-INTEROPERABLE —
+    /// same d-tag, and content sealed by either path opens under the other. This is what guarantees
+    /// the seal/open API migration did not change the wire form (a reborn agent decrypts its own past
+    /// engrams). If these two APIs ever diverged, this cross-decrypt would fail (the STOP trigger).
+    #[test]
+    fn byte_identical_migration_node_key_vs_conversation_key() {
+        let keys = keys_from_byte(11);
+        let node = EngramCrypto::new(keys.clone()).unwrap();
+        // The SAME K_self the node-key path uses internally (ConversationKey::derive), fed to the
+        // Q constructor — so the only difference is which API seals/opens.
+        let root = ConversationKey::derive(keys.secret_key(), &keys.public_key()).unwrap();
+        let mut k_self = [0u8; 32];
+        k_self.copy_from_slice(root.as_bytes());
+        let q = EngramCrypto::from_conversation_key(Zeroizing::new(k_self), keys.public_key()).unwrap();
+
+        for slug in ["core", "mem/a/b", "mem/mission"] {
+            assert_eq!(node.dtag(slug), q.dtag(slug), "d-tag must be byte-identical across the migration");
+        }
+        assert_eq!(node.public_key(), q.public_key(), "author identity must match");
+
+        let frame = EngramFrame::live("mem/mission", vec![0x00, 0xff, b'h', b'i', 0x10]);
+        let sealed_by_node = node.encrypt(&frame).unwrap();
+        assert_eq!(
+            q.decrypt(&sealed_by_node).unwrap(),
+            frame,
+            "the Q (ConversationKey) path must open content sealed by the node-key (nip44) path"
+        );
+        let sealed_by_q = q.encrypt(&frame).unwrap();
+        assert_eq!(
+            node.decrypt(&sealed_by_q).unwrap(),
+            frame,
+            "the node-key path must open content sealed by the Q path"
+        );
+        println!("BYTE-IDENTICAL-MIGRATION PASS: node-key and from_conversation_key are wire-interoperable (same d-tag + cross-decrypt both ways)");
+    }
+
+    /// THE REVIVE PROPERTY: an agent reborn on a DIFFERENT quorum subset re-derives the SAME `K_self`
+    /// (threshold ECDH under Q is quorum-agnostic) and so computes the SAME d-tags AND opens the same
+    /// content — it reads its OWN past engrams. A foreign key cannot. This is "a revived agent carries
+    /// its memory", proven at the crypto layer (the in-process boot-ceremony equivalent).
+    #[test]
+    fn reborn_reads_its_past_under_q() {
+        use kirby_custody::{
+            generate_dealer_keyset, group_xonly_q, key_packages, nip44_conversation_key,
+            threshold_ecdh_tweaked_q,
+        };
+        let keyset = generate_dealer_keyset(2, 3).unwrap();
+        let kps: Vec<_> = key_packages(&keyset).unwrap().into_values().collect();
+        let q_xonly = group_xonly_q(&keyset.pubkeys).unwrap();
+        let q_pubkey = PublicKey::from_slice(&q_xonly).unwrap();
+
+        // Instance A derives K_self via quorum {1,2}; the reborn instance B via {2,3} (a DIFFERENT
+        // subset, modelling a different surviving pair after failover).
+        let shared_a = threshold_ecdh_tweaked_q(&[&kps[0], &kps[1]], &keyset.pubkeys, &q_xonly).unwrap();
+        let shared_b = threshold_ecdh_tweaked_q(&[&kps[1], &kps[2]], &keyset.pubkeys, &q_xonly).unwrap();
+        let k_a = nip44_conversation_key(&shared_a).unwrap();
+        let k_b = nip44_conversation_key(&shared_b).unwrap();
+        assert_eq!(k_a, k_b, "K_self is quorum-agnostic — a reborn agent on a different subset derives the same root");
+
+        let a = EngramCrypto::from_conversation_key(Zeroizing::new(k_a), q_pubkey).unwrap();
+        let b = EngramCrypto::from_conversation_key(Zeroizing::new(k_b), q_pubkey).unwrap();
+
+        let frame = EngramFrame::live("mem/mission", b"the runway is finite".to_vec());
+        let sealed = a.encrypt(&frame).unwrap();
+        assert_eq!(a.dtag("mem/mission"), b.dtag("mem/mission"), "the reborn agent computes the same d-tag (finds it)");
+        assert_eq!(b.decrypt(&sealed).unwrap(), frame, "the reborn agent decrypts its own past engram under Q");
+
+        // A foreign key (a different agent / different Q) cannot open it (encrypt-to-self privacy).
+        let other = EngramCrypto::new(keys_from_byte(2)).unwrap();
+        assert!(other.decrypt(&sealed).is_err(), "a non-Q key must not open a Q-sealed engram");
+        println!("REBORN-READS-PAST PASS: an agent reborn on a different quorum subset re-derives K_self under Q and reads its own past engrams");
     }
 }
