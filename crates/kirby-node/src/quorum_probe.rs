@@ -36,11 +36,13 @@
 //! holder is excluded. An absent/malformed local placement is [`QuorumReadiness::StalePlacement`].
 
 use std::future::Future;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kirby_custody::seam::CoSignEvent;
 
+use crate::keyset_provisioning::{is_distributed_keystore, keystore_loadable_at, load_placement};
 use crate::quorum_signer::{identifier_to_u16, MIN_SIGNERS};
 use crate::remote_holder::{
     coordinator_id, HolderTransportFactory, ROUND_PROBE, ROUND_PROBE_ACK,
@@ -166,6 +168,78 @@ pub async fn can_assemble_quorum<P: HolderQuorumProbe>(
     } else {
         QuorumReadiness::QuorumUnreachable
     }
+}
+
+/// What THIS node contributes to a distributed quorum: which share it holds and whether that share
+/// is loadable right now. A survivor is one of the 2-of-3 ONLY if it can load its OWN share (the
+/// probe supplies the other holders). Resolving this from a node's keystore + placement is the
+/// holder-node deployment layout that lands with cross-machine distribution; until then the fleet
+/// loop has no self-holder to pass and the distributed branch fails closed (see
+/// [`takeover_readiness`]).
+#[derive(Debug, Clone, Copy)]
+pub struct SelfHolder {
+    /// This node's own FROST identifier in the agent's placement (1..=SHARE_COUNT).
+    pub identifier: u16,
+    /// Whether this node can load its own share right now (a survivor that cannot load its own
+    /// share is not one of the quorum).
+    pub share_loadable: bool,
+}
+
+/// Compute the takeover gate-(a) [`QuorumReadiness`] for `agent_id` -- the ONE place the fleet loop
+/// ([`crate::spawn::SpawnConsumer::admit_takeover`]'s caller) and the revive test decide it, so both
+/// gate on identical logic.
+///
+///   * CO-LOCATED (the ONLY live path in prod: distributed signing defaults off and no placement.json
+///     ships), OR distributed-shaped but the flag is off (INERT, treated co-located) -> the unchanged
+///     all-shares-local check ([`keystore_loadable_at`]), byte-identical to before #49.
+///   * DISTRIBUTED + engaged (flag on AND placement present) -> this node's own share plus a bounded,
+///     authenticated liveness probe of the other placement holders ([`can_assemble_quorum`]), dialed
+///     through `factory`. FAIL-CLOSED on any ambiguity: no `self_holder` (holder-node layout not yet
+///     resolvable), no `factory` (no hub wired), or a malformed placement all yield a non-`CanSign`
+///     verdict, never a co-located fallback on a distributed keystore.
+pub async fn takeover_readiness(
+    agent_id: &str,
+    keystore_dir: &Path,
+    distributed_signing_enabled: bool,
+    self_holder: Option<SelfHolder>,
+    factory: Option<&dyn HolderTransportFactory>,
+    deadlines: ProbeDeadlines,
+) -> QuorumReadiness {
+    if !(distributed_signing_enabled && is_distributed_keystore(keystore_dir)) {
+        return if keystore_loadable_at(keystore_dir) {
+            QuorumReadiness::CanSign
+        } else {
+            QuorumReadiness::LocalNotLoadable
+        };
+    }
+    // DISTRIBUTED + engaged: need this node's own-share contribution AND a transport to the holders.
+    // Either missing is fail-closed (never adopt an identity we cannot prove we can sign for).
+    let (Some(self_holder), Some(factory)) = (self_holder, factory) else {
+        return QuorumReadiness::QuorumUnreachable;
+    };
+    let placement = match load_placement(keystore_dir) {
+        Ok(p) => p,
+        Err(_) => return QuorumReadiness::StalePlacement,
+    };
+    // The supplied self-holder identifier MUST be a member of THIS agent's placement roster.
+    // Otherwise `can_assemble_quorum` would count "self" as a live holder for a share that is not
+    // part of this Q's placement -- admitting a takeover this node cannot actually sign for (a
+    // stale/mismatched holder layout). Fail closed as StalePlacement, never trust an off-roster self.
+    if !placement.holders.iter().any(|h| h.identifier == self_holder.identifier) {
+        return QuorumReadiness::StalePlacement;
+    }
+    let roster: Vec<(u16, String)> =
+        placement.holders.iter().map(|h| (h.identifier, h.address.clone())).collect();
+    let probe = RelayHolderProbe::new(factory);
+    can_assemble_quorum(
+        agent_id,
+        self_holder.identifier,
+        self_holder.share_loadable,
+        &roster,
+        deadlines,
+        &probe,
+    )
+    .await
 }
 
 /// A monotonic probe session id (routing/echo correlation only -- a probe generates no nonce and is

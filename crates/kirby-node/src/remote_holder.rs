@@ -197,6 +197,24 @@ pub trait HolderTransportFactory {
     fn ceremony_gate(&self) -> CeremonyGate;
 }
 
+/// Resolves the per-agent co-sign [`HolderTransportFactory`] (the agent's coordinator hub) that a
+/// DISTRIBUTED sign path needs to reach that agent's remote holders. Two engaged distributed sign
+/// sites take a factory from here: the takeover-admission liveness probe ([`crate::quorum_probe`])
+/// and the distributed lease claim ([`crate::relay_lease::RelayLeaseGrantor`]). It is injected ONLY
+/// where distributed signing is engaged (the ON-flip control-plane wiring builds it over a live relay
+/// connection; the tests supply an in-process fleet); everywhere else it is absent, so the co-located
+/// path never constructs a hub. Per-agent because the hub coordinates ONE agent's holder roster (its
+/// `#p`-addressed co-sign subscription), while a node's grantor/fleet-loop serve many agents.
+pub trait CoSignFactoryProvider: Send + Sync {
+    /// The co-sign hub for `agent_id`'s quorum, or an error if one cannot be established (dialed
+    /// fail-closed by the caller: no factory => no distributed signature, never a co-located
+    /// fallback on a distributed keystore).
+    fn factory_for(
+        &self,
+        agent_id: &str,
+    ) -> anyhow::Result<Arc<dyn HolderTransportFactory + Send + Sync>>;
+}
+
 /// The coordinator-side PROXY for a holder whose share lives on another machine.
 ///
 /// It implements [`Holder`] by exchanging opaque [`CoSignEvent`]s with a

@@ -426,13 +426,30 @@ impl FleetSupervisor {
         // keystore is distinct (the same isolation the treasury path has). This runs AFTER
         // allocation (so instance_id exists) and BEFORE launch (so the agent is born with Q).
         let keystore_dir = crate::keyset_provisioning::keystore_dir_for(&allocation.instance_id);
-        let frost_identity = crate::keyset_provisioning::provision_keyset_at(&keystore_dir)
-            .map_err(|e| {
+        // DISTRIBUTED LAUNCH (#49): a node winning a takeover of an agent whose keyset was
+        // provisioned DISTRIBUTED (anchor + placement, shares on remote holders) must NOT co-located
+        // mint -- it has no local shares to reload, and provision_keyset_at would fail (or mint a NEW
+        // Q, losing the identity). RELOAD the sovereign identity instead; the child process loads the
+        // distributed signer at runtime via the flag-aware dispatcher. Engaged IFF the ON-flip flag is
+        // set AND the keystore is distributed; otherwise the co-located provision/reload is
+        // byte-identical to before.
+        let frost_identity = if self.base_config.identity.distributed_signing_enabled
+            && crate::keyset_provisioning::is_distributed_keystore(&keystore_dir)
+        {
+            crate::keyset_provisioning::load_distributed_identity(&keystore_dir).map_err(|e| {
+                anyhow::anyhow!(
+                    "fleet supervisor: reload distributed FROST identity for tenant {:?}: {e}",
+                    tenant.agent_id
+                )
+            })?
+        } else {
+            crate::keyset_provisioning::provision_keyset_at(&keystore_dir).map_err(|e| {
                 anyhow::anyhow!(
                     "fleet supervisor: provision FROST keyset for tenant {:?}: {e}",
                     tenant.agent_id
                 )
-            })?;
+            })?
+        };
         let frost_npub = frost_identity.npub();
 
         // (3) Claim the per-agent lease for THIS node at `term` (S1): term 1 for a first launch,

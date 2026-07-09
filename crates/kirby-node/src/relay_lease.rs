@@ -546,12 +546,36 @@ impl LeasePublisher for RelayLeasePublisher {
 pub struct RelayLeaseGrantor {
     node_id: LeaseNodeId,
     publisher: Arc<dyn LeasePublisher>,
+    /// The #49 ON-flip gate (`identity.distributed_signing_enabled`). FALSE by default, so the
+    /// lease path is byte-identical to the co-located grantor. When TRUE, a DISTRIBUTED keystore's
+    /// lease is signed under the NETWORK quorum via `cosign_provider` instead of being refused.
+    distributed_signing_enabled: bool,
+    /// Per-agent co-sign hub source for distributed lease signing (the term+1 ownership claim over
+    /// remote holders). `None` for a co-located grantor. Consulted ONLY when
+    /// `distributed_signing_enabled` AND the keystore is distributed; a distributed keystore with the
+    /// flag off (or no provider) still FAILS CLOSED (the stale-share guard is never weakened).
+    cosign_provider: Option<Arc<dyn crate::remote_holder::CoSignFactoryProvider>>,
 }
 
 impl RelayLeaseGrantor {
-    /// Build a grantor for this node over a relay publisher.
+    /// Build a grantor for this node over a relay publisher. Co-located by default (distributed
+    /// signing off, no co-sign provider) -- byte-identical to before #49.
     pub fn new(node_id: LeaseNodeId, publisher: Arc<dyn LeasePublisher>) -> Self {
-        Self { node_id, publisher }
+        Self { node_id, publisher, distributed_signing_enabled: false, cosign_provider: None }
+    }
+
+    /// Engage DISTRIBUTED lease signing (#49 Inc2 ON-flip): a distributed keystore's term+1 lease is
+    /// FROST-signed under the network quorum via `provider`'s per-agent co-sign hub, rather than
+    /// refused at the stale-share wall. `enabled` mirrors `identity.distributed_signing_enabled`; the
+    /// co-located path is untouched. With `enabled=false` this is a no-op (the guard still holds).
+    pub fn with_distributed_signing(
+        mut self,
+        enabled: bool,
+        provider: Arc<dyn crate::remote_holder::CoSignFactoryProvider>,
+    ) -> Self {
+        self.distributed_signing_enabled = enabled;
+        self.cosign_provider = Some(provider);
+        self
     }
 
     /// CLAIM `agent_id`'s lease for this node at `term` using the per-agent quorum loaded from
@@ -570,38 +594,12 @@ impl RelayLeaseGrantor {
             "a node can only claim a lease naming ITSELF as holder: requested holder {node_id} != this node {}",
             self.node_id
         );
-        // INC2a co-gate (fail-closed): the lease signer is a THIRD Q-sign site (alongside the beacon
-        // signer + the voice actuator). Distributed lease signing over remote holders lands with the
-        // ON-flip (Inc2b/Inc3); until then a DISTRIBUTED keystore must NOT sign a lease via the
-        // co-located loader -- that would either fail confusingly or, on a mixed keystore, silently
-        // sign with STALE local shares (masking distributed intent). Refuse LOUD. A co-located
-        // keystore (today's default -- no placement.json) is byte-identical below.
-        //
-        // Flag-AGNOSTIC by design: this keys off is_distributed_keystore ALONE, NOT
-        // identity.distributed_signing_enabled. It is finding-1 STALE-SHARE protection (never
-        // lease-sign from local shares on a distributed-shaped keystore), ORTHOGONAL to the flag's
-        // finding-2 concurrent-ceremony purpose -- the flag gates the shared co-sign HUB, which the
-        // lease never uses (it builds its own single_agent authority). Do NOT "reconcile" this with
-        // the flag: making it flag-aware would WEAKEN the stale-share guard.
-        if crate::keyset_provisioning::is_distributed_keystore(keystore_dir) {
-            anyhow::bail!(
-                "FROST keystore {} for agent {agent_id} is DISTRIBUTED, but distributed lease \
-                 signing (over remote holders) is not yet wired -- it lands with the Inc2+3 ON-flip. \
-                 Refusing to sign this lease from the co-located loader (fail closed; never sign a \
-                 lease with stale local shares).",
-                keystore_dir.display()
-            );
-        }
-        // Load the tenant's OWN quorum Q from the keystore the supervisor provisioned, and
-        // build a single-agent authority that signs THIS agent's lease under THAT Q.
-        let signer = Arc::new(
-            crate::keyset_provisioning::load_quorum_signer_at(keystore_dir).with_context(|| {
-                format!(
-                    "load the per-agent quorum for {agent_id} from {} to sign its lease",
-                    keystore_dir.display()
-                )
-            })?,
-        );
+        // Load the per-agent quorum Q that signs this lease, honoring the #49 ON-flip AND the
+        // stale-share guard (see [`Self::load_lease_signer`]): a CO-LOCATED keystore loads its local
+        // quorum (byte-identical to before); a DISTRIBUTED keystore signs under the NETWORK quorum
+        // when engaged and FAILS CLOSED otherwise (never from stale local shares). Build a
+        // single-agent authority that signs THIS agent's lease under THAT Q.
+        let signer = Arc::new(self.load_lease_signer(agent_id, keystore_dir)?);
         let authority = RelayLeaseAuthority::single_agent(self.node_id, agent_id, signer);
         let event = authority.claim(agent_id, term).await?;
         self.publisher
@@ -609,6 +607,67 @@ impl RelayLeaseGrantor {
             .await
             .context("publish the claimed lease to the relay")?;
         Ok(LeaseResponse { node_id, term })
+    }
+
+    /// Load the per-agent quorum signer for a lease claim, honoring the #49 ON-flip AND the
+    /// stale-share guard. A CO-LOCATED keystore loads its local quorum (byte-identical to before).
+    /// A DISTRIBUTED keystore (placement.json present) is signed ONLY under the network quorum, and
+    /// ONLY when `distributed_signing_enabled` is set AND a co-sign provider is wired; otherwise it
+    /// FAILS CLOSED. This is deliberately MORE conservative than the general signer dispatcher
+    /// ([`crate::keyset_provisioning::load_agent_quorum_signer`], whose flag-off branch loads
+    /// co-located): a lease is the single-writer OWNERSHIP fence, so a distributed-shaped keystore
+    /// must never sign one from local (possibly stale) shares -- lifting the wall means routing to
+    /// the network quorum, never relaxing to a co-located fallback.
+    fn load_lease_signer(
+        &self,
+        agent_id: &str,
+        keystore_dir: &std::path::Path,
+    ) -> anyhow::Result<QuorumSigner> {
+        if !crate::keyset_provisioning::is_distributed_keystore(keystore_dir) {
+            // CO-LOCATED: byte-identical to the pre-#49 lease path.
+            return crate::keyset_provisioning::load_quorum_signer_at(keystore_dir).with_context(
+                || {
+                    format!(
+                        "load the co-located per-agent quorum for {agent_id} from {} to sign its lease",
+                        keystore_dir.display()
+                    )
+                },
+            );
+        }
+        // DISTRIBUTED keystore: sign the ownership lease ONLY under the network quorum. Fail closed
+        // if the ON-flip flag is off (the stale-share guard: never sign a distributed-shaped
+        // keystore's lease from local shares -- the SAME refusal as before #49, now flag-gated).
+        if !self.distributed_signing_enabled {
+            anyhow::bail!(
+                "FROST keystore {} for agent {agent_id} is DISTRIBUTED but distributed lease signing \
+                 is not enabled (identity.distributed_signing_enabled=false). Refusing to sign this \
+                 lease (fail closed; never sign a lease with stale local shares).",
+                keystore_dir.display()
+            );
+        }
+        // Engaged: reach the agent's remote holders through its co-sign hub and sign the term+1
+        // lease under the NETWORK quorum (this node's own share + the reachable holders), via the
+        // SAME distributed QuorumSigner path the agent's beacons use. No provider wired => fail
+        // closed (never a co-located fallback).
+        let provider = self.cosign_provider.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "FROST keystore {} for agent {agent_id} is DISTRIBUTED and distributed signing is \
+                 enabled, but no co-sign factory provider is wired to reach the remote holders -- \
+                 refusing to sign the lease (fail closed).",
+                keystore_dir.display()
+            )
+        })?;
+        let factory = provider.factory_for(agent_id).with_context(|| {
+            format!("establish the co-sign hub for {agent_id} to sign its distributed lease")
+        })?;
+        crate::keyset_provisioning::load_quorum_signer_distributed(keystore_dir, factory.as_ref())
+            .with_context(|| {
+                format!(
+                    "build the distributed quorum signer for {agent_id} from {} to sign its lease \
+                     under the network quorum",
+                    keystore_dir.display()
+                )
+            })
     }
 }
 
@@ -1356,10 +1415,12 @@ mod fence_qverify_tests {
 }
 
 /// INC2a lease-signer co-gate: the kind-31002 lease FROST-sign site (`claim_for`) is a THIRD
-/// Q-sign site (alongside the beacon signer + the voice actuator). It must FAIL CLOSED on a
-/// DISTRIBUTED keystore -- distributed lease signing over remote holders lands with the Inc2+3
-/// ON-flip. A co-located keystore (today's default) is unaffected. Closes the codex-flagged
-/// third sign-site bypass.
+/// Q-sign site (alongside the beacon signer + the voice actuator). On a DISTRIBUTED keystore it
+/// must NEVER sign from co-located (stale) shares. #49 lifts the old flag-agnostic wall to a
+/// FLAG-GATED one: distributed signing ENGAGED (flag on + a co-sign provider) signs the lease under
+/// the network quorum (proven by the revive integration test); NOT engaged (the default: flag off,
+/// or no provider) still FAILS CLOSED. A co-located keystore is unaffected. This test pins the
+/// fail-closed (default) leg -- the stale-share guard the wall-lift preserves.
 #[cfg(test)]
 mod inc2_lease_cogate_tests {
     use super::*;
@@ -1373,10 +1434,13 @@ mod inc2_lease_cogate_tests {
         }
     }
 
-    /// A DISTRIBUTED keystore (placement.json present) makes a lease claim fail closed with the
-    /// co-gate error -- never signing via the co-located loader. RED-on-revert: remove the guard in
-    /// `claim_for` and the error changes (load_quorum_signer_at fails "not provisioned" instead of
-    /// the co-gate message), so this assertion no longer holds -- the guard bites.
+    /// A DISTRIBUTED keystore with distributed signing OFF (the default grantor: flag false, no
+    /// co-sign provider) makes a lease claim FAIL CLOSED -- never signing via the co-located loader
+    /// (the preserved stale-share guard). RED-on-revert: drop the `distributed_signing_enabled` guard
+    /// in `load_lease_signer` and, with no provider, the error changes (the "no provider wired" bail,
+    /// or a co-located load), so this assertion no longer holds -- the guard bites. The ENGAGED
+    /// (flag-on) leg that SIGNS under the network quorum is proven by
+    /// `keyset_provisioning::...::revive_identity_across_nodes_via_distributed_quorum`.
     #[tokio::test]
     async fn distributed_keystore_lease_claim_fails_closed() {
         // The guard keys off placement.json presence BEFORE loading any signer, so a bare dir with
@@ -1392,16 +1456,17 @@ mod inc2_lease_cogate_tests {
         assert!(crate::keyset_provisioning::is_distributed_keystore(&dir));
 
         const NODE: LeaseNodeId = 7;
+        // The DEFAULT grantor: distributed signing off, no co-sign provider (the prod default).
         let grantor = RelayLeaseGrantor::new(NODE, std::sync::Arc::new(NeverPublisher));
         let err = match grantor.claim_for("agent-x", NODE, 1, &dir).await {
-            Ok(_) => panic!("a DISTRIBUTED keystore lease claim MUST fail closed (Inc2+3 ON-flip)"),
+            Ok(_) => panic!("a DISTRIBUTED keystore lease claim MUST fail closed with signing OFF"),
             Err(e) => format!("{e:#}"),
         };
         assert!(
-            err.contains("DISTRIBUTED") && err.contains("ON-flip"),
-            "the lease co-gate error must name the distributed keystore + the ON-flip, got: {err}"
+            err.contains("DISTRIBUTED") && err.contains("not enabled"),
+            "the fail-closed error must name the distributed keystore + that signing is not enabled, got: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
-        println!("INC2a LEASE CO-GATE PASS (fail-closed): {err}");
+        println!("INC2a LEASE CO-GATE PASS (fail-closed, flag off): {err}");
     }
 }

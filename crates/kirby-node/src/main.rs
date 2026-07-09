@@ -887,6 +887,10 @@ async fn run_fleet_supervisor_cmd(
     let spawn_cfg = config.fleet.spawn.clone();
     let spawn_relay_url = config.relay.url.clone();
     let spawn_max_tenants = config.fleet.max_tenants as usize;
+    // The #49 ON-flip gate: the failover admission gate computes DISTRIBUTED readiness (own share +
+    // a bounded quorum probe) only when this is set. FALSE by default => co-located readiness,
+    // byte-identical to before. Captured before `config` moves into the supervisor.
+    let distributed_signing_enabled = config.identity.distributed_signing_enabled;
 
     // N1 — NODE presence: the persistent daemon beacons its OWN node-level presence (signed by
     // the durable node identity key, NOT any agent's FROST key) on the fleet relay, on the
@@ -978,6 +982,7 @@ async fn run_fleet_supervisor_cmd(
         spawn_cfg,
         &spawn_relay_url,
         spawn_max_tenants,
+        distributed_signing_enabled,
         ledger,
     )
     .await;
@@ -1138,6 +1143,7 @@ async fn run_spawn_control_plane(
     spawn_cfg: kirby_node::config::SpawnConfig,
     relay_url: &str,
     max_tenants: usize,
+    distributed_signing_enabled: bool,
     ledger: std::sync::Arc<kirby_node::spawn::SledSpawnLedger>,
 ) -> anyhow::Result<()> {
     use std::collections::HashSet;
@@ -1150,7 +1156,8 @@ async fn run_spawn_control_plane(
     use std::collections::BTreeMap;
 
     use kirby_node::failover_detect::{detect_takeovers, drop_backed_off_verdicts};
-    use kirby_node::keyset_provisioning::{keystore_dir_for, keystore_loadable_at};
+    use kirby_node::keyset_provisioning::keystore_dir_for;
+    use kirby_node::quorum_probe::{takeover_readiness, ProbeDeadlines};
     use kirby_node::relay_lease::{FleetLeaseObserver, LEASE_TTL_SECS};
     use kirby_node::spawn::{
         AllowlistAuthorizer, SeedFunder, SpawnConsumer, SpawnOutcome, TakeoverAdmission,
@@ -1387,18 +1394,24 @@ async fn run_spawn_control_plane(
                     let keystore_dir = keystore_dir_for(
                         &kirby_node::fleet::instance_id_for(&verdict.agent_id),
                     );
-                    // Gate (a) readiness. CO-LOCATED (the ONLY live path today: distributed signing
-                    // defaults off and no placement.json ships in prod) -> the unchanged all-shares-
-                    // local check, byte-identical to before #49. The DISTRIBUTED quorum-probe path
-                    // (`kirby_node::quorum_probe::can_assemble_quorum`: this node's own share + a
-                    // bounded, authenticated liveness probe of the other placement holders) is wired
-                    // in HERE when the co-sign transport is wired into the fleet loop, co-gated with
-                    // distributed signing going live (see the #49 admission notes in `quorum_probe`).
-                    let readiness = if keystore_loadable_at(&keystore_dir) {
-                        kirby_node::quorum_probe::QuorumReadiness::CanSign
-                    } else {
-                        kirby_node::quorum_probe::QuorumReadiness::LocalNotLoadable
-                    };
+                    // Gate (a) readiness, via the ONE helper the revive integration test also drives
+                    // (`takeover_readiness`). CO-LOCATED (the only live path today: distributed
+                    // signing defaults off and no placement.json ships in prod) -> the unchanged
+                    // all-shares-local check, byte-identical to before #49. DISTRIBUTED (flag on +
+                    // placement present) -> this node's own share plus a bounded quorum probe. The
+                    // fleet loop cannot YET resolve this node's own placement identifier/share (the
+                    // holder-node layout that lands with cross-machine distribution) nor stand up a
+                    // live co-sign hub, so it passes `None`/`None`: distributed readiness stays
+                    // FAIL-CLOSED here until that ON-flip wiring lands, and co-located is unaffected.
+                    let readiness = takeover_readiness(
+                        &verdict.agent_id,
+                        &keystore_dir,
+                        distributed_signing_enabled,
+                        None,
+                        None,
+                        ProbeDeadlines::seconds_scale(),
+                    )
+                    .await;
                     match consumer
                         .admit_takeover(
                             &verdict.agent_id,

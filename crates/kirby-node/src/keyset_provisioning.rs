@@ -1263,6 +1263,38 @@ pub(crate) fn load_quorum_signer_distributed(
     )
 }
 
+/// RELOAD the sovereign [`FrostIdentity`] (Q + npub) of an already-provisioned DISTRIBUTED keystore
+/// -- WITHOUT co-located minting. The distributed launch path (a node winning a takeover) uses this
+/// instead of [`provision_keyset_at`]: the keyset was provisioned distributed (anchor + placement,
+/// shares on remote holders), so its local dir holds NO co-located shares to reload, and
+/// [`provision_keyset_at`] would fail (or, on a mixed keystore, validate stale local shares). This
+/// reloads ONLY the node-local group anchor (the verifying material, which every holder-or-coordinator
+/// node has), never a share, so a host reading this process finds nothing signable. Fail-closed if the
+/// keystore is not a fully-provisioned distributed keystore (anchor + placement both present).
+pub fn load_distributed_identity(keystore_dir: &Path) -> anyhow::Result<FrostIdentity> {
+    if !has_identity_anchor(keystore_dir) {
+        anyhow::bail!(
+            "distributed keystore {} has no group anchor (group_pubkeys.json) -- it is not \
+             provisioned; refusing to load an identity (fail closed)",
+            keystore_dir.display()
+        );
+    }
+    if !is_distributed_keystore(keystore_dir) {
+        anyhow::bail!(
+            "keystore {} has no placement.json -- it is CO-LOCATED, not distributed; use \
+             provision_keyset_at for a co-located launch",
+            keystore_dir.display()
+        );
+    }
+    FrostIdentity::load(&pubkeys_path(keystore_dir)).with_context(|| {
+        format!(
+            "reload the sovereign distributed FROST identity anchor at {} (the agent already owns \
+             this Q; never regenerate)",
+            keystore_dir.display()
+        )
+    })
+}
+
 /// THE SINGLE FLAG-AWARE SIGN-PATH DISPATCHER: build the agent's [`QuorumSigner`] from its keystore
 /// dir, choosing the co-located or distributed loader. This is the ONE place the all-local vs
 /// distributed choice lives, so there is NO flag-blind route to distributed signing (every caller
@@ -2188,6 +2220,251 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
         println!("FLIP-NO-SHARE-HOME PASS: distributed sign works with local sinks DELETED (RemoteHolders); the from-sinks path fails -> the TEE-substitute wall holds");
+    }
+
+    // ============================================================================================
+    // #49 IDENTITY REVIVE (the deliverable proof): provision Q distributed -> node A alive -> A
+    // down -> node B probes+admits+claims the term+1 lease under the NETWORK quorum -> node B
+    // launches signing the SAME npub; node A cannot double-claim (the single-writer fence holds).
+    // Drives the REAL new seams: takeover_readiness (gate a), the lifted lease wall
+    // (RelayLeaseGrantor::with_distributed_signing), and the distributed sign path.
+    // ============================================================================================
+
+    /// An in-process [`crate::relay_lease::LeasePublisher`] that records every published lease so the
+    /// test can re-verify the claimed lease under Q.
+    struct ReviveMemPublisher {
+        events: std::sync::Mutex<Vec<kirby_custody::cosign_net::NostrEvent>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::relay_lease::LeasePublisher for ReviveMemPublisher {
+        async fn publish_lease(
+            &self,
+            event: &kirby_custody::cosign_net::NostrEvent,
+        ) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+
+    /// A [`crate::remote_holder::CoSignFactoryProvider`] that hands the distributed lease claim the
+    /// SAME in-process holder fleet the sign path uses (the co-sign hub, in production).
+    struct ReviveFleetProvider(std::sync::Arc<crate::remote_holder::InProcessHolderFleet>);
+    impl crate::remote_holder::CoSignFactoryProvider for ReviveFleetProvider {
+        fn factory_for(
+            &self,
+            _agent_id: &str,
+        ) -> anyhow::Result<
+            std::sync::Arc<dyn crate::remote_holder::HolderTransportFactory + Send + Sync>,
+        > {
+            let factory: std::sync::Arc<
+                dyn crate::remote_holder::HolderTransportFactory + Send + Sync,
+            > = self.0.clone();
+            Ok(factory)
+        }
+    }
+
+    #[tokio::test]
+    async fn revive_identity_across_nodes_via_distributed_quorum() {
+        use crate::quorum_probe::{takeover_readiness, ProbeDeadlines, QuorumReadiness, SelfHolder};
+        use crate::relay_lease::{confirm_takeover_win, ObservedLeaseRecord, RelayLeaseGrantor};
+        use crate::remote_holder::InProcessHolderFleet;
+        use std::sync::{Arc, Mutex};
+
+        const AGENT: &str = "kirby-revive";
+        const NODE_A: crate::lease::LeaseNodeId = 1;
+        const NODE_B: crate::lease::LeaseNodeId = 2;
+
+        // (0) PROVISION Q DISTRIBUTED across 3 in-process holders (one share each, none co-located).
+        let (anchor, dirs) = dist_dirs("revive");
+        let sinks = sealed_sinks(&dirs);
+        let placement = placement_for_sealed_sinks();
+        let id = provision_keyset_distributed(&anchor, &placement, &as_dyn(&sinks))
+            .expect("provision the distributed sovereign Q");
+        let q_hex = hex::encode(id.q_bytes());
+        assert!(id.npub().starts_with("npub1"), "the agent has a sovereign npub");
+
+        // The 3 share-holders stand up "off-box" (each unseals ITS OWN share); they survive A's death.
+        let holders = Arc::new(build_inproc_fleet(&anchor, &sinks));
+
+        // (1) NODE A is LIVE: it signs under the network quorum (the agent, running on node A).
+        let signer_a =
+            load_quorum_signer_distributed(&anchor, holders.as_ref()).expect("node A signer");
+        let event_a = signer_a
+            .sign_nostr_event(1, 1_750_000_000, "node A: alive under Q")
+            .expect("node A signs under the distributed quorum");
+        assert_eq!(event_a.pubkey, q_hex, "node A signs under the agent's Q");
+        assert_event_verifies_under_q(&event_a, &anchor);
+
+        // (2) NODE A DIES.
+        drop(signer_a);
+
+        // (3) NODE B READINESS (gate a, the #49 admission wiring the fleet loop consumes): node B is a
+        //     survivor holding share 1; a bounded probe of holders 2,3 proves the 2-of-3 quorum ->
+        //     CanSign. (admit_takeover's CanSign -> Admit mapping is spawn::tooth4.)
+        let self_b = SelfHolder { identifier: 1, share_loadable: true };
+        let readiness = takeover_readiness(
+            AGENT,
+            &anchor,
+            true, // distributed_signing_enabled (flag ON in this test)
+            Some(self_b),
+            Some(holders.as_ref()),
+            ProbeDeadlines::seconds_scale(),
+        )
+        .await;
+        assert_eq!(
+            readiness,
+            QuorumReadiness::CanSign,
+            "node B (own share + reachable co-holders) can assemble the quorum"
+        );
+        // Fail-closed contrast: with NO reachable co-holder (empty fleet), node B cannot prove a
+        // quorum -- the probe actually gates admission (it is not a rubber stamp).
+        let no_holders = InProcessHolderFleet::new();
+        let readiness_down = takeover_readiness(
+            AGENT,
+            &anchor,
+            true,
+            Some(self_b),
+            Some(&no_holders),
+            ProbeDeadlines::seconds_scale(),
+        )
+        .await;
+        assert_eq!(
+            readiness_down,
+            QuorumReadiness::QuorumUnreachable,
+            "node B with no reachable co-holder fails closed"
+        );
+        // Fail-closed: a self-holder identifier NOT in the placement roster is rejected -- never
+        // count an off-roster "self" toward THIS Q's quorum (a stale/mismatched holder layout).
+        let off_roster = SelfHolder { identifier: 99, share_loadable: true };
+        let readiness_off = takeover_readiness(
+            AGENT,
+            &anchor,
+            true,
+            Some(off_roster),
+            Some(holders.as_ref()),
+            ProbeDeadlines::seconds_scale(),
+        )
+        .await;
+        assert_eq!(
+            readiness_off,
+            QuorumReadiness::StalePlacement,
+            "a self-holder identifier absent from the placement roster must fail closed"
+        );
+
+        // (4) NODE B CLAIMS the term+1 lease under the NETWORK quorum (the lifted #49 wall): a
+        //     grantor with distributed signing engaged signs the ownership lease via the remote
+        //     holders, NOT co-located stale shares.
+        let publisher = Arc::new(ReviveMemPublisher { events: Mutex::new(Vec::new()) });
+        let provider = Arc::new(ReviveFleetProvider(holders.clone()));
+        let grantor_b = RelayLeaseGrantor::new(NODE_B, publisher.clone())
+            .with_distributed_signing(true, provider.clone());
+        let claimed = grantor_b
+            .claim_for(AGENT, NODE_B, 2, &anchor)
+            .await
+            .expect("node B claims the term+1 lease under the network quorum");
+        assert_eq!((claimed.node_id, claimed.term), (NODE_B, 2));
+        let lease_event = publisher
+            .events
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("node B published its lease");
+        assert_eq!(lease_event.pubkey, q_hex, "the lease is signed under the agent's Q (not node B's key)");
+        assert_event_verifies_under_q(&lease_event, &anchor);
+
+        // Guard preserved: a grantor with distributed signing OFF must still FAIL CLOSED on the same
+        // distributed keystore (never sign a lease from co-located/stale shares).
+        let grantor_off = RelayLeaseGrantor::new(NODE_B, publisher.clone());
+        let err = grantor_off
+            .claim_for(AGENT, NODE_B, 2, &anchor)
+            .await
+            .expect_err("flag off must fail closed on a distributed keystore");
+        assert!(
+            format!("{err:#}").contains("distributed lease signing is not enabled"),
+            "the stale-share guard is preserved when the flag is off: {err:#}"
+        );
+
+        // (5) NODE B LAUNCHES: it loads its distributed signer and signs a FRESH event.
+        let signer_b =
+            load_quorum_signer_distributed(&anchor, holders.as_ref()).expect("node B signer");
+        let event_b = signer_b
+            .sign_nostr_event(1, 1_750_000_100, "node B: revived under the SAME Q")
+            .expect("node B signs post-takeover");
+        assert_event_verifies_under_q(&event_b, &anchor);
+
+        // THE REVIVE: node B signs under the SAME Q as node A -- the identity moved machines.
+        assert_eq!(
+            event_b.pubkey, event_a.pubkey,
+            "node B signs the SAME npub as node A -- the sovereign identity survived the machine's death"
+        );
+        assert_eq!(event_b.pubkey, q_hex);
+
+        // (6) FENCE: node A cannot ALSO claim -- the monotonic-term single-writer lease fence. With
+        //     node B's term-2 lease surviving, node A's read-after-write confirm at the stale term 1
+        //     (or a contested term 2 it does not hold) DENIES its launch (confirm_takeover_win, the
+        //     SAME fence the supervisor's launch path uses).
+        let surviving = ObservedLeaseRecord { holder_node_id: NODE_B, term: 2, issued_at: 1_750_000_050 };
+        assert!(
+            !confirm_takeover_win(Some(surviving), 1, NODE_A),
+            "node A claiming the STALE term 1 cannot confirm a win (the fence holds)"
+        );
+        assert!(
+            !confirm_takeover_win(Some(surviving), 2, NODE_A),
+            "node A cannot confirm a win at term 2 either (it does not hold the surviving lease)"
+        );
+        assert!(
+            confirm_takeover_win(Some(surviving), 2, NODE_B),
+            "node B legitimately won term 2 (its own surviving lease)"
+        );
+
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        println!(
+            "REVIVE PASS: distributed Q -> node A signs -> A down -> node B probes+claims term+1 (network quorum, wall lifted) -> node B signs the SAME npub; node A double-claim fenced out"
+        );
+    }
+
+    /// #49 step-4 (distributed launch): a node winning a takeover of a DISTRIBUTED keystore RELOADS
+    /// the sovereign identity via [`load_distributed_identity`] -- the SAME Q, NEVER a co-located
+    /// mint. Fail-closed both ways: a CO-LOCATED keystore (no placement) and an UNPROVISIONED one (no
+    /// anchor) are rejected, so the distributed launch branch can never silently mint a new identity.
+    /// RED-on-revert: point the branch at `provision_keyset_at` and it would fail (no local shares) or
+    /// mint a new Q -- this asserts the RELOAD returns the pre-existing Q.
+    #[test]
+    fn load_distributed_identity_reloads_same_q_and_rejects_colocated() {
+        let (anchor, dirs) = dist_dirs("dist-reload");
+        let sinks = sealed_sinks(&dirs);
+        let placement = placement_for_sealed_sinks();
+        let id = provision_keyset_distributed(&anchor, &placement, &as_dyn(&sinks))
+            .expect("provision distributed");
+
+        // The distributed launch reloads the SAME sovereign Q + npub (no co-located mint).
+        let reloaded = load_distributed_identity(&anchor).expect("reload distributed identity");
+        assert_eq!(reloaded.q_bytes(), id.q_bytes(), "the distributed launch reloads the SAME Q");
+        assert_eq!(reloaded.npub(), id.npub());
+
+        // A CO-LOCATED keystore (no placement.json) is rejected -- the branch never mis-handles it.
+        let colo = temp_keystore("dist-reload-colo");
+        provision_keyset_at(&colo).expect("provision co-located");
+        assert!(
+            load_distributed_identity(&colo).is_err(),
+            "a co-located keystore must be rejected (no placement.json)"
+        );
+
+        // An UNPROVISIONED keystore (placement present but NO anchor) is rejected -- never a silent
+        // new identity.
+        let empty = temp_keystore("dist-reload-empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join(PLACEMENT_FILE), "{}").unwrap();
+        assert!(
+            load_distributed_identity(&empty).is_err(),
+            "no anchor must be rejected (not provisioned)"
+        );
+
+        let _ = std::fs::remove_dir_all(anchor.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&colo);
+        let _ = std::fs::remove_dir_all(&empty);
+        println!("DIST-RELOAD PASS: load_distributed_identity reloads the SAME Q; co-located + unprovisioned rejected");
     }
 
     /// A fail-closed reload over a missing holder share. An ESTABLISHED
